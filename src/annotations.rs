@@ -32,7 +32,7 @@ pub fn tags_in_comment(text: &str) -> Vec<PerfTag> {
     while let Some(found) = text[position..].find("@perf") {
         let start = position + found + "@perf".len();
 
-        match tag_at(&text[start..]) {
+        match tag_and_length_of(&text[start..]) {
             Some((tag, consumed)) => {
                 if !tags.contains(&tag) {
                     tags.push(tag);
@@ -68,7 +68,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if !self.tag_cache.contains_key(&key) {
             let start = kind.span().start;
             let tags = if is_owner(self.project, file, key.1, start) {
-                leading_tags(self.project, file, start)
+                leading_tags_of(self.project, file, start)
             } else {
                 Vec::new()
             };
@@ -129,7 +129,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             node = nodes.parent_id(node);
         }
 
-        leading_tags(project, file, start)
+        leading_tags_of(project, file, start)
     }
 
     pub fn is_hot_path(&mut self, file: FileId, kind: AstKind<'a>) -> bool {
@@ -162,18 +162,42 @@ fn is_owner(project: &Project<'_>, file: FileId, node: NodeId, start: u32) -> bo
         || nodes.kind(parent).span().start != start
 }
 
-fn leading_tags(project: &Project<'_>, file: FileId, start: u32) -> Vec<PerfTag> {
+fn leading_tags_of(project: &Project<'_>, file: FileId, start: u32) -> Vec<PerfTag> {
     let source = project.file(file);
     let comments = source.semantic.comments();
-    let before = comments.partition_point(|comment| comment.span.start < start);
-    let attached: Vec<_> = comments[..before]
-        .iter()
-        .rev()
-        .take_while(|comment| comment.is_leading() && comment.attached_to == start)
-        .collect();
+    let before = comments.partition_point(|comment| comment.span.end <= start);
+    let mut gap_start = start as usize;
+    let mut first = before;
+
+    loop {
+        gap_start = source.text[..gap_start]
+            .trim_end_matches(is_trivia_space)
+            .len();
+
+        match first.checked_sub(1).map(|previous| &comments[previous]) {
+            Some(comment) if comment.span.end as usize == gap_start => {
+                gap_start = comment.span.start as usize;
+                first -= 1;
+            }
+            _ => break,
+        }
+    }
+
+    let mut collecting = gap_start == 0;
+    let mut cursor = gap_start;
     let mut tags = Vec::new();
 
-    for comment in attached.into_iter().rev() {
+    for comment in &comments[first..before] {
+        if source.text[cursor..comment.span.start as usize].contains(['\n', '\r']) {
+            collecting = true;
+        }
+
+        cursor = comment.span.end as usize;
+
+        if !collecting {
+            continue;
+        }
+
         for tag in tags_in_comment(comment.content_span().source_text(source.text)) {
             if !tags.contains(&tag) {
                 tags.push(tag);
@@ -184,7 +208,11 @@ fn leading_tags(project: &Project<'_>, file: FileId, start: u32) -> Vec<PerfTag>
     tags
 }
 
-fn tag_at(text: &str) -> Option<(PerfTag, usize)> {
+fn is_trivia_space(character: char) -> bool {
+    character.is_whitespace() || character == '\u{feff}'
+}
+
+fn tag_and_length_of(text: &str) -> Option<(PerfTag, usize)> {
     let trimmed = text.trim_start();
     let skipped = text.len() - trimmed.len();
 

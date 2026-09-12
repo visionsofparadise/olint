@@ -11,6 +11,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
+use oxc_span::Span;
 use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportImportName,
     ModuleRecord,
@@ -276,7 +277,7 @@ impl<'a> Declarations<'a> {
         file: FileId,
         name: &str,
     ) -> Option<Declaration<'a>> {
-        let target = self.followed_export(project, file, name)?;
+        let target = self.followed_export_of(project, file, name)?;
 
         declaration_of_target(project, target)
     }
@@ -290,12 +291,12 @@ impl<'a> Declarations<'a> {
         let mut seen = HashSet::new();
         let mut visited = HashSet::new();
 
-        self.export_names(project, file, true, &mut visited, &mut seen, &mut names);
+        self.collect_export_names(project, file, true, &mut visited, &mut seen, &mut names);
 
         names
             .into_iter()
             .filter_map(|(name, provider)| {
-                let target = self.followed_export(project, provider, &name)?;
+                let target = self.followed_export_of(project, provider, &name)?;
 
                 declaration_of_target(project, target).map(|declaration| (name, declaration))
             })
@@ -363,7 +364,7 @@ impl<'a> Declarations<'a> {
 
                 member_writes
                     .entry(file)
-                    .or_insert_with(|| written_member_names(project, file))
+                    .or_insert_with(|| written_member_names_of(project, file))
                     .contains(&name)
             }
         }
@@ -392,14 +393,19 @@ impl<'a> Declarations<'a> {
 
         match (project.resolve(file, source), imported) {
             (Resolved::File(target), Some(name)) => self
-                .followed_export(project, target, name)
+                .followed_export_of(project, target, name)
                 .unwrap_or(Target::External),
             (Resolved::File(target), None) => Target::Namespace(target),
             _ => Target::External,
         }
     }
 
-    fn followed_export(&self, project: &Project<'a>, file: FileId, name: &str) -> Option<Target> {
+    fn followed_export_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        name: &str,
+    ) -> Option<Target> {
         let key = (file, name.to_string());
 
         if let Some(cached) = self.followed.borrow().get(&key) {
@@ -407,14 +413,14 @@ impl<'a> Declarations<'a> {
         }
 
         let mut visited = HashSet::new();
-        let target = self.export_target(project, file, name, &mut visited);
+        let target = self.export_target_of(project, file, name, &mut visited);
 
         self.followed.borrow_mut().insert(key, target);
 
         target
     }
 
-    fn export_target(
+    fn export_target_of(
         &self,
         project: &Project<'a>,
         file: FileId,
@@ -457,7 +463,7 @@ impl<'a> Declarations<'a> {
                         let imported =
                             imported_name_of(module_record, entry, imported.name.as_str());
 
-                        self.export_target(project, target, imported, visited)
+                        self.export_target_of(project, target, imported, visited)
                     }
                     _ => None,
                 },
@@ -469,12 +475,12 @@ impl<'a> Declarations<'a> {
             return None;
         }
 
-        star_targets(project, module_record, file)
+        star_targets_of(project, module_record, file)
             .into_iter()
-            .find_map(|target| self.export_target(project, target, name, visited))
+            .find_map(|target| self.export_target_of(project, target, name, visited))
     }
 
-    fn export_names(
+    fn collect_export_names(
         &self,
         project: &Project<'a>,
         file: FileId,
@@ -488,10 +494,14 @@ impl<'a> Declarations<'a> {
         }
 
         let module_record = self.module_records[file.0 as usize];
-        let entries = module_record
+        let functions = exported_function_statements_of(project, file);
+        let mut entries: Vec<&ExportEntry<'_>> = module_record
             .local_export_entries
             .iter()
-            .chain(&module_record.indirect_export_entries);
+            .chain(&module_record.indirect_export_entries)
+            .collect();
+
+        entries.sort_by_key(|entry| (!functions.contains(&entry.statement_span), entry.span.start));
 
         for entry in entries {
             let Some(name) = export_name_of(entry) else {
@@ -503,13 +513,41 @@ impl<'a> Declarations<'a> {
             }
         }
 
-        for target in star_targets(project, module_record, file) {
-            self.export_names(project, target, false, visited, seen, names);
+        for target in star_targets_of(project, module_record, file) {
+            self.collect_export_names(project, target, false, visited, seen, names);
         }
     }
 }
 
-fn star_targets(
+fn exported_function_statements_of(project: &Project<'_>, file: FileId) -> HashSet<Span> {
+    project
+        .file(file)
+        .program
+        .body
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::ExportDeclaration(export)
+                if matches!(
+                    export.declaration,
+                    oxc_ast::ast::Declaration::FunctionDeclaration(_)
+                ) =>
+            {
+                Some(export.span)
+            }
+            Statement::ExportDefaultDeclaration(export)
+                if matches!(
+                    export.declaration,
+                    ExportDefaultDeclarationKind::FunctionDeclaration(_)
+                ) =>
+            {
+                Some(export.span)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn star_targets_of(
     project: &Project<'_>,
     module_record: &ModuleRecord<'_>,
     file: FileId,
@@ -718,7 +756,7 @@ fn element_index_of(class: &Class<'_>, name: &str) -> Option<u32> {
         .map(|index| index as u32)
 }
 
-fn written_member_names(project: &Project<'_>, file: FileId) -> HashSet<String> {
+fn written_member_names_of(project: &Project<'_>, file: FileId) -> HashSet<String> {
     project
         .file(file)
         .semantic
@@ -729,11 +767,11 @@ fn written_member_names(project: &Project<'_>, file: FileId) -> HashSet<String> 
             AstKind::UpdateExpression(update) => update.argument.as_member_expression(),
             _ => None,
         })
-        .filter_map(this_member_name)
+        .filter_map(this_member_name_of)
         .collect()
 }
 
-fn this_member_name(member: &MemberExpression<'_>) -> Option<String> {
+fn this_member_name_of(member: &MemberExpression<'_>) -> Option<String> {
     match member {
         MemberExpression::StaticMemberExpression(member)
             if matches!(member.object, Expression::ThisExpression(_)) =>

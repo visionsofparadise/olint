@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::Program;
+use oxc_ast::ast::{Program, Statement, TSModuleReference};
 use oxc_parser::Parser;
 use oxc_resolver::{
     ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
@@ -64,12 +64,19 @@ pub struct Site {
     pub line: u32,
 }
 
+struct OpenFile<'a> {
+    file: SourceFile<'a>,
+    imports: Vec<PathBuf>,
+    next: usize,
+}
+
 const PARSED_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+const TYPESCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts"];
 
 impl<'a> Project<'a> {
     pub fn load(allocator: &'a Allocator, tsconfig: &Path) -> Result<Project<'a>, ProjectError> {
         let selection = select_files(tsconfig)?;
-        let tsconfig_path = canonical_path(tsconfig).map_err(|source| ProjectError::Read {
+        let tsconfig_path = canonical_path_of(tsconfig).map_err(|source| ProjectError::Read {
             path: tsconfig.to_path_buf(),
             source,
         })?;
@@ -106,50 +113,69 @@ impl<'a> Project<'a> {
             by_path: HashMap::new(),
             resolver,
         };
-        let mut queue: VecDeque<PathBuf> = selection
-            .files
-            .into_iter()
-            .filter(|path| is_parsed_path(path))
-            .collect();
-        let mut queued: HashSet<PathBuf> = queue.iter().cloned().collect();
+        let allow_js = selection.allow_js;
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut stack: Vec<OpenFile<'a>> = Vec::new();
 
-        while let Some(path) = queue.pop_front() {
-            let id = FileId(project.files.len() as u32);
-            let file = parse_file(allocator, id, path, &project.root)?;
-            let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
-            let mut specifiers: Vec<(u32, &str)> = file
-                .module_record
-                .requested_modules
-                .iter()
-                .map(|(specifier, requests)| {
-                    let start = requests.iter().map(|request| request.span.start).min();
-
-                    (start.unwrap_or(0), specifier.as_str())
-                })
-                .collect();
-
-            specifiers.sort_unstable();
-
-            for (_, specifier) in specifiers {
-                let Ok(resolution) = project.resolver.resolve(&directory, specifier) else {
-                    continue;
-                };
-                let target = strip_verbatim_prefix(resolution.path());
-
-                if target.starts_with(&project.root)
-                    && is_parsed_path(&target)
-                    && !forward_slashes(&target).contains("/node_modules/")
-                    && queued.insert(target.clone())
-                {
-                    queue.push_back(target);
-                }
+        for root in selection.files {
+            if !is_parsed_path(&root, allow_js) || !seen.insert(root.clone()) {
+                continue;
             }
 
-            project.by_path.insert(file.path.clone(), id);
-            project.files.push(file);
+            stack.push(project.open(allocator, root, allow_js)?);
+
+            while let Some(top) = stack.last_mut() {
+                match top.imports.get(top.next).cloned() {
+                    Some(target) => {
+                        top.next += 1;
+
+                        if seen.insert(target.clone()) {
+                            let opened = project.open(allocator, target, allow_js)?;
+
+                            stack.push(opened);
+                        }
+                    }
+                    None => {
+                        let Some(OpenFile { mut file, .. }) = stack.pop() else {
+                            break;
+                        };
+
+                        file.id = FileId(project.files.len() as u32);
+
+                        project.by_path.insert(file.path.clone(), file.id);
+                        project.files.push(file);
+                    }
+                }
+            }
         }
 
         Ok(project)
+    }
+
+    fn open(
+        &self,
+        allocator: &'a Allocator,
+        path: PathBuf,
+        allow_js: bool,
+    ) -> Result<OpenFile<'a>, ProjectError> {
+        let file = parse_file(allocator, path, &self.root)?;
+        let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let imports = import_specifiers_of(&file)
+            .into_iter()
+            .filter_map(|specifier| self.resolver.resolve(&directory, &specifier).ok())
+            .map(|resolution| strip_verbatim_prefix(resolution.path()))
+            .filter(|target| {
+                target.starts_with(&self.root)
+                    && is_parsed_path(target, allow_js)
+                    && !forward_slashes_of(target).contains("/node_modules/")
+            })
+            .collect();
+
+        Ok(OpenFile {
+            file,
+            imports,
+            next: 0,
+        })
     }
 
     pub fn file(&self, id: FileId) -> &SourceFile<'a> {
@@ -161,7 +187,7 @@ impl<'a> Project<'a> {
             return Some(*id);
         }
 
-        canonical_path(path)
+        canonical_path_of(path)
             .ok()
             .and_then(|canonical| self.by_path.get(&canonical).copied())
     }
@@ -188,7 +214,7 @@ impl<'a> Project<'a> {
     }
 
     pub fn line_of(&self, id: FileId, offset: u32) -> u32 {
-        line_in(&self.file(id).line_starts, offset)
+        line_of_offset(&self.file(id).line_starts, offset)
     }
 
     pub fn site_of(&self, id: FileId, span: Span) -> Site {
@@ -203,13 +229,13 @@ impl<'a> Project<'a> {
 
         file.path.starts_with(&self.root)
             && !is_declaration_path(&file.path)
-            && !forward_slashes(&file.path).contains("/node_modules/")
+            && !forward_slashes_of(&file.path).contains("/node_modules/")
     }
 
     pub fn is_test_path(&self, id: FileId) -> bool {
         let file = self.file(id);
 
-        is_test_relative(&forward_slashes(&file.path), &file.relative)
+        is_test_relative(&forward_slashes_of(&file.path), &file.relative)
     }
 }
 
@@ -251,11 +277,11 @@ pub fn is_test_relative(absolute_forward: &str, relative: &str) -> bool {
         .any(|directory| SEGMENTS.contains(directory))
 }
 
-pub fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
+pub fn canonical_path_of(path: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path).map(|canonical| strip_verbatim_prefix(&canonical))
 }
 
-pub fn forward_slashes(path: impl AsRef<Path>) -> String {
+pub fn forward_slashes_of(path: impl AsRef<Path>) -> String {
     path.as_ref().to_string_lossy().replace('\\', "/")
 }
 
@@ -273,13 +299,67 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn is_parsed_path(path: &Path) -> bool {
+fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
     let extension = path
         .extension()
-        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .map(|extension| extension.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let allowed = if allow_js {
+        PARSED_EXTENSIONS
+    } else {
+        TYPESCRIPT_EXTENSIONS
+    };
 
-    PARSED_EXTENSIONS.contains(&extension.as_str()) && !is_declaration_path(path)
+    allowed.contains(&extension.as_str()) && !is_declaration_path(path)
+}
+
+fn import_specifiers_of(file: &SourceFile<'_>) -> Vec<String> {
+    let mut static_imports: Vec<(u32, String)> = file
+        .module_record
+        .requested_modules
+        .iter()
+        .filter_map(|(specifier, requests)| {
+            let start = requests.iter().map(|request| request.span.start).min()?;
+
+            Some((start, specifier.to_string()))
+        })
+        .collect();
+
+    for statement in &file.program.body {
+        if let Statement::TSImportEqualsDeclaration(declaration) = statement {
+            if let TSModuleReference::ExternalModuleReference(reference) =
+                &declaration.module_reference
+            {
+                static_imports.push((
+                    declaration.span.start,
+                    reference.expression.value.to_string(),
+                ));
+            }
+        }
+    }
+
+    static_imports.sort_by_key(|(start, _)| *start);
+
+    let dynamic_imports = file
+        .module_record
+        .dynamic_imports
+        .iter()
+        .filter_map(|import| {
+            let text = import.module_request.source_text(file.text);
+            let quote = text.chars().next()?;
+
+            matches!(quote, '"' | '\'' | '`')
+                .then(|| text.strip_prefix(quote)?.strip_suffix(quote))
+                .flatten()
+                .filter(|inner| !(quote == '`' && inner.contains("${")))
+                .map(str::to_string)
+        });
+
+    static_imports
+        .into_iter()
+        .map(|(_, specifier)| specifier)
+        .chain(dynamic_imports)
+        .collect()
 }
 
 fn is_declaration_path(path: &Path) -> bool {
@@ -294,7 +374,7 @@ fn is_declaration_path(path: &Path) -> bool {
         || (name.ends_with(".ts") && name.contains(".d."))
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
+fn relative_path_of(root: &Path, path: &Path) -> String {
     let root_components: Vec<Component> = root.components().collect();
     let path_components: Vec<Component> = path.components().collect();
     let shared = root_components
@@ -344,13 +424,12 @@ fn line_starts_of(text: &str) -> Vec<u32> {
     starts
 }
 
-fn line_in(line_starts: &[u32], offset: u32) -> u32 {
+fn line_of_offset(line_starts: &[u32], offset: u32) -> u32 {
     line_starts.partition_point(|start| *start <= offset) as u32
 }
 
 fn parse_file<'a>(
     allocator: &'a Allocator,
-    id: FileId,
     path: PathBuf,
     root: &Path,
 ) -> Result<SourceFile<'a>, ProjectError> {
@@ -384,8 +463,8 @@ fn parse_file<'a>(
         .semantic;
 
     Ok(SourceFile {
-        id,
-        relative: relative_path(root, &path),
+        id: FileId(u32::MAX),
+        relative: relative_path_of(root, &path),
         path,
         text,
         program,

@@ -6,27 +6,27 @@ use oxc_ast::AstKind;
 
 mod support;
 
-use support::{file_of, first_node, with_project, TYPED_PACKAGE};
+use support::{file_of, first_node_of, run_in_project, TYPED_PACKAGE};
 
-fn reference_named<'a>(
+fn reference_of<'a>(
     project: &Project<'a>,
     file: FileId,
     name: &str,
 ) -> &'a IdentifierReference<'a> {
-    first_node(project, file, |kind| match kind {
+    first_node_of(project, file, |kind| match kind {
         AstKind::IdentifierReference(reference) if reference.name == name => Some(reference),
         _ => None,
     })
 }
 
-fn first_class<'a>(project: &Project<'a>, file: FileId) -> &'a Class<'a> {
-    first_node(project, file, |kind| match kind {
+fn first_class_of<'a>(project: &Project<'a>, file: FileId) -> &'a Class<'a> {
+    first_node_of(project, file, |kind| match kind {
         AstKind::Class(class) => Some(class),
         _ => None,
     })
 }
 
-fn function_name(declaration: Option<Declaration<'_>>) -> String {
+fn function_name_of(declaration: Option<Declaration<'_>>) -> String {
     match declaration {
         Some(Declaration::Function {
             function: FunctionNode::Function(function),
@@ -46,17 +46,17 @@ fn declaration_of_reference<'a>(
     file: FileId,
     name: &str,
 ) -> Option<Declaration<'a>> {
-    declarations.of_reference(project, file, reference_named(project, file, name))
+    declarations.of_reference(project, file, reference_of(project, file, name))
 }
 
-fn imported_function_name(files: &[(&str, &str)], name: &str) -> String {
+fn imported_function_name_of(files: &[(&str, &str)], name: &str) -> String {
     let mut found = String::new();
 
-    with_project(files, |project, root| {
+    run_in_project(files, |project, root| {
         let declarations = Declarations::new(project);
         let index = file_of(project, root, "index.ts");
 
-        found = function_name(declaration_of_reference(
+        found = function_name_of(declaration_of_reference(
             project,
             &declarations,
             index,
@@ -77,7 +77,7 @@ fn of_export_follows_a_named_re_export_chain() {
         ("index.ts", "import { last } from \"./c\";\nlast();"),
     ];
 
-    assert_eq!(imported_function_name(&files, "last"), "target");
+    assert_eq!(imported_function_name_of(&files, "last"), "target");
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn star_exports_terminate_through_a_cycle() {
         ("b.ts", "export * from \"./a\";\nexport function fromB() {}"),
     ];
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let declarations = Declarations::new(project);
         let a = file_of(project, root, "a.ts");
         let names: Vec<String> = declarations
@@ -98,7 +98,7 @@ fn star_exports_terminate_through_a_cycle() {
             .collect();
 
         assert_eq!(
-            function_name(declarations.of_export(project, a, "fromB")),
+            function_name_of(declarations.of_export(project, a, "fromB")),
             "fromB"
         );
         assert!(declarations.of_export(project, a, "missing").is_none());
@@ -117,7 +117,7 @@ fn namespace_import_reaches_its_members() {
         ),
     ];
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let declarations = Declarations::new(project);
         let index = file_of(project, root, "index.ts");
         let lib = file_of(project, root, "lib.ts");
@@ -126,7 +126,7 @@ fn namespace_import_reaches_its_members() {
             Some(Declaration::Namespace { file }) => {
                 assert_eq!(file, lib);
                 assert_eq!(
-                    function_name(declarations.of_export(project, file, "run")),
+                    function_name_of(declarations.of_export(project, file, "run")),
                     "run"
                 );
             }
@@ -143,7 +143,7 @@ fn default_import_reaches_the_default_export() {
         ("index.ts", "import go from \"./lib\";\ngo();"),
     ];
 
-    assert_eq!(imported_function_name(&files, "go"), "run");
+    assert_eq!(imported_function_name_of(&files, "go"), "run");
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn node_modules_import_is_external() {
     ]
     .concat();
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let declarations = Declarations::new(project);
         let index = file_of(project, root, "index.ts");
 
@@ -178,10 +178,10 @@ fn member_of_finds_a_private_name() {
         ),
     ];
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let declarations = Declarations::new(project);
         let file = file_of(project, root, "box.ts");
-        let class = first_class(project, file);
+        let class = first_class_of(project, file);
 
         match declarations.member_of(project, file, class, "#secret") {
             Some(Declaration::Member {
@@ -203,12 +203,12 @@ fn is_written_sees_nested_reassignment_and_member_writes() {
         ),
     ];
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let declarations = Declarations::new(project);
         let file = file_of(project, root, "state.ts");
-        let class = first_class(project, file);
+        let class = first_class_of(project, file);
         let written = |name: &str| {
-            let reference = reference_named(project, file, name);
+            let reference = reference_of(project, file, name);
             let binding = declarations
                 .binding_of_reference(project, file, reference)
                 .expect("a binding");
@@ -227,6 +227,65 @@ fn is_written_sees_nested_reassignment_and_member_writes() {
         assert!(!written("fixed"));
         assert!(member_written("size"));
         assert!(!member_written("limit"));
+    });
+}
+
+#[test]
+fn exports_of_follows_typescript_binding_order() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "index.ts",
+            "export * from \"./star\";
+export const first = 1;
+export { reexported } from \"./other\";
+export function hoisted() {}
+import value from \"./other\";
+export { value };
+export default function () {}
+export interface Shape { x: number }",
+        ),
+        (
+            "star.ts",
+            "export function fromStar() {}
+export const first = 2;",
+        ),
+        (
+            "other.ts",
+            "export function reexported() {}
+export default function named() {}",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let declarations = Declarations::new(project);
+        let index = file_of(project, root, "index.ts");
+        let names: Vec<String> = declarations
+            .exports_of(project, index)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "hoisted",
+                "default",
+                "first",
+                "reexported",
+                "value",
+                "Shape",
+                "fromStar"
+            ]
+        );
+        assert_eq!(
+            function_name_of(declarations.of_export(project, index, "value")),
+            "named"
+        );
+        assert_eq!(
+            function_name_of(declarations.of_export(project, index, "default")),
+            ""
+        );
     });
 }
 

@@ -32,7 +32,7 @@ pub fn project_of(files: &[(&str, &str)]) -> TempDir {
     directory
 }
 
-pub fn with_project(files: &[(&str, &str)], body: impl for<'a> FnOnce(&Project<'a>, &Path)) {
+pub fn run_in_project(files: &[(&str, &str)], body: impl for<'a> FnOnce(&Project<'a>, &Path)) {
     let directory = project_of(files);
     let allocator = Allocator::default();
     let project =
@@ -47,7 +47,7 @@ pub fn file_of(project: &Project<'_>, root: &Path, relative: &str) -> FileId {
         .unwrap_or_else(|| panic!("{relative} is loaded"))
 }
 
-pub fn first_node<'a, T>(
+pub fn first_node_of<'a, T>(
     project: &Project<'a>,
     file: FileId,
     pick: impl Fn(AstKind<'a>) -> Option<T>,

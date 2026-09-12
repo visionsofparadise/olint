@@ -43,7 +43,7 @@ fn line_starts_count_bytes_and_every_line_break() {
     let starts = line_starts_of(text);
 
     assert_eq!(starts, vec![0, 3, 6, 8, 12]);
-    assert_eq!(line_in(&starts, 2), 1);
-    assert_eq!(line_in(&starts, 3), 2);
-    assert_eq!(line_in(&starts, 12), 5);
+    assert_eq!(line_of_offset(&starts, 2), 1);
+    assert_eq!(line_of_offset(&starts, 3), 2);
+    assert_eq!(line_of_offset(&starts, 12), 5);
 }

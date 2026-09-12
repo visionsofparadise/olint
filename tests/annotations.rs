@@ -6,7 +6,7 @@ use oxc_ast::AstKind;
 
 mod support;
 
-use support::{file_of, first_node, with_project};
+use support::{file_of, first_node_of, run_in_project};
 
 const OPTIONS: Options = Options {
     strings_linear: true,
@@ -32,18 +32,18 @@ fn function_tags_climb_to_the_tagged_declaration() {
         ),
     ];
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let mut analysis = Analysis::new(project, OPTIONS);
         let file = file_of(project, root, "engine.ts");
-        let exported = first_node(project, file, |kind| match kind {
+        let exported = first_node_of(project, file, |kind| match kind {
             AstKind::VariableDeclarator(declarator) => arrow_of(declarator.init.as_ref()),
             _ => None,
         });
-        let method = first_node(project, file, |kind| match kind {
+        let method = first_node_of(project, file, |kind| match kind {
             AstKind::MethodDefinition(method) => Some(FunctionNode::Function(&method.value)),
             _ => None,
         });
-        let property = first_node(project, file, |kind| match kind {
+        let property = first_node_of(project, file, |kind| match kind {
             AstKind::PropertyDefinition(property) => arrow_of(property.value.as_ref()),
             _ => None,
         });
@@ -70,11 +70,11 @@ fn perf_tags_belong_to_the_outermost_node_at_a_position() {
         ),
     ];
 
-    with_project(&files, |project, root| {
+    run_in_project(&files, |project, root| {
         let mut analysis = Analysis::new(project, OPTIONS);
         let file = file_of(project, root, "loop.ts");
         let pick = |wanted: fn(&AstKind<'_>) -> bool| {
-            first_node(project, file, move |kind| wanted(&kind).then_some(kind))
+            first_node_of(project, file, move |kind| wanted(&kind).then_some(kind))
         };
         let loop_statement = pick(|kind| matches!(kind, AstKind::ForOfStatement(_)));
         let statement = pick(|kind| matches!(kind, AstKind::ExpressionStatement(_)));
@@ -85,5 +85,39 @@ fn perf_tags_belong_to_the_outermost_node_at_a_position() {
         assert_eq!(analysis.perf_tags(file, statement), [PerfTag::Hot]);
         assert!(analysis.perf_tags(file, call).is_empty());
         assert!(analysis.is_hot_path(file, body));
+    });
+}
+
+#[test]
+fn comments_before_the_first_line_break_are_not_leading() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "same.ts",
+            "export function s(xs: number[], k: number) {\n\tswitch (k) {\n\t\tcase 0: // @perf hot\n\t\t\txs.sort();\n\t\t\tbreak;\n\t}\n\txs.pop(); /* @perf cold */ xs.reverse();\n\tconst y = // @perf O(N)\n\t\txs.length;\n\t/* one */ // @perf bounded\n\txs.shift();\n\treturn y;\n}\n",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let mut analysis = Analysis::new(project, OPTIONS);
+        let file = file_of(project, root, "same.ts");
+        let tagged: Vec<(String, Vec<PerfTag>)> = project
+            .file(file)
+            .semantic
+            .nodes()
+            .iter()
+            .map(|node| node.kind())
+            .filter_map(|kind| {
+                let tags = analysis.perf_tags(file, kind).to_vec();
+                let text = oxc_span::GetSpan::span(&kind).source_text(project.file(file).text);
+
+                (!tags.is_empty()).then(|| (text.to_string(), tags))
+            })
+            .collect();
+
+        assert_eq!(
+            tagged,
+            vec![("xs.shift();".to_string(), vec![PerfTag::Bounded])]
+        );
     });
 }
