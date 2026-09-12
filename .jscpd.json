@@ -1,0 +1,10 @@
+{
+	"minLines": 5,
+	"minTokens": 50,
+	"gitignore": true,
+	"absolute": true,
+	"threshold": 0,
+	"format": ["javascript", "rust"],
+	"reporters": ["console"],
+	"ignore": ["**/.*/**", "**/*.md", "**/__fixtures__/**", "**/package.json", "package-lock.json", "**/*.test.rs"]
+}

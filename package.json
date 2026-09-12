@@ -1,0 +1,34 @@
+{
+	"name": "olint",
+	"description": "Asymptotic cost lint for TypeScript",
+	"author": "Matt Cavender",
+	"license": "MIT",
+	"version": "0.1.0",
+	"private": true,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/visionsofparadise/olint.git"
+	},
+	"type": "module",
+	"engines": {
+		"node": ">=24",
+		"npm": ">=12"
+	},
+	"scripts": {
+		"start": "cargo run",
+		"build": "cargo build --release",
+		"unit": "cargo test",
+		"prepare": "node -e \"const c=require('node:child_process');if(c.spawnSync('git',['rev-parse','--is-inside-work-tree'],{stdio:'ignore'}).status===0)c.execFileSync('git',['config','core.hooksPath','.githooks'])\" && node tools.mjs install && cargo install styling-lint --version 0.1.0 --locked && cargo install cargo-machete --version 0.9.2 --locked",
+		"check": "concurrently --group \"prettier --check .\" \"markdownlint-cli2 \\\"**/*.md\\\"\" \"jscpd .\" \"cargo fmt --check\" \"cargo check --all-targets && cargo clippy --all-targets -- -D warnings\" \"cargo machete\" \"styling-lint check\"",
+		"fix": "concurrently -m 1 --group \"prettier --write .\" \"markdownlint-cli2 --fix \\\"**/*.md\\\"\" \"cargo clippy --fix --allow-dirty --allow-staged --all-targets -- -D warnings\" \"cargo fmt\" \"styling-lint fix\""
+	},
+	"devDependencies": {
+		"@commitlint/cli": "21.2.2",
+		"@commitlint/config-conventional": "21.2.2",
+		"concurrently": "10.0.5",
+		"jscpd": "5.1.2",
+		"markdownlint-cli2": "0.23.2",
+		"prettier": "3.9.6"
+	},
+	"allowScripts": {}
+}

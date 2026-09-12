@@ -1,0 +1,13 @@
+[package]
+name = "olint"
+version = "0.1.0"
+authors = ["Matt Cavender"]
+description = "Asymptotic cost lint for TypeScript"
+license = "MIT"
+repository = "https://github.com/visionsofparadise/olint"
+publish = false
+edition = "2021"
+rust-version = "1.88"
+
+[lints.rust]
+nonstandard_style = "deny"
