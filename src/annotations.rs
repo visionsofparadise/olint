@@ -1,0 +1,238 @@
+use oxc_ast::ast::Statement;
+use oxc_ast::AstKind;
+use oxc_semantic::NodeId;
+use oxc_span::GetSpan;
+
+use crate::analysis::Analysis;
+use crate::cost::Cost;
+use crate::declarations::FunctionNode;
+use crate::project::{FileId, Project};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PerfTag {
+    Ignore,
+    Hot,
+    Cold,
+    Bounded,
+    Cost(String),
+    Max(String),
+}
+
+const WORD_TAGS: &[(&str, PerfTag)] = &[
+    ("ignore", PerfTag::Ignore),
+    ("hot", PerfTag::Hot),
+    ("cold", PerfTag::Cold),
+    ("bounded", PerfTag::Bounded),
+];
+
+pub fn tags_in_comment(text: &str) -> Vec<PerfTag> {
+    let mut tags = Vec::new();
+    let mut position = 0;
+
+    while let Some(found) = text[position..].find("@perf") {
+        let start = position + found + "@perf".len();
+
+        match tag_at(&text[start..]) {
+            Some((tag, consumed)) => {
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+
+                position = start + consumed;
+            }
+            None => position = start,
+        }
+    }
+
+    tags
+}
+
+pub fn cost_tag_of(tags: &[PerfTag]) -> Option<(Cost, String)> {
+    tags.iter().find_map(|tag| match tag {
+        PerfTag::Cost(text) => Cost::parse(text).map(|cost| (cost, text.clone())),
+        _ => None,
+    })
+}
+
+pub fn max_tag_of(tags: &[PerfTag]) -> Option<(Cost, String)> {
+    tags.iter().find_map(|tag| match tag {
+        PerfTag::Max(text) => Cost::parse(text).map(|cost| (cost, text.clone())),
+        _ => None,
+    })
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    pub fn perf_tags(&mut self, file: FileId, kind: AstKind<'a>) -> &[PerfTag] {
+        let key = (file, kind.node_id());
+
+        if !self.tag_cache.contains_key(&key) {
+            let start = kind.span().start;
+            let tags = if is_owner(self.project, file, key.1, start) {
+                leading_tags(self.project, file, start)
+            } else {
+                Vec::new()
+            };
+
+            self.tag_cache.insert(key, tags);
+        }
+
+        &self.tag_cache[&key]
+    }
+
+    pub fn function_tags(&mut self, file: FileId, function: FunctionNode<'a>) -> Vec<PerfTag> {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let mut node = function.node_id();
+        let is_expression = match function {
+            FunctionNode::Arrow(_) => true,
+            FunctionNode::Function(inner) => inner.is_expression(),
+        };
+
+        if is_expression
+            && matches!(
+                nodes.parent_kind(node),
+                AstKind::VariableDeclarator(_)
+                    | AstKind::PropertyDefinition(_)
+                    | AstKind::ObjectProperty(_)
+            )
+        {
+            node = nodes.parent_id(node);
+        }
+
+        if let (AstKind::VariableDeclarator(_), AstKind::VariableDeclaration(declaration)) =
+            (nodes.kind(node), nodes.parent_kind(node))
+        {
+            if declaration.declarations.len() == 1 {
+                node = nodes.parent_id(node);
+            }
+        }
+
+        if matches!(
+            nodes.kind(node),
+            AstKind::Function(_) | AstKind::VariableDeclaration(_) | AstKind::Class(_)
+        ) && matches!(
+            nodes.parent_kind(node),
+            AstKind::ExportDeclaration(_) | AstKind::ExportDefaultDeclaration(_)
+        ) {
+            node = nodes.parent_id(node);
+        }
+
+        if matches!(nodes.kind(node), AstKind::Function(_))
+            && matches!(nodes.parent_kind(node), AstKind::MethodDefinition(_))
+        {
+            node = nodes.parent_id(node);
+        }
+
+        let start = nodes.kind(node).span().start;
+
+        while !is_owner(project, file, node, start) {
+            node = nodes.parent_id(node);
+        }
+
+        leading_tags(project, file, start)
+    }
+
+    pub fn is_hot_path(&mut self, file: FileId, kind: AstKind<'a>) -> bool {
+        if self.perf_tags(file, kind).contains(&PerfTag::Hot) {
+            return true;
+        }
+
+        let statements: &'a [Statement<'a>] = match kind {
+            AstKind::BlockStatement(block) => &block.body,
+            AstKind::SwitchCase(case) => &case.consequent,
+            AstKind::CatchClause(clause) => &clause.body.body,
+            _ => return false,
+        };
+        let nodes = self.project.file(file).semantic.nodes();
+
+        statements.iter().any(|statement| {
+            let kind = nodes.kind(statement.node_id());
+
+            self.perf_tags(file, kind).contains(&PerfTag::Hot)
+        })
+    }
+}
+
+fn is_owner(project: &Project<'_>, file: FileId, node: NodeId, start: u32) -> bool {
+    let nodes = project.file(file).semantic.nodes();
+    let parent = nodes.parent_id(node);
+
+    parent == node
+        || matches!(nodes.kind(parent), AstKind::Program(_))
+        || nodes.kind(parent).span().start != start
+}
+
+fn leading_tags(project: &Project<'_>, file: FileId, start: u32) -> Vec<PerfTag> {
+    let source = project.file(file);
+    let comments = source.semantic.comments();
+    let before = comments.partition_point(|comment| comment.span.start < start);
+    let attached: Vec<_> = comments[..before]
+        .iter()
+        .rev()
+        .take_while(|comment| comment.is_leading() && comment.attached_to == start)
+        .collect();
+    let mut tags = Vec::new();
+
+    for comment in attached.into_iter().rev() {
+        for tag in tags_in_comment(comment.content_span().source_text(source.text)) {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+    }
+
+    tags
+}
+
+fn tag_at(text: &str) -> Option<(PerfTag, usize)> {
+    let trimmed = text.trim_start();
+    let skipped = text.len() - trimmed.len();
+
+    if skipped == 0 {
+        return None;
+    }
+
+    for (word, tag) in WORD_TAGS {
+        if let Some(rest) = trimmed.strip_prefix(word) {
+            if !rest.starts_with(|character: char| {
+                character.is_ascii_alphanumeric() || character == '_'
+            }) {
+                return Some((tag.clone(), skipped + word.len()));
+            }
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("max") {
+        let inner = rest.trim_start();
+        let gap = rest.len() - inner.len();
+
+        if gap > 0 {
+            if let Some(length) = cost_length_of(inner) {
+                let tag = PerfTag::Max(collapse_whitespace(&inner[..length]));
+
+                return Some((tag, skipped + "max".len() + gap + length));
+            }
+        }
+    }
+
+    cost_length_of(trimmed).map(|length| {
+        (
+            PerfTag::Cost(collapse_whitespace(&trimmed[..length])),
+            skipped + length,
+        )
+    })
+}
+
+fn cost_length_of(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix("O(")?;
+
+    rest.find(')').map(|close| "O(".len() + close + 1)
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+#[path = "annotations.test.rs"]
+mod tests;

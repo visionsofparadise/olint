@@ -31,19 +31,4 @@ indexmap = "=2.14.2"
 tempfile = "=3.27.0"
 
 [package.metadata.cargo-machete]
-ignored = [
-	"oxc_allocator",
-	"oxc_parser",
-	"oxc_ast",
-	"oxc_ast_visit",
-	"oxc_span",
-	"oxc_semantic",
-	"oxc_syntax",
-	"oxc_resolver",
-	"globset",
-	"serde",
-	"serde_json",
-	"clap",
-	"indexmap",
-	"tempfile",
-]
+ignored = ["oxc_ast_visit", "serde", "serde_json"]
