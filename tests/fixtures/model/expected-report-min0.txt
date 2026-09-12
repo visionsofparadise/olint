@@ -196,3 +196,185 @@ O(N log N)     usesPathAlias  src/modules/paths.ts:3
     calls sharedFn()                                       src/modules/paths.ts:4  = O(N log N)
     does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
 
+O(N)           forInRecord  src/bounds.ts:65
+    in loop for-in                                           src/bounds.ts:67  x N
+
+O(N)           forAwaitLoop  src/bounds.ts:89
+    in loop for-of                                           src/bounds.ts:91  x N
+
+O(N)           hotIfBranch  src/branches.ts:1
+    in loop for-of                                           src/branches.ts:5  x N
+
+O(N)           hotCaseBranch  src/branches.ts:12
+    in loop for-of                                           src/branches.ts:17  x N
+
+O(N)           hotTryBranch  src/branches.ts:25
+    in loop for-of                                           src/branches.ts:29  x N
+
+O(N)           hotBlockStatement  src/branches.ts:36
+    in loop for-of                                           src/branches.ts:40  x N
+
+O(N)           coldStatementFn  src/branches.ts:44
+    in loop for-of                                           src/branches.ts:48  x N
+
+O(N)           ignoredStatementFn  src/branches.ts:59
+    in loop for-of                                           src/branches.ts:63  x N
+
+O(N)           boundedLoopStatement  src/branches.ts:74
+    in loop for-of                                           src/branches.ts:77  x N
+
+O(N)           switchDiscriminantCost  src/branches.ts:137
+    does xs.indexOf()                                     src/branches.ts:138  x N
+
+O(N)           drainedBudget  src/budgets.ts:1
+    in loop while [budget: i < n]                            src/budgets.ts:5  x N
+
+O(N)           shareOfBudget  src/budgets.ts:26
+    in loop while [budget: i < n, by g]                      src/budgets.ts:29  x N
+
+O(N)           ordinaryForLoopCounterExcluded  src/budgets.ts:41
+    in loop for                                              src/budgets.ts:43  x N
+
+O(N)           costedCallback  src/calls.ts:1
+    in loop for                                              src/calls.ts:3  x N
+
+O(N)           runNTimes  src/calls.ts:7
+    in loop for                                              src/calls.ts:9  x N
+
+O(N)           sumRest  src/calls.ts:17
+    does args.reduce()                                    src/calls.ts:18  x N
+
+O(N)           inlineCallbackCall  src/calls.ts:27
+    does xs.map()                                         src/calls.ts:28  x N
+
+O(N)           functionReturningFunction  src/calls.ts:35
+    does xs.map()                                         src/calls.ts:37  x N
+
+O(N)           calleeFn  src/calls.ts:40
+    in loop for                                              src/calls.ts:42  x N
+
+O(N)           callThroughCast  src/calls.ts:48
+    calls calleeFn()                                       src/calls.ts:49  = O(N)
+    in loop for                                              src/calls.ts:42  x N
+
+O(N)           WithReadonlyItems.addAll  src/classes.ts:77
+    does spread ...xs                                     src/classes.ts:78  x N
+
+O(N)           pushesToReadonlyItems  src/classes.ts:81
+    calls WithReadonlyItems.addAll()                       src/classes.ts:83  = O(N)
+    does spread ...xs                                     src/classes.ts:78  x N
+
+O(N)           arrayLinearCall  src/methods.ts:1
+    does xs.includes()                                    src/methods.ts:2  x N
+
+O(N)           setLinearCall  src/methods.ts:9
+    does s.forEach()                                      src/methods.ts:10  x N
+
+O(N)           mapLinearCall  src/methods.ts:13
+    does m.forEach()                                      src/methods.ts:14  x N
+
+O(N)           objectKeysCall  src/methods.ts:33
+    does Object.keys(o)                                   src/methods.ts:34  x N
+
+O(N)           arrayFromCallback  src/methods.ts:37
+    does Array.from({ length: n })                        src/methods.ts:38  x N
+
+O(N)           jsonParseCall  src/methods.ts:41
+    does JSON.parse(text)                                 src/methods.ts:42  x N
+
+O(N)           bufferConcatCall  src/methods.ts:47
+    does Buffer.concat(parts)                             src/methods.ts:48  x N
+
+O(N)           unknownReceiverCall  src/methods.ts:55
+    does recv.includes()?                                 src/methods.ts:56  x N
+
+O(N)           factorialLike  src/recursion.ts:1
+    calls factorialLike()                                  src/recursion.ts:2  = O(N)
+
+O(N)           directRecursion  src/recursion.ts:4
+    calls factorialLike()                                  src/recursion.ts:5  = O(N)
+
+O(N)           isEvenRec  src/recursion.ts:8
+    calls isEvenRec()                                      src/recursion.ts:9  = O(N)
+
+O(N)           isOddRec  src/recursion.ts:11
+    does [recursion cycle with isEvenRec()]               src/recursion.ts:8
+    calls isEvenRec()                                      src/recursion.ts:9  = O(N)
+
+O(N)           mutualRecursionCaller  src/recursion.ts:14
+    calls isEvenRec()                                      src/recursion.ts:15  = O(N)
+
+O(N)           cycleStart  src/recursion.ts:18
+    calls cycleStart()                                     src/recursion.ts:20  = O(N)
+
+O(N)           CycleHolder.step  src/recursion.ts:23
+    does [recursion cycle with cycleStart()]              src/recursion.ts:18
+    calls cycleStart()                                     src/recursion.ts:20  = O(N)
+
+O(N)           cycleContinue  src/recursion.ts:28
+    does [recursion cycle with cycleStart()]              src/recursion.ts:18
+    calls cycleStart()                                     src/recursion.ts:20  = O(N)
+
+O(N)           forInIndexSig  src/types.ts:6
+    in loop for-in                                           src/types.ts:8  x N
+
+O(1)           constantBoundLoop  src/bounds.ts:6
+
+O(1)           constantOffsetFromStart  src/bounds.ts:12
+
+O(1)           forOfTuple  src/bounds.ts:53
+
+O(1)           forInClosed  src/bounds.ts:59
+
+O(1)           singleIterationLoop  src/bounds.ts:71
+
+O(1)           makeAdder  src/calls.ts:31
+
+O(1)           <returned fn>  src/calls.ts:32
+
+O(1)           WithGetter.constructor  src/classes.ts:42
+
+O(1)           readsGetter  src/classes.ts:49
+
+O(1)           arrayLiteralSpread  src/constants.ts:1
+
+O(1)           conditionalConstants  src/constants.ts:6
+
+O(1)           derivedConstantArrays  src/constants.ts:10
+
+O(1)           newArrayConstant  src/constants.ts:20
+
+O(1)           SizedConst.values  src/constants.ts:26
+
+O(1)           readonlyFieldConst  src/constants.ts:31
+
+O(1)           constEnumKeys  src/constants.ts:41
+
+O(1)           asConstArray  src/constants.ts:45
+
+O(1)           stringLiteralConstant  src/constants.ts:49
+
+O(1)           regexpConstCall  src/methods.ts:23
+
+O(1)           newMapConstant  src/methods.ts:65
+
+O(1)           pkgWrapped  src/modules/external.ts:3
+
+O(1)           usesNamespaceImport  src/modules/named.ts:7
+
+O(1)           pickType  src/types.ts:29
+
+O(1)           omitType  src/types.ts:32
+
+O(1)           readonlyType  src/types.ts:35
+
+O(1)           keyofType  src/types.ts:39
+
+O(1)           genericWithConstraint  src/types.ts:51
+
+O(1)           destructuredParam  src/types.ts:55
+
+O(1)           callsMethodShapedProperty  src/types.ts:62
+
+O(1)           usesNamedThing  src/types.ts:66
+

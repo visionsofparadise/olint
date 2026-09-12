@@ -1,4 +1,3 @@
-// hot tag on a branch of an if.
 export function hotIfBranch(xs: number[][], fast: boolean): number {
 	let sum = 0;
 	if (fast) {
@@ -10,7 +9,6 @@ export function hotIfBranch(xs: number[][], fast: boolean): number {
 	return sum;
 }
 
-// hot tag on a case.
 export function hotCaseBranch(xs: number[][], mode: number): number {
 	let sum = 0;
 	switch (mode) {
@@ -24,7 +22,6 @@ export function hotCaseBranch(xs: number[][], mode: number): number {
 	return sum;
 }
 
-// hot tag on a try block/catch part.
 export function hotTryBranch(xs: number[][]): number {
 	let sum = 0;
 	try {
@@ -36,7 +33,6 @@ export function hotTryBranch(xs: number[][]): number {
 	return sum;
 }
 
-// hot tag on a plain block statement.
 export function hotBlockStatement(xs: number[][]): number {
 	let sum = 0;
 	for (const row of xs) for (const v of row) sum += v;
@@ -45,7 +41,6 @@ export function hotBlockStatement(xs: number[][]): number {
 	return sum;
 }
 
-// cold tag on a statement.
 export function coldStatementFn(xs: number[][]): number {
 	let sum = 0;
 	// @perf cold
@@ -61,7 +56,6 @@ export function coldFunctionTagged(xs: number[][]): number {
 	return sum;
 }
 
-// ignore tag on a statement.
 export function ignoredStatementFn(xs: number[][]): number {
 	let sum = 0;
 	// @perf ignore
@@ -70,7 +64,6 @@ export function ignoredStatementFn(xs: number[][]): number {
 	return sum;
 }
 
-// ignore tag on a whole function.
 // @perf ignore
 export function ignoredFunctionTagged(xs: number[][]): number {
 	let sum = 0;
@@ -78,7 +71,6 @@ export function ignoredFunctionTagged(xs: number[][]): number {
 	return sum;
 }
 
-// bounded tag on a loop.
 export function boundedLoopStatement(xs: number[][], channels: number): number {
 	let sum = 0;
 	// @perf bounded
@@ -86,7 +78,6 @@ export function boundedLoopStatement(xs: number[][], channels: number): number {
 	return sum;
 }
 
-// bounded tag on a non-loop statement.
 export function boundedNonLoopStatement(xs: number[][]): number {
 	let sum = 0;
 	// @perf bounded
@@ -95,7 +86,6 @@ export function boundedNonLoopStatement(xs: number[][]): number {
 	return sum;
 }
 
-// O(N log N) tag on a statement.
 export function nlognStatementTagged(xs: number[][]): number {
 	let sum = 0;
 	// @perf O(N log N)
@@ -110,6 +100,12 @@ export function nlognFunctionTagged(xs: number[][]): number {
 	return sum;
 }
 
+export function nlognExpressionStatementTagged(xs: number[][]): number {
+	// @perf O(N log N)
+	xs.sort((a, b) => a.length - b.length);
+	return xs.length;
+}
+
 /** @perf max O(N^3) */
 export function maxTaggedPublicFn(xs: number[][]): number {
 	let sum = 0;
@@ -117,10 +113,6 @@ export function maxTaggedPublicFn(xs: number[][]): number {
 	return sum;
 }
 
-// return inside a loop. The costly operation must happen in a statement
-// *before* the return (not inside the returned expression itself), because a
-// `return <costed expr>` redirects its own cost straight to the function's
-// exit part before the branch-lifting logic ever inspects it.
 export function returnInsideLoop(xs: number[][]): number {
 	for (const row of xs) {
 		if (row.length > 0) {
@@ -131,7 +123,6 @@ export function returnInsideLoop(xs: number[][]): number {
 	return -1;
 }
 
-// break inside a loop, likewise needing a nonzero branch cost.
 export function breakInsideLoop(xs: number[][]): number {
 	let sum = 0;
 	for (const row of xs) {
@@ -143,7 +134,6 @@ export function breakInsideLoop(xs: number[][]): number {
 	return sum;
 }
 
-// switch whose discriminant expression itself has a nonzero cost.
 export function switchDiscriminantCost(xs: number[], target: number): string {
 	switch (xs.indexOf(target)) {
 		case -1:

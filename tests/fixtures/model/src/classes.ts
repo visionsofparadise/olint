@@ -1,4 +1,3 @@
-// A class with a costed constructor, instantiated via new.
 export class CostedCtor {
 	total: number;
 	constructor(rows: number[][]) {
@@ -11,7 +10,6 @@ export function instantiateCostedCtor(rows: number[][]): number {
 	return new CostedCtor(rows).total;
 }
 
-// A private method.
 export class WithPrivateMethod {
 	private compute(rows: number[][]): number {
 		let sum = 0;
@@ -26,7 +24,6 @@ export function callsPrivateMethod(rows: number[][]): number {
 	return new WithPrivateMethod().run(rows);
 }
 
-// A #private method.
 export class WithHashPrivateMethod {
 	#compute(rows: number[][]): number {
 		let sum = 0;
@@ -41,7 +38,6 @@ export function callsHashPrivateMethod(rows: number[][]): number {
 	return new WithHashPrivateMethod().run(rows);
 }
 
-// A getter.
 export class WithGetter {
 	constructor(private rows: number[][]) {}
 	get total(): number {
@@ -54,7 +50,6 @@ export function readsGetter(rows: number[][]): number {
 	return new WithGetter(rows).total;
 }
 
-// A static method.
 export class WithStaticMethod {
 	static compute(rows: number[][]): number {
 		let sum = 0;
@@ -66,7 +61,6 @@ export function callsStaticMethod(rows: number[][]): number {
 	return WithStaticMethod.compute(rows);
 }
 
-// An instance property holding an arrow function.
 export class WithArrowProperty {
 	handler = (rows: number[][]): number => {
 		let sum = 0;
@@ -78,7 +72,6 @@ export function callsArrowProperty(rows: number[][]): number {
 	return new WithArrowProperty().handler(rows);
 }
 
-// this.items.push(...) where items is a readonly array field.
 export class WithReadonlyItems {
 	readonly items: number[] = [];
 	addAll(xs: number[]): void {
@@ -91,7 +84,6 @@ export function pushesToReadonlyItems(xs: number[]): number {
 	return c.items.length;
 }
 
-// A class expression, not a class declaration.
 export const ClassExpressionExample = class {
 	run(rows: number[][]): number {
 		let sum = 0;

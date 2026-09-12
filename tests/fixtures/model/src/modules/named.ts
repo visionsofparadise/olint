@@ -1,4 +1,3 @@
-// A namespace import.
 import * as star from "./star";
 
 export interface NamedThing {

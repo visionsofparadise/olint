@@ -1,5 +1,3 @@
-// Diffs the reference perfLint.ts against the ported olint binary on one tsconfig's --report output.
-// Usage: node reference/parity.mjs <tsconfig> [--types=oracle|syntactic]
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -29,6 +27,22 @@ const referenceResult = spawnSync("node", [path.join(repo, "reference", "perfLin
 	maxBuffer,
 });
 const olintResult = spawnSync(olintBin, [tsconfig, "--report", `--types=${types}`], { encoding: "utf8", maxBuffer });
+
+const reportFailure = (label, result) => {
+	if (result.error) {
+		console.error(`${label}: ${result.error.message}`);
+		return true;
+	}
+	if (result.status !== 0) {
+		console.error(result.stderr ?? "");
+		return true;
+	}
+	return false;
+};
+
+const referenceFailed = reportFailure("reference", referenceResult);
+const olintFailed = reportFailure("olint", olintResult);
+if (referenceFailed || olintFailed) process.exit(2);
 
 const referenceOut = referenceResult.stdout ?? "";
 const olintOut = olintResult.stdout ?? "";
