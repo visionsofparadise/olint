@@ -1,2 +1,4 @@
 package-lock.json
 Cargo.lock
+reference/
+tests/fixtures/

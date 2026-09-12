@@ -6,5 +6,14 @@
 	"threshold": 0,
 	"format": ["javascript", "rust"],
 	"reporters": ["console"],
-	"ignore": ["**/.*/**", "**/*.md", "**/__fixtures__/**", "**/package.json", "package-lock.json", "**/*.test.rs"]
+	"ignore": [
+		"**/.*/**",
+		"**/*.md",
+		"**/__fixtures__/**",
+		"**/package.json",
+		"package-lock.json",
+		"**/*.test.rs",
+		"**/reference/**",
+		"**/tests/fixtures/**"
+	]
 }

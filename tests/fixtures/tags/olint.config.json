@@ -1,0 +1,5 @@
+{
+	"max": "O(N^2)",
+	"entrypoints": { "src/index.ts": "O(N^2)" },
+	"ignore": ["src/internal/**"]
+}

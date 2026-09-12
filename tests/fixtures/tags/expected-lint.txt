@@ -1,0 +1,21 @@
+# tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 10 public functions
+
+O(N^3) > O(N^2)  cubic  src/public.ts:1  via src/index.ts
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^3) > O(N^2)  Engine.run  src/public.ts:21  via src/index.ts
+    calls cubic()                                          src/public.ts:22  = O(N^3)
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^3) > O(N^2)  uses  src/public.ts:34  via src/index.ts
+    calls notExported()                                    src/public.ts:34  = O(N^3)
+    calls cubic()                                          src/public.ts:31  = O(N^3)
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+3 over limit

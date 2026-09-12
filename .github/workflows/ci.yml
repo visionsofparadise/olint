@@ -1,0 +1,42 @@
+name: CI
+
+on:
+   push:
+   pull_request:
+
+permissions:
+   contents: read
+
+jobs:
+   test:
+      strategy:
+         fail-fast: false
+         matrix:
+            os: [ubuntu-latest, windows-latest, macos-latest]
+      runs-on: ${{ matrix.os }}
+      steps:
+         - uses: actions/checkout@v7.0.1
+         - uses: dtolnay/rust-toolchain@stable
+           with:
+              components: rustfmt, clippy
+         - uses: actions/setup-node@v7.0.0
+           with:
+              node-version: "24"
+         - name: Pin npm 12
+           run: npm install -g npm@12
+         - name: Enforce install-script allowlist
+           run: npm config set strict-allow-scripts=true --location=project
+         - run: npm ci
+         - run: npm run check
+         - run: npm run unit
+         - run: npm run integration
+         - run: npm run build
+
+   msrv:
+      runs-on: ubuntu-latest
+      steps:
+         - uses: actions/checkout@v7.0.1
+         - uses: dtolnay/rust-toolchain@1.96.0
+         - run: cargo check --locked --all-targets
+           env:
+              RUSTUP_TOOLCHAIN: 1.96.0

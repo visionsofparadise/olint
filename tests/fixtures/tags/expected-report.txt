@@ -1,0 +1,84 @@
+# tsconfig.json  (27 functions in 3 files)
+
+O(N)               11
+O(N^3)              8
+O(N^2)              6
+O(1)                1
+O(N^4)              1
+
+O(N^4)         hidden  src/internal/hidden.ts:1
+    in loop for-of                                           src/internal/hidden.ts:3  x N
+        in loop for-of                                       src/internal/hidden.ts:3  x N
+            in loop for-of                                   src/internal/hidden.ts:3  x N
+                in loop for-of                               src/internal/hidden.ts:3  x N
+
+O(N^3)         coldFn [@perf cold]  src/tags.ts:77
+    in loop for-of                                           src/tags.ts:79  x N
+        in loop for-of                                       src/tags.ts:79  x N
+            in loop for-of                                   src/tags.ts:79  x N
+
+O(N^3)         costFn [@perf O(N)]  src/tags.ts:129
+    in loop for-of                                           src/tags.ts:131  x N
+        in loop for-of                                       src/tags.ts:131  x N
+            in loop for-of                                   src/tags.ts:131  x N
+
+O(N^3)         cubic  src/public.ts:1
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^3)         acceptedCubic  src/public.ts:8
+    in loop for-of                                           src/public.ts:10  x N
+        in loop for-of                                       src/public.ts:10  x N
+            in loop for-of                                   src/public.ts:10  x N
+
+O(N^3)         Engine.run  src/public.ts:21
+    calls cubic()                                          src/public.ts:22  = O(N^3)
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^3)         Engine.helper  src/public.ts:25
+    calls cubic()                                          src/public.ts:26  = O(N^3)
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^3)         notExported  src/public.ts:30
+    calls cubic()                                          src/public.ts:31  = O(N^3)
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^3)         uses  src/public.ts:34
+    calls notExported()                                    src/public.ts:34  = O(N^3)
+    calls cubic()                                          src/public.ts:31  = O(N^3)
+    in loop for-of                                           src/public.ts:3  x N
+        in loop for-of                                       src/public.ts:3  x N
+            in loop for-of                                   src/public.ts:3  x N
+
+O(N^2)         plainNested  src/tags.ts:1
+    in loop for-of                                           src/tags.ts:3  x N
+        in loop for-of                                       src/tags.ts:3  x N
+
+O(N^2)         Svc.rebuild [@perf cold]  src/tags.ts:91
+    in loop for-of                                           src/tags.ts:93  x N
+        in loop for-of                                       src/tags.ts:93  x N
+
+O(N^2)         untagged  src/tags.ts:104
+    in loop for-of                                           src/tags.ts:109  x N
+        in loop for-of                                       src/tags.ts:109  x N
+
+O(N^2)         callsCostFn  src/tags.ts:135
+    in loop for-of                                           src/tags.ts:137  x N
+        calls costFn()                                     src/tags.ts:137  = O(N)
+        reads as @perf O(N)                                   src/tags.ts:129  = O(N)
+
+O(N^2)         coldFirstOfTwo  src/tags.ts:162
+    in loop for-of                                           src/tags.ts:164  x N
+        in loop for-of                                       src/tags.ts:167  x N
+
+O(N^2)         quadratic  src/public.ts:14
+    in loop for-of                                           src/public.ts:16  x N
+        in loop for-of                                       src/public.ts:16  x N
+
