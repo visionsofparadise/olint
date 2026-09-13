@@ -515,7 +515,7 @@ fn is_declaration_path(path: &Path) -> bool {
         || (name.ends_with(".ts") && name.contains(".d."))
 }
 
-fn relative_path_of(root: &Path, path: &Path) -> String {
+pub fn relative_path_of(root: &Path, path: &Path) -> String {
     let root_components: Vec<Component> = root.components().collect();
     let path_components: Vec<Component> = path.components().collect();
     let shared = root_components

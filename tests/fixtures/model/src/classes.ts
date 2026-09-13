@@ -136,3 +136,28 @@ class QuotedHolder {
 export function useQuotedHolder(): number {
 	return new QuotedHolder().self();
 }
+
+export class AccessorHolder {
+	accessor sweep = (xs: number[]) => {
+		for (const x of xs) x;
+	};
+	static accessor build = (xs: number[]) => {
+		for (const x of xs) this.helper(xs);
+	};
+	private accessor hidden = (xs: number[]) => {
+		for (const x of xs) x;
+	};
+	static helper(xs: number[]) {
+		for (const x of xs) x;
+	}
+	/** @perf ignore */
+	accessor quiet = (xs: number[]) => {
+		for (const x of xs) x;
+	};
+	run(xs: number[]) {
+		for (const x of xs) this.sweep(xs);
+	}
+	walk(xs: number[], other: AccessorHolder) {
+		for (const x of xs) other.hidden(xs);
+	}
+}

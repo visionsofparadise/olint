@@ -103,6 +103,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 nodes.parent_kind(node),
                 AstKind::VariableDeclarator(_)
                     | AstKind::PropertyDefinition(_)
+                    | AstKind::AccessorProperty(_)
                     | AstKind::ObjectProperty(_)
             )
         {

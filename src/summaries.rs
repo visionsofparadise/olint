@@ -383,6 +383,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    fn field_name_of(
+        &self,
+        file: FileId,
+        field: NodeId,
+        key: &oxc_ast::ast::PropertyKey<'a>,
+        computed: bool,
+    ) -> String {
+        format!(
+            "{}{}",
+            self.method_owner_of(file, field),
+            self.key_text_of(file, key, computed)
+        )
+    }
+
     pub fn name_of(&self, file: FileId, function: FunctionNode<'a>) -> String {
         let nodes = self.project.file(file).semantic.nodes();
         let node = function.node_id();
@@ -427,11 +441,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return self.key_text_of(file, &property.key, property.computed);
             }
             AstKind::PropertyDefinition(property) => {
-                return format!(
-                    "{}{}",
-                    self.method_owner_of(file, parent),
-                    self.key_text_of(file, &property.key, property.computed)
-                );
+                return self.field_name_of(file, parent, &property.key, property.computed);
+            }
+            AstKind::AccessorProperty(property) => {
+                return self.field_name_of(file, parent, &property.key, property.computed);
             }
             _ => {}
         }

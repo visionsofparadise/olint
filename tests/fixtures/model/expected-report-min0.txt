@@ -1,8 +1,8 @@
-# tsconfig.json  (144 functions in 15 files)
+# tsconfig.json  (150 functions in 15 files)
 
-O(N)               54
+O(N)               57
 O(1)               41
-O(N^2)             35
+O(N^2)             38
 O(N log N)         10
 O(N^3)              4
 
@@ -129,6 +129,21 @@ O(N^2)         usesClassExpression  src/classes.ts:94
     calls <class>.run()                                    src/classes.ts:95  = O(N^2)
     in loop for-of                                           src/classes.ts:90  x N
         in loop for-of                                       src/classes.ts:90  x N
+
+O(N^2)         AccessorHolder.build  src/classes.ts:144
+    in loop for-of                                           src/classes.ts:145  x N
+        calls AccessorHolder.helper()                      src/classes.ts:145  = O(N)
+        in loop for-of                                       src/classes.ts:151  x N
+
+O(N^2)         AccessorHolder.run  src/classes.ts:157
+    in loop for-of                                           src/classes.ts:158  x N
+        calls AccessorHolder.sweep()                       src/classes.ts:158  = O(N)
+        in loop for-of                                       src/classes.ts:142  x N
+
+O(N^2)         AccessorHolder.walk  src/classes.ts:160
+    in loop for-of                                           src/classes.ts:161  x N
+        calls AccessorHolder.hidden()                      src/classes.ts:161  = O(N)
+        in loop for-of                                       src/classes.ts:148  x N
 
 O(N^2)         stringLinearCall  src/methods.ts:17
     in loop for-of                                           src/methods.ts:19  x N
@@ -320,6 +335,15 @@ O(N)           MergedHolder.run  src/classes.ts:105
 
 O(N)           QuotedHolder.run  src/classes.ts:128
     does mergedItems.indexOf()                            src/classes.ts:129  x N
+
+O(N)           AccessorHolder.sweep  src/classes.ts:141
+    in loop for-of                                           src/classes.ts:142  x N
+
+O(N)           AccessorHolder.hidden  src/classes.ts:147
+    in loop for-of                                           src/classes.ts:148  x N
+
+O(N)           AccessorHolder.helper  src/classes.ts:150
+    in loop for-of                                           src/classes.ts:151  x N
 
 O(N)           arrayLinearCall  src/methods.ts:1
     does xs.includes()                                    src/methods.ts:2  x N

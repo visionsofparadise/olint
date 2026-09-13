@@ -566,7 +566,7 @@ fn extended_path_of(tsconfig: &Path, specifier: &str) -> Result<PathBuf, Project
         })
 }
 
-fn normalized_path_of(path: &Path) -> PathBuf {
+pub fn normalized_path_of(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
     for component in path.components() {

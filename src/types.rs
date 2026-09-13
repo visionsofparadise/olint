@@ -50,6 +50,7 @@ fn is_declaration_kind(kind: &AstKind<'_>) -> bool {
             | AstKind::Class(_)
             | AstKind::MethodDefinition(_)
             | AstKind::PropertyDefinition(_)
+            | AstKind::AccessorProperty(_)
             | AstKind::ObjectProperty(_)
             | AstKind::TSEnumDeclaration(_)
             | AstKind::TSEnumMember(_)

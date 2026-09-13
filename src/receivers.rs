@@ -287,6 +287,9 @@ fn class_of_this<'a>(
             AstKind::PropertyDefinition(property) if placement == Placement::Either => {
                 placement = placement_of(property.r#static);
             }
+            AstKind::AccessorProperty(property) if placement == Placement::Either => {
+                placement = placement_of(property.r#static);
+            }
             AstKind::StaticBlock(_) if placement == Placement::Either => {
                 placement = Placement::Static;
             }

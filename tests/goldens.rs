@@ -1,11 +1,9 @@
 use std::path::Path;
 
 use olint::analysis::{Analysis, Options, TypeMode};
-use olint::annotations::{cost_tag_of, PerfTag};
 use olint::oracle::{ask, OracleError};
 use olint::project::Project;
-use olint::report::{chain_lines, report_row};
-use olint::summaries::Substitutions;
+use olint::report::{chain_lines, order_by_cost_descending, report_row, report_rows_of};
 use oxc_allocator::Allocator;
 
 const ORACLE: Options = Options {
@@ -44,50 +42,34 @@ fn rows_of(fixture: &str) -> Vec<Row> {
             error => panic!("the oracle failed: {error:?}"),
         });
 
-    let mut rows: Vec<(olint::cost::Part, Row)> = Vec::new();
+    let mut rows: Vec<(olint::cost::Cost, Row)> = report_rows_of(&mut analysis, &functions)
+        .into_iter()
+        .map(|report| {
+            let mut lines = vec![report_row(
+                &project,
+                report.cost,
+                &report.name,
+                report.mark.as_deref(),
+                report.site,
+            )];
 
-    for (file, function) in functions {
-        let tags = analysis.function_tags(file, function);
-        let mark = if tags.contains(&PerfTag::Cold) {
-            Some("cold".to_string())
-        } else {
-            cost_tag_of(&tags).map(|(_, text)| text)
-        };
-        let part = match mark {
-            Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
-            None => analysis.summarize(file, function),
-        }
-        .total();
-        let name = analysis.name_of(file, function);
-        let site = analysis.function_site_of(file, function);
-        let mut lines = vec![report_row(
-            &project,
-            part.cost,
-            &name,
-            mark.as_deref(),
-            site,
-        )];
+            chain_lines(&project, &report.chain, 1, &mut lines);
 
-        chain_lines(&project, &part.chain, 1, &mut lines);
+            (
+                report.cost,
+                Row {
+                    block: lines.join(
+                        "
+",
+                    ),
+                    n: report.cost.n,
+                    log: report.cost.log,
+                },
+            )
+        })
+        .collect();
 
-        let row = Row {
-            block: lines.join("\n"),
-            n: part.cost.n,
-            log: part.cost.log,
-        };
-
-        rows.push((part, row));
-    }
-
-    rows.sort_by(|(left, _), (right, _)| {
-        if left.cost.exceeds(right.cost) {
-            std::cmp::Ordering::Less
-        } else if right.cost.exceeds(left.cost) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
+    rows.sort_by(|(left, _), (right, _)| order_by_cost_descending(*left, *right));
 
     rows.into_iter().map(|(_, row)| row).collect()
 }

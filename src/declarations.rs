@@ -465,6 +465,10 @@ impl<'a> Declarations<'a> {
                     function_of_initializer(property.value.as_ref())
                         .map(|function| (file, function))
                 }
+                ClassElement::AccessorProperty(property) => {
+                    function_of_initializer(property.value.as_ref())
+                        .map(|function| (file, function))
+                }
                 _ => None,
             },
             Declaration::Property { file, property } => {
@@ -818,23 +822,16 @@ pub(crate) fn declaration_of_node<'a>(
 
     match nodes.kind(node) {
         AstKind::ObjectProperty(property) => Some(Declaration::Property { file, property }),
-        AstKind::MethodDefinition(method) => {
+        kind @ (AstKind::MethodDefinition(_)
+        | AstKind::PropertyDefinition(_)
+        | AstKind::AccessorProperty(_)) => {
             let class = class_of_element_node(project, file, node)?;
-            let element = class.body.body.iter().find(|element| {
-                matches!(element, ClassElement::MethodDefinition(candidate) if std::ptr::eq(&**candidate, method))
-            })?;
-
-            Some(Declaration::Member {
-                file,
-                class,
-                element,
-            })
-        }
-        AstKind::PropertyDefinition(property) => {
-            let class = class_of_element_node(project, file, node)?;
-            let element = class.body.body.iter().find(|element| {
-                matches!(element, ClassElement::PropertyDefinition(candidate) if std::ptr::eq(&**candidate, property))
-            })?;
+            let span = kind.span();
+            let element = class
+                .body
+                .body
+                .iter()
+                .find(|element| element.span() == span)?;
 
             Some(Declaration::Member {
                 file,
@@ -916,7 +913,7 @@ fn function_of_parameter<'a>(
     }
 }
 
-fn function_of_initializer<'a>(
+pub(crate) fn function_of_initializer<'a>(
     initializer: Option<&'a Expression<'a>>,
 ) -> Option<FunctionNode<'a>> {
     match initializer? {
