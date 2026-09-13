@@ -7,11 +7,11 @@ use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
 
 use crate::analysis::Analysis;
-use crate::annotations::{cost_tag_of, skip_tag_of, PerfTag};
 use crate::bounds::{loop_label, short};
 use crate::cost::{nest, Cost, Factor, Part, Reading};
 use crate::declarations::{Declaration, FunctionNode, ParameterNode};
 use crate::declared_types::{DeclaredType, Kind};
+use crate::directives::{cost_tag_of, skip_tag_of, PerfTag};
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,

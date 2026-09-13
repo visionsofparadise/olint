@@ -274,5 +274,5 @@ fn collapse_whitespace(text: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "annotations.test.rs"]
+#[path = "directives.test.rs"]
 mod tests;

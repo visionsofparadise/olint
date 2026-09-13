@@ -1,5 +1,4 @@
 pub mod analysis;
-pub mod annotations;
 pub mod bounds;
 pub mod budgets;
 pub mod config;
@@ -7,6 +6,7 @@ pub mod constants;
 pub mod cost;
 pub mod declarations;
 pub mod declared_types;
+pub mod directives;
 pub mod paths;
 pub mod project;
 pub mod public;

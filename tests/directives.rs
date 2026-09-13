@@ -1,6 +1,6 @@
 use olint::analysis::{Analysis, Options, TypeMode};
-use olint::annotations::PerfTag;
 use olint::declarations::FunctionNode;
+use olint::directives::PerfTag;
 use oxc_ast::ast::Expression;
 use oxc_ast::AstKind;
 

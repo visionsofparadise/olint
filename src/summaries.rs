@@ -6,9 +6,9 @@ use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
 
 use crate::analysis::{Analysis, Stats};
-use crate::annotations::{cost_tag_of, skip_tag_of, PerfTag};
 use crate::cost::{Cost, Factor, Part, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
+use crate::directives::{cost_tag_of, skip_tag_of, PerfTag};
 use crate::project::{FileId, Site};
 use crate::syntax::{is_identifier_pattern, unwrap};
 use crate::tsc::{Query, TscError, TscReply};

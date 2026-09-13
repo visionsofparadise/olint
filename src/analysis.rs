@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 use oxc_semantic::NodeId;
 
-use crate::annotations::PerfTag;
 use crate::budgets::BudgetContext;
 use crate::cost::{Part, Reading};
 use crate::declarations::{Binding, Declarations};
+use crate::directives::PerfTag;
 use crate::project::{FileId, Project};
 use crate::summaries::{Substitutions, SummaryKey};
 use crate::tsc::{Query, TscAnswer};

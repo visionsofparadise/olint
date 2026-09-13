@@ -9,9 +9,9 @@ use oxc_span::GetSpan;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
-use crate::annotations::PerfTag;
 use crate::budgets::{is_less, sides_of, Subtree};
 use crate::cost::Cost;
+use crate::directives::PerfTag;
 use crate::project::FileId;
 use crate::syntax::{
     call_of, collapsed_text_of, compact_text_of, identifier_of, is_iteration_kind, loop_body_of,

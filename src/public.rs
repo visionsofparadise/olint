@@ -4,9 +4,9 @@ use oxc_ast::ast::{BindingPattern, ClassElement, PropertyKey, TSAccessibility};
 use oxc_semantic::NodeId;
 
 use crate::analysis::Analysis;
-use crate::annotations::{max_tag_of, PerfTag};
 use crate::config::{Config, Limit};
 use crate::declarations::{function_of_initializer, Declaration, FunctionNode};
+use crate::directives::{max_tag_of, PerfTag};
 use crate::paths::relative_path_of;
 use crate::project::FileId;
 

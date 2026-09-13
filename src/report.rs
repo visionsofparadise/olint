@@ -1,8 +1,8 @@
 use crate::analysis::Analysis;
-use crate::annotations::{cost_tag_of, PerfTag};
 use crate::config::Config;
 use crate::cost::{Cost, Factor, Part};
 use crate::declarations::FunctionNode;
+use crate::directives::{cost_tag_of, PerfTag};
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
