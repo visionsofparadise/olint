@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indexmap::IndexMap;
@@ -81,10 +81,10 @@ pub fn select_files(tsconfig: &Path) -> Result<TsconfigFiles, ProjectError> {
     let mut literal: IndexMap<String, PathBuf> = IndexMap::new();
 
     for file in merged.files.iter().flatten() {
-        if let Ok(path) = canonical_path_of(file) {
-            if path.is_file() {
-                literal.insert(key_of(&path), path);
-            }
+        let path = normalized_path_of(file);
+
+        if path.is_file() {
+            literal.insert(key_of(&path), path);
         }
     }
 
@@ -564,6 +564,22 @@ fn extended_path_of(tsconfig: &Path, specifier: &str) -> Result<PathBuf, Project
             path: tsconfig.to_path_buf(),
             message: format!("cannot find extended configuration {specifier}"),
         })
+}
+
+fn normalized_path_of(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
 }
 
 fn absolutize(patterns: &mut Option<Vec<PathBuf>>, directory: &str) {

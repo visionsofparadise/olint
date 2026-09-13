@@ -494,6 +494,106 @@ fn load_marks_typescript_under_node_modules_external() {
 }
 
 #[test]
+fn resolve_prefers_a_package_typings_field_over_a_typescript_main() {
+    let files = [
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "include": ["src"] }"#,
+        ),
+        (
+            "src/index.ts",
+            "import patch from \"patch\";\nexport const go = () => patch();",
+        ),
+        (
+            "node_modules/patch/package.json",
+            r#"{ "name": "patch", "main": "index.js", "typings": "index.d.ts" }"#,
+        ),
+        ("node_modules/patch/index.js", "module.exports = () => 1;"),
+        (
+            "node_modules/patch/index.ts",
+            "export default function patch(xs: number[] = []) { return xs.length; }",
+        ),
+        (
+            "node_modules/patch/index.d.ts",
+            "export default function patch(): number;",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let resolved = project.resolve(file_of(project, root, "src/index.ts"), "patch");
+        let loaded: Vec<&str> = project
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect();
+
+        assert_eq!(loaded, vec!["src/index.ts"]);
+        assert!(matches!(resolved, Resolved::External(path) if path.ends_with("index.d.ts")));
+    });
+}
+
+#[test]
+fn load_keys_a_doubly_reachable_file_to_its_canonical_path() {
+    let tree = [
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "include": ["src"] }"#,
+        ),
+        (
+            "linked-first.json",
+            r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "files": ["src/linked/util.ts", "src/index.ts"] }"#,
+        ),
+        (
+            "src/index.ts",
+            "import { util } from \"../real/util\";\nexport const run = () => util([1]);",
+        ),
+        (
+            "real/util.ts",
+            "export function util(xs: number[]) { for (const x of xs) { x; } }",
+        ),
+    ];
+    let (_directory, root, linked) = linked_tree_of(&tree, &[("src/linked", "real")]);
+
+    if !linked {
+        return;
+    }
+
+    for (tsconfig, order) in [
+        (
+            "tsconfig.json",
+            vec!["real/util.ts", "src/index.ts", "src/linked/util.ts"],
+        ),
+        (
+            "linked-first.json",
+            vec!["src/linked/util.ts", "real/util.ts", "src/index.ts"],
+        ),
+    ] {
+        let allocator = oxc_allocator::Allocator::default();
+        let project =
+            olint::project::Project::load(&allocator, &root.join(tsconfig)).expect("project loads");
+        let id_of = |relative: &str| {
+            project
+                .files
+                .iter()
+                .find(|file| file.relative == relative)
+                .map(|file| file.id)
+                .expect("loaded")
+        };
+        let relatives: Vec<&str> = project
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect();
+
+        assert_eq!(relatives, order);
+        assert_eq!(
+            project.resolve(id_of("src/index.ts"), "../real/util"),
+            Resolved::File(id_of("real/util.ts"))
+        );
+    }
+}
+
+#[test]
 fn select_files_keeps_files_under_a_symlinked_directory() {
     let (_directory, root, linked) = linked_tree_of(
         &[

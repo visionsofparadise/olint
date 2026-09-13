@@ -143,7 +143,11 @@ impl<'a> Project<'a> {
                             file.id = FileId(project.files.len() as u32);
 
                             if let Ok(canonical) = canonical_path_of(&file.path) {
-                                project.by_path.insert(canonical, file.id);
+                                if canonical == file.path {
+                                    project.by_path.insert(canonical, file.id);
+                                } else {
+                                    project.by_path.entry(canonical).or_insert(file.id);
+                                }
                             }
 
                             project.by_path.insert(file.path.clone(), file.id);
@@ -166,7 +170,13 @@ impl<'a> Project<'a> {
         imports: &mut HashMap<PathBuf, Vec<Import>>,
         stack: &mut Vec<Frame<'a>>,
     ) -> Result<(), ProjectError> {
-        if let Some(id) = self.by_path.get(&path).copied() {
+        let stored = self
+            .by_path
+            .get(&path)
+            .copied()
+            .filter(|id| is_same_written_path(&self.files[id.0 as usize].path, &path));
+
+        if let Some(id) = stored {
             let file = &mut self.files[id.0 as usize];
 
             if file.external_library && !external {
@@ -363,6 +373,16 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn is_same_written_path(stored: &Path, path: &Path) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        stored
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&path.to_string_lossy())
+    } else {
+        stored == path
+    }
+}
+
 fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
     let extension = path
         .extension()
@@ -396,6 +416,7 @@ fn resolve_options_of(tsconfig: &Path) -> ResolveOptions {
                 [".cts", ".cjs"].map(String::from).to_vec(),
             ),
         ],
+        main_fields: ["types", "typings", "main"].map(String::from).to_vec(),
         main_files: vec!["index".to_string()],
         condition_names: ["import", "types", "default"].map(String::from).to_vec(),
         tsconfig: Some(TsconfigDiscovery::Manual(TsconfigOptions {
