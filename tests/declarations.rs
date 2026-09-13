@@ -1,4 +1,4 @@
-use olint::analysis::Stats;
+use olint::analysis::{Analysis, Stats};
 use olint::declarations::{Declaration, Declarations, FunctionNode};
 use olint::project::{FileId, Project};
 use oxc_ast::ast::{Class, ClassElement, IdentifierReference, PropertyKey};
@@ -6,7 +6,7 @@ use oxc_ast::AstKind;
 
 mod support;
 
-use support::{file_of, first_node_of, run_in_project, TYPED_PACKAGE};
+use support::{call_of, file_of, first_node_of, run_in_project, SYNTACTIC, TYPED_PACKAGE};
 
 fn reference_of<'a>(
     project: &Project<'a>,
@@ -160,11 +160,19 @@ fn default_import_reaches_the_default_export() {
 }
 
 #[test]
-fn node_modules_import_is_external() {
+fn package_declarations_have_no_function_and_javascript_packages_are_external() {
     let files = [
         &[
             ("tsconfig.json", "{}"),
-            ("index.ts", "import { run } from \"pkg\";\nrun();"),
+            (
+                "index.ts",
+                "import { run } from \"pkg\";\nimport plain from \"plain\";\nrun();\nplain();",
+            ),
+            (
+                "node_modules/plain/package.json",
+                r#"{ "name": "plain", "main": "index.js" }"#,
+            ),
+            ("node_modules/plain/index.js", "module.exports = () => 1;"),
         ][..],
         &TYPED_PACKAGE,
     ]
@@ -173,9 +181,12 @@ fn node_modules_import_is_external() {
     run_in_project(&files, |project, root| {
         let declarations = Declarations::new(project);
         let index = file_of(project, root, "index.ts");
+        let run = declaration_of_reference(project, &declarations, index, "run");
 
+        assert!(matches!(run, Some(Declaration::Function { .. })));
+        assert!(declarations.function_of(run.expect("declared")).is_none());
         assert!(matches!(
-            declaration_of_reference(project, &declarations, index, "run"),
+            declaration_of_reference(project, &declarations, index, "plain"),
             Some(Declaration::External)
         ));
     });
@@ -352,4 +363,44 @@ fn stats_lines_order_by_count_then_insertion() {
         stats.lines(),
         vec!["    2  second", "    1  first", "    1  third"]
     );
+}
+
+#[test]
+fn package_declaration_files_resolve_callees_without_bodies() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "node_modules/engine/package.json",
+            r#"{ "name": "engine", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/engine/index.d.ts",
+            "export declare function run(xs: number[]): number;\nexport declare class Engine {\n\trun(): number;\n\tstatic make(): Engine;\n}",
+        ),
+        (
+            "index.ts",
+            "import { run, Engine } from \"engine\";\nexport function f() {\n\trun([1]);\n\tconst engine = new Engine();\n\tengine.run();\n\tEngine.make();\n}",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+        let index = file_of(project, root, "index.ts");
+        let package = file_of(project, root, "node_modules/engine/index.d.ts");
+        let resolved: Vec<(bool, bool)> = ["run", "engine.run", "Engine.make"]
+            .iter()
+            .map(|callee| {
+                let declaration =
+                    analysis.callee_declaration_of(index, call_of(project, index, callee));
+                let function = declaration
+                    .and_then(|declaration| analysis.declarations.function_of(declaration));
+
+                (declaration.is_some(), function.is_some())
+            })
+            .collect();
+
+        assert!(project.file(package).external_library);
+        assert!(!project.is_project_file(package));
+        assert_eq!(resolved, vec![(true, false); 3]);
+    });
 }

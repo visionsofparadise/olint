@@ -253,11 +253,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         expression: &'a Expression<'a>,
     ) -> DeclaredType {
-        self.declared_type_of_expression_at(file, expression, 0)
+        self.declared_type_of_nested_expression(file, expression, 0)
     }
 
     pub fn declared_type_of_type(&mut self, file: FileId, ty: &'a TSType<'a>) -> DeclaredType {
-        self.declared_type_of_type_at(file, ty, 0)
+        self.declared_type_of_nested_type(file, ty, 0)
     }
 
     fn declaration_of_type_name(
@@ -266,6 +266,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
         name: &'a TSTypeName<'a>,
     ) -> Option<Declaration<'a>> {
         self.declarations.of_type_name(self.project, file, name)
+    }
+
+    fn is_global_type_name(&self, file: FileId, name: &TSTypeName<'a>) -> bool {
+        match name {
+            TSTypeName::IdentifierReference(reference) => {
+                reference.reference_id.get().is_none_or(|reference_id| {
+                    self.project
+                        .file(file)
+                        .semantic
+                        .scoping()
+                        .get_reference(reference_id)
+                        .symbol_id()
+                        .is_none()
+                })
+            }
+            TSTypeName::QualifiedName(qualified) => self.is_global_type_name(file, &qualified.left),
+            TSTypeName::ThisExpression(_) => false,
+        }
     }
 
     fn declaration_of_identifier(
@@ -303,7 +321,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn declared_type_of_type_at(
+    fn declared_type_of_nested_type(
         &mut self,
         file: FileId,
         ty: &'a TSType<'a>,
@@ -315,10 +333,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match ty {
             TSType::TSParenthesizedType(parenthesized) => {
-                self.declared_type_of_type_at(file, &parenthesized.type_annotation, depth + 1)
+                self.declared_type_of_nested_type(file, &parenthesized.type_annotation, depth + 1)
             }
             TSType::TSTypeOperatorType(operator) => {
-                self.declared_type_of_type_at(file, &operator.type_annotation, depth + 1)
+                self.declared_type_of_nested_type(file, &operator.type_annotation, depth + 1)
             }
             TSType::TSTupleType(_) => DeclaredType {
                 kind: Kind::Array,
@@ -348,7 +366,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let parts: Vec<DeclaredType> = union
                     .types
                     .iter()
-                    .map(|part| self.declared_type_of_type_at(file, part, depth + 1))
+                    .map(|part| self.declared_type_of_nested_type(file, part, depth + 1))
                     .collect();
 
                 joined_type_of(&parts, true)
@@ -357,7 +375,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let parts: Vec<DeclaredType> = intersection
                     .types
                     .iter()
-                    .map(|part| self.declared_type_of_type_at(file, part, depth + 1))
+                    .map(|part| self.declared_type_of_nested_type(file, part, depth + 1))
                     .collect();
 
                 joined_type_of(&parts, false)
@@ -383,7 +401,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(argument) = first_type_argument_of(reference) {
             if UNWRAPPED_TYPE_NAMES.contains(&name) {
-                return self.declared_type_of_type_at(file, argument, depth + 1);
+                return self.declared_type_of_nested_type(file, argument, depth + 1);
             }
 
             if name == "Pick" || name == "Omit" {
@@ -391,21 +409,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     kind: Kind::Other,
                     tuple: false,
                     closed: self
-                        .declared_type_of_type_at(file, argument, depth + 1)
+                        .declared_type_of_nested_type(file, argument, depth + 1)
                         .closed,
                 };
             }
         }
 
         let Some(declaration) = self.declaration_of_type_name(file, &reference.type_name) else {
-            return DeclaredType::default();
+            return if self.is_global_type_name(file, &reference.type_name) {
+                declared_type_of(Kind::Other)
+            } else {
+                DeclaredType::default()
+            };
         };
 
         match declaration {
             Declaration::TypeAlias {
                 file: target,
                 declaration,
-            } => self.declared_type_of_type_at(target, &declaration.type_annotation, depth + 1),
+            } => self.declared_type_of_nested_type(target, &declaration.type_annotation, depth + 1),
             Declaration::Interface {
                 file: target,
                 declaration,
@@ -432,7 +454,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 file: target,
                 parameter,
             } => match &parameter.constraint {
-                Some(constraint) => self.declared_type_of_type_at(target, constraint, depth + 1),
+                Some(constraint) => {
+                    self.declared_type_of_nested_type(target, constraint, depth + 1)
+                }
                 None => DeclaredType::default(),
             },
             _ => DeclaredType::default(),
@@ -449,8 +473,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 !object.properties.is_empty()
                     && object.properties.iter().all(|property| match property {
                         ObjectPropertyKind::SpreadProperty(spread) => {
-                            self.declared_type_of_expression_at(file, &spread.argument, depth + 1)
-                                .closed
+                            self.declared_type_of_nested_expression(
+                                file,
+                                &spread.argument,
+                                depth + 1,
+                            )
+                            .closed
                         }
                         ObjectPropertyKind::ObjectProperty(_) => true,
                     })
@@ -524,7 +552,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.is_closed_container(Container::Class(file, class), depth + 1)
             }
             Some(Declaration::TypeAlias { file, declaration }) => {
-                self.declared_type_of_type_at(file, &declaration.type_annotation, depth + 1)
+                self.declared_type_of_nested_type(file, &declaration.type_annotation, depth + 1)
                     .closed
             }
             _ => false,
@@ -713,10 +741,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
     fn declared_type_of_typing(&mut self, typing: Option<Typing<'a>>, depth: u32) -> DeclaredType {
         match typing {
             Some(Typing::Annotation(file, annotation)) => {
-                self.declared_type_of_type_at(file, annotation, depth + 1)
+                self.declared_type_of_nested_type(file, annotation, depth + 1)
             }
             Some(Typing::Initializer(file, initializer)) => {
-                self.declared_type_of_expression_at(file, initializer, depth + 1)
+                self.declared_type_of_nested_expression(file, initializer, depth + 1)
             }
             None => DeclaredType::default(),
         }
@@ -798,7 +826,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    fn declared_type_of_expression_at(
+    fn declared_type_of_nested_expression(
         &mut self,
         file: FileId,
         expression: &'a Expression<'a>,
@@ -810,12 +838,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match expression {
             Expression::TSAsExpression(assertion) if !is_const_type(&assertion.type_annotation) => {
-                return self.declared_type_of_type_at(file, &assertion.type_annotation, depth + 1);
+                return self.declared_type_of_nested_type(
+                    file,
+                    &assertion.type_annotation,
+                    depth + 1,
+                );
             }
             Expression::TSSatisfiesExpression(assertion)
                 if !is_const_type(&assertion.type_annotation) =>
             {
-                return self.declared_type_of_type_at(file, &assertion.type_annotation, depth + 1);
+                return self.declared_type_of_nested_type(
+                    file,
+                    &assertion.type_annotation,
+                    depth + 1,
+                );
             }
             _ => {}
         }
@@ -862,8 +898,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             }
             Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
-                let left = self.declared_type_of_expression_at(file, &binary.left, depth + 1);
-                let right = self.declared_type_of_expression_at(file, &binary.right, depth + 1);
+                let left = self.declared_type_of_nested_expression(file, &binary.left, depth + 1);
+                let right = self.declared_type_of_nested_expression(file, &binary.right, depth + 1);
 
                 return if left.kind == Kind::String || right.kind == Kind::String {
                     declared_type_of(Kind::String)
@@ -873,8 +909,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             Expression::ConditionalExpression(conditional) => {
                 let parts = [
-                    self.declared_type_of_expression_at(file, &conditional.consequent, depth + 1),
-                    self.declared_type_of_expression_at(file, &conditional.alternate, depth + 1),
+                    self.declared_type_of_nested_expression(
+                        file,
+                        &conditional.consequent,
+                        depth + 1,
+                    ),
+                    self.declared_type_of_nested_expression(
+                        file,
+                        &conditional.alternate,
+                        depth + 1,
+                    ),
                 ];
 
                 return joined_type_of(&parts, true);
@@ -886,8 +930,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 ) =>
             {
                 let parts = [
-                    self.declared_type_of_expression_at(file, &logical.left, depth + 1),
-                    self.declared_type_of_expression_at(file, &logical.right, depth + 1),
+                    self.declared_type_of_nested_expression(file, &logical.left, depth + 1),
+                    self.declared_type_of_nested_expression(file, &logical.right, depth + 1),
                 ];
 
                 return joined_type_of(&parts, true);
@@ -957,7 +1001,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             }
 
-            let received = self.declared_type_of_expression_at(file, receiver, depth + 1);
+            let received = self.declared_type_of_nested_expression(file, receiver, depth + 1);
 
             if received.kind == Kind::String && STRING_TO_ARRAY_NAMES.contains(&method) {
                 return declared_type_of(Kind::Array);
@@ -991,7 +1035,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             return match return_type_of_callee(declaration) {
                 Some((target, return_type)) => {
-                    self.declared_type_of_type_at(target, return_type, depth + 1)
+                    self.declared_type_of_nested_type(target, return_type, depth + 1)
                 }
                 None => DeclaredType::default(),
             };
@@ -1018,8 +1062,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if let AstKind::ForOfStatement(statement) = nodes.parent_kind(declaration_node) {
                 if matches!(statement.left, ForStatementLeft::VariableDeclaration(_)) {
-                    let source =
-                        self.declared_type_of_expression_at(target, &statement.right, depth + 1);
+                    let source = self.declared_type_of_nested_expression(
+                        target,
+                        &statement.right,
+                        depth + 1,
+                    );
 
                     return if source.kind == Kind::String {
                         declared_type_of(Kind::String)
@@ -1058,7 +1105,7 @@ fn named_kind_of(name: &str) -> Option<Kind> {
         .or_else(|| TYPED_ARRAYS.contains(&name).then_some(Kind::Array))
 }
 
-fn is_const_type(ty: &TSType<'_>) -> bool {
+pub(crate) fn is_const_type(ty: &TSType<'_>) -> bool {
     matches!(ty, TSType::TSTypeReference(reference) if type_name_text_of(&reference.type_name) == "const")
 }
 
@@ -1093,8 +1140,10 @@ fn member_of_container<'a>(container: Option<Container<'a>>, name: &str) -> Opti
                     _ => None,
                 })
         }
-        Container::TypeLiteral(file, literal) => signature_named(file, &literal.members, name),
-        Container::Interface(file, interface) => signature_named(file, &interface.body.body, name),
+        Container::TypeLiteral(file, literal) => member_signature_of(file, &literal.members, name),
+        Container::Interface(file, interface) => {
+            member_signature_of(file, &interface.body.body, name)
+        }
         Container::Class(file, class) => class.body.body.iter().find_map(|element| match element {
             ClassElement::MethodDefinition(method)
                 if method.kind != MethodDefinitionKind::Constructor
@@ -1125,7 +1174,7 @@ fn member_of_container<'a>(container: Option<Container<'a>>, name: &str) -> Opti
     }
 }
 
-fn signature_named<'a>(
+fn member_signature_of<'a>(
     file: FileId,
     signatures: &'a [TSSignature<'a>],
     name: &str,

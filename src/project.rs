@@ -111,7 +111,7 @@ impl<'a> Project<'a> {
         let mut stack: Vec<Frame<'a>> = Vec::new();
 
         for root in selection.files {
-            if is_parsed_path(&root, allow_js) {
+            if is_parsed_path(&root, allow_js) && !is_declaration_path(&root) {
                 project.visit(allocator, root, false, allow_js, &mut imports, &mut stack)?;
             }
 
@@ -170,6 +170,8 @@ impl<'a> Project<'a> {
         imports: &mut HashMap<PathBuf, Vec<Import>>,
         stack: &mut Vec<Frame<'a>>,
     ) -> Result<(), ProjectError> {
+        let declaration = is_declaration_path(&path);
+        let resets = !external && !declaration;
         let stored = self
             .by_path
             .get(&path)
@@ -179,7 +181,7 @@ impl<'a> Project<'a> {
         if let Some(id) = stored {
             let file = &mut self.files[id.0 as usize];
 
-            if file.external_library && !external {
+            if file.external_library && resets {
                 file.external_library = false;
 
                 stack.push(Frame::Rewalk { path, next: 0 });
@@ -194,7 +196,7 @@ impl<'a> Project<'a> {
         });
 
         if let Some(file) = open {
-            if file.external_library && !external {
+            if file.external_library && resets {
                 file.external_library = false;
 
                 stack.push(Frame::Rewalk { path, next: 0 });
@@ -203,9 +205,13 @@ impl<'a> Project<'a> {
             return Ok(());
         }
 
-        let mut file = parse_file(allocator, path, &self.root)?;
+        let mut file = match parse_file(allocator, path, &self.root) {
+            Ok(file) => file,
+            Err(_) if declaration => return Ok(()),
+            Err(error) => return Err(error),
+        };
 
-        file.external_library = external;
+        file.external_library = external || declaration;
 
         imports.insert(file.path.clone(), self.imports_of(&file, allow_js));
         stack.push(Frame::Open {
@@ -394,29 +400,29 @@ fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
         TYPESCRIPT_EXTENSIONS
     };
 
-    allowed.contains(&extension.as_str()) && !is_declaration_path(path)
+    allowed.contains(&extension.as_str())
 }
 
 fn resolve_options_of(tsconfig: &Path) -> ResolveOptions {
     ResolveOptions {
-        extensions: [".ts", ".tsx", ".mts", ".cts", ".js", ".json"]
+        extensions: [".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".json"]
             .map(String::from)
             .to_vec(),
         extension_alias: vec![
             (
                 ".js".to_string(),
-                [".ts", ".tsx", ".js"].map(String::from).to_vec(),
+                [".ts", ".tsx", ".d.ts", ".js"].map(String::from).to_vec(),
             ),
             (
                 ".mjs".to_string(),
-                [".mts", ".mjs"].map(String::from).to_vec(),
+                [".mts", ".d.mts", ".mjs"].map(String::from).to_vec(),
             ),
             (
                 ".cjs".to_string(),
-                [".cts", ".cjs"].map(String::from).to_vec(),
+                [".cts", ".d.cts", ".cjs"].map(String::from).to_vec(),
             ),
         ],
-        main_fields: ["types", "typings", "main"].map(String::from).to_vec(),
+        main_fields: ["typings", "types", "main"].map(String::from).to_vec(),
         main_files: vec!["index".to_string()],
         condition_names: ["import", "types", "default"].map(String::from).to_vec(),
         tsconfig: Some(TsconfigDiscovery::Manual(TsconfigOptions {

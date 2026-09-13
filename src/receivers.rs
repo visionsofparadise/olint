@@ -4,12 +4,13 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 
-use crate::constants::{member_name_of, unwrap};
+use crate::constants::{member_name_of, unwrap, unwrap_to_cast};
 use crate::declarations::{element_name_of, Declaration, Declarations};
 use crate::declared_types::{declarator_of_identifier, formal_parameter_of_identifier};
 use crate::project::{FileId, Project};
 
 const MAXIMUM_BASE_CLASSES: usize = 32;
+const MAXIMUM_ALIASES: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -26,16 +27,17 @@ impl<'a> Declarations<'a> {
         callee: &'a MemberExpression<'a>,
     ) -> Option<Declaration<'a>> {
         let name = member_name_of(callee)?;
-        let object = unwrap(callee.object());
+        let object = unwrap_to_cast(callee.object());
 
         if let Expression::ThisExpression(_) = object {
-            let (target, class) = class_of_this(project, file, callee)?;
+            let (target, class, placement) = class_of_this(project, file, callee)?;
 
-            return self.inherited_member_of(project, target, class, &name, Placement::Either);
+            return self.inherited_member_of(project, target, class, &name, placement);
         }
 
         if let Expression::NewExpression(new) = object {
-            let (target, class) = self.class_named_by(project, file, unwrap(&new.callee))?;
+            let (target, class) =
+                self.class_of_expression(project, file, unwrap_to_cast(&new.callee))?;
 
             return self.inherited_member_of(project, target, class, &name, Placement::Instance);
         }
@@ -74,20 +76,16 @@ impl<'a> Declarations<'a> {
                 })
             });
 
-        if let Some((target, TSType::TSTypeReference(type_reference))) = annotation {
-            if let Some(Declaration::Class {
-                file: class_file,
+        if let Some((target, annotated)) = annotation {
+            let (class_file, class) = self.class_of_type(project, target, annotated)?;
+
+            return self.inherited_member_of(
+                project,
+                class_file,
                 class,
-            }) = self.of_type_name(project, target, &type_reference.type_name)
-            {
-                return self.inherited_member_of(
-                    project,
-                    class_file,
-                    class,
-                    &name,
-                    Placement::Instance,
-                );
-            }
+                &name,
+                Placement::Instance,
+            );
         }
 
         let (target, declarator, constant) = declarator_of_identifier(&declaration)?;
@@ -96,10 +94,10 @@ impl<'a> Declarations<'a> {
             return None;
         }
 
-        match unwrap(declarator.init.as_ref()?) {
+        match unwrap_to_cast(declarator.init.as_ref()?) {
             Expression::NewExpression(new) => {
                 let (class_file, class) =
-                    self.class_named_by(project, target, unwrap(&new.callee))?;
+                    self.class_of_expression(project, target, unwrap_to_cast(&new.callee))?;
 
                 self.inherited_member_of(project, class_file, class, &name, Placement::Instance)
             }
@@ -173,11 +171,42 @@ impl<'a> Declarations<'a> {
             }
 
             let heritage = class.heritage.as_ref()?;
-            let Expression::Identifier(base) = unwrap(&heritage.expression) else {
+            let Expression::Identifier(base) = unwrap_to_cast(&heritage.expression) else {
                 return None;
             };
 
             current = self.class_of_reference(project, file, base)?;
+        }
+
+        None
+    }
+
+    fn class_of_type(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        annotated: &'a TSType<'a>,
+    ) -> Option<(FileId, &'a Class<'a>)> {
+        let mut current = (file, annotated);
+
+        for _ in 0..MAXIMUM_ALIASES {
+            let (file, annotated) = current;
+
+            current = match annotated {
+                TSType::TSParenthesizedType(parenthesized) => {
+                    (file, &parenthesized.type_annotation)
+                }
+                TSType::TSTypeReference(type_reference) => {
+                    match self.of_type_name(project, file, &type_reference.type_name)? {
+                        Declaration::Class { file, class } => return Some((file, class)),
+                        Declaration::TypeAlias { file, declaration } => {
+                            (file, &declaration.type_annotation)
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
         }
 
         None
@@ -194,7 +223,7 @@ impl<'a> Declarations<'a> {
             declaration => {
                 let (target, declarator, constant) = declarator_of_identifier(&declaration)?;
 
-                match (constant, unwrap(declarator.init.as_ref()?)) {
+                match (constant, unwrap_to_cast(declarator.init.as_ref()?)) {
                     (true, Expression::ClassExpression(class)) => Some((target, class)),
                     _ => None,
                 }
@@ -202,7 +231,7 @@ impl<'a> Declarations<'a> {
         }
     }
 
-    fn class_named_by(
+    fn class_of_expression(
         &self,
         project: &Project<'a>,
         file: FileId,
@@ -219,25 +248,39 @@ fn class_of_this<'a>(
     project: &Project<'a>,
     file: FileId,
     callee: &'a MemberExpression<'a>,
-) -> Option<(FileId, &'a Class<'a>)> {
+) -> Option<(FileId, &'a Class<'a>, Placement)> {
     let nodes = project.file(file).semantic.nodes();
+    let mut placement = Placement::Either;
 
     for ancestor in nodes.ancestors(member_node_id_of(callee)) {
         match ancestor.kind() {
-            AstKind::Class(class) => return Some((file, class)),
-            AstKind::Function(_)
-                if !matches!(
-                    nodes.parent_kind(ancestor.id()),
-                    AstKind::MethodDefinition(_)
-                ) =>
-            {
-                return None;
+            AstKind::Class(class) => return Some((file, class, placement)),
+            AstKind::Function(_) => match nodes.parent_kind(ancestor.id()) {
+                AstKind::MethodDefinition(method) if placement == Placement::Either => {
+                    placement = placement_of(method.r#static);
+                }
+                AstKind::MethodDefinition(_) => {}
+                _ => return None,
+            },
+            AstKind::PropertyDefinition(property) if placement == Placement::Either => {
+                placement = placement_of(property.r#static);
+            }
+            AstKind::StaticBlock(_) if placement == Placement::Either => {
+                placement = Placement::Static;
             }
             _ => {}
         }
     }
 
     None
+}
+
+fn placement_of(is_static: bool) -> Placement {
+    if is_static {
+        Placement::Static
+    } else {
+        Placement::Instance
+    }
 }
 
 fn member_node_id_of(member: &MemberExpression<'_>) -> oxc_semantic::NodeId {

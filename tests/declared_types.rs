@@ -16,7 +16,7 @@ fn declared_types_of(types: &str, index: &str) -> Vec<DeclaredType> {
     })
 }
 
-fn declared(kind: Kind, tuple: bool, closed: bool) -> DeclaredType {
+fn expected_type_of(kind: Kind, tuple: bool, closed: bool) -> DeclaredType {
     DeclaredType {
         kind,
         tuple,
@@ -34,12 +34,12 @@ fn parameters_read_their_annotations() {
     assert_eq!(
         found,
         vec![
-            declared(Kind::Array, true, false),
-            declared(Kind::Array, false, false),
-            declared(Kind::Other, false, false),
-            declared(Kind::Other, false, true),
-            declared(Kind::Other, false, true),
-            declared(Kind::Other, false, true),
+            expected_type_of(Kind::Array, true, false),
+            expected_type_of(Kind::Array, false, false),
+            expected_type_of(Kind::Other, false, false),
+            expected_type_of(Kind::Other, false, true),
+            expected_type_of(Kind::Other, false, true),
+            expected_type_of(Kind::Other, false, true),
         ]
     );
 }
@@ -54,8 +54,8 @@ fn type_names_follow_aliases_imports_and_constraints() {
     assert_eq!(
         found,
         vec![
-            declared(Kind::Other, false, true),
-            declared(Kind::Array, false, false),
+            expected_type_of(Kind::Other, false, true),
+            expected_type_of(Kind::Array, false, false),
         ]
     );
 }
@@ -70,13 +70,46 @@ fn expressions_read_calls_constructors_and_patterns() {
     assert_eq!(
         found,
         vec![
-            declared(Kind::Array, false, false),
-            declared(Kind::Set, false, false),
-            declared(Kind::Unknown, false, false),
-            declared(Kind::Unknown, false, false),
-            declared(Kind::Array, true, false),
-            declared(Kind::Array, true, false),
-            declared(Kind::Array, false, false),
+            expected_type_of(Kind::Array, false, false),
+            expected_type_of(Kind::Set, false, false),
+            expected_type_of(Kind::Unknown, false, false),
+            expected_type_of(Kind::Unknown, false, false),
+            expected_type_of(Kind::Array, true, false),
+            expected_type_of(Kind::Array, true, false),
+            expected_type_of(Kind::Array, false, false),
+        ]
+    );
+}
+
+#[test]
+fn package_declaration_aliases_resolve_and_lib_globals_read_as_other() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/pkg/index.d.ts",
+            "export type Items = string[];\nexport interface Box { width: number }",
+        ),
+        (
+            "index.ts",
+            "import type { Items, Box } from \"pkg\";\nfunction make(): number[] {\n\treturn [1];\n}\nexport function f(items: Items, box: Box, r: ReturnType<typeof make>, p: Parameters<typeof make>, a: Awaited<Promise<string[]>>, d: Date) {\n\tprobe(items);\n\tprobe(box);\n\tprobe(r);\n\tprobe(p);\n\tprobe(a);\n\tprobe(d);\n}",
+        ),
+    ];
+
+    assert_eq!(
+        probe_results_of(&files, |analysis, file, probe| {
+            analysis.declared_type_of_expression(file, probe)
+        }),
+        vec![
+            expected_type_of(Kind::Array, false, false),
+            expected_type_of(Kind::Other, false, true),
+            expected_type_of(Kind::Other, false, false),
+            expected_type_of(Kind::Other, false, false),
+            expected_type_of(Kind::Other, false, false),
+            expected_type_of(Kind::Other, false, false),
         ]
     );
 }

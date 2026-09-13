@@ -30,7 +30,7 @@ fn byte_span_of(needle: &str) -> (u32, u32) {
     (start as u32, (start + needle.len()) as u32)
 }
 
-fn with_source(body: impl for<'a> FnOnce(&Project<'a>, FileId)) {
+fn run_with_source(body: impl for<'a> FnOnce(&Project<'a>, FileId)) {
     let files = [("tsconfig.json", "{}"), ("index.ts", SOURCE)];
 
     run_in_project(&files, |project, root| {
@@ -40,7 +40,7 @@ fn with_source(body: impl for<'a> FnOnce(&Project<'a>, FileId)) {
 
 #[test]
 fn recording_asks_only_for_sites_syntax_leaves_open() {
-    with_source(|project, file| {
+    run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
 
         analysis.set_pass(OraclePass::Recording);
@@ -71,7 +71,7 @@ fn recording_asks_only_for_sites_syntax_leaves_open() {
 
 #[test]
 fn answering_takes_recorded_answers_and_counts_misses() {
-    with_source(|project, file| {
+    run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
         let loose = receiver_of(project, file, "loose.map");
         let other = receiver_of(project, file, "other.map");
@@ -97,7 +97,7 @@ fn answering_takes_recorded_answers_and_counts_misses() {
 
 #[test]
 fn callee_answers_map_to_the_declaration_they_span() {
-    with_source(|project, file| {
+    run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
         let path = project.file(file).path.to_string_lossy().replace('\\', "/");
         let (function_start, function_end) = byte_span_of("export function run() {}");
@@ -138,7 +138,7 @@ fn callee_answers_map_to_the_declaration_they_span() {
 
 #[test]
 fn recording_reuses_answers_from_earlier_rounds() {
-    with_source(|project, file| {
+    run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
         let loose = receiver_of(project, file, "loose.map");
 

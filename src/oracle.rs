@@ -60,6 +60,7 @@ pub const SCRIPT: &str = include_str!("types_oracle.mjs");
 const TYPESCRIPT_UNAVAILABLE: i32 = 3;
 
 pub fn ask(root: &Path, tsconfig: &Path, queries: &[Query]) -> Result<OracleReply, OracleError> {
+    let tsconfig = std::path::absolute(tsconfig).map_err(OracleError::NodeUnavailable)?;
     let request = serde_json::to_vec(&Request {
         tsconfig: tsconfig.to_string_lossy().into_owned(),
         queries,

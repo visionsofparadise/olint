@@ -5,7 +5,7 @@ mod support;
 
 use support::{file_of, member_callee_of, run_in_project};
 
-fn described(declarations: &Declarations<'_>, declaration: Option<Declaration<'_>>) -> String {
+fn description_of(declarations: &Declarations<'_>, declaration: Option<Declaration<'_>>) -> String {
     let Some(declaration) = declaration else {
         return "none".to_string();
     };
@@ -78,7 +78,7 @@ fn receivers_of(files: &[(&str, &str)], callees: &[&str]) -> Vec<String> {
             .map(|callee| {
                 let member = member_callee_of(project, file, callee);
 
-                described(
+                description_of(
                     &declarations,
                     declarations.member_of_receiver(project, file, member),
                 )
@@ -153,7 +153,7 @@ fn this_resolves_inside_methods_only() {
                 _ => None,
             })
             .map(|member| {
-                described(
+                description_of(
                     &declarations,
                     declarations.member_of_receiver(project, file, member),
                 )
@@ -184,6 +184,45 @@ fn object_literals_and_namespaces_resolve_their_functions() {
             "property run arrow",
             "property walk function",
             "function run function",
+        ]
+    );
+}
+
+#[test]
+fn declared_types_and_casts_hide_the_initializer() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "index.ts",
+            "interface IEngine { run(): number; readonly MAX: number }\ninterface Handlers { run(): number }\ninterface Shape { m(): void }\nclass Engine implements IEngine { readonly MAX = 4; run() { return 1; } }\ntype Alias = Engine;\nexport function f(x: any) {\n\tconst a: IEngine = new Engine();\n\ta.run();\n\tconst b = new Engine() as IEngine;\n\tb.run();\n\tconst c: Handlers = { run: () => 1 };\n\tc.run();\n\tconst d = { run: () => 1 } as Handlers;\n\td.run();\n\tconst e = { run: () => 1 } satisfies Handlers;\n\te.run();\n\tconst g: Alias = new Engine();\n\tg.run();\n\tconst h = new Engine()!;\n\th.run();\n\t(x as Shape).m();\n}\nexport class Clock {\n\tm() {}\n\tn() {\n\t\t(this as any).m();\n\t}\n}",
+        ),
+    ];
+
+    assert_eq!(
+        receivers_of(
+            &files,
+            &[
+                "a.run",
+                "b.run",
+                "c.run",
+                "d.run",
+                "e.run",
+                "g.run",
+                "h.run",
+                "(x as Shape).m",
+                "(this as any).m",
+            ]
+        ),
+        vec![
+            "none",
+            "none",
+            "none",
+            "none",
+            "property run arrow",
+            "member run function",
+            "member run function",
+            "none",
+            "none",
         ]
     );
 }

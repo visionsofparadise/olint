@@ -113,11 +113,20 @@ fn resolve_maps_a_js_specifier_to_the_ts_file() {
 }
 
 #[test]
-fn resolve_reports_node_modules_as_external() {
+fn resolve_loads_a_package_declaration_file_outside_the_project() {
     let files = [
         &[
-            ("tsconfig.json", r#"{ "include": ["src"] }"#),
-            ("src/index.ts", "import { run } from \"pkg\";\nrun();"),
+            ("tsconfig.json", r#"{ "include": ["src", "types"] }"#),
+            (
+                "src/index.ts",
+                "import { run } from \"pkg\";\nimport { plain } from \"plain\";\nrun(plain);",
+            ),
+            ("types/global.d.ts", "declare const unused: number;"),
+            (
+                "node_modules/plain/package.json",
+                r#"{ "name": "plain", "main": "index.js" }"#,
+            ),
+            ("node_modules/plain/index.js", "exports.plain = 1;"),
         ][..],
         &TYPED_PACKAGE,
     ]
@@ -125,10 +134,15 @@ fn resolve_reports_node_modules_as_external() {
 
     run_in_project(&files, |project, root| {
         let index = file_of(project, root, "src/index.ts");
+        let Resolved::File(package) = project.resolve(index, "pkg") else {
+            panic!("the package's declaration file is loaded");
+        };
 
-        assert_eq!(project.files.len(), 1);
+        assert_eq!(project.files.len(), 2);
+        assert!(project.file(package).external_library);
+        assert!(!project.is_project_file(package));
         assert!(matches!(
-            project.resolve(index, "pkg"),
+            project.resolve(index, "plain"),
             Resolved::External(_)
         ));
     });
@@ -482,14 +496,12 @@ fn load_marks_typescript_under_node_modules_external() {
             vec![
                 ("node_modules/pkg/helper.ts", false),
                 ("node_modules/pkg/index.ts", false),
+                ("node_modules/typed/index.d.ts", false),
                 ("src/index.ts", true)
             ]
         );
         assert!(matches!(project.resolve(index, "pkg"), Resolved::File(_)));
-        assert!(matches!(
-            project.resolve(index, "typed"),
-            Resolved::External(_)
-        ));
+        assert!(matches!(project.resolve(index, "typed"), Resolved::File(_)));
     });
 }
 
@@ -506,7 +518,11 @@ fn resolve_prefers_a_package_typings_field_over_a_typescript_main() {
         ),
         (
             "node_modules/patch/package.json",
-            r#"{ "name": "patch", "main": "index.js", "typings": "index.d.ts" }"#,
+            r#"{ "name": "patch", "main": "index.js", "types": "types.d.ts", "typings": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/patch/types.d.ts",
+            "export default function patch(): string;",
         ),
         ("node_modules/patch/index.js", "module.exports = () => 1;"),
         (
@@ -527,8 +543,13 @@ fn resolve_prefers_a_package_typings_field_over_a_typescript_main() {
             .map(|file| file.relative.as_str())
             .collect();
 
-        assert_eq!(loaded, vec!["src/index.ts"]);
-        assert!(matches!(resolved, Resolved::External(path) if path.ends_with("index.d.ts")));
+        assert_eq!(
+            loaded,
+            vec!["node_modules/patch/index.d.ts", "src/index.ts"]
+        );
+        assert!(
+            matches!(resolved, Resolved::File(id) if project.file(id).relative == "node_modules/patch/index.d.ts")
+        );
     });
 }
 

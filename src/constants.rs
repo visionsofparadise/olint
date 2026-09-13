@@ -11,7 +11,7 @@ use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
 use crate::declarations::{Declaration, FunctionNode};
-use crate::declared_types::declarator_of_identifier;
+use crate::declared_types::{declarator_of_identifier, is_const_type};
 use crate::project::FileId;
 use crate::tables::{DERIVED_METHODS, OBJECT_KEYED, TYPED_ARRAYS};
 
@@ -22,6 +22,21 @@ pub fn unwrap<'a>(e: &'a Expression<'a>) -> &'a Expression<'a> {
         Expression::TSSatisfiesExpression(inner) => unwrap(&inner.expression),
         Expression::TSNonNullExpression(inner) => unwrap(&inner.expression),
         Expression::TSTypeAssertion(inner) => unwrap(&inner.expression),
+        _ => e,
+    }
+}
+
+pub(crate) fn unwrap_to_cast<'a>(e: &'a Expression<'a>) -> &'a Expression<'a> {
+    match e {
+        Expression::ParenthesizedExpression(inner) => unwrap_to_cast(&inner.expression),
+        Expression::TSSatisfiesExpression(inner) => unwrap_to_cast(&inner.expression),
+        Expression::TSNonNullExpression(inner) => unwrap_to_cast(&inner.expression),
+        Expression::TSAsExpression(inner) if is_const_type(&inner.type_annotation) => {
+            unwrap_to_cast(&inner.expression)
+        }
+        Expression::TSTypeAssertion(inner) if is_const_type(&inner.type_annotation) => {
+            unwrap_to_cast(&inner.expression)
+        }
         _ => e,
     }
 }
@@ -352,7 +367,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         member: &'a MemberExpression<'a>,
     ) -> Option<Declaration<'a>> {
         if let MemberExpression::StaticMemberExpression(access) = member {
-            let object = unwrap(&access.object);
+            let object = unwrap_to_cast(&access.object);
             let enumeration = match object {
                 Expression::Identifier(reference) => {
                     self.declarations

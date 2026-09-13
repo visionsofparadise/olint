@@ -66,12 +66,12 @@ const kindOfType = (t) => {
 	return "other";
 };
 const isTuple = (t) => !!checker.isTupleType?.(t);
-const closedObject = (t) => {
+const isClosedObject = (t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) return false;
-	if (t.isUnion() || t.isIntersection()) return t.types.every(closedObject);
+	if (t.isUnion() || t.isIntersection()) return t.types.every(isClosedObject);
 	if (t.isTypeParameter()) {
 		const base = t.getConstraint();
-		return base ? closedObject(base) : false;
+		return base ? isClosedObject(base) : false;
 	}
 	if (!(t.flags & ts.TypeFlags.Object)) return false;
 	if (kindOfType(t) !== "other") return false;
@@ -80,7 +80,7 @@ const closedObject = (t) => {
 	return t.getProperties().length > 0;
 };
 
-const nodeAt = (sf, pos, end) => {
+const findNode = (sf, pos, end) => {
 	let best;
 	const visit = (n) => {
 		if (n.getStart(sf) > pos || n.getEnd() < end) return;
@@ -155,7 +155,7 @@ const answers = input.queries.map((q) => {
 	if (!sf) return null;
 	files.set(file, sf);
 	const offset = offsetsOf(sf);
-	const n = nodeAt(sf, offset.toUtf16(q.pos), offset.toUtf16(q.end));
+	const n = findNode(sf, offset.toUtf16(q.pos), offset.toUtf16(q.end));
 	if (!n) return null;
 	if (q.query === "callee") {
 		const node = unwrapNode(n);
@@ -176,7 +176,7 @@ const answers = input.queries.map((q) => {
 		query: "type",
 		kind: kindOfType(t),
 		tuple: isTuple(t) || (t.isUnion() && t.types.length > 0 && t.types.every(isTuple)),
-		closed: closedObject(t),
+		closed: isClosedObject(t),
 	};
 });
 process.stdout.write(JSON.stringify({ typescript: ts.version, from: tsPath, answers }));

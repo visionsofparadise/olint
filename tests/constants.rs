@@ -52,3 +52,12 @@ fn inherited_members_and_namespace_exports_are_followed() {
 
     assert_eq!(found, vec![true, true, true, false]);
 }
+
+#[test]
+fn declared_types_casts_and_static_placement_decide_member_constants() {
+    let found = constant_sizes_of(
+        "interface IEngine { readonly MAX: number }\nclass Engine implements IEngine { readonly MAX = 4; }\ntype Alias = Engine;\nexport class Twin {\n\tstatic size = 1;\n\treadonly size = 9;\n\tm() {\n\t\tconst a: IEngine = new Engine();\n\t\tconst b = new Engine() as IEngine;\n\t\tconst g: Alias = new Engine();\n\t\tprobe(new Uint8Array(a.MAX));\n\t\tprobe(new Uint8Array(b.MAX));\n\t\tprobe(new Uint8Array(g.MAX));\n\t\tprobe(new Uint8Array(this.size));\n\t}\n\tstatic s() {\n\t\tprobe(new Uint8Array(this.size));\n\t}\n}",
+    );
+
+    assert_eq!(found, vec![false, false, true, true, false]);
+}

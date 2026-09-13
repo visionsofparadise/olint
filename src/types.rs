@@ -143,7 +143,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             end: span.end,
         };
 
-        match self.lookup(site_key_of(file, span, QueryKind::Callee), query) {
+        match self.answer_of_site(site_key_of(file, span, QueryKind::Callee), query) {
             Lookup::Answered(Some(OracleAnswer::Callee(answer))) => {
                 self.declaration_of_callee_answer(&answer)
             }
@@ -179,13 +179,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             end: span.end,
         };
 
-        match self.lookup(site_key_of(file, span, QueryKind::Type), query) {
+        match self.answer_of_site(site_key_of(file, span, QueryKind::Type), query) {
             Lookup::Answered(Some(OracleAnswer::Type(answer))) => Some(answer),
             _ => None,
         }
     }
 
-    fn lookup(&mut self, key: SiteKey, query: Query) -> Lookup<OracleAnswer> {
+    fn answer_of_site(&mut self, key: SiteKey, query: Query) -> Lookup<OracleAnswer> {
         if self.pass == OraclePass::Off {
             return Lookup::Unanswered;
         }
