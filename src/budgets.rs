@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentTarget, AssignmentTargetPropertyIdentifier,
-    BindingIdentifier, DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement,
-    ForStatementInit, Function, FunctionBody, IdentifierReference, ObjectProperty,
-    SimpleAssignmentTarget, Statement, VariableDeclarationKind, WhileStatement,
+    ArrowFunctionExpression, AssignmentTarget, BindingIdentifier, DoWhileStatement, Expression,
+    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, Function, FunctionBody,
+    IdentifierReference, SimpleAssignmentTarget, Statement, VariableDeclarationKind,
+    WhileStatement,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
@@ -132,28 +132,6 @@ impl<'a> Visit<'a> for Subtree<'a> {
     fn visit_do_while_statement(&mut self, statement: &DoWhileStatement<'a>) {
         if !self.prune_loops {
             oxc_ast_visit::walk::walk_do_while_statement(self, statement);
-        }
-    }
-
-    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
-        if property.shorthand {
-            self.enter_node(AstKind::ObjectProperty(self.alloc(property)));
-            self.visit_property_key(&property.key);
-        } else {
-            oxc_ast_visit::walk::walk_object_property(self, property);
-        }
-    }
-
-    fn visit_assignment_target_property_identifier(
-        &mut self,
-        property: &AssignmentTargetPropertyIdentifier<'a>,
-    ) {
-        self.enter_node(AstKind::AssignmentTargetPropertyIdentifier(
-            self.alloc(property),
-        ));
-
-        if let Some(init) = &property.init {
-            self.visit_expression(init);
         }
     }
 }
@@ -438,40 +416,63 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn is_invariant(
-        &self,
+        &mut self,
         file: FileId,
         e: &'a Expression<'a>,
         writes: &HashMap<Binding, Vec<WriteKind>>,
     ) -> bool {
-        self.reads_of(file, Root::Expression(e))
+        self.reads_of(file, e.node_id())
             .iter()
             .all(|binding| writes.get(binding).is_none_or(|found| found.is_empty()))
     }
 
-    pub(crate) fn reads_of(&self, file: FileId, root: Root<'a>) -> Vec<Binding> {
-        self.bindings_of(file, Subtree::of(root, false, false))
-    }
-
-    fn bindings_of(&self, file: FileId, kinds: Vec<AstKind<'a>>) -> Vec<Binding> {
+    pub(crate) fn reads_of(&mut self, file: FileId, root: NodeId) -> Vec<Binding> {
         let mut reads = Vec::new();
+        let mut node = root;
 
-        for kind in kinds {
+        loop {
+            let kind = self.kind_of_node(file, node);
             let binding = match kind {
                 AstKind::IdentifierReference(reference) => {
-                    self.binding_of_identifier(file, reference)
+                    let shorthand = matches!(
+                        self.project.file(file).semantic.nodes().parent_kind(node),
+                        AstKind::AssignmentTargetPropertyIdentifier(_)
+                    );
+
+                    if shorthand {
+                        None
+                    } else {
+                        self.binding_of_identifier(file, reference)
+                    }
                 }
                 AstKind::BindingIdentifier(identifier) => binding_identifier_of(file, identifier),
                 _ => None,
             };
 
             if let Some(binding) = binding {
-                if !reads.contains(&binding) {
-                    reads.push(binding);
+                reads.push(binding);
+            }
+
+            let stops = match kind {
+                AstKind::ArrowFunctionExpression(arrow) => arrow.r#async,
+                AstKind::Function(function) => function.r#async || function.generator,
+                AstKind::YieldExpression(expression) => expression.delegate,
+                AstKind::FormalParameterRest(_) | AstKind::BindingRestElement(_) => true,
+                AstKind::ArrayAssignmentTarget(target) => {
+                    matches!(target.elements.first(), Some(None))
                 }
+                _ => false,
+            };
+
+            if stops {
+                return reads;
+            }
+
+            match self.children_of(file, node).first() {
+                Some(child) => node = *child,
+                None => return reads,
             }
         }
-
-        reads
     }
 
     fn writes_of(&mut self, file: FileId, body: Root<'a>) -> HashMap<Binding, Vec<WriteKind>> {
@@ -510,7 +511,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                                 | AssignmentTarget::ObjectAssignmentTarget(_)
                         ) =>
                     {
-                        let bindings = self.pattern_reads_of(file, &assignment.left);
+                        let bindings = self.reads_of(file, assignment.left.node_id());
 
                         for binding in bindings {
                             writes.entry(binding).or_default().push(WriteKind::Other);
@@ -558,18 +559,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         writes
-    }
-
-    fn pattern_reads_of(&self, file: FileId, target: &'a AssignmentTarget<'a>) -> Vec<Binding> {
-        let mut subtree = Subtree {
-            kinds: Vec::new(),
-            prune_functions: false,
-            prune_loops: false,
-        };
-
-        subtree.visit_assignment_target(target);
-
-        self.bindings_of(file, subtree.kinds)
     }
 
     fn add_target_write(

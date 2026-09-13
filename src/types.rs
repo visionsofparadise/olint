@@ -215,8 +215,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Lookup::Unanswered;
         }
 
+        let replaying = self.pass == OraclePass::Recording && self.replays_type_answers;
+
         if let Some(answer) = self.answers.get(&key) {
-            if self.pass == OraclePass::Recording && key.3 == QueryKind::Type {
+            if self.pass == OraclePass::Recording && key.3 == QueryKind::Type && !replaying {
                 return Lookup::Unanswered;
             }
 
@@ -224,6 +226,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         match self.pass {
+            OraclePass::Recording if replaying && key.3 == QueryKind::Type => {}
             OraclePass::Recording => {
                 self.needed.entry(key).or_insert(query);
             }

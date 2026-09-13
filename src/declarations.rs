@@ -200,18 +200,41 @@ impl<'a> Declarations<'a> {
         object: &Expression<'a>,
         name: &str,
     ) -> Option<Binding> {
-        let Expression::Identifier(reference) = object else {
-            return None;
-        };
-        let (target_file, symbol) = self.symbol_of_reference(project, file, reference)?;
+        let owner = self.namespace_target_of(project, file, object)?;
 
-        match self.target_of_symbol(project, target_file, symbol) {
-            Target::Namespace(namespace) => {
-                match self.followed_export_of(project, namespace, name)? {
-                    Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
-                    _ => None,
-                }
+        match self.member_target_of(project, owner, name)? {
+            Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
+            _ => None,
+        }
+    }
+
+    fn namespace_target_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        object: &Expression<'a>,
+    ) -> Option<Target> {
+        match object {
+            Expression::ParenthesizedExpression(inner) => {
+                self.namespace_target_of(project, file, &inner.expression)
             }
+            Expression::Identifier(reference) => {
+                let (target_file, symbol) = self.symbol_of_reference(project, file, reference)?;
+
+                Some(self.target_of_symbol(project, target_file, symbol))
+            }
+            Expression::StaticMemberExpression(member) => {
+                let owner = self.namespace_target_of(project, file, &member.object)?;
+
+                self.member_target_of(project, owner, member.property.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn member_target_of(&self, project: &Project<'a>, owner: Target, name: &str) -> Option<Target> {
+        match owner {
+            Target::Namespace(namespace) => self.followed_export_of(project, namespace, name),
             Target::Symbol(file, symbol) => {
                 let semantic = &project.file(file).semantic;
                 let scoping = semantic.scoping();
@@ -223,7 +246,7 @@ impl<'a> Declarations<'a> {
 
                             scoping
                                 .get_binding(scope, name.into())
-                                .map(|symbol| Binding::Symbol { file, symbol })
+                                .map(|symbol| Target::Symbol(file, symbol))
                         }
                         _ => None,
                     }
@@ -231,6 +254,43 @@ impl<'a> Declarations<'a> {
             }
             _ => None,
         }
+    }
+
+    fn merged_namespace_symbol_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &IdentifierReference<'a>,
+    ) -> Option<SymbolId> {
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let scoping = semantic.scoping();
+        let name = reference.name.as_str();
+
+        nodes
+            .ancestors(reference.node_id())
+            .find_map(|ancestor| match ancestor.kind() {
+                AstKind::TSNamespaceDeclaration(enclosing) => {
+                    let namespace = enclosing.id.symbol_id.get()?;
+
+                    scoping
+                        .symbol_declarations(namespace)
+                        .find_map(|node| match nodes.kind(node) {
+                            AstKind::TSNamespaceDeclaration(block) => {
+                                let symbol =
+                                    scoping.get_binding(block.scope_id.get()?, name.into())?;
+                                let declaration = scoping.symbol_declaration(symbol);
+                                let exported = nodes.ancestors(declaration).take(3).any(|parent| {
+                                    matches!(parent.kind(), AstKind::ExportDeclaration(_))
+                                });
+
+                                exported.then_some(symbol)
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            })
     }
 
     pub fn is_member_first_declared_by_interface(
@@ -247,7 +307,9 @@ impl<'a> Declarations<'a> {
 
         semantic.scoping().symbol_declarations(symbol).any(|node| {
             match semantic.nodes().kind(node) {
-                AstKind::TSInterfaceDeclaration(interface) if interface.span.start < class.span.start => {
+                AstKind::TSInterfaceDeclaration(interface)
+                    if interface.span.start < class.span.start =>
+                {
                     interface.body.body.iter().any(|signature| {
                         let key = match signature {
                             TSSignature::TSPropertySignature(property) => &property.key,
@@ -255,7 +317,11 @@ impl<'a> Declarations<'a> {
                             _ => return false,
                         };
 
-                        matches!(key, PropertyKey::StaticIdentifier(identifier) if identifier.name == name)
+                        match key {
+                            PropertyKey::StaticIdentifier(identifier) => identifier.name == name,
+                            PropertyKey::StringLiteral(literal) => literal.value == name,
+                            _ => false,
+                        }
                     })
                 }
                 _ => false,
@@ -467,6 +533,10 @@ impl<'a> Declarations<'a> {
             .get_reference(reference_id)
             .symbol_id()
         {
+            return Some((file, symbol));
+        }
+
+        if let Some(symbol) = self.merged_namespace_symbol_of(project, file, reference) {
             return Some((file, symbol));
         }
 

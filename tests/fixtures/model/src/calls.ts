@@ -70,3 +70,10 @@ export function instantiationExpression(xs: number[]) {
 	const g = makeIdentity(xs)<number>;
 	return g;
 }
+
+export function parenthesizedRest(xs: number[]): number {
+	let a: number;
+	let rest: number[];
+	[a, ...(rest)] = xs;
+	return a + rest.length;
+}

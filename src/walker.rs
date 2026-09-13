@@ -137,7 +137,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.project.site_of(file, span)
     }
 
-    fn children_of(&mut self, file: FileId, node: NodeId) -> Vec<NodeId> {
+    pub(crate) fn children_of(&mut self, file: FileId, node: NodeId) -> Vec<NodeId> {
         let project = self.project;
         let children = self.children.entry(file).or_insert_with(|| {
             let nodes = project.file(file).semantic.nodes();
@@ -639,7 +639,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return inner;
         }
 
-        let label = format!("spread ...{}", short(self.text_of(file, target_span)));
+        let written = self.text_of(file, rest.span);
+        let label = format!(
+            "spread ...{}",
+            short(written.strip_prefix("...").unwrap_or(written).trim_start())
+        );
         let site = self.site_of_node(file, rest.node_id());
 
         inner.merge(Reading::of_part(nest(label, site, Cost::N, Part::none())))

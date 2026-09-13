@@ -1,8 +1,8 @@
-# tsconfig.json  (131 functions in 15 files)
+# tsconfig.json  (144 functions in 15 files)
 
-O(N)               47
-O(1)               38
-O(N^2)             32
+O(N)               54
+O(1)               41
+O(N^2)             35
 O(N log N)         10
 O(N^3)              4
 
@@ -41,6 +41,14 @@ O(N^2)         scopedBudget  src/budgets.ts:13
 O(N^2)         namespaceWrite  src/budgets.ts:62
     in loop for-of                                           src/budgets.ts:64  x N
         in loop while                                        src/budgets.ts:65  x N
+
+O(N^2)         nestedNamespaceWrite  src/budgets.ts:123
+    in loop for-of                                           src/budgets.ts:125  x N
+        in loop while                                        src/budgets.ts:126  x N
+
+O(N^2)         mergedBlockWrite  src/budgets.ts:140
+    in loop for-of                                           src/budgets.ts:142  x N
+        in loop while                                        src/budgets.ts:143  x N
 
 O(N^2)         callbackSubstituted  src/calls.ts:13
     calls runNTimes()                                      src/calls.ts:14  = O(N^2)
@@ -141,6 +149,11 @@ O(N^2)         newSetNonConst  src/methods.ts:59
 O(N^2)         unionCallback  src/methods.ts:80
     does s.union()                                        src/methods.ts:83  x N
         does list.map()?                                  src/methods.ts:83  x N
+
+O(N^2)         unionHidesCallee  src/methods.ts:112
+    does s.union()                                        src/methods.ts:114  x N
+        calls RoundEngine.run()                            src/methods.ts:114  = O(N)
+        does xs.indexOf()                                 src/methods.ts:104  x N
 
 O(N^2)         threeCycleEntry  src/recursion.ts:32
     in loop for-of                                           src/recursion.ts:34  x N

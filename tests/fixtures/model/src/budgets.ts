@@ -70,3 +70,81 @@ export namespace BudgetSpace {
 		return i;
 	}
 }
+
+export function compoundBound(xs: number[], n: number): number {
+	let i = 0;
+	let k = 0;
+	for (const x of xs) {
+		while (i < n - k) {
+			i++;
+		}
+		k += x;
+	}
+	return i;
+}
+
+export function callBound(xs: number[], n: number, size: (a: number) => number): number {
+	let i = 0;
+	for (const x of xs) {
+		while (i < size(n)) {
+			i++;
+		}
+		n += x;
+	}
+	return i;
+}
+
+export function swapPattern(xs: number[], n: number): number {
+	let i = 0;
+	let j = 0;
+	for (const x of xs) {
+		while (j < n) {
+			j++;
+		}
+		[i, j] = [x, i];
+	}
+	return i + j;
+}
+
+export function shorthandDefault(xs: number[], next: () => { i?: number }, d: number): number {
+	let i = 0;
+	for (const x of xs) {
+		while (i < d) {
+			i++;
+		}
+		({ i = d } = next());
+	}
+	return i + xs.length;
+}
+
+export namespace BudgetOuter {
+	export namespace Inner {
+		export let size = 10;
+		export function nestedNamespaceWrite(xs: number[]): number {
+			let i = 0;
+			for (const x of xs) {
+				while (i < size) {
+					i++;
+				}
+				BudgetOuter.Inner.size += x;
+			}
+			return i;
+		}
+	}
+}
+
+export namespace BudgetMerged {
+	export let cap = 3;
+}
+export namespace BudgetMerged {
+	export function mergedBlockWrite(xs: number[]): number {
+		let i = 0;
+		for (const x of xs) {
+			while (i < cap) {
+				i++;
+			}
+			BudgetMerged.cap += x;
+		}
+		return i;
+	}
+}

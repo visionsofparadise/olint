@@ -1,8 +1,8 @@
-# tsconfig.json  (131 functions in 15 files)
+# tsconfig.json  (144 functions in 15 files)
 
-O(N)               47
-O(1)               38
-O(N^2)             32
+O(N)               54
+O(1)               41
+O(N^2)             35
 O(N log N)         10
 O(N^3)              4
 
@@ -41,6 +41,14 @@ O(N^2)         scopedBudget  src/budgets.ts:13
 O(N^2)         namespaceWrite  src/budgets.ts:62
     in loop for-of                                           src/budgets.ts:64  x N
         in loop while                                        src/budgets.ts:65  x N
+
+O(N^2)         nestedNamespaceWrite  src/budgets.ts:123
+    in loop for-of                                           src/budgets.ts:125  x N
+        in loop while                                        src/budgets.ts:126  x N
+
+O(N^2)         mergedBlockWrite  src/budgets.ts:140
+    in loop for-of                                           src/budgets.ts:142  x N
+        in loop while                                        src/budgets.ts:143  x N
 
 O(N^2)         callbackSubstituted  src/calls.ts:13
     calls runNTimes()                                      src/calls.ts:14  = O(N^2)
@@ -141,6 +149,11 @@ O(N^2)         newSetNonConst  src/methods.ts:59
 O(N^2)         unionCallback  src/methods.ts:80
     does s.union()                                        src/methods.ts:83  x N
         does list.map()?                                  src/methods.ts:83  x N
+
+O(N^2)         unionHidesCallee  src/methods.ts:112
+    does s.union()                                        src/methods.ts:114  x N
+        calls RoundEngine.run()                            src/methods.ts:114  = O(N)
+        does xs.indexOf()                                 src/methods.ts:104  x N
 
 O(N^2)         threeCycleEntry  src/recursion.ts:32
     in loop for-of                                           src/recursion.ts:34  x N
@@ -249,6 +262,18 @@ O(N)           ordinaryForLoopCounterExcluded  src/budgets.ts:41
 O(N)           shorthandDestructure  src/budgets.ts:47
     in loop for-of                                           src/budgets.ts:50  x N
 
+O(N)           compoundBound  src/budgets.ts:74
+    in loop for-of                                           src/budgets.ts:77  x N
+
+O(N)           callBound  src/budgets.ts:86
+    in loop for-of                                           src/budgets.ts:88  x N
+
+O(N)           swapPattern  src/budgets.ts:97
+    in loop for-of                                           src/budgets.ts:100  x N
+
+O(N)           shorthandDefault  src/budgets.ts:109
+    in loop for-of                                           src/budgets.ts:111  x N
+
 O(N)           costedCallback  src/calls.ts:1
     in loop for                                              src/calls.ts:3  x N
 
@@ -280,6 +305,9 @@ O(N)           destructureObjectRest  src/calls.ts:59
 O(N)           makeIdentity  src/calls.ts:65
     does xs.map()                                         src/calls.ts:66  x N
 
+O(N)           parenthesizedRest  src/calls.ts:74
+    does spread ...(rest)                                 src/calls.ts:77  x N
+
 O(N)           WithReadonlyItems.addAll  src/classes.ts:77
     does spread ...xs                                     src/classes.ts:78  x N
 
@@ -289,6 +317,9 @@ O(N)           pushesToReadonlyItems  src/classes.ts:81
 
 O(N)           MergedHolder.run  src/classes.ts:105
     does mergedItems.indexOf()                            src/classes.ts:106  x N
+
+O(N)           QuotedHolder.run  src/classes.ts:128
+    does mergedItems.indexOf()                            src/classes.ts:129  x N
 
 O(N)           arrayLinearCall  src/methods.ts:1
     does xs.includes()                                    src/methods.ts:2  x N
@@ -319,6 +350,9 @@ O(N)           surrogateCutLabel  src/methods.ts:94
 
 O(N)           nextLineLabel  src/methods.ts:98
     does (prefix + "ab").split() [string]                src/methods.ts:99  x N
+
+O(N)           RoundEngine.run  src/methods.ts:103
+    does xs.indexOf()                                     src/methods.ts:104  x N
 
 O(N)           factorialLike  src/recursion.ts:1
     calls factorialLike()                                  src/recursion.ts:2  = O(N)
@@ -376,6 +410,10 @@ O(1)           useMergedHolder  src/classes.ts:113
 
 O(1)           ComputedKeys.[ Symbol.iterator ]  src/classes.ts:118
 
+O(1)           QuotedHolder.self  src/classes.ts:131
+
+O(1)           useQuotedHolder  src/classes.ts:136
+
 O(1)           arrayLiteralSpread  src/constants.ts:1
 
 O(1)           conditionalConstants  src/constants.ts:6
@@ -405,6 +443,8 @@ O(1)           makeDoubled  src/methods.ts:76
 O(1)           spreadRestTupleSet  src/methods.ts:86
 
 O(1)           spreadRestKeys  src/methods.ts:90
+
+O(1)           makeRoundEngine  src/methods.ts:108
 
 O(1)           pkgWrapped  src/modules/external.ts:3
 

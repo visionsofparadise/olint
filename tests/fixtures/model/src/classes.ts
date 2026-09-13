@@ -119,3 +119,20 @@ export class ComputedKeys {
 		return [1].values();
 	}
 }
+
+interface QuotedHolder {
+	"run"(): number;
+}
+
+class QuotedHolder {
+	run(): number {
+		return mergedItems.indexOf(2);
+	}
+	self(): number {
+		return this.run();
+	}
+}
+
+export function useQuotedHolder(): number {
+	return new QuotedHolder().self();
+}

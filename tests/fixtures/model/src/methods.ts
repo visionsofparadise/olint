@@ -98,3 +98,18 @@ export function surrogateCutLabel(prefix: string) {
 export function nextLineLabel(prefix: string) {
 	return (prefix + "ab").split(",");
 }
+
+class RoundEngine {
+	run(xs: number[]): number {
+		return xs.indexOf(1);
+	}
+}
+
+function makeRoundEngine() {
+	return new RoundEngine();
+}
+
+export function unionHidesCallee(xs: number[]) {
+	const s = makeUnionSet();
+	return s.union(() => makeRoundEngine().run(xs));
+}

@@ -567,6 +567,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         loop {
             self.summarize_reportable(functions);
 
+            if !self.answers.is_empty() {
+                self.reset_between_passes();
+
+                self.replays_type_answers = true;
+
+                self.summarize_reportable(functions);
+
+                self.replays_type_answers = false;
+            }
+
             let queries = self.needed_queries();
             let asked_nothing = queries.is_empty();
 
