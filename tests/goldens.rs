@@ -58,10 +58,7 @@ fn rows_of(fixture: &str) -> Vec<Row> {
             (
                 report.cost,
                 Row {
-                    block: lines.join(
-                        "
-",
-                    ),
+                    block: lines.join("\n"),
                     n: report.cost.n,
                     log: report.cost.log,
                 },

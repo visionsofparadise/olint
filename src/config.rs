@@ -350,7 +350,7 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
             })?,
         None => project.root.join("olint.config.json"),
     };
-    let exists = path.is_file();
+    let exists = path.exists();
     let raw = match exists {
         true => {
             let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
