@@ -34,6 +34,13 @@ pub enum ConfigError {
         field: String,
         text: String,
     },
+    Entrypoints {
+        text: String,
+    },
+    Entrypoint {
+        field: String,
+        text: String,
+    },
     Ignore {
         pattern: String,
     },
@@ -198,6 +205,8 @@ fn matches_terms(terms: &[Term], units: &[u16]) -> bool {
 
 pub const LIMIT_FORMS: &str = "O(1), O(log N), O(N), O(N log N) or O(N^k)";
 
+pub const ENTRYPOINT_FORMS: &str = r#"a path string or { "path": string, "max": string }"#;
+
 pub fn limit_of(text: &str, field: &str) -> Result<Limit, ConfigError> {
     match Cost::parse(text) {
         Some(cost) => Ok(Limit {
@@ -340,6 +349,61 @@ pub fn package_entries(project: &Project<'_>) -> Vec<PathBuf> {
     found
 }
 
+fn entrypoint_of(item: &Value, field: &str, max: &Limit) -> Result<(String, Limit), ConfigError> {
+    let invalid = || ConfigError::Entrypoint {
+        field: field.to_string(),
+        text: item.to_string(),
+    };
+
+    match item {
+        Value::String(path) => Ok((path.clone(), max.clone())),
+        Value::Object(fields) => {
+            if fields.keys().any(|key| key != "path" && key != "max") {
+                return Err(invalid());
+            }
+
+            let Some(Value::String(path)) = fields.get("path") else {
+                return Err(invalid());
+            };
+            let Some(limit) = fields.get("max") else {
+                return Err(invalid());
+            };
+
+            Ok((path.clone(), json_limit_of(limit, &format!("{field}.max"))?))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+pub fn entrypoints_of(
+    value: &Value,
+    root: &Path,
+    max: &Limit,
+) -> Result<Vec<(PathBuf, Limit)>, ConfigError> {
+    let Value::Array(items) = value else {
+        return Err(ConfigError::Entrypoints {
+            text: value.to_string(),
+        });
+    };
+    let mut entrypoints: Vec<(PathBuf, Limit)> = Vec::new();
+
+    for (index, item) in items.iter().enumerate() {
+        let (path, limit) = entrypoint_of(item, &format!("entrypoints[{index}]"), max)?;
+        let entry = normalized_path_of(&root.join(path));
+
+        match entrypoints.iter_mut().find(|(known, _)| *known == entry) {
+            Some(known) => {
+                if known.1.cost.exceeds(limit.cost) {
+                    known.1 = limit;
+                }
+            }
+            None => entrypoints.push((entry, limit)),
+        }
+    }
+
+    Ok(entrypoints)
+}
+
 pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Config, ConfigError> {
     let path = match explicit {
         Some(explicit) => std::path::absolute(explicit)
@@ -370,26 +434,13 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
         Some(value) => json_limit_of(value, "max")?,
         None => limit_of("O(N^2)", "max")?,
     };
-    let mut entrypoints: Vec<(PathBuf, Limit)> = Vec::new();
-
-    match raw.get("entrypoints") {
-        Some(value @ (Value::Object(_) | Value::Array(_))) => {
-            for (key, limit) in values_of(value) {
-                let limit = json_limit_of(limit, &format!("entrypoints[\"{key}\"]"))?;
-                let entry = normalized_path_of(&project.root.join(&key));
-
-                match entrypoints.iter_mut().find(|(known, _)| *known == entry) {
-                    Some(known) => known.1 = limit,
-                    None => entrypoints.push((entry, limit)),
-                }
-            }
-        }
-        _ => {
-            for entry in package_entries(project) {
-                entrypoints.push((entry, max.clone()));
-            }
-        }
-    }
+    let entrypoints = match raw.get("entrypoints") {
+        Some(value) => entrypoints_of(value, &project.root, &max)?,
+        None => package_entries(project)
+            .into_iter()
+            .map(|entry| (entry, max.clone()))
+            .collect(),
+    };
 
     let ignore = match raw.get("ignore") {
         Some(Value::Array(patterns)) => patterns

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
-use olint::config::{read_config, ConfigError, LIMIT_FORMS};
+use olint::config::{read_config, ConfigError, ENTRYPOINT_FORMS, LIMIT_FORMS};
 use olint::project::{Project, ProjectError};
 use olint::public::public_functions;
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
@@ -65,6 +65,12 @@ impl fmt::Display for Failure {
             }
             Failure::Config(ConfigError::Limit { field, text }) => {
                 format!("{field} must be {LIMIT_FORMS}, got {text}")
+            }
+            Failure::Config(ConfigError::Entrypoints { text }) => {
+                format!("entrypoints must be an array of items each {ENTRYPOINT_FORMS}, got {text}")
+            }
+            Failure::Config(ConfigError::Entrypoint { field, text }) => {
+                format!("{field} must be {ENTRYPOINT_FORMS}, got {text}")
             }
             Failure::Config(ConfigError::Ignore { pattern }) => {
                 format!("ignore pattern {pattern} is not a valid glob")
