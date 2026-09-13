@@ -7,7 +7,8 @@ use crate::analysis::Analysis;
 use crate::annotations::{max_tag_of, PerfTag};
 use crate::config::{Config, Limit};
 use crate::declarations::{function_of_initializer, Declaration, FunctionNode};
-use crate::project::{relative_path_of, FileId};
+use crate::paths::relative_path_of;
+use crate::project::FileId;
 
 pub struct PublicFunction<'a> {
     pub file: FileId,

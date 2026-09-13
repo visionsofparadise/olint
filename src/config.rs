@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::budgets::collapsed_text_of;
 use crate::cost::Cost;
-use crate::project::{relative_path_of, Project};
-use crate::tsconfig::normalized_path_of;
+use crate::paths::{normalized_path_of, relative_path_of};
+use crate::project::Project;
+use crate::syntax::collapsed_text_of;
 
 #[derive(Clone, Debug)]
 pub struct Limit {

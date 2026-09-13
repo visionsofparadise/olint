@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Program, Statement, TSModuleReference};
@@ -11,6 +11,9 @@ use oxc_semantic::{Semantic, SemanticBuilder};
 use oxc_span::{SourceType, Span};
 use oxc_syntax::module_record::ModuleRecord;
 
+use crate::paths::{
+    canonical_path_of, forward_slashes_of, relative_path_of, strip_verbatim_prefix,
+};
 use crate::tsconfig::select_files;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -365,28 +368,6 @@ pub fn is_test_relative(absolute_forward: &str, relative: &str) -> bool {
         .any(|directory| SEGMENTS.contains(directory))
 }
 
-pub fn canonical_path_of(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(path).map(|canonical| strip_verbatim_prefix(&canonical))
-}
-
-pub fn forward_slashes_of(path: impl AsRef<Path>) -> String {
-    path.as_ref().to_string_lossy().replace('\\', "/")
-}
-
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return PathBuf::from(format!(r"\\{rest}"));
-    }
-
-    if let Some(rest) = text.strip_prefix(r"\\?\") {
-        return PathBuf::from(rest);
-    }
-
-    path.to_path_buf()
-}
-
 fn is_same_written_path(stored: &Path, path: &Path) -> bool {
     if cfg!(any(windows, target_os = "macos")) {
         stored
@@ -513,25 +494,6 @@ fn is_declaration_path(path: &Path) -> bool {
         .iter()
         .any(|suffix| name.ends_with(suffix))
         || (name.ends_with(".ts") && name.contains(".d."))
-}
-
-pub fn relative_path_of(root: &Path, path: &Path) -> String {
-    let root_components: Vec<Component> = root.components().collect();
-    let path_components: Vec<Component> = path.components().collect();
-    let shared = root_components
-        .iter()
-        .zip(&path_components)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut segments: Vec<String> = vec!["..".to_string(); root_components.len() - shared];
-
-    segments.extend(
-        path_components[shared..]
-            .iter()
-            .map(|component| component.as_os_str().to_string_lossy().into_owned()),
-    );
-
-    segments.join("/")
 }
 
 fn line_starts_of(text: &str) -> Vec<u32> {

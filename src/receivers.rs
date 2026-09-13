@@ -4,10 +4,10 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 
-use crate::constants::{member_name_of, unwrap, unwrap_to_cast};
 use crate::declarations::{element_name_of, Declaration, Declarations};
 use crate::declared_types::{declarator_of_identifier, formal_parameter_of_identifier};
 use crate::project::{FileId, Project};
+use crate::syntax::{member_name_of, unwrap, unwrap_to_cast};
 
 const MAXIMUM_BASE_CLASSES: usize = 32;
 const MAXIMUM_ALIASES: usize = 8;

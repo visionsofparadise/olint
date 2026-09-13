@@ -4,8 +4,8 @@ use std::hash::{Hash, Hasher};
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, Class, ClassElement, ExportDefaultDeclarationKind, Expression,
-    FormalParameter, FormalParameterRest, Function, IdentifierReference, MemberExpression,
-    MethodDefinitionKind, ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
+    FormalParameter, FormalParameterRest, Function, IdentifierReference, MethodDefinitionKind,
+    ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
     TSInterfaceDeclaration, TSModuleReference, TSSignature, TSTypeAliasDeclaration, TSTypeName,
     TSTypeParameter, VariableDeclarationKind, VariableDeclarator,
 };
@@ -22,15 +22,7 @@ use crate::project::{FileId, Project, Resolved, SourceFile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Binding {
-    Symbol {
-        file: FileId,
-        symbol: SymbolId,
-    },
-    Member {
-        file: FileId,
-        class: NodeId,
-        element: u32,
-    },
+    Symbol { file: FileId, symbol: SymbolId },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,7 +141,6 @@ enum Target {
 pub struct Declarations<'a> {
     followed: RefCell<HashMap<(FileId, String), Option<Target>>>,
     globals: RefCell<HashMap<String, Option<(FileId, SymbolId)>>>,
-    member_writes: RefCell<HashMap<FileId, HashSet<String>>>,
     module_records: Vec<&'a ModuleRecord<'a>>,
 }
 
@@ -158,7 +149,6 @@ impl<'a> Declarations<'a> {
         Declarations {
             followed: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashMap::new()),
-            member_writes: RefCell::new(HashMap::new()),
             module_records: project
                 .files
                 .iter()
@@ -329,44 +319,12 @@ impl<'a> Declarations<'a> {
         })
     }
 
-    pub fn member_binding(
-        &self,
-        _project: &Project<'a>,
-        file: FileId,
-        class: &'a Class<'a>,
-        name: &str,
-    ) -> Option<Binding> {
-        let element = element_index_of(class, name)?;
-
-        Some(Binding::Member {
-            file,
-            class: class.node_id(),
-            element,
-        })
-    }
-
     pub fn of_binding(&self, project: &Project<'a>, binding: Binding) -> Option<Declaration<'a>> {
         match binding {
             Binding::Symbol { file, symbol } => {
                 let target = self.target_of_symbol(project, file, symbol);
 
                 declaration_of_target(project, target)
-            }
-            Binding::Member {
-                file,
-                class,
-                element,
-            } => {
-                let AstKind::Class(class) = project.file(file).semantic.nodes().kind(class) else {
-                    return None;
-                };
-                let element = class.body.body.get(element as usize)?;
-
-                Some(Declaration::Member {
-                    file,
-                    class,
-                    element,
-                })
             }
         }
     }
@@ -393,25 +351,6 @@ impl<'a> Declarations<'a> {
             }
             TSTypeName::ThisExpression(_) => None,
         }
-    }
-
-    pub fn member_of(
-        &self,
-        _project: &Project<'a>,
-        file: FileId,
-        class: &'a Class<'a>,
-        name: &str,
-    ) -> Option<Declaration<'a>> {
-        let element = class
-            .body
-            .body
-            .get(element_index_of(class, name)? as usize)?;
-
-        Some(Declaration::Member {
-            file,
-            class,
-            element,
-        })
     }
 
     pub fn of_export(
@@ -486,39 +425,6 @@ impl<'a> Declarations<'a> {
                 })
             }
             _ => None,
-        }
-    }
-
-    pub fn is_written(&self, project: &Project<'a>, binding: Binding) -> bool {
-        match binding {
-            Binding::Symbol { file, symbol } => project
-                .file(file)
-                .semantic
-                .scoping()
-                .symbol_is_mutated(symbol),
-            Binding::Member {
-                file,
-                class,
-                element,
-            } => {
-                let AstKind::Class(class) = project.file(file).semantic.nodes().kind(class) else {
-                    return false;
-                };
-                let Some(name) = class
-                    .body
-                    .body
-                    .get(element as usize)
-                    .and_then(element_name_of)
-                else {
-                    return false;
-                };
-                let mut member_writes = self.member_writes.borrow_mut();
-
-                member_writes
-                    .entry(file)
-                    .or_insert_with(|| written_member_names_of(project, file))
-                    .contains(&name)
-            }
         }
     }
 
@@ -992,46 +898,6 @@ pub(crate) fn element_name_of(element: &ClassElement<'_>) -> Option<String> {
         PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.to_string()),
         PropertyKey::StringLiteral(literal) => Some(literal.value.to_string()),
         PropertyKey::PrivateIdentifier(identifier) => Some(format!("#{}", identifier.name)),
-        _ => None,
-    }
-}
-
-fn element_index_of(class: &Class<'_>, name: &str) -> Option<u32> {
-    class
-        .body
-        .body
-        .iter()
-        .position(|element| element_name_of(element).as_deref() == Some(name))
-        .map(|index| index as u32)
-}
-
-fn written_member_names_of(project: &Project<'_>, file: FileId) -> HashSet<String> {
-    project
-        .file(file)
-        .semantic
-        .nodes()
-        .iter()
-        .filter_map(|node| match node.kind() {
-            AstKind::AssignmentExpression(assignment) => assignment.left.as_member_expression(),
-            AstKind::UpdateExpression(update) => update.argument.as_member_expression(),
-            _ => None,
-        })
-        .filter_map(this_member_name_of)
-        .collect()
-}
-
-fn this_member_name_of(member: &MemberExpression<'_>) -> Option<String> {
-    match member {
-        MemberExpression::StaticMemberExpression(member)
-            if matches!(member.object, Expression::ThisExpression(_)) =>
-        {
-            Some(member.property.name.to_string())
-        }
-        MemberExpression::PrivateFieldExpression(member)
-            if matches!(member.object, Expression::ThisExpression(_)) =>
-        {
-            Some(format!("#{}", member.field.name))
-        }
         _ => None,
     }
 }

@@ -7,12 +7,11 @@ use oxc_span::GetSpan;
 
 use crate::analysis::{Analysis, Stats};
 use crate::annotations::{cost_tag_of, skip_tag_of, PerfTag};
-use crate::constants::unwrap;
 use crate::cost::{Cost, Factor, Part, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
-use crate::declared_types::is_identifier_pattern;
 use crate::oracle::{OracleError, OracleReply, Query};
 use crate::project::{FileId, Site};
+use crate::syntax::{is_identifier_pattern, unwrap};
 use crate::types::OraclePass;
 use crate::walker::tagged_reading_of;
 
@@ -64,12 +63,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .scoping()
                 .symbol_name(symbol)
                 .to_string(),
-            Binding::Member { .. } => match self.declarations.of_binding(self.project, binding) {
-                Some(Declaration::Member { element, .. }) => {
-                    crate::declarations::element_name_of(element).unwrap_or_default()
-                }
-                _ => String::new(),
-            },
         }
     }
 
@@ -599,7 +592,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 rounds.sites += queries.len();
                 rounds.rounds += 1;
 
-                self.take_answers(reply);
+                self.take_answers(reply)?;
             }
 
             self.reset_between_passes();

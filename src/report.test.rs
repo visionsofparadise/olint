@@ -52,7 +52,6 @@ fn row_of(cost: Cost, name: &str, file: u32, line: u32) -> ReportRow {
             line,
         },
         chain: Vec::new(),
-        file: FileId(file),
     }
 }
 

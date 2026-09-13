@@ -10,13 +10,13 @@ use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
 use crate::annotations::PerfTag;
-use crate::budgets::{
-    compact_text_of, identifier_of, is_iteration_kind, is_less, loop_body_of, sides_of, Root,
-    Subtree,
-};
-use crate::constants::{call_of, unwrap};
+use crate::budgets::{is_less, sides_of, Subtree};
 use crate::cost::Cost;
 use crate::project::FileId;
+use crate::syntax::{
+    call_of, collapsed_text_of, compact_text_of, identifier_of, is_iteration_kind, loop_body_of,
+    unwrap, Root,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bound {
@@ -52,7 +52,7 @@ pub fn loop_label(kind: AstKind<'_>) -> &'static str {
 }
 
 pub fn short(text: &str) -> String {
-    let collapsed = crate::budgets::collapsed_text_of(text);
+    let collapsed = collapsed_text_of(text);
 
     if utf16_length_of(&collapsed) <= 40 {
         return collapsed;

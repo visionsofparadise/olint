@@ -1,11 +1,12 @@
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indexmap::IndexMap;
 use oxc_resolver::{ExtendsField, ResolveOptions, Resolver, TsConfig};
 
-use crate::project::{canonical_path_of, forward_slashes_of, ProjectError};
+use crate::paths::{canonical_path_of, forward_slashes_of, normalized_path_of};
+use crate::project::ProjectError;
 
 pub struct TsconfigFiles {
     pub root_dir: PathBuf,
@@ -564,22 +565,6 @@ fn extended_path_of(tsconfig: &Path, specifier: &str) -> Result<PathBuf, Project
             path: tsconfig.to_path_buf(),
             message: format!("cannot find extended configuration {specifier}"),
         })
-}
-
-pub fn normalized_path_of(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-
-    normalized
 }
 
 fn absolutize(patterns: &mut Option<Vec<PathBuf>>, directory: &str) {

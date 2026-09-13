@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use olint::analysis::Analysis;
-use olint::budgets::is_iteration_kind;
 use olint::cost::Cost;
 use olint::declarations::FunctionNode;
 use olint::project::Project;
+use olint::syntax::is_iteration_kind;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 

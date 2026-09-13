@@ -1,4 +1,5 @@
-use olint::project::{canonical_path_of, Resolved};
+use olint::paths::canonical_path_of;
+use olint::project::Resolved;
 use olint::tsconfig::select_files;
 use oxc_ast::AstKind;
 

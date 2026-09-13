@@ -1,7 +1,7 @@
 use olint::analysis::{Analysis, Stats};
 use olint::declarations::{Declaration, Declarations, FunctionNode};
 use olint::project::{FileId, Project};
-use oxc_ast::ast::{Class, ClassElement, IdentifierReference, PropertyKey};
+use oxc_ast::ast::IdentifierReference;
 use oxc_ast::AstKind;
 
 mod support;
@@ -15,13 +15,6 @@ fn reference_of<'a>(
 ) -> &'a IdentifierReference<'a> {
     first_node_of(project, file, |kind| match kind {
         AstKind::IdentifierReference(reference) if reference.name == name => Some(reference),
-        _ => None,
-    })
-}
-
-fn first_class_of<'a>(project: &Project<'a>, file: FileId) -> &'a Class<'a> {
-    first_node_of(project, file, |kind| match kind {
-        AstKind::Class(class) => Some(class),
         _ => None,
     })
 }
@@ -189,68 +182,6 @@ fn package_declarations_have_no_function_and_javascript_packages_are_external() 
             declaration_of_reference(project, &declarations, index, "plain"),
             Some(Declaration::External)
         ));
-    });
-}
-
-#[test]
-fn member_of_finds_a_private_name() {
-    let files = [
-        ("tsconfig.json", "{}"),
-        (
-            "box.ts",
-            "export class Box {\n\tsecret() {}\n\t#secret() {}\n\topen() { this.#secret(); }\n}",
-        ),
-    ];
-
-    run_in_project(&files, |project, root| {
-        let declarations = Declarations::new(project);
-        let file = file_of(project, root, "box.ts");
-        let class = first_class_of(project, file);
-
-        match declarations.member_of(project, file, class, "#secret") {
-            Some(Declaration::Member {
-                element: ClassElement::MethodDefinition(method),
-                ..
-            }) => assert!(matches!(method.key, PropertyKey::PrivateIdentifier(_))),
-            other => panic!("expected the private method, found {other:?}"),
-        }
-    });
-}
-
-#[test]
-fn is_written_sees_nested_reassignment_and_member_writes() {
-    let files = [
-        ("tsconfig.json", "{}"),
-        (
-            "state.ts",
-            "let count = 0;\nconst fixed = 1;\nexport function bump() {\n\tconst inner = () => { count = count + fixed; };\n\tinner();\n}\nexport class Counter {\n\tsize = 0;\n\tlimit = 1;\n\tgrow() { this.size += this.limit; }\n}",
-        ),
-    ];
-
-    run_in_project(&files, |project, root| {
-        let declarations = Declarations::new(project);
-        let file = file_of(project, root, "state.ts");
-        let class = first_class_of(project, file);
-        let written = |name: &str| {
-            let reference = reference_of(project, file, name);
-            let binding = declarations
-                .binding_of_reference(project, file, reference)
-                .expect("a binding");
-
-            declarations.is_written(project, binding)
-        };
-        let member_written = |name: &str| {
-            let binding = declarations
-                .member_binding(project, file, class, name)
-                .expect("a member");
-
-            declarations.is_written(project, binding)
-        };
-
-        assert!(written("count"));
-        assert!(!written("fixed"));
-        assert!(member_written("size"));
-        assert!(!member_written("limit"));
     });
 }
 

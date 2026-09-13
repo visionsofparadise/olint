@@ -1,7 +1,7 @@
 use olint::analysis::Analysis;
 use olint::declarations::{Declaration, FunctionNode};
 use olint::declared_types::Kind;
-use olint::oracle::{CalleeAnswer, OracleAnswer, OracleReply, Query, TypeAnswer};
+use olint::oracle::{CalleeAnswer, OracleAnswer, OracleError, OracleReply, Query, TypeAnswer};
 use olint::project::{FileId, Project};
 use olint::types::OraclePass;
 use oxc_ast::ast::Expression;
@@ -78,11 +78,13 @@ fn answering_takes_recorded_answers_and_counts_misses() {
 
         analysis.set_pass(OraclePass::Recording);
         analysis.kind_of(file, loose, "map");
-        analysis.take_answers(reply_of(vec![Some(OracleAnswer::Type(TypeAnswer {
-            kind: Kind::Array,
-            tuple: false,
-            closed: false,
-        }))]));
+        analysis
+            .take_answers(reply_of(vec![Some(OracleAnswer::Type(TypeAnswer {
+                kind: Kind::Array,
+                tuple: false,
+                closed: false,
+            }))]))
+            .expect("the reply answers every query");
         analysis.set_pass(OraclePass::Answering);
 
         assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Array);
@@ -106,18 +108,20 @@ fn callee_answers_map_to_the_declaration_they_span() {
         analysis.set_pass(OraclePass::Recording);
         analysis.callee_declaration_of(file, call_of(project, file, "make().run"));
         analysis.callee_declaration_of(file, call_of(project, file, "make().go"));
-        analysis.take_answers(reply_of(vec![
-            Some(OracleAnswer::Callee(CalleeAnswer {
-                file: path.clone(),
-                start: function_start,
-                end: function_end,
-            })),
-            Some(OracleAnswer::Callee(CalleeAnswer {
-                file: path,
-                start: method_start,
-                end: method_end,
-            })),
-        ]));
+        analysis
+            .take_answers(reply_of(vec![
+                Some(OracleAnswer::Callee(CalleeAnswer {
+                    file: path.clone(),
+                    start: function_start,
+                    end: function_end,
+                })),
+                Some(OracleAnswer::Callee(CalleeAnswer {
+                    file: path,
+                    start: method_start,
+                    end: method_end,
+                })),
+            ]))
+            .expect("the reply answers every query");
         analysis.set_pass(OraclePass::Answering);
 
         let function = analysis.callee_declaration_of(file, call_of(project, file, "make().run"));
@@ -144,11 +148,13 @@ fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
 
         analysis.set_pass(OraclePass::Recording);
         analysis.kind_of(file, loose, "map");
-        analysis.take_answers(reply_of(vec![Some(OracleAnswer::Type(TypeAnswer {
-            kind: Kind::Set,
-            tuple: false,
-            closed: false,
-        }))]));
+        analysis
+            .take_answers(reply_of(vec![Some(OracleAnswer::Type(TypeAnswer {
+                kind: Kind::Set,
+                tuple: false,
+                closed: false,
+            }))]))
+            .expect("the reply answers every query");
 
         assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Unknown);
         assert!(analysis.needed_queries().is_empty());
@@ -161,5 +167,24 @@ fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
             .lines()
             .iter()
             .any(|line| line.ends_with("oracle: miss")));
+    });
+}
+
+#[test]
+fn a_reply_missing_answers_ends_the_rounds_as_malformed() {
+    run_with_source(|project, _| {
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+        let functions = analysis.reportable();
+        let mut asked = 0;
+        let gathered = analysis.gather_answers(&functions, |queries| {
+            asked += 1;
+
+            assert!(!queries.is_empty());
+
+            Ok(reply_of(Vec::new()))
+        });
+
+        assert!(matches!(gathered, Err(OracleError::Malformed(_))));
+        assert_eq!(asked, 1);
     });
 }

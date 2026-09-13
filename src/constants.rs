@@ -1,6 +1,6 @@
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, AssignmentTarget, CallExpression, ClassElement, Expression,
-    Function, IdentifierReference, MemberExpression, ReturnStatement, SimpleAssignmentTarget,
+    Argument, ArrowFunctionExpression, AssignmentTarget, ClassElement, Expression, Function,
+    IdentifierReference, MemberExpression, ReturnStatement, SimpleAssignmentTarget,
     TSEnumMemberName,
 };
 use oxc_ast::AstKind;
@@ -11,61 +11,10 @@ use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
 use crate::declarations::{Declaration, FunctionNode};
-use crate::declared_types::{declarator_of_identifier, is_const_type, DeclaredType};
+use crate::declared_types::{declarator_of_identifier, DeclaredType};
 use crate::project::FileId;
+use crate::syntax::{call_of, member_expression_of, unwrap, unwrap_to_cast};
 use crate::tables::{DERIVED_METHODS, OBJECT_KEYED, TYPED_ARRAYS};
-
-pub fn unwrap<'a>(e: &'a Expression<'a>) -> &'a Expression<'a> {
-    match e {
-        Expression::ParenthesizedExpression(inner) => unwrap(&inner.expression),
-        Expression::TSAsExpression(inner) => unwrap(&inner.expression),
-        Expression::TSSatisfiesExpression(inner) => unwrap(&inner.expression),
-        Expression::TSNonNullExpression(inner) => unwrap(&inner.expression),
-        Expression::TSTypeAssertion(inner) => unwrap(&inner.expression),
-        _ => e,
-    }
-}
-
-pub(crate) fn unwrap_to_cast<'a>(e: &'a Expression<'a>) -> &'a Expression<'a> {
-    match e {
-        Expression::ParenthesizedExpression(inner) => unwrap_to_cast(&inner.expression),
-        Expression::TSSatisfiesExpression(inner) => unwrap_to_cast(&inner.expression),
-        Expression::TSNonNullExpression(inner) => unwrap_to_cast(&inner.expression),
-        Expression::TSAsExpression(inner) if is_const_type(&inner.type_annotation) => {
-            unwrap_to_cast(&inner.expression)
-        }
-        Expression::TSTypeAssertion(inner) if is_const_type(&inner.type_annotation) => {
-            unwrap_to_cast(&inner.expression)
-        }
-        _ => e,
-    }
-}
-
-pub(crate) fn call_of<'a>(e: &'a Expression<'a>) -> Option<&'a CallExpression<'a>> {
-    match e {
-        Expression::CallExpression(call) => Some(call),
-        Expression::ChainExpression(chain) => match &chain.expression {
-            oxc_ast::ast::ChainElement::CallExpression(call) => Some(call),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn member_expression_of<'a>(e: &'a Expression<'a>) -> Option<&'a MemberExpression<'a>> {
-    match e {
-        Expression::ChainExpression(chain) => chain.expression.as_member_expression(),
-        _ => e.as_member_expression(),
-    }
-}
-
-pub(crate) fn member_name_of(member: &MemberExpression<'_>) -> Option<String> {
-    match member {
-        MemberExpression::StaticMemberExpression(member) => Some(member.property.name.to_string()),
-        MemberExpression::PrivateFieldExpression(member) => Some(format!("#{}", member.field.name)),
-        MemberExpression::ComputedMemberExpression(_) => None,
-    }
-}
 
 fn argument_expression_of<'a>(argument: Option<&'a Argument<'a>>) -> Option<&'a Expression<'a>> {
     argument?.as_expression()

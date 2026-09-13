@@ -5,11 +5,11 @@ use oxc_ast::AstKind;
 use oxc_span::{GetSpan, Span};
 
 use crate::analysis::Analysis;
-use crate::constants::{member_expression_of, unwrap};
 use crate::declarations::{declaration_of_node, Declaration};
 use crate::declared_types::{DeclaredType, Kind};
-use crate::oracle::{CalleeAnswer, OracleAnswer, OracleReply, Query, TypeAnswer};
+use crate::oracle::{CalleeAnswer, OracleAnswer, OracleError, OracleReply, Query, TypeAnswer};
 use crate::project::FileId;
+use crate::syntax::{member_expression_of, unwrap};
 use crate::tables::method_matters;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,7 +186,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.needed.values().cloned().collect()
     }
 
-    pub fn take_answers(&mut self, reply: OracleReply) {
+    pub fn take_answers(&mut self, reply: OracleReply) -> Result<(), OracleError> {
+        if reply.answers.len() != self.needed.len() {
+            return Err(OracleError::Malformed(format!(
+                "{} answers for {} queries",
+                reply.answers.len(),
+                self.needed.len()
+            )));
+        }
+
         let keys: Vec<SiteKey> = self.needed.keys().copied().collect();
 
         for (key, answer) in keys.into_iter().zip(reply.answers) {
@@ -196,6 +204,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.oracle_info = format!("typescript {} at {}", reply.typescript, reply.from);
 
         self.needed.clear();
+
+        Ok(())
+    }
+
+    pub fn fall_back_to_declarations(&mut self) {
+        self.reset_between_passes();
+        self.needed.clear();
+        self.answers.clear();
+
+        self.replays_type_answers = false;
+        self.pass = OraclePass::Off;
     }
 
     fn type_answer_of(&mut self, file: FileId, span: Span) -> Option<TypeAnswer> {

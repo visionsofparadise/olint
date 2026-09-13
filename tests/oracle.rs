@@ -116,7 +116,9 @@ fn byte_order_marks_keep_answers_on_their_utf8_spans() {
 
     analysis.set_pass(OraclePass::Recording);
     analysis.callee_declaration_of(file, parse);
-    analysis.take_answers(reply_of(&project.tsconfig_path, &analysis.needed_queries()));
+    analysis
+        .take_answers(reply_of(&project.tsconfig_path, &analysis.needed_queries()))
+        .expect("the reply answers every query");
     analysis.set_pass(OraclePass::Answering);
 
     assert!(matches!(

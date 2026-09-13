@@ -10,7 +10,6 @@ use olint::oracle::{ask, OracleError};
 use olint::project::{Project, ProjectError};
 use olint::public::public_functions;
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
-use olint::types::OraclePass;
 use oxc_allocator::Allocator;
 
 #[derive(Parser)]
@@ -119,7 +118,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
     let mut analysis = Analysis::new(&project, options);
     let functions = analysis.reportable();
 
-    if cli.types != TypeMode::Syntactic {
+    if analysis.options.types != TypeMode::Syntactic {
         let gathered = analysis.gather_answers(&functions, |queries| {
             ask(&project.root, &project.tsconfig_path, queries)
         });
@@ -131,16 +130,13 @@ fn run(cli: Cli) -> Result<i32, Failure> {
             ),
             Err(
                 error @ (OracleError::NodeUnavailable(_) | OracleError::TypescriptUnavailable(_)),
-            ) if cli.types == TypeMode::Auto => {
+            ) if analysis.options.types == TypeMode::Auto => {
                 eprintln!(
                     "olint: types from declarations only ({})",
                     reason_of(&error)
                 );
 
-                analysis.reset_between_passes();
-                analysis.needed.clear();
-                analysis.answers.clear();
-                analysis.set_pass(OraclePass::Off);
+                analysis.fall_back_to_declarations();
             }
             Err(error) => return Err(Failure::Oracle(error)),
         }
@@ -151,7 +147,11 @@ fn run(cli: Cli) -> Result<i32, Failure> {
     let code = if cli.report {
         let rows = report_rows_of(&mut analysis, &functions);
 
-        print_lines(&report_lines(&project, &rows, cli.min));
+        print_lines(&report_lines(
+            &project,
+            &rows,
+            analysis.options.minimum_exponent,
+        ));
 
         0
     } else {

@@ -1,18 +1,18 @@
 use oxc_ast::ast::{
-    BindingPattern, Class, ClassElement, Expression, ForStatementLeft, FormalParameter,
-    FormalParameterRest, MemberExpression, MethodDefinition, MethodDefinitionKind,
-    ObjectExpression, ObjectProperty, ObjectPropertyKind, PropertyKey, PropertyKind,
-    TSInterfaceDeclaration, TSLiteral, TSMethodSignatureKind, TSSignature, TSType,
-    TSTypeAnnotation, TSTypeLiteral, TSTypeName, TSTypeReference, VariableDeclarator,
+    Class, ClassElement, Expression, ForStatementLeft, FormalParameter, FormalParameterRest,
+    MemberExpression, MethodDefinition, MethodDefinitionKind, ObjectExpression, ObjectProperty,
+    ObjectPropertyKind, PropertyKey, PropertyKind, TSInterfaceDeclaration, TSLiteral,
+    TSMethodSignatureKind, TSSignature, TSType, TSTypeAnnotation, TSTypeLiteral, TSTypeName,
+    TSTypeReference, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_syntax::operator::{BinaryOperator, LogicalOperator};
 
 use crate::analysis::Analysis;
-use crate::constants::{call_of, member_expression_of, unwrap};
 use crate::declarations::{Declaration, FunctionNode, ParameterNode};
 use crate::project::FileId;
-use crate::tables::{KIND_OF_NAME, STRING_LINEAR, TYPED_ARRAYS};
+use crate::syntax::{call_of, is_const_type, is_identifier_pattern, member_expression_of, unwrap};
+use crate::tables::{KIND_OF_NAME, STRING_LINEAR, STRING_TO_ARRAY, TYPED_ARRAYS};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,7 +58,6 @@ pub struct DeclaredType {
 const MAXIMUM_DEPTH: u32 = 8;
 const MAXIMUM_CONTAINER_DEPTH: u32 = 256;
 const UNWRAPPED_TYPE_NAMES: &[&str] = &["Readonly", "Required", "Partial", "NonNullable"];
-const STRING_TO_ARRAY_NAMES: &[&str] = &["split", "match"];
 const NON_STRING_RESULTS: &[&str] = &[
     "split",
     "match",
@@ -200,10 +199,6 @@ fn return_type_of_function_expression<'a>(
     }
 }
 
-pub(crate) fn is_identifier_pattern(pattern: &BindingPattern<'_>) -> bool {
-    matches!(pattern, BindingPattern::BindingIdentifier(_))
-}
-
 pub(crate) fn declarator_of_identifier<'a>(
     declaration: &Declaration<'a>,
 ) -> Option<(FileId, &'a VariableDeclarator<'a>, bool)> {
@@ -268,10 +263,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Some(declaration) => self.declared_type_of_binding(declaration, 0),
             None => DeclaredType::default(),
         }
-    }
-
-    pub fn declared_type_of_type(&mut self, file: FileId, ty: &'a TSType<'a>) -> DeclaredType {
-        self.declared_type_of_nested_type(file, ty, 0)
     }
 
     fn declaration_of_type_name(
@@ -1017,7 +1008,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let received = self.declared_type_of_nested_expression(file, receiver, depth + 1);
 
-            if received.kind == Kind::String && STRING_TO_ARRAY_NAMES.contains(&method) {
+            if received.kind == Kind::String && STRING_TO_ARRAY.contains(&method) {
                 return declared_type_of(Kind::Array);
             }
 
@@ -1117,10 +1108,6 @@ fn named_kind_of(name: &str) -> Option<Kind> {
         .find(|(known, _)| *known == name)
         .map(|(_, kind)| *kind)
         .or_else(|| TYPED_ARRAYS.contains(&name).then_some(Kind::Array))
-}
-
-pub(crate) fn is_const_type(ty: &TSType<'_>) -> bool {
-    matches!(ty, TSType::TSTypeReference(reference) if type_name_text_of(&reference.type_name) == "const")
 }
 
 fn return_type_of_callee<'a>(

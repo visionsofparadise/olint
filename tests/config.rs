@@ -12,7 +12,7 @@ fn entries_of(files: &[(&str, &str)]) -> Vec<String> {
     run_in_project(files, |project, _| {
         entries = package_entries(project)
             .iter()
-            .map(|entry| olint::project::relative_path_of(&project.root, entry))
+            .map(|entry| olint::paths::relative_path_of(&project.root, entry))
             .collect();
     });
 
@@ -64,7 +64,7 @@ fn read_config_keeps_entrypoints_in_file_order_with_their_limits() {
                 .iter()
                 .map(|(path, limit)| {
                     (
-                        olint::project::relative_path_of(&project.root, path),
+                        olint::paths::relative_path_of(&project.root, path),
                         limit.text.clone(),
                     )
                 })

@@ -3,7 +3,8 @@ use crate::annotations::{cost_tag_of, PerfTag};
 use crate::config::Config;
 use crate::cost::{Cost, Factor, Part};
 use crate::declarations::FunctionNode;
-use crate::project::{relative_path_of, FileId, Project, Site};
+use crate::paths::relative_path_of;
+use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
 use crate::summaries::Substitutions;
 
@@ -89,16 +90,6 @@ fn lines_of_chain(
     }
 }
 
-pub fn report_row(
-    project: &Project<'_>,
-    cost: Cost,
-    name: &str,
-    mark: Option<&str>,
-    site: Site,
-) -> String {
-    row_text_of(cost, name, mark, &location_of(project, site))
-}
-
 fn row_text_of(cost: Cost, name: &str, mark: Option<&str>, location: &str) -> String {
     let mark = match mark {
         Some(mark) => format!(" [@perf {mark}]"),
@@ -124,7 +115,6 @@ pub struct ReportRow {
     pub mark: Option<String>,
     pub site: Site,
     pub chain: Vec<Factor>,
-    pub file: FileId,
 }
 
 pub fn report_rows_of<'a>(
@@ -152,7 +142,6 @@ pub fn report_rows_of<'a>(
             mark,
             site: analysis.function_site_of(file, function),
             chain: part.chain,
-            file,
         });
     }
 
@@ -244,7 +233,7 @@ fn lines_of_report(
     minimum_exponent: u32,
     location: &dyn Fn(Site) -> String,
 ) -> Vec<String> {
-    let mut files: Vec<FileId> = rows.iter().map(|row| row.file).collect();
+    let mut files: Vec<FileId> = rows.iter().map(|row| row.site.file).collect();
 
     files.sort();
     files.dedup();

@@ -7,6 +7,7 @@ use crate::analysis::Analysis;
 use crate::cost::Cost;
 use crate::declarations::FunctionNode;
 use crate::project::{FileId, Project};
+use crate::syntax::collapsed_text_of;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PerfTag {
@@ -269,7 +270,7 @@ fn cost_length_of(text: &str) -> Option<usize> {
 }
 
 fn collapse_whitespace(text: &str) -> String {
-    crate::budgets::collapsed_text_of(text)
+    collapsed_text_of(text)
 }
 
 #[cfg(test)]

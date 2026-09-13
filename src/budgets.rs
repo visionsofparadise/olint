@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentTarget, BindingIdentifier, DoWhileStatement, Expression,
-    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, Function, FunctionBody,
-    IdentifierReference, SimpleAssignmentTarget, Statement, VariableDeclarationKind,
-    WhileStatement,
+    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, Function, IdentifierReference,
+    SimpleAssignmentTarget, Statement, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
@@ -16,10 +15,13 @@ use oxc_syntax::operator::{
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
-use crate::constants::{call_of, member_expression_of, member_name_of, unwrap};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
-use crate::declared_types::is_identifier_pattern;
 use crate::project::FileId;
+use crate::syntax::{
+    body_root_of, call_of, collapsed_text_of, compact_text_of, identifier_of,
+    is_identifier_pattern, is_iteration_kind, loop_body_of, member_expression_of, member_name_of,
+    unwrap, Root,
+};
 use crate::tables::MUTATORS;
 
 #[derive(Clone, Debug)]
@@ -55,13 +57,6 @@ pub struct Spend {
     pub text: String,
     pub share: Option<Binding>,
     pub scope: Option<NodeId>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum Root<'a> {
-    Statement(&'a Statement<'a>),
-    Expression(&'a Expression<'a>),
-    Body(&'a FunctionBody<'a>),
 }
 
 pub(crate) struct Subtree<'a> {
@@ -136,19 +131,6 @@ impl<'a> Visit<'a> for Subtree<'a> {
     }
 }
 
-pub(crate) fn body_root_of<'a>(function: FunctionNode<'a>) -> Option<Root<'a>> {
-    match function {
-        FunctionNode::Function(function) => function.body.as_deref().map(Root::Body),
-        FunctionNode::Arrow(arrow) => Some(match &arrow.body {
-            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Root::Body(body),
-            body => Root::Expression(
-                body.as_expression()
-                    .expect("an arrow body is a block or an expression"),
-            ),
-        }),
-    }
-}
-
 pub(crate) struct Sides<'a> {
     pub left: Option<&'a Expression<'a>>,
     pub right: &'a Expression<'a>,
@@ -193,44 +175,6 @@ fn is_greater(operator: BinaryOperator) -> bool {
         operator,
         BinaryOperator::GreaterThan | BinaryOperator::GreaterEqualThan
     )
-}
-
-pub(crate) fn identifier_of<'a>(e: &'a Expression<'a>) -> Option<&'a IdentifierReference<'a>> {
-    match e {
-        Expression::Identifier(reference) => Some(reference),
-        _ => None,
-    }
-}
-
-pub(crate) fn collapsed_text_of(text: &str) -> String {
-    let mut collapsed = String::with_capacity(text.len());
-    let mut in_space = false;
-
-    for character in text.chars() {
-        if is_space(character) {
-            if !in_space {
-                collapsed.push(' ');
-            }
-
-            in_space = true;
-        } else {
-            collapsed.push(character);
-
-            in_space = false;
-        }
-    }
-
-    collapsed
-}
-
-pub(crate) fn compact_text_of(text: &str) -> String {
-    text.chars()
-        .filter(|character| !is_space(*character))
-        .collect()
-}
-
-pub(crate) fn is_space(character: char) -> bool {
-    (character.is_whitespace() && character != '\u{85}') || character == '\u{feff}'
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -893,28 +837,6 @@ pub(crate) fn binding_identifier_of(
         .symbol_id
         .get()
         .map(|symbol| Binding::Symbol { file, symbol })
-}
-
-pub fn is_iteration_kind(kind: &AstKind<'_>) -> bool {
-    matches!(
-        kind,
-        AstKind::ForStatement(_)
-            | AstKind::ForInStatement(_)
-            | AstKind::ForOfStatement(_)
-            | AstKind::WhileStatement(_)
-            | AstKind::DoWhileStatement(_)
-    )
-}
-
-pub(crate) fn loop_body_of<'a>(kind: AstKind<'a>) -> Option<&'a Statement<'a>> {
-    match kind {
-        AstKind::ForStatement(statement) => Some(&statement.body),
-        AstKind::ForInStatement(statement) => Some(&statement.body),
-        AstKind::ForOfStatement(statement) => Some(&statement.body),
-        AstKind::WhileStatement(statement) => Some(&statement.body),
-        AstKind::DoWhileStatement(statement) => Some(&statement.body),
-        _ => None,
-    }
 }
 
 fn has_continue_at_level(body: &Statement<'_>) -> bool {
