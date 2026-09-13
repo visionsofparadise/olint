@@ -1,5 +1,7 @@
 pub mod analysis;
 pub mod annotations;
+pub mod bounds;
+pub mod budgets;
 pub mod constants;
 pub mod cost;
 pub mod declarations;
@@ -7,6 +9,9 @@ pub mod declared_types;
 pub mod oracle;
 pub mod project;
 pub mod receivers;
+pub mod report;
+pub mod summaries;
 pub mod tables;
 pub mod tsconfig;
 pub mod types;
+pub mod walker;

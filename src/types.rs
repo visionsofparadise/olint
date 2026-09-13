@@ -136,7 +136,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let MemberExpression::StaticMemberExpression(access) = member else {
             return None;
         };
-        let span = access.span;
+
+        self.callee_answer_of(file, access.span)
+    }
+
+    pub(crate) fn callee_answer_of(&mut self, file: FileId, span: Span) -> Option<Declaration<'a>> {
         let query = Query::Callee {
             file: self.query_path_of(file),
             pos: span.start,

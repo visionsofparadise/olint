@@ -4,9 +4,10 @@ use std::fs;
 use std::path::Path;
 
 use olint::analysis::{Analysis, Options, TypeMode};
+use olint::declarations::FunctionNode;
 use olint::project::{FileId, Project};
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{CallExpression, Expression, MemberExpression};
+use oxc_ast::ast::{BindingPattern, CallExpression, Expression, MemberExpression};
 use oxc_ast::AstKind;
 use oxc_span::GetSpan;
 use tempfile::TempDir;
@@ -127,4 +128,32 @@ pub fn first_node_of<'a, T>(
         .iter()
         .find_map(|node| pick(node.kind()))
         .expect("a matching node")
+}
+
+pub fn function_named<'a>(project: &Project<'a>, file: FileId, name: &str) -> FunctionNode<'a> {
+    let nodes = project.file(file).semantic.nodes();
+
+    first_node_of(project, file, |kind| match kind {
+        AstKind::Function(function) if function.id.as_ref().is_some_and(|id| id.name == name) => {
+            Some(FunctionNode::Function(function))
+        }
+        AstKind::ArrowFunctionExpression(arrow) => match nodes.parent_kind(arrow.node_id()) {
+            AstKind::VariableDeclarator(declarator) if matches!(&declarator.id, BindingPattern::BindingIdentifier(id) if id.name == name) => {
+                Some(FunctionNode::Arrow(arrow))
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+pub fn with_source(source: &str, body: impl for<'p, 'a> FnOnce(&mut Analysis<'p, 'a>, FileId)) {
+    let files = [("tsconfig.json", "{}"), ("index.ts", source)];
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+
+        body(&mut analysis, file);
+    });
 }

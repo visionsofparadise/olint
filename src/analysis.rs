@@ -1,12 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use oxc_semantic::NodeId;
 
 use crate::annotations::PerfTag;
-use crate::declarations::Declarations;
+use crate::budgets::BudgetContext;
+use crate::cost::{Part, Reading};
+use crate::declarations::{Binding, Declarations};
 use crate::oracle::{OracleAnswer, Query};
 use crate::project::{FileId, Project};
+use crate::summaries::{Substitutions, SummaryKey};
 use crate::types::{OraclePass, QueryKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -54,6 +57,16 @@ pub struct Analysis<'p, 'a> {
     pub needed: IndexMap<(FileId, u32, u32, QueryKind), Query>,
     pub answers: HashMap<(FileId, u32, u32, QueryKind), Option<OracleAnswer>>,
     pub oracle_info: String,
+    pub summaries: HashMap<SummaryKey, Reading>,
+    pub stack: Vec<SummaryKey>,
+    pub minimum_hit: usize,
+    pub pending_cycle: Vec<SummaryKey>,
+    pub current_substitutions: Substitutions,
+    pub budget_context: Option<BudgetContext>,
+    pub share_bindings: Vec<Binding>,
+    pub pending_scoped: HashMap<(FileId, NodeId), Part>,
+    pub bound_seen: HashSet<(FileId, NodeId)>,
+    pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -68,6 +81,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             needed: IndexMap::new(),
             answers: HashMap::new(),
             oracle_info: String::new(),
+            summaries: HashMap::new(),
+            stack: Vec::new(),
+            minimum_hit: usize::MAX,
+            pending_cycle: Vec::new(),
+            current_substitutions: Substitutions::new(),
+            budget_context: None,
+            share_bindings: Vec::new(),
+            pending_scoped: HashMap::new(),
+            bound_seen: HashSet::new(),
+            children: HashMap::new(),
         }
     }
 }

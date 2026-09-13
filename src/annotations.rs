@@ -47,6 +47,16 @@ pub fn tags_in_comment(text: &str) -> Vec<PerfTag> {
     tags
 }
 
+pub fn skip_tag_of(tags: &[PerfTag]) -> Option<&'static str> {
+    if tags.contains(&PerfTag::Ignore) {
+        Some("ignore")
+    } else if tags.contains(&PerfTag::Cold) {
+        Some("cold")
+    } else {
+        None
+    }
+}
+
 pub fn cost_tag_of(tags: &[PerfTag]) -> Option<(Cost, String)> {
     tags.iter().find_map(|tag| match tag {
         PerfTag::Cost(text) => Cost::parse(text).map(|cost| (cost, text.clone())),
