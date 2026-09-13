@@ -25,6 +25,7 @@ pub struct SourceFile<'a> {
     pub semantic: Semantic<'a>,
     pub module_record: &'a ModuleRecord<'a>,
     pub line_starts: Vec<u32>,
+    pub external_library: bool,
 }
 
 pub struct Project<'a> {
@@ -33,6 +34,7 @@ pub struct Project<'a> {
     pub files: Vec<SourceFile<'a>>,
     by_path: HashMap<PathBuf, FileId>,
     resolver: Resolver,
+    package_resolver: Resolver,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,12 +68,13 @@ pub struct Site {
 
 struct OpenFile<'a> {
     file: SourceFile<'a>,
-    imports: Vec<PathBuf>,
+    imports: Vec<(PathBuf, bool)>,
     next: usize,
 }
 
 const PARSED_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const TYPESCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts"];
+const JAVASCRIPT_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs"];
 
 impl<'a> Project<'a> {
     pub fn load(allocator: &'a Allocator, tsconfig: &Path) -> Result<Project<'a>, ProjectError> {
@@ -80,38 +83,18 @@ impl<'a> Project<'a> {
             path: tsconfig.to_path_buf(),
             source,
         })?;
-        let resolver = Resolver::new(ResolveOptions {
-            extensions: [".ts", ".tsx", ".mts", ".cts", ".js", ".json"]
-                .map(String::from)
-                .to_vec(),
-            extension_alias: vec![
-                (
-                    ".js".to_string(),
-                    [".ts", ".tsx", ".js"].map(String::from).to_vec(),
-                ),
-                (
-                    ".mjs".to_string(),
-                    [".mts", ".mjs"].map(String::from).to_vec(),
-                ),
-                (
-                    ".cjs".to_string(),
-                    [".cts", ".cjs"].map(String::from).to_vec(),
-                ),
-            ],
-            main_files: vec!["index".to_string()],
-            condition_names: ["import", "types", "default"].map(String::from).to_vec(),
-            tsconfig: Some(TsconfigDiscovery::Manual(TsconfigOptions {
-                config_file: tsconfig_path.clone(),
-                references: TsconfigReferences::Disabled,
-            })),
-            ..ResolveOptions::default()
+        let package_resolver = Resolver::new(ResolveOptions {
+            tsconfig: None,
+            ..resolve_options_of(&tsconfig_path)
         });
+        let resolver = Resolver::new(resolve_options_of(&tsconfig_path));
         let mut project = Project {
             root: selection.root_dir,
             tsconfig_path,
             files: Vec::new(),
             by_path: HashMap::new(),
             resolver,
+            package_resolver,
         };
         let allow_js = selection.allow_js;
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -122,15 +105,15 @@ impl<'a> Project<'a> {
                 continue;
             }
 
-            stack.push(project.open(allocator, root, allow_js)?);
+            stack.push(project.open(allocator, root, false, allow_js)?);
 
             while let Some(top) = stack.last_mut() {
                 match top.imports.get(top.next).cloned() {
-                    Some(target) => {
+                    Some((target, external)) => {
                         top.next += 1;
 
                         if seen.insert(target.clone()) {
-                            let opened = project.open(allocator, target, allow_js)?;
+                            let opened = project.open(allocator, target, external, allow_js)?;
 
                             stack.push(opened);
                         }
@@ -156,18 +139,35 @@ impl<'a> Project<'a> {
         &self,
         allocator: &'a Allocator,
         path: PathBuf,
+        external_library: bool,
         allow_js: bool,
     ) -> Result<OpenFile<'a>, ProjectError> {
-        let file = parse_file(allocator, path, &self.root)?;
+        let mut file = parse_file(allocator, path, &self.root)?;
         let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
+
+        file.external_library = external_library;
+
         let imports = import_specifiers_of(&file)
             .into_iter()
-            .filter_map(|specifier| self.resolver.resolve(&directory, &specifier).ok())
-            .map(|resolution| strip_verbatim_prefix(resolution.path()))
-            .filter(|target| {
-                target.starts_with(&self.root)
-                    && is_parsed_path(target, allow_js)
-                    && !forward_slashes_of(target).contains("/node_modules/")
+            .filter_map(|specifier| {
+                let resolution = self.resolver.resolve(&directory, &specifier).ok()?;
+                let target = strip_verbatim_prefix(resolution.path());
+                let target = canonical_path_of(&target).unwrap_or(target);
+                let from_packages = is_package_specifier(&specifier)
+                    && self
+                        .package_resolver
+                        .resolve(&directory, &specifier)
+                        .is_ok_and(|package| {
+                            let package = strip_verbatim_prefix(package.path());
+
+                            canonical_path_of(&package).unwrap_or(package) == target
+                        });
+                let external = external_library || from_packages;
+
+                (is_parsed_path(&target, allow_js)
+                    && !(external && is_javascript_path(&target))
+                    && !forward_slashes_of(&target).contains("/node_modules/"))
+                .then_some((target, external))
             })
             .collect();
 
@@ -227,7 +227,7 @@ impl<'a> Project<'a> {
     pub fn is_project_file(&self, id: FileId) -> bool {
         let file = self.file(id);
 
-        file.path.starts_with(&self.root)
+        !file.external_library
             && !is_declaration_path(&file.path)
             && !forward_slashes_of(&file.path).contains("/node_modules/")
     }
@@ -311,6 +311,48 @@ fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
     };
 
     allowed.contains(&extension.as_str()) && !is_declaration_path(path)
+}
+
+fn resolve_options_of(tsconfig: &Path) -> ResolveOptions {
+    ResolveOptions {
+        extensions: [".ts", ".tsx", ".mts", ".cts", ".js", ".json"]
+            .map(String::from)
+            .to_vec(),
+        extension_alias: vec![
+            (
+                ".js".to_string(),
+                [".ts", ".tsx", ".js"].map(String::from).to_vec(),
+            ),
+            (
+                ".mjs".to_string(),
+                [".mts", ".mjs"].map(String::from).to_vec(),
+            ),
+            (
+                ".cjs".to_string(),
+                [".cts", ".cjs"].map(String::from).to_vec(),
+            ),
+        ],
+        main_files: vec!["index".to_string()],
+        condition_names: ["import", "types", "default"].map(String::from).to_vec(),
+        tsconfig: Some(TsconfigDiscovery::Manual(TsconfigOptions {
+            config_file: tsconfig.to_path_buf(),
+            references: TsconfigReferences::Disabled,
+        })),
+        ..ResolveOptions::default()
+    }
+}
+
+fn is_package_specifier(specifier: &str) -> bool {
+    !(specifier.starts_with('.')
+        || specifier.starts_with('/')
+        || specifier.starts_with('#')
+        || Path::new(specifier).is_absolute())
+}
+
+fn is_javascript_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        JAVASCRIPT_EXTENSIONS.contains(&extension.to_string_lossy().as_ref())
+    })
 }
 
 fn import_specifiers_of(file: &SourceFile<'_>) -> Vec<String> {
@@ -471,6 +513,7 @@ fn parse_file<'a>(
         semantic,
         module_record,
         line_starts: line_starts_of(text),
+        external_library: false,
     })
 }
 

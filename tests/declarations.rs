@@ -40,6 +40,19 @@ fn function_name_of(declaration: Option<Declaration<'_>>) -> String {
     }
 }
 
+fn shape_of(declaration: &Declaration<'_>) -> &'static str {
+    match declaration {
+        Declaration::Function {
+            function: FunctionNode::Function(function),
+            ..
+        } if function.body.is_none() => "signature",
+        Declaration::Function { .. } => "function",
+        Declaration::Interface { .. } => "interface",
+        Declaration::Class { .. } => "class",
+        _ => "other",
+    }
+}
+
 fn declaration_of_reference<'a>(
     project: &Project<'a>,
     declarations: &Declarations<'a>,
@@ -98,10 +111,10 @@ fn star_exports_terminate_through_a_cycle() {
             .collect();
 
         assert_eq!(
-            function_name_of(declarations.of_export(project, a, "fromB")),
+            function_name_of(declarations.of_export(project, a, "fromB").pop()),
             "fromB"
         );
-        assert!(declarations.of_export(project, a, "missing").is_none());
+        assert!(declarations.of_export(project, a, "missing").is_empty());
         assert_eq!(names, vec!["fromA", "fromB"]);
     });
 }
@@ -126,7 +139,7 @@ fn namespace_import_reaches_its_members() {
             Some(Declaration::Namespace { file }) => {
                 assert_eq!(file, lib);
                 assert_eq!(
-                    function_name_of(declarations.of_export(project, file, "run")),
+                    function_name_of(declarations.of_export(project, file, "run").pop()),
                     "run"
                 );
             }
@@ -279,12 +292,50 @@ export default function named() {}",
             ]
         );
         assert_eq!(
-            function_name_of(declarations.of_export(project, index, "value")),
+            function_name_of(declarations.of_export(project, index, "value").pop()),
             "named"
         );
         assert_eq!(
-            function_name_of(declarations.of_export(project, index, "default")),
+            function_name_of(declarations.of_export(project, index, "default").pop()),
             ""
+        );
+    });
+}
+
+#[test]
+fn exports_carry_every_declaration_in_typescript_order() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "index.ts",
+            "export interface Merged { x: number }\nexport class Merged { run() { return 1; } }\nexport function over(a: string): void;\nexport function over(a: number): void;\nexport function over(a: any) { return a; }\nover(1);",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let declarations = Declarations::new(project);
+        let index = file_of(project, root, "index.ts");
+        let exports = declarations.exports_of(project, index);
+        let shapes: Vec<(String, Vec<&str>)> = exports
+            .iter()
+            .map(|(name, found)| (name.clone(), found.iter().map(shape_of).collect()))
+            .collect();
+
+        assert_eq!(
+            shapes,
+            vec![
+                (
+                    "over".to_string(),
+                    vec!["signature", "signature", "function"]
+                ),
+                ("Merged".to_string(), vec!["interface", "class"]),
+            ]
+        );
+        assert_eq!(
+            declaration_of_reference(project, &declarations, index, "over")
+                .as_ref()
+                .map(shape_of),
+            Some("signature")
         );
     });
 }

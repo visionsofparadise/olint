@@ -265,3 +265,73 @@ fn extends_with_a_dotted_name_resolves_as_a_package() {
 
     assert_eq!(files, vec!["src/b.ts"]);
 }
+
+#[cfg(unix)]
+fn link_directory(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn link_directory(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[test]
+fn load_follows_imports_outside_the_tsconfig_directory() {
+    let directory = project_of(&[
+        ("app/tsconfig.json", r#"{ "include": ["src"] }"#),
+        (
+            "app/src/index.ts",
+            "import { shared } from \"shared\";\nimport { rel } from \"../../shared/src/rel\";\nexport const run = () => shared([1]) + rel;",
+        ),
+        (
+            "shared/package.json",
+            r#"{ "name": "shared", "exports": { ".": "./src/index.ts" } }"#,
+        ),
+        (
+            "shared/src/index.ts",
+            "export function shared(xs: number[]) { return xs.length; }",
+        ),
+        ("shared/src/rel.ts", "export const rel = 1;"),
+    ]);
+    let root = canonical_path_of(directory.path()).expect("root");
+
+    std::fs::create_dir_all(root.join("app/node_modules")).expect("node_modules");
+
+    let linked =
+        link_directory(&root.join("shared"), &root.join("app/node_modules/shared")).is_ok();
+    let allocator = oxc_allocator::Allocator::default();
+    let project = olint::project::Project::load(&allocator, &root.join("app/tsconfig.json"))
+        .expect("project loads");
+    let relatives: Vec<&str> = project
+        .files
+        .iter()
+        .map(|file| file.relative.as_str())
+        .collect();
+    let index = file_of(&project, &root, "app/src/index.ts");
+    let rel = file_of(&project, &root, "shared/src/rel.ts");
+
+    assert!(project.is_project_file(rel));
+    assert_eq!(
+        project.resolve(index, "../../shared/src/rel"),
+        Resolved::File(rel)
+    );
+
+    if linked {
+        let shared = file_of(&project, &root, "shared/src/index.ts");
+
+        assert_eq!(
+            relatives,
+            vec![
+                "../shared/src/index.ts",
+                "../shared/src/rel.ts",
+                "src/index.ts"
+            ]
+        );
+        assert_eq!(project.resolve(index, "shared"), Resolved::File(shared));
+        assert!(!project.is_project_file(shared));
+    } else {
+        eprintln!("directory symlinks are unavailable here; the package import is not exercised");
+        assert_eq!(relatives, vec!["../shared/src/rel.ts", "src/index.ts"]);
+    }
+}

@@ -11,7 +11,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportImportName,
     ModuleRecord,
@@ -241,9 +241,10 @@ impl<'a> Declarations<'a> {
             }
             TSTypeName::QualifiedName(qualified) => {
                 match self.of_type_name(project, file, &qualified.left)? {
-                    Declaration::Namespace { file: target } => {
-                        self.of_export(project, target, qualified.right.name.as_str())
-                    }
+                    Declaration::Namespace { file: target } => self
+                        .of_export(project, target, qualified.right.name.as_str())
+                        .into_iter()
+                        .next(),
                     Declaration::External => Some(Declaration::External),
                     _ => None,
                 }
@@ -276,17 +277,17 @@ impl<'a> Declarations<'a> {
         project: &Project<'a>,
         file: FileId,
         name: &str,
-    ) -> Option<Declaration<'a>> {
-        let target = self.followed_export_of(project, file, name)?;
-
-        declaration_of_target(project, target)
+    ) -> Vec<Declaration<'a>> {
+        self.followed_export_of(project, file, name)
+            .map(|target| declarations_of_target(project, target))
+            .unwrap_or_default()
     }
 
     pub fn exports_of(
         &self,
         project: &Project<'a>,
         file: FileId,
-    ) -> Vec<(String, Declaration<'a>)> {
+    ) -> Vec<(String, Vec<Declaration<'a>>)> {
         let mut names = Vec::new();
         let mut seen = HashSet::new();
         let mut visited = HashSet::new();
@@ -298,7 +299,9 @@ impl<'a> Declarations<'a> {
             .filter_map(|(name, provider)| {
                 let target = self.followed_export_of(project, provider, &name)?;
 
-                declaration_of_target(project, target).map(|declaration| (name, declaration))
+                let declarations = declarations_of_target(project, target);
+
+                (!declarations.is_empty()).then_some((name, declarations))
             })
             .collect()
     }
@@ -583,11 +586,7 @@ fn symbol_of_reference(
 fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<Declaration<'a>> {
     match target {
         Target::Symbol(file, symbol) => {
-            let node = project
-                .file(file)
-                .semantic
-                .scoping()
-                .symbol_declaration(symbol);
+            let node = *declaration_nodes_of(project, file, symbol).first()?;
 
             declaration_of_node(project, file, node)
         }
@@ -595,6 +594,32 @@ fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<De
         Target::Namespace(file) => Some(Declaration::Namespace { file }),
         Target::External => Some(Declaration::External),
     }
+}
+
+fn declarations_of_target<'a>(project: &Project<'a>, target: Target) -> Vec<Declaration<'a>> {
+    match target {
+        Target::Symbol(file, symbol) => declaration_nodes_of(project, file, symbol)
+            .into_iter()
+            .filter_map(|node| declaration_of_node(project, file, node))
+            .collect(),
+        other => declaration_of_target(project, other).into_iter().collect(),
+    }
+}
+
+fn declaration_nodes_of(project: &Project<'_>, file: FileId, symbol: SymbolId) -> Vec<NodeId> {
+    let semantic = &project.file(file).semantic;
+    let nodes = semantic.nodes();
+    let mut declarations: Vec<NodeId> = semantic.scoping().symbol_declarations(symbol).collect();
+
+    declarations.sort_by_key(|node| {
+        let kind = nodes.kind(*node);
+        let function_declaration =
+            matches!(kind, AstKind::Function(function) if function.is_declaration());
+
+        (!function_declaration, kind.span().start)
+    });
+
+    declarations
 }
 
 fn declaration_of_node<'a>(
