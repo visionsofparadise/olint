@@ -130,7 +130,7 @@ pub fn first_node_of<'a, T>(
         .expect("a matching node")
 }
 
-pub fn function_named<'a>(project: &Project<'a>, file: FileId, name: &str) -> FunctionNode<'a> {
+pub fn function_of_name<'a>(project: &Project<'a>, file: FileId, name: &str) -> FunctionNode<'a> {
     let nodes = project.file(file).semantic.nodes();
 
     first_node_of(project, file, |kind| match kind {
@@ -147,7 +147,7 @@ pub fn function_named<'a>(project: &Project<'a>, file: FileId, name: &str) -> Fu
     })
 }
 
-pub fn with_source(source: &str, body: impl for<'p, 'a> FnOnce(&mut Analysis<'p, 'a>, FileId)) {
+pub fn run_with_source(source: &str, body: impl for<'p, 'a> FnOnce(&mut Analysis<'p, 'a>, FileId)) {
     let files = [("tsconfig.json", "{}"), ("index.ts", source)];
 
     run_in_project(&files, |project, root| {

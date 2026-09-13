@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentTarget, BindingIdentifier, DoWhileStatement, Expression,
-    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, Function, FunctionBody,
-    IdentifierReference, SimpleAssignmentTarget, Statement, VariableDeclarationKind,
-    WhileStatement,
+    ArrowFunctionExpression, AssignmentTarget, AssignmentTargetPropertyIdentifier,
+    BindingIdentifier, DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement,
+    ForStatementInit, Function, FunctionBody, IdentifierReference, ObjectProperty,
+    SimpleAssignmentTarget, Statement, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
@@ -134,6 +134,28 @@ impl<'a> Visit<'a> for Subtree<'a> {
             oxc_ast_visit::walk::walk_do_while_statement(self, statement);
         }
     }
+
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        if property.shorthand {
+            self.enter_node(AstKind::ObjectProperty(self.alloc(property)));
+            self.visit_property_key(&property.key);
+        } else {
+            oxc_ast_visit::walk::walk_object_property(self, property);
+        }
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        property: &AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        self.enter_node(AstKind::AssignmentTargetPropertyIdentifier(
+            self.alloc(property),
+        ));
+
+        if let Some(init) = &property.init {
+            self.visit_expression(init);
+        }
+    }
 }
 
 pub(crate) fn body_root_of<'a>(function: FunctionNode<'a>) -> Option<Root<'a>> {
@@ -229,8 +251,8 @@ pub(crate) fn compact_text_of(text: &str) -> String {
         .collect()
 }
 
-fn is_space(character: char) -> bool {
-    character.is_whitespace() || character == '\u{feff}'
+pub(crate) fn is_space(character: char) -> bool {
+    (character.is_whitespace() && character != '\u{85}') || character == '\u{feff}'
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -262,7 +284,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     pub fn collect_budgets(&mut self, file: FileId, function: FunctionNode<'a>) -> BudgetContext {
         let body = body_root_of(function);
         let writes = match body {
-            Some(body) => self.writes_in(file, body),
+            Some(body) => self.writes_of(file, body),
             None => HashMap::new(),
         };
         let mut budgets: HashMap<Binding, Budget> = HashMap::new();
@@ -427,10 +449,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub(crate) fn reads_of(&self, file: FileId, root: Root<'a>) -> Vec<Binding> {
-        self.bindings_among(file, Subtree::of(root, false, false))
+        self.bindings_of(file, Subtree::of(root, false, false))
     }
 
-    fn bindings_among(&self, file: FileId, kinds: Vec<AstKind<'a>>) -> Vec<Binding> {
+    fn bindings_of(&self, file: FileId, kinds: Vec<AstKind<'a>>) -> Vec<Binding> {
         let mut reads = Vec::new();
 
         for kind in kinds {
@@ -452,7 +474,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reads
     }
 
-    fn writes_in(&mut self, file: FileId, body: Root<'a>) -> HashMap<Binding, Vec<WriteKind>> {
+    fn writes_of(&mut self, file: FileId, body: Root<'a>) -> HashMap<Binding, Vec<WriteKind>> {
         let mut writes: HashMap<Binding, Vec<WriteKind>> = HashMap::new();
 
         for kind in Subtree::of(body, true, false) {
@@ -547,7 +569,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         subtree.visit_assignment_target(target);
 
-        self.bindings_among(file, subtree.kinds)
+        self.bindings_of(file, subtree.kinds)
     }
 
     fn add_target_write(
@@ -588,20 +610,38 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.expression_write_binding_of(file, &inner.expression)
             }
             SimpleAssignmentTarget::ComputedMemberExpression(member) => {
-                identifier_of(unwrap(&member.object))
-                    .and_then(|reference| self.binding_of_identifier(file, reference))
+                self.accessed_binding_of(file, &member.object)
+            }
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                self.declarations.binding_of_access(
+                    self.project,
+                    file,
+                    unwrap(&member.object),
+                    member.property.name.as_str(),
+                )
             }
             _ => None,
         }
     }
 
     fn expression_write_binding_of(&self, file: FileId, e: &'a Expression<'a>) -> Option<Binding> {
-        let e = unwrap(e);
+        match unwrap(e) {
+            Expression::ComputedMemberExpression(member) => {
+                self.accessed_binding_of(file, &member.object)
+            }
+            other => self.accessed_binding_of(file, other),
+        }
+    }
 
-        match e {
+    fn accessed_binding_of(&self, file: FileId, e: &'a Expression<'a>) -> Option<Binding> {
+        match unwrap(e) {
             Expression::Identifier(reference) => self.binding_of_identifier(file, reference),
-            Expression::ComputedMemberExpression(member) => identifier_of(unwrap(&member.object))
-                .and_then(|reference| self.binding_of_identifier(file, reference)),
+            Expression::StaticMemberExpression(member) => self.declarations.binding_of_access(
+                self.project,
+                file,
+                unwrap(&member.object),
+                member.property.name.as_str(),
+            ),
             _ => None,
         }
     }

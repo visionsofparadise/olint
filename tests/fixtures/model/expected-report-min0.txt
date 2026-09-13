@@ -1,8 +1,8 @@
-# tsconfig.json  (113 functions in 15 files)
+# tsconfig.json  (131 functions in 15 files)
 
-O(N)               39
-O(1)               30
-O(N^2)             30
+O(N)               47
+O(1)               38
+O(N^2)             32
 O(N log N)         10
 O(N^3)              4
 
@@ -37,6 +37,10 @@ O(N^2)         boundedNonLoopStatement  src/branches.ts:81
 O(N^2)         scopedBudget  src/budgets.ts:13
     in loop for                                              src/budgets.ts:15  x N
         in loop while [budget: i < width, per for at 15]     src/budgets.ts:18  x N
+
+O(N^2)         namespaceWrite  src/budgets.ts:62
+    in loop for-of                                           src/budgets.ts:64  x N
+        in loop while                                        src/budgets.ts:65  x N
 
 O(N^2)         callbackSubstituted  src/calls.ts:13
     calls runNTimes()                                      src/calls.ts:14  = O(N^2)
@@ -134,6 +138,10 @@ O(N^2)         newSetNonConst  src/methods.ts:59
     in loop for-of                                           src/methods.ts:61  x N
         calls Set(xs)                                      src/methods.ts:61  = O(N)
 
+O(N^2)         unionCallback  src/methods.ts:80
+    does s.union()                                        src/methods.ts:83  x N
+        does list.map()?                                  src/methods.ts:83  x N
+
 O(N^2)         threeCycleEntry  src/recursion.ts:32
     in loop for-of                                           src/recursion.ts:34  x N
         calls cycleStart()                                 src/recursion.ts:34  = O(N)
@@ -202,6 +210,9 @@ O(N)           forInRecord  src/bounds.ts:65
 O(N)           forAwaitLoop  src/bounds.ts:89
     in loop for-of                                           src/bounds.ts:91  x N
 
+O(N)           unaryHalving  src/bounds.ts:95
+    in loop while                                            src/bounds.ts:98  x N
+
 O(N)           hotIfBranch  src/branches.ts:1
     in loop for-of                                           src/branches.ts:5  x N
 
@@ -235,6 +246,9 @@ O(N)           shareOfBudget  src/budgets.ts:26
 O(N)           ordinaryForLoopCounterExcluded  src/budgets.ts:41
     in loop for                                              src/budgets.ts:43  x N
 
+O(N)           shorthandDestructure  src/budgets.ts:47
+    in loop for-of                                           src/budgets.ts:50  x N
+
 O(N)           costedCallback  src/calls.ts:1
     in loop for                                              src/calls.ts:3  x N
 
@@ -257,12 +271,24 @@ O(N)           callThroughCast  src/calls.ts:48
     calls calleeFn()                                       src/calls.ts:49  = O(N)
     in loop for                                              src/calls.ts:42  x N
 
+O(N)           destructureRest  src/calls.ts:52
+    does spread ...rest                                   src/calls.ts:55  x N
+
+O(N)           destructureObjectRest  src/calls.ts:59
+    does spread ...rest                                   src/calls.ts:61  x N
+
+O(N)           makeIdentity  src/calls.ts:65
+    does xs.map()                                         src/calls.ts:66  x N
+
 O(N)           WithReadonlyItems.addAll  src/classes.ts:77
     does spread ...xs                                     src/classes.ts:78  x N
 
 O(N)           pushesToReadonlyItems  src/classes.ts:81
     calls WithReadonlyItems.addAll()                       src/classes.ts:83  = O(N)
     does spread ...xs                                     src/classes.ts:78  x N
+
+O(N)           MergedHolder.run  src/classes.ts:105
+    does mergedItems.indexOf()                            src/classes.ts:106  x N
 
 O(N)           arrayLinearCall  src/methods.ts:1
     does xs.includes()                                    src/methods.ts:2  x N
@@ -287,6 +313,12 @@ O(N)           bufferConcatCall  src/methods.ts:47
 
 O(N)           unknownReceiverCall  src/methods.ts:55
     does recv.includes()?                                 src/methods.ts:56  x N
+
+O(N)           surrogateCutLabel  src/methods.ts:94
+    does (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa�....split() [string] src/methods.ts:95  x N
+
+O(N)           nextLineLabel  src/methods.ts:98
+    does (prefix + "ab").split() [string]                src/methods.ts:99  x N
 
 O(N)           factorialLike  src/recursion.ts:1
     calls factorialLike()                                  src/recursion.ts:2  = O(N)
@@ -332,9 +364,17 @@ O(1)           makeAdder  src/calls.ts:31
 
 O(1)           <returned fn>  src/calls.ts:32
 
+O(1)           instantiationExpression  src/calls.ts:69
+
 O(1)           WithGetter.constructor  src/classes.ts:42
 
 O(1)           readsGetter  src/classes.ts:49
+
+O(1)           MergedHolder.self  src/classes.ts:108
+
+O(1)           useMergedHolder  src/classes.ts:113
+
+O(1)           ComputedKeys.[ Symbol.iterator ]  src/classes.ts:118
 
 O(1)           arrayLiteralSpread  src/constants.ts:1
 
@@ -357,6 +397,14 @@ O(1)           stringLiteralConstant  src/constants.ts:49
 O(1)           regexpConstCall  src/methods.ts:23
 
 O(1)           newMapConstant  src/methods.ts:65
+
+O(1)           makeUnionSet  src/methods.ts:72
+
+O(1)           makeDoubled  src/methods.ts:76
+
+O(1)           spreadRestTupleSet  src/methods.ts:86
+
+O(1)           spreadRestKeys  src/methods.ts:90
 
 O(1)           pkgWrapped  src/modules/external.ts:3
 

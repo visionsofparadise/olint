@@ -48,3 +48,25 @@ type CalleeType = (x: number) => number;
 export function callThroughCast(x: number): number {
 	return (calleeFn as CalleeType)(x);
 }
+
+export function destructureRest(xs: number[]): number {
+	let head: number;
+	let rest: number[];
+	[head, ...rest] = xs;
+	return head + rest.length;
+}
+
+export function destructureObjectRest(obj: Record<string, number>): Record<string, number> {
+	let rest: Record<string, number>;
+	({ ...rest } = obj);
+	return rest;
+}
+
+function makeIdentity(xs: number[]) {
+	return xs.map((x) => x);
+}
+
+export function instantiationExpression(xs: number[]) {
+	const g = makeIdentity(xs)<number>;
+	return g;
+}

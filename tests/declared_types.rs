@@ -4,14 +4,14 @@ mod support;
 
 use support::probe_results_of;
 
-fn declared_types_in(files: &[(&str, &str)]) -> Vec<DeclaredType> {
+fn probed_types_of(files: &[(&str, &str)]) -> Vec<DeclaredType> {
     probe_results_of(files, |analysis, file, probe| {
         analysis.declared_type_of_expression(file, probe)
     })
 }
 
 fn declared_types_of(types: &str, index: &str) -> Vec<DeclaredType> {
-    declared_types_in(&[
+    probed_types_of(&[
         ("tsconfig.json", "{}"),
         ("types.ts", types),
         ("index.ts", index),
@@ -102,7 +102,7 @@ fn package_declaration_aliases_resolve_and_lib_globals_read_as_other() {
     ];
 
     assert_eq!(
-        declared_types_in(&files),
+        probed_types_of(&files),
         vec![
             expected_type_of(Kind::Array, false, false),
             expected_type_of(Kind::Other, false, true),
@@ -135,7 +135,7 @@ interface AmbientShape {
     ];
 
     assert_eq!(
-        declared_types_in(&files),
+        probed_types_of(&files),
         vec![
             expected_type_of(Kind::Array, false, false),
             expected_type_of(Kind::Other, false, true),

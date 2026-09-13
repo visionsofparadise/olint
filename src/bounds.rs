@@ -6,7 +6,7 @@ use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
 use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
 use crate::annotations::PerfTag;
@@ -65,6 +65,10 @@ pub fn short(text: &str) -> String {
         units += character.len_utf16();
 
         if units > 37 {
+            if units == 38 && character.len_utf16() == 2 {
+                kept.push(char::REPLACEMENT_CHARACTER);
+            }
+
             break;
         }
 
@@ -189,34 +193,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn inner_bound_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Bound {
         if self.perf_tags(file, loop_kind).contains(&PerfTag::Bounded) {
-            return constant_bound("@perf bounded");
+            return constant_bound_of("@perf bounded");
         }
 
         let Some(body) = loop_body_of(loop_kind) else {
-            return linear_bound();
+            return linear_bound_of();
         };
 
         if self.ends_in(file, body).is_some() {
-            return constant_bound("single iteration");
+            return constant_bound_of("single iteration");
         }
 
         match loop_kind {
             AstKind::ForOfStatement(statement) => {
                 if self.is_constant_sized(file, &statement.right) {
-                    constant_bound("constant collection")
+                    constant_bound_of("constant collection")
                 } else if self.is_share_sized(file, &statement.right) {
-                    constant_bound("share of budget")
+                    constant_bound_of("share of budget")
                 } else {
-                    linear_bound()
+                    linear_bound_of()
                 }
             }
             AstKind::ForInStatement(statement) => {
                 if self.is_constant_sized(file, &statement.right)
                     || self.is_closed(file, &statement.right)
                 {
-                    constant_bound("closed object type")
+                    constant_bound_of("closed object type")
                 } else {
-                    linear_bound()
+                    linear_bound_of()
                 }
             }
             AstKind::ForStatement(statement) => self.bound_of_for(file, statement),
@@ -226,11 +230,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             AstKind::DoWhileStatement(statement) => {
                 self.bound_of_while(file, &statement.test, &statement.body)
             }
-            _ => linear_bound(),
+            _ => linear_bound_of(),
         }
     }
 
-    fn same_text(&self, file: FileId, left: &Expression<'_>, right: &Expression<'_>) -> bool {
+    fn is_same_text(&self, file: FileId, left: &Expression<'_>, right: &Expression<'_>) -> bool {
         compact_text_of(self.text_of(file, left.span()))
             == compact_text_of(self.text_of(file, right.span()))
     }
@@ -259,17 +263,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let bound = unwrap(&binary.right);
 
                 if self.is_share_sized(file, bound) {
-                    return constant_bound("share of budget");
+                    return constant_bound_of("share of budget");
                 }
 
                 if let Expression::BinaryExpression(sum) = bound {
                     if sum.operator == BinaryOperator::Addition
-                        && ((self.same_text(file, &sum.left, variable.init)
+                        && ((self.is_same_text(file, &sum.left, variable.init)
                             && self.is_share_sized(file, &sum.right))
-                            || (self.same_text(file, &sum.right, variable.init)
+                            || (self.is_same_text(file, &sum.right, variable.init)
                                 && self.is_share_sized(file, &sum.left)))
                     {
-                        return constant_bound("share of budget");
+                        return constant_bound_of("share of budget");
                     }
                 }
             }
@@ -280,7 +284,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             for side in unwrapped.into_iter().flatten() {
                 if self.is_numeric_constant(file, side) {
-                    return constant_bound("constant bound");
+                    return constant_bound_of("constant bound");
                 }
             }
 
@@ -299,19 +303,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         let left = unwrap(&offset.left);
                         let right = unwrap(&offset.right);
 
-                        if (self.same_text(file, left, variable.init)
+                        if (self.is_same_text(file, left, variable.init)
                             && self.is_numeric_constant(file, right))
-                            || (self.same_text(file, right, variable.init)
+                            || (self.is_same_text(file, right, variable.init)
                                 && self.is_numeric_constant(file, left))
                         {
-                            return constant_bound("constant offset from start");
+                            return constant_bound_of("constant offset from start");
                         }
                     }
                 }
             }
         }
 
-        linear_bound()
+        linear_bound_of()
     }
 
     fn is_geometric(&mut self, file: FileId, value: &'a Expression<'a>, name: &str) -> bool {
@@ -373,7 +377,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         false
     }
 
-    fn assignments_to(
+    fn assignments_of(
         &mut self,
         file: FileId,
         body: &'a Statement<'a>,
@@ -420,6 +424,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         }
                     }
                 }
+                AstKind::UnaryExpression(unary)
+                    if matches!(
+                        unary.operator,
+                        UnaryOperator::UnaryPlus
+                            | UnaryOperator::UnaryNegation
+                            | UnaryOperator::LogicalNot
+                            | UnaryOperator::BitwiseNot
+                    ) =>
+                {
+                    if let Expression::Identifier(target) = &unary.argument {
+                        if names.iter().any(|known| known == target.name.as_str()) {
+                            found.push(AssignmentWrite::Other);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -427,7 +446,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         found
     }
 
-    fn midpoint_names(
+    fn midpoint_names_of(
         &self,
         file: FileId,
         body: &'a Statement<'a>,
@@ -470,16 +489,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         names.visit_expression(condition);
 
         if names.names.is_empty() {
-            return linear_bound();
+            return linear_bound_of();
         }
 
-        let writes = self.assignments_to(file, body, &names.names);
+        let writes = self.assignments_of(file, body, &names.names);
 
         if writes.is_empty() {
-            return linear_bound();
+            return linear_bound_of();
         }
 
-        let midpoints = self.midpoint_names(file, body, &names.names);
+        let midpoints = self.midpoint_names_of(file, body, &names.names);
         let is_midpoint = |name: &str| midpoints.iter().any(|known| known == name);
         let mut halving = true;
 
@@ -519,7 +538,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 why: Some("halving"),
             }
         } else {
-            linear_bound()
+            linear_bound_of()
         }
     }
 }
@@ -575,14 +594,14 @@ fn loop_variable_of<'a>(statement: &'a ForStatement<'a>) -> Option<LoopVariable<
     }
 }
 
-fn constant_bound(why: &'static str) -> Bound {
+fn constant_bound_of(why: &'static str) -> Bound {
     Bound {
         factor: Cost::ONE,
         why: Some(why),
     }
 }
 
-fn linear_bound() -> Bound {
+fn linear_bound_of() -> Bound {
     Bound {
         factor: Cost::N,
         why: None,

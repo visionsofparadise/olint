@@ -363,12 +363,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
         key: &oxc_ast::ast::PropertyKey<'a>,
         computed: bool,
     ) -> String {
-        let text = self.text_of(file, key.span());
+        let span = key.span();
 
-        if computed {
-            format!("[{text}]")
-        } else {
-            text.to_string()
+        if !computed {
+            return self.text_of(file, span).to_string();
+        }
+
+        let source = self.project.file(file).text;
+        let before = &source[..span.start as usize];
+        let after = &source[span.end as usize..];
+        let open = before.trim_end().strip_suffix('[').map(str::len);
+        let close = after
+            .find(|character: char| !character.is_whitespace())
+            .filter(|index| after[*index..].starts_with(']'));
+
+        match (open, close) {
+            (Some(open), Some(close)) => source[open..span.end as usize + close + 1].to_string(),
+            _ => format!("[{}]", self.text_of(file, span)),
         }
     }
 

@@ -2,7 +2,7 @@ use olint::cost::Cost;
 
 mod support;
 
-use support::{function_named, with_source};
+use support::{function_of_name, run_with_source};
 
 fn labels_of(chain: &[olint::cost::Factor]) -> Vec<String> {
     chain.iter().map(|factor| factor.label.clone()).collect()
@@ -10,10 +10,10 @@ fn labels_of(chain: &[olint::cost::Factor]) -> Vec<String> {
 
 #[test]
 fn self_recursion_charges_one_n() {
-    with_source(
+    run_with_source(
         "export function walk(n: number): number {\n\treturn n > 0 ? walk(n - 1) : 0;\n}",
         |analysis, file| {
-            let walk = function_named(analysis.project, file, "walk");
+            let walk = function_of_name(analysis.project, file, "walk");
             let part = analysis.summarize(file, walk).total();
 
             assert_eq!(part.cost, Cost::N);
@@ -24,11 +24,11 @@ fn self_recursion_charges_one_n() {
 
 #[test]
 fn a_cycle_member_takes_the_root_summary() {
-    with_source(
+    run_with_source(
         "export function ping(n: number): number {\n\treturn n > 0 ? pong(n - 1) : 0;\n}\nexport function pong(n: number): number {\n\treturn n > 0 ? ping(n - 1) : 0;\n}",
         |analysis, file| {
-            let ping = function_named(analysis.project, file, "ping");
-            let pong = function_named(analysis.project, file, "pong");
+            let ping = function_of_name(analysis.project, file, "ping");
+            let pong = function_of_name(analysis.project, file, "pong");
             let root = analysis.summarize(file, ping).total();
             let member = analysis.summarize(file, pong).total();
 
@@ -45,10 +45,10 @@ fn a_cycle_member_takes_the_root_summary() {
 
 #[test]
 fn a_costed_callback_multiplies_inside_its_caller() {
-    with_source(
+    run_with_source(
         "function each(xs: number[], visit: (x: number) => void) {\n\tfor (const x of xs) visit(x);\n}\nexport function f(xs: number[], ys: number[]) {\n\teach(xs, (x) => {\n\t\tys.indexOf(x);\n\t});\n}",
         |analysis, file| {
-            let f = function_named(analysis.project, file, "f");
+            let f = function_of_name(analysis.project, file, "f");
             let first = analysis.summarize(file, f);
             let second = analysis.summarize(file, f);
 
@@ -61,7 +61,7 @@ fn a_costed_callback_multiplies_inside_its_caller() {
 
 #[test]
 fn functions_are_named_by_their_shape() {
-    with_source(
+    run_with_source(
         "export default function () {}\nexport function plain() {\n\treturn () => 1;\n}\nexport const arrow = () => 1;\nexport class Box {\n\tconstructor() {}\n\tget size() {\n\t\treturn 1;\n\t}\n\t#hidden() {}\n\thandler = () => 1;\n}\nexport const Anonymous = class {\n\trun() {}\n};\nexport const object = {\n\tmethod() {},\n\tproperty: function () {},\n};\nexport const named = function inner() {};\n[1].map(function () {});\n",
         |analysis, file| {
             let names: Vec<String> = analysis
@@ -106,7 +106,7 @@ fn functions_are_named_by_their_shape() {
 
 #[test]
 fn reportable_skips_inline_callbacks_and_ignored_functions() {
-    with_source(
+    run_with_source(
         "export function kept(xs: number[]) {\n\treturn xs.map((x) => x + 1);\n}\n// @perf ignore\nexport function skipped() {}\n",
         |analysis, _| {
             let names: Vec<String> = analysis

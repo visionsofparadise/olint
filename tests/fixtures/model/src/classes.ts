@@ -94,3 +94,28 @@ export const ClassExpressionExample = class {
 export function usesClassExpression(rows: number[][]): number {
 	return new ClassExpressionExample().run(rows);
 }
+
+declare const mergedItems: number[];
+
+interface MergedHolder {
+	run(): number;
+}
+
+class MergedHolder {
+	run(): number {
+		return mergedItems.indexOf(1);
+	}
+	self(): number {
+		return this.run();
+	}
+}
+
+export function useMergedHolder(): number {
+	return new MergedHolder().self();
+}
+
+export class ComputedKeys {
+	[ Symbol.iterator ]() {
+		return [1].values();
+	}
+}

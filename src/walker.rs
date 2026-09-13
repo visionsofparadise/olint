@@ -1,5 +1,6 @@
 use oxc_ast::ast::{
-    Argument, CallExpression, Expression, MemberExpression, NewExpression, SpreadElement, Statement,
+    Argument, AssignmentTarget, AssignmentTargetRest, CallExpression, Expression, MemberExpression,
+    NewExpression, SpreadElement, Statement,
 };
 use oxc_ast::{AstKind, AstType};
 use oxc_semantic::NodeId;
@@ -12,7 +13,7 @@ use crate::budgets::{body_root_of, identifier_of, is_iteration_kind, loop_body_o
 use crate::constants::{member_expression_of, member_name_of, unwrap};
 use crate::cost::{nest, Cost, Factor, Part, Reading};
 use crate::declarations::{Declaration, FunctionNode, ParameterNode};
-use crate::declared_types::{is_identifier_pattern, Kind};
+use crate::declared_types::{is_identifier_pattern, DeclaredType, Kind};
 use crate::project::{FileId, Site};
 use crate::tables::{
     ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, GLOBAL_FUNCTIONS_LINEAR, GLOBAL_LINEAR,
@@ -79,6 +80,7 @@ fn is_type_kind(ty: AstType) -> bool {
             | AstType::JSDocNullableType
             | AstType::JSDocNonNullableType
             | AstType::JSDocUnknownType
+            | AstType::TSInstantiationExpression
     )
 }
 
@@ -96,19 +98,19 @@ fn is_function_argument(argument: &Argument<'_>) -> bool {
     )
 }
 
-fn table_has(table: &[&str], name: &str) -> bool {
+fn is_listed(table: &[&str], name: &str) -> bool {
     table.contains(&name)
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
     pub fn cost_of_statement(&mut self, file: FileId, s: &'a Statement<'a>) -> Reading {
-        let kind = self.kind_at(file, s.node_id());
+        let kind = self.kind_of_node(file, s.node_id());
 
         self.cost_of_node(file, kind)
     }
 
     pub fn cost_of_expression(&mut self, file: FileId, e: &'a Expression<'a>) -> Reading {
-        let kind = self.kind_at(file, e.node_id());
+        let kind = self.kind_of_node(file, e.node_id());
 
         self.cost_of_node(file, kind)
     }
@@ -116,7 +118,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     pub fn cost_of_function_body(&mut self, file: FileId, function: FunctionNode<'a>) -> Reading {
         match body_root_of(function) {
             Some(Root::Body(body)) => {
-                let kind = self.kind_at(file, body.node_id());
+                let kind = self.kind_of_node(file, body.node_id());
 
                 self.cost_of_node(file, kind)
             }
@@ -125,12 +127,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    pub(crate) fn kind_at(&self, file: FileId, node: NodeId) -> AstKind<'a> {
+    pub(crate) fn kind_of_node(&self, file: FileId, node: NodeId) -> AstKind<'a> {
         self.project.file(file).semantic.nodes().kind(node)
     }
 
-    pub(crate) fn site_at(&self, file: FileId, node: NodeId) -> Site {
-        let span = self.kind_at(file, node).span();
+    pub(crate) fn site_of_node(&self, file: FileId, node: NodeId) -> Site {
+        let span = self.kind_of_node(file, node).span();
 
         self.project.site_of(file, span)
     }
@@ -160,7 +162,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn cost_of_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> Reading {
-        let kind = self.kind_at(file, argument.node_id());
+        let kind = self.kind_of_node(file, argument.node_id());
 
         self.cost_of_node(file, kind)
     }
@@ -192,7 +194,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 "@perf O(...): statement"
             });
 
-            let site = self.site_at(file, kind.node_id());
+            let site = self.site_of_node(file, kind.node_id());
 
             return Reading::of_part(tagged_part_of(cost, &text, site));
         }
@@ -209,7 +211,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let mut reading = self.cost_of_expression(file, &statement.test);
 
                 for branch in branches {
-                    let part = self.branch_result(file, branch, statement.node_id());
+                    let part = self.branch_reading_of(file, branch, statement.node_id());
 
                     reading = reading.merge(part);
                 }
@@ -221,7 +223,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let cases: Vec<AstKind<'a>> = statement
                     .cases
                     .iter()
-                    .map(|case| self.kind_at(file, case.node_id()))
+                    .map(|case| self.kind_of_node(file, case.node_id()))
                     .collect();
 
                 for case in self.hot_kinds_of(file, cases, "case") {
@@ -233,14 +235,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 reading
             }
             AstKind::TryStatement(statement) => {
-                let mut parts = vec![self.kind_at(file, statement.block.node_id())];
+                let mut parts = vec![self.kind_of_node(file, statement.block.node_id())];
 
                 if let Some(handler) = &statement.handler {
-                    parts.push(self.kind_at(file, handler.node_id()));
+                    parts.push(self.kind_of_node(file, handler.node_id()));
                 }
 
                 if let Some(finalizer) = &statement.finalizer {
-                    parts.push(self.kind_at(file, finalizer.node_id()));
+                    parts.push(self.kind_of_node(file, finalizer.node_id()));
                 }
 
                 let mut reading = Reading::empty();
@@ -267,13 +269,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.cost_of_exit(file, Some(&statement.argument), statement.node_id())
             }
             AstKind::SpreadElement(spread) => self.cost_of_spread(file, spread),
+            AstKind::AssignmentTargetRest(rest) => self.cost_of_rest_target(file, rest),
             AstKind::NewExpression(new) => self.cost_of_new(file, new),
             AstKind::CallExpression(call) => self.cost_of_call(file, call),
             _ => {
                 let mut reading = Reading::empty();
 
                 for child in self.children_of(file, kind.node_id()) {
-                    let child = self.kind_at(file, child);
+                    let child = self.kind_of_node(file, child);
                     let cost = self.cost_of_node(file, child);
 
                     reading = reading.merge(cost);
@@ -315,7 +318,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .iter()
             .copied()
             .filter(|statement| {
-                let kind = self.kind_at(file, statement.node_id());
+                let kind = self.kind_of_node(file, statement.node_id());
 
                 self.is_hot_path(file, kind)
             })
@@ -343,7 +346,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let hot: Vec<&'a Statement<'a>> = statements
             .iter()
             .filter(|statement| {
-                let kind = self.kind_at(file, statement.node_id());
+                let kind = self.kind_of_node(file, statement.node_id());
 
                 self.perf_tags(file, kind).contains(&PerfTag::Hot)
             })
@@ -365,7 +368,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading
     }
 
-    fn branch_result(
+    fn branch_reading_of(
         &mut self,
         file: FileId,
         body: &'a Statement<'a>,
@@ -383,7 +386,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 };
                 let mut chain = vec![Factor {
                     label: format!("[{} branch: runs once per {}]", exit.text(), unit),
-                    site: self.site_at(file, site_node),
+                    site: self.site_of_node(file, site_node),
                     cost: Cost::ONE,
                     inner: Vec::new(),
                 }];
@@ -425,7 +428,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             }
 
-            let child = self.kind_at(file, child);
+            let child = self.kind_of_node(file, child);
             let cost = self.cost_of_node(file, child);
 
             sibling = sibling.merge(cost);
@@ -494,8 +497,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let per = match scope {
                 Some(scope) => format!(
                     ", per {} at {}",
-                    loop_label(self.kind_at(file, scope)),
-                    self.site_at(file, scope).line
+                    loop_label(self.kind_of_node(file, scope)),
+                    self.site_of_node(file, scope).line
                 ),
                 None => String::new(),
             };
@@ -503,7 +506,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             label.push_str(&format!(" [budget: {}{}]", budget.text, per));
         }
 
-        let site = self.site_at(file, node);
+        let site = self.site_of_node(file, node);
         let looped = nest(label, site, bound.factor, body.main);
 
         if let (Some(_), Some(scope)) = (&budget, scope) {
@@ -598,7 +601,46 @@ impl<'p, 'a> Analysis<'p, 'a> {
             "spread ...{}",
             short(self.text_of(file, spread.argument.span()))
         );
-        let site = self.site_at(file, spread.node_id());
+        let site = self.site_of_node(file, spread.node_id());
+
+        inner.merge(Reading::of_part(nest(label, site, Cost::N, Part::none())))
+    }
+
+    fn cost_of_rest_target(&mut self, file: FileId, rest: &'a AssignmentTargetRest<'a>) -> Reading {
+        let mut inner = Reading::empty();
+
+        for child in self.children_of(file, rest.node_id()) {
+            let child = self.kind_of_node(file, child);
+            let cost = self.cost_of_node(file, child);
+
+            inner = inner.merge(cost);
+        }
+
+        let target_span = rest.target.span();
+        let constant = match &rest.target {
+            AssignmentTarget::AssignmentTargetIdentifier(reference) => {
+                if matches!(
+                    self.declarations
+                        .of_reference(self.project, file, reference),
+                    Some(Declaration::Parameter {
+                        parameter: ParameterNode::Rest(_),
+                        ..
+                    })
+                ) {
+                    return inner;
+                }
+
+                self.is_constant_sized_reference(file, reference)
+            }
+            _ => self.is_tuple_site(file, DeclaredType::default(), target_span),
+        };
+
+        if constant {
+            return inner;
+        }
+
+        let label = format!("spread ...{}", short(self.text_of(file, target_span)));
+        let site = self.site_of_node(file, rest.node_id());
 
         inner.merge(Reading::of_part(nest(label, site, Cost::N, Part::none())))
     }
@@ -654,7 +696,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let name = self.name_of(target, function);
             let name = name.strip_suffix(".constructor").unwrap_or(&name);
-            let site = self.site_at(file, new.node_id());
+            let site = self.site_of_node(file, new.node_id());
 
             return reading.merge(Reading::of_part(Part {
                 cost: callee.cost,
@@ -673,7 +715,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
         let first = new.arguments.first();
 
-        if table_has(LINEAR_CONSTRUCTORS, constructor) {
+        if is_listed(LINEAR_CONSTRUCTORS, constructor) {
             if let Some(first) = first {
                 if self.is_share_sized_argument(file, first) {
                     self.stats.count("share: constructor");
@@ -687,7 +729,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         "new {constructor}({})",
                         short(self.text_of(file, first.span()))
                     );
-                    let site = self.site_at(file, new.node_id());
+                    let site = self.site_of_node(file, new.node_id());
 
                     return reading.merge(Reading::of_part(nest(
                         label,
@@ -709,13 +751,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn is_constant_sized_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
-        match argument.as_expression() {
-            Some(expression) => self.is_constant_sized(file, expression),
-            None => false,
-        }
-    }
-
     fn is_numeric_constant_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
         match argument.as_expression() {
             Some(expression) => self.is_numeric_constant(file, expression),
@@ -723,7 +758,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn callback_part(&mut self, file: FileId, argument: Option<&'a Argument<'a>>) -> Part {
+    fn callback_part_of(&mut self, file: FileId, argument: Option<&'a Argument<'a>>) -> Part {
         self.part_of_argument(file, argument).unwrap_or_default()
     }
 
@@ -749,7 +784,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let declaration = self.callee_declaration_of(file, call);
-        let site = self.site_at(file, call.node_id());
+        let site = self.site_of_node(file, call.node_id());
 
         if let (true, Some(Declaration::Parameter { parameter, .. }), Some(reference)) =
             (self.options.callbacks, declaration, identifier_of(callee))
@@ -820,7 +855,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let Some(reference) = identifier_of(callee) {
-            if table_has(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str()) {
+            if is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str()) {
                 return reading.merge(Reading::of_part(nest(
                     format!("{}()", reference.name),
                     site,
@@ -856,16 +891,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Some(argument) => {
                         self.is_constant_sized_argument(file, argument)
                             || (global_name == "Object"
-                                && table_has(OBJECT_KEYED, &method)
-                                && argument.as_expression().is_some_and(|argument| {
-                                    self.is_enum_object(file, argument)
-                                        || self.is_closed(file, argument)
-                                }))
+                                && is_listed(OBJECT_KEYED, &method)
+                                && (argument
+                                    .as_expression()
+                                    .is_some_and(|argument| self.is_enum_object(file, argument))
+                                    || self.is_closed_argument(file, argument)))
                     }
                     None => false,
                 };
                 let callback = if method == "from" {
-                    self.callback_part(file, call.arguments.get(1))
+                    self.callback_part_of(file, call.arguments.get(1))
                 } else {
                     Part::none()
                 };
@@ -908,14 +943,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.stats.count("share: array method");
         }
 
-        if array_like && (table_has(ARRAY_N_LOG_N, &method) || table_has(ARRAY_LINEAR, &method)) {
+        if array_like && (is_listed(ARRAY_N_LOG_N, &method) || is_listed(ARRAY_LINEAR, &method)) {
             self.stats.count(&format!(
                 "array method: {}",
                 if bounded { "bounded" } else { "N" }
             ));
         }
 
-        if kind == Kind::String && table_has(STRING_LINEAR, &method) {
+        if kind == Kind::String && is_listed(STRING_LINEAR, &method) {
             self.stats.count(&format!(
                 "string method: {}",
                 if bounded { "bounded" } else { "N" }
@@ -923,8 +958,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if array_like {
-            if table_has(ARRAY_N_LOG_N, &method) {
-                let callback = self.callback_part(file, first);
+            if is_listed(ARRAY_N_LOG_N, &method) {
+                let callback = self.callback_part_of(file, first);
                 let part = if bounded {
                     callback
                 } else {
@@ -934,9 +969,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return reading.merge(Reading::of_part(part));
             }
 
-            if table_has(ARRAY_LINEAR, &method) {
-                let callback = if table_has(CALLBACK_METHODS, &method) {
-                    self.callback_part(file, first)
+            if is_listed(ARRAY_LINEAR, &method) {
+                let callback = if is_listed(CALLBACK_METHODS, &method) {
+                    self.callback_part_of(file, first)
                 } else {
                     Part::none()
                 };
@@ -950,17 +985,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        if (kind == Kind::Set && table_has(SET_LINEAR, &method))
-            || (kind == Kind::Map && table_has(MAP_LINEAR, &method))
+        if (kind == Kind::Set && is_listed(SET_LINEAR, &method))
+            || (kind == Kind::Map && is_listed(MAP_LINEAR, &method))
         {
-            let callback = self.callback_part(file, first);
+            let callback = self.callback_part_of(file, first);
 
             return reading.merge(Reading::of_part(nest(label(""), site, Cost::N, callback)));
         }
 
         if self.options.strings_linear
             && (kind == Kind::String || kind == Kind::Unknown)
-            && table_has(STRING_LINEAR, &method)
+            && is_listed(STRING_LINEAR, &method)
             && !bounded
         {
             return reading.merge(Reading::of_part(nest(
@@ -971,7 +1006,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             )));
         }
 
-        if self.options.strings_linear && kind == Kind::RegExp && table_has(REGEXP_LINEAR, &method)
+        if self.options.strings_linear && kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method)
         {
             if let Some(argument) = first {
                 if !self.is_constant_sized_argument(file, argument) {

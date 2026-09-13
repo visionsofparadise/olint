@@ -2,13 +2,13 @@ use olint::cost::{Cost, Reading};
 
 mod support;
 
-use support::{function_named, with_source};
+use support::{function_of_name, run_with_source};
 
 fn reading_of(source: &str, name: &str) -> (Reading, Vec<String>) {
     let mut found = (Reading::empty(), Vec::new());
 
-    with_source(source, |analysis, file| {
-        let function = function_named(analysis.project, file, name);
+    run_with_source(source, |analysis, file| {
+        let function = function_of_name(analysis.project, file, name);
         let reading = analysis.cost_of_function_body(file, function);
         let labels = reading
             .total()

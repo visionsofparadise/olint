@@ -137,7 +137,7 @@ fn callee_answers_map_to_the_declaration_they_span() {
 }
 
 #[test]
-fn recording_reuses_answers_from_earlier_rounds() {
+fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
     run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
         let loose = receiver_of(project, file, "loose.map");
@@ -150,8 +150,12 @@ fn recording_reuses_answers_from_earlier_rounds() {
             closed: false,
         }))]));
 
-        assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Set);
+        assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Unknown);
         assert!(analysis.needed_queries().is_empty());
+
+        analysis.set_pass(OraclePass::Answering);
+
+        assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Set);
         assert!(!analysis
             .stats
             .lines()

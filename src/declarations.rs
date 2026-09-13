@@ -6,8 +6,8 @@ use oxc_ast::ast::{
     ArrowFunctionExpression, Class, ClassElement, ExportDefaultDeclarationKind, Expression,
     FormalParameter, FormalParameterRest, Function, IdentifierReference, MemberExpression,
     MethodDefinitionKind, ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
-    TSInterfaceDeclaration, TSModuleReference, TSTypeAliasDeclaration, TSTypeName, TSTypeParameter,
-    VariableDeclarationKind, VariableDeclarator,
+    TSInterfaceDeclaration, TSModuleReference, TSSignature, TSTypeAliasDeclaration, TSTypeName,
+    TSTypeParameter, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
@@ -191,6 +191,76 @@ impl<'a> Declarations<'a> {
             Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
             _ => None,
         }
+    }
+
+    pub fn binding_of_access(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        object: &Expression<'a>,
+        name: &str,
+    ) -> Option<Binding> {
+        let Expression::Identifier(reference) = object else {
+            return None;
+        };
+        let (target_file, symbol) = self.symbol_of_reference(project, file, reference)?;
+
+        match self.target_of_symbol(project, target_file, symbol) {
+            Target::Namespace(namespace) => {
+                match self.followed_export_of(project, namespace, name)? {
+                    Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
+                    _ => None,
+                }
+            }
+            Target::Symbol(file, symbol) => {
+                let semantic = &project.file(file).semantic;
+                let scoping = semantic.scoping();
+
+                scoping.symbol_declarations(symbol).find_map(|node| {
+                    match semantic.nodes().kind(node) {
+                        AstKind::TSNamespaceDeclaration(namespace) => {
+                            let scope = namespace.scope_id.get()?;
+
+                            scoping
+                                .get_binding(scope, name.into())
+                                .map(|symbol| Binding::Symbol { file, symbol })
+                        }
+                        _ => None,
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_member_first_declared_by_interface(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        class: &'a Class<'a>,
+        name: &str,
+    ) -> bool {
+        let Some(symbol) = class.id.as_ref().and_then(|id| id.symbol_id.get()) else {
+            return false;
+        };
+        let semantic = &project.file(file).semantic;
+
+        semantic.scoping().symbol_declarations(symbol).any(|node| {
+            match semantic.nodes().kind(node) {
+                AstKind::TSInterfaceDeclaration(interface) if interface.span.start < class.span.start => {
+                    interface.body.body.iter().any(|signature| {
+                        let key = match signature {
+                            TSSignature::TSPropertySignature(property) => &property.key,
+                            TSSignature::TSMethodSignature(method) => &method.key,
+                            _ => return false,
+                        };
+
+                        matches!(key, PropertyKey::StaticIdentifier(identifier) if identifier.name == name)
+                    })
+                }
+                _ => false,
+            }
+        })
     }
 
     pub fn member_binding(

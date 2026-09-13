@@ -68,3 +68,33 @@ export function newMapConstant(): Map<string, number> {
 		["b", 2],
 	]);
 }
+
+function makeUnionSet() {
+	return new Set<number>();
+}
+
+function makeDoubled() {
+	return [1, 2, 3].map((x) => x * 2);
+}
+
+export function unionCallback(n: number) {
+	const s = makeUnionSet();
+	const list = makeDoubled();
+	return s.union(() => list.map((x) => x + n));
+}
+
+export function spreadRestTupleSet(...rows: [number, number][]) {
+	return new Set(...rows);
+}
+
+export function spreadRestKeys(...rows: { a: number; b: number }[]) {
+	return Object.keys(...rows);
+}
+
+export function surrogateCutLabel(prefix: string) {
+	return (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa😀bbbbbbbbb").split(",");
+}
+
+export function nextLineLabel(prefix: string) {
+	return (prefix + "ab").split(",");
+}

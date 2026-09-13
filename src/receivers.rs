@@ -32,6 +32,10 @@ impl<'a> Declarations<'a> {
         if let Expression::ThisExpression(_) = object {
             let (target, class, placement) = class_of_this(project, file, callee)?;
 
+            if self.is_member_first_declared_by_interface(project, target, class, &name) {
+                return None;
+            }
+
             return self.inherited_member_of(project, target, class, &name, placement);
         }
 

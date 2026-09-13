@@ -10,7 +10,7 @@ use oxc_ast::AstKind;
 
 mod support;
 
-use support::{with_source, SYNTACTIC};
+use support::{run_with_source, SYNTACTIC};
 
 fn loop_reasons_of(
     analysis: &mut Analysis<'_, '_>,
@@ -86,7 +86,7 @@ fn every_bound_reason_fires_on_the_model_fixture() {
 
 #[test]
 fn a_while_counter_stepped_linearly_is_linear() {
-    with_source(
+    run_with_source(
         "export function f(n: number) {\n\twhile (n > 1) {\n\t\tn = n - 1;\n\t}\n}",
         |analysis, file| {
             assert_eq!(

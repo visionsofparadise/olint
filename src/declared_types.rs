@@ -256,6 +256,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.declared_type_of_nested_expression(file, expression, 0)
     }
 
+    pub(crate) fn declared_type_of_identifier(
+        &mut self,
+        file: FileId,
+        reference: &'a oxc_ast::ast::IdentifierReference<'a>,
+    ) -> DeclaredType {
+        match self
+            .declarations
+            .of_reference(self.project, file, reference)
+        {
+            Some(declaration) => self.declared_type_of_binding(declaration, 0),
+            None => DeclaredType::default(),
+        }
+    }
+
     pub fn declared_type_of_type(&mut self, file: FileId, ty: &'a TSType<'a>) -> DeclaredType {
         self.declared_type_of_nested_type(file, ty, 0)
     }

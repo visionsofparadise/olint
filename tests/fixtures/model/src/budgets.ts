@@ -43,3 +43,30 @@ export function ordinaryForLoopCounterExcluded(n: number, xs: number[]): number 
 	for (let i = 0; i < n; i++) sum += xs[i];
 	return sum;
 }
+
+export function shorthandDestructure(xs: number[], n: number, next: () => { i: number }): number {
+	let i = 0;
+	let total = 0;
+	for (const x of xs) {
+		while (i < n) {
+			total += x;
+			i++;
+		}
+	}
+	({ i } = next());
+	return total;
+}
+
+export namespace BudgetSpace {
+	export let limit = 10;
+	export function namespaceWrite(xs: number[]): number {
+		let i = 0;
+		for (const x of xs) {
+			while (i < limit) {
+				i++;
+			}
+			BudgetSpace.limit += x;
+		}
+		return i;
+	}
+}

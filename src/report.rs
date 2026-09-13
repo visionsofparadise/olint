@@ -3,7 +3,7 @@ use crate::project::{Project, Site};
 
 const LOOP_LABELS: &[&str] = &["for", "for-of", "for-in", "while", "do-while"];
 
-fn padded(text: &str, width: usize) -> String {
+fn padded_text_of(text: &str, width: usize) -> String {
     let length: usize = text.chars().map(char::len_utf16).sum();
 
     if length >= width {
@@ -69,7 +69,7 @@ fn lines_of_chain(
         out.push(format!(
             "{}{relation} {} {}{cost}",
             "    ".repeat(depth),
-            padded(shown, width),
+            padded_text_of(shown, width),
             location(factor.site)
         ));
 
@@ -97,7 +97,7 @@ pub fn report_row(
 
     format!(
         "{} {name}{mark}  {}",
-        padded(&cost.text(), 14),
+        padded_text_of(&cost.text(), 14),
         location_of(project, site)
     )
 }

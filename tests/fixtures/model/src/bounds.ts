@@ -91,3 +91,17 @@ export async function forAwaitLoop(xs: AsyncIterable<number>): Promise<number> {
 	for await (const x of xs) sum += x;
 	return sum;
 }
+
+export function unaryHalving(xs: number[], target: number): number {
+	let lo = 0;
+	let hi = xs.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >> 1;
+		if (~lo) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo + target;
+}

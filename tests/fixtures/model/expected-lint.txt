@@ -1,4 +1,4 @@
-# tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 96 public functions
+# tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 108 public functions
 
 O(N^3) > O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src/index.ts
     in loop for-of                                           src/types.ts:72  x N

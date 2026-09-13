@@ -268,7 +268,7 @@ fn cost_length_of(text: &str) -> Option<usize> {
 }
 
 fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::budgets::collapsed_text_of(text)
 }
 
 #[cfg(test)]

@@ -6,10 +6,12 @@ use oxc_ast::AstKind;
 
 mod support;
 
-use support::{first_node_of, function_named, probes_of, with_source};
+use support::{
+    file_of, first_node_of, function_of_name, probes_of, run_in_project, run_with_source, SYNTACTIC,
+};
 
 fn single_budget_of(analysis: &mut Analysis<'_, '_>, file: FileId) -> Budget {
-    let function = function_named(analysis.project, file, "f");
+    let function = function_of_name(analysis.project, file, "f");
     let context = analysis.collect_budgets(file, function);
     let budgets: Vec<&Budget> = context.budgets.values().collect();
 
@@ -20,7 +22,7 @@ fn single_budget_of(analysis: &mut Analysis<'_, '_>, file: FileId) -> Budget {
 
 #[test]
 fn a_counter_raised_toward_an_invariant_bound_is_a_budget() {
-    with_source(
+    run_with_source(
         "export function f(n: number) {\n\tlet i = 0;\n\twhile (i < n) {\n\t\ti += 1;\n\t}\n}",
         |analysis, file| {
             let budget = single_budget_of(analysis, file);
@@ -34,10 +36,10 @@ fn a_counter_raised_toward_an_invariant_bound_is_a_budget() {
 
 #[test]
 fn a_counter_moved_both_ways_is_no_budget() {
-    with_source(
+    run_with_source(
         "export function f(n: number) {\n\tlet i = 0;\n\twhile (i < n) {\n\t\ti += 1;\n\t\tif (i > 3) i--;\n\t}\n}",
         |analysis, file| {
-            let function = function_named(analysis.project, file, "f");
+            let function = function_of_name(analysis.project, file, "f");
 
             assert!(analysis.collect_budgets(file, function).budgets.is_empty());
         },
@@ -46,7 +48,7 @@ fn a_counter_moved_both_ways_is_no_budget() {
 
 #[test]
 fn a_for_counter_scopes_its_budget_to_the_for() {
-    with_source(
+    run_with_source(
         "export function f(n: number) {\n\tfor (let i = 0; i < n; i++) {}\n}",
         |analysis, file| {
             let for_node = first_node_of(analysis.project, file, |kind| match kind {
@@ -61,11 +63,11 @@ fn a_for_counter_scopes_its_budget_to_the_for() {
 
 #[test]
 fn a_stable_step_spends_a_share_and_sizes_its_slices() {
-    with_source(
+    run_with_source(
         "export function f(n: number, g: number, buf: Uint8Array) {\n\tconst p = 4;\n\tlet i = 0;\n\twhile (i < n) {\n\t\tprobe(buf.subarray(0, g));\n\t\tprobe(p + g);\n\t\tprobe(buf.subarray(0, n));\n\t\ti += g;\n\t}\n}",
         |analysis, file| {
             let project = analysis.project;
-            let function = function_named(project, file, "f");
+            let function = function_of_name(project, file, "f");
             let context = analysis.collect_budgets(file, function);
             let loop_kind = first_node_of(project, file, |kind| {
                 matches!(kind, AstKind::WhileStatement(_)).then_some(kind)
@@ -93,4 +95,48 @@ fn a_stable_step_spends_a_share_and_sizes_its_slices() {
             assert_eq!(sized, vec![true, true, false]);
         },
     );
+}
+
+#[test]
+fn a_bound_written_through_its_namespace_is_not_invariant() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        ("lib.ts", "export let limit = 10;"),
+        (
+            "index.ts",
+            "import * as lib from \"./lib\";
+import { limit } from \"./lib\";
+export function f(xs: number[]) {
+	let i = 0;
+	while (i < limit) {
+		i++;
+	}
+	lib.limit += xs.length;
+}
+export namespace Space {
+	export let size = 10;
+	export function g(xs: number[]) {
+		let j = 0;
+		while (j < size) {
+			j++;
+		}
+		Space.size += xs.length;
+	}
+}",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+
+        for name in ["f", "g"] {
+            let function = function_of_name(project, file, name);
+
+            assert!(
+                analysis.collect_budgets(file, function).budgets.is_empty(),
+                "{name} writes its bound"
+            );
+        }
+    });
 }

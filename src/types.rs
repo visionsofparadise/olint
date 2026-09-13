@@ -7,7 +7,7 @@ use oxc_span::{GetSpan, Span};
 use crate::analysis::Analysis;
 use crate::constants::{member_expression_of, unwrap};
 use crate::declarations::{declaration_of_node, Declaration};
-use crate::declared_types::Kind;
+use crate::declared_types::{DeclaredType, Kind};
 use crate::oracle::{CalleeAnswer, OracleAnswer, OracleReply, Query, TypeAnswer};
 use crate::project::FileId;
 use crate::tables::method_matters;
@@ -69,7 +69,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut kind = self.declared_type_of_expression(file, e).kind;
 
         if kind == Kind::Unknown && method_matters(method) {
-            if let Some(answer) = self.type_answer_of(file, e) {
+            if let Some(answer) = self.type_answer_of(file, unwrap(e).span()) {
                 kind = answer.kind;
             }
         }
@@ -80,11 +80,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub fn is_tuple(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
-        let mut tuple = self.declared_type_of_expression(file, e).tuple;
+        let declared = self.declared_type_of_expression(file, e);
+
+        self.is_tuple_site(file, declared, unwrap(e).span())
+    }
+
+    pub(crate) fn is_tuple_site(
+        &mut self,
+        file: FileId,
+        declared: DeclaredType,
+        span: Span,
+    ) -> bool {
+        let mut tuple = declared.tuple;
 
         if !tuple {
             tuple = self
-                .type_answer_of(file, e)
+                .type_answer_of(file, span)
                 .is_some_and(|answer| answer.tuple);
         }
 
@@ -96,11 +107,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub fn is_closed(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
-        let mut closed = self.declared_type_of_expression(file, e).closed;
+        let declared = self.declared_type_of_expression(file, e);
+
+        self.is_closed_site(file, declared, unwrap(e).span())
+    }
+
+    pub(crate) fn is_closed_site(
+        &mut self,
+        file: FileId,
+        declared: DeclaredType,
+        span: Span,
+    ) -> bool {
+        let mut closed = declared.closed;
 
         if !closed {
             closed = self
-                .type_answer_of(file, e)
+                .type_answer_of(file, span)
                 .is_some_and(|answer| answer.closed);
         }
 
@@ -175,8 +197,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.needed.clear();
     }
 
-    fn type_answer_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<TypeAnswer> {
-        let span = unwrap(e).span();
+    fn type_answer_of(&mut self, file: FileId, span: Span) -> Option<TypeAnswer> {
         let query = Query::Type {
             file: self.query_path_of(file),
             pos: span.start,
@@ -195,6 +216,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let Some(answer) = self.answers.get(&key) {
+            if self.pass == OraclePass::Recording && key.3 == QueryKind::Type {
+                return Lookup::Unanswered;
+            }
+
             return Lookup::Answered(answer.clone());
         }
 
