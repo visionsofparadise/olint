@@ -60,3 +60,10 @@ fn a_star_does_not_match_a_minified_script() {
     assert!(file_matches("/r/src/*", "/r/src/b.min.ts"));
     assert!(file_matches("/r/src/*.js", "/r/src/b.js"));
 }
+
+#[test]
+fn a_question_mark_skips_a_leading_dot_only() {
+    assert!(file_matches("/r/src/a?ts", "/r/src/a.ts"));
+    assert!(!file_matches("/r/src/?hidden.ts", "/r/src/.hidden.ts"));
+    assert!(file_matches("/r/src/?hidden.ts", "/r/src/xhidden.ts"));
+}

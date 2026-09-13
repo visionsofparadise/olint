@@ -335,3 +335,189 @@ fn load_follows_imports_outside_the_tsconfig_directory() {
         assert_eq!(relatives, vec!["../shared/src/rel.ts", "src/index.ts"]);
     }
 }
+
+fn linked_tree_of(
+    files: &[(&str, &str)],
+    links: &[(&str, &str)],
+) -> (tempfile::TempDir, std::path::PathBuf, bool) {
+    let directory = project_of(files);
+    let root = canonical_path_of(directory.path()).expect("root");
+    let linked = links.iter().all(|(link, target)| {
+        let link = root.join(link);
+
+        std::fs::create_dir_all(link.parent().expect("parent")).expect("link parent");
+
+        link_directory(&root.join(target), &link).is_ok()
+    });
+
+    if !linked {
+        eprintln!("directory symlinks are unavailable here; the linked tree is not exercised");
+    }
+
+    (directory, root, linked)
+}
+
+fn loaded_files_of(tsconfig: &std::path::Path) -> Vec<(String, bool)> {
+    let allocator = oxc_allocator::Allocator::default();
+    let project = olint::project::Project::load(&allocator, tsconfig).expect("project loads");
+
+    project
+        .files
+        .iter()
+        .map(|file| (file.relative.clone(), project.is_project_file(file.id)))
+        .collect()
+}
+
+#[test]
+fn load_resets_a_package_file_reached_again_from_the_project() {
+    let (_directory, root, linked) = linked_tree_of(
+        &[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "include": ["a.ts", "packages/lib/src/**/*"] }"#,
+            ),
+            (
+                "a.ts",
+                "import { lib } from \"lib\";\nexport const a = () => lib([1]);",
+            ),
+            (
+                "packages/lib/package.json",
+                r#"{ "name": "lib", "exports": { ".": "./src/index.ts" } }"#,
+            ),
+            (
+                "packages/lib/src/index.ts",
+                "export function lib(xs: number[]) { return xs.length; }",
+            ),
+        ],
+        &[("node_modules/lib", "packages/lib")],
+    );
+
+    if linked {
+        assert_eq!(
+            loaded_files_of(&root.join("tsconfig.json")),
+            vec![
+                ("packages/lib/src/index.ts".to_string(), true),
+                ("a.ts".to_string(), true)
+            ]
+        );
+    }
+}
+
+#[test]
+fn load_keeps_a_paths_mapping_out_of_the_external_libraries() {
+    let (_directory, root, _) = linked_tree_of(
+        &[
+            (
+                "app/tsconfig.json",
+                r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "baseUrl": ".", "paths": { "shared": ["../shared/src/index.ts"] } }, "include": ["src"] }"#,
+            ),
+            (
+                "app/src/index.ts",
+                "import { shared } from \"shared\";\nexport const run = () => shared([1]);",
+            ),
+            (
+                "shared/package.json",
+                r#"{ "name": "shared", "exports": { ".": "./src/index.ts" } }"#,
+            ),
+            (
+                "shared/src/index.ts",
+                "export function shared(xs: number[]) { return xs.length; }",
+            ),
+        ],
+        &[("app/node_modules/shared", "shared")],
+    );
+
+    assert_eq!(
+        loaded_files_of(&root.join("app/tsconfig.json")),
+        vec![
+            ("../shared/src/index.ts".to_string(), true),
+            ("src/index.ts".to_string(), true)
+        ]
+    );
+}
+
+#[test]
+fn load_marks_typescript_under_node_modules_external() {
+    let files = [
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "include": ["src"] }"#,
+        ),
+        (
+            "src/index.ts",
+            "import { run } from \"pkg\";\nimport { typed } from \"typed\";\nexport const go = () => run([1]) + typed();",
+        ),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "exports": { ".": "./index.ts" } }"#,
+        ),
+        (
+            "node_modules/pkg/index.ts",
+            "import { helper } from \"./helper\";\nexport function run(xs: number[]) { return helper(xs); }",
+        ),
+        (
+            "node_modules/pkg/helper.ts",
+            "export function helper(xs: number[]) { return xs.length; }",
+        ),
+        (
+            "node_modules/typed/package.json",
+            r#"{ "name": "typed", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/typed/index.d.ts",
+            "export declare function typed(): number;",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let index = file_of(project, root, "src/index.ts");
+        let loaded: Vec<(&str, bool)> = project
+            .files
+            .iter()
+            .map(|file| (file.relative.as_str(), project.is_project_file(file.id)))
+            .collect();
+
+        assert_eq!(
+            loaded,
+            vec![
+                ("node_modules/pkg/helper.ts", false),
+                ("node_modules/pkg/index.ts", false),
+                ("src/index.ts", true)
+            ]
+        );
+        assert!(matches!(project.resolve(index, "pkg"), Resolved::File(_)));
+        assert!(matches!(
+            project.resolve(index, "typed"),
+            Resolved::External(_)
+        ));
+    });
+}
+
+#[test]
+fn select_files_keeps_files_under_a_symlinked_directory() {
+    let (_directory, root, linked) = linked_tree_of(
+        &[
+            ("tsconfig.json", r#"{ "include": ["src"] }"#),
+            ("src/x.ts", "export const x = 1;"),
+            ("elsewhere/y.ts", "export const y = 1;"),
+        ],
+        &[("src/linked", "elsewhere")],
+    );
+    let selection = select_files(&root.join("tsconfig.json")).expect("selection");
+    let relatives: Vec<String> = selection
+        .files
+        .iter()
+        .map(|file| {
+            file.strip_prefix(&root)
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+
+    if linked {
+        assert_eq!(relatives, vec!["src/x.ts", "src/linked/y.ts"]);
+    } else {
+        assert_eq!(relatives, vec!["src/x.ts"]);
+    }
+}

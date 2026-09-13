@@ -191,11 +191,11 @@ impl Walk<'_> {
             return;
         };
 
-        if !self.visited.insert(canonical.clone()) {
+        if !self.visited.insert(canonical) {
             return;
         }
 
-        let Ok(entries) = std::fs::read_dir(&canonical) else {
+        let Ok(entries) = std::fs::read_dir(directory) else {
             return;
         };
         let mut files = Vec::new();
@@ -215,7 +215,7 @@ impl Walk<'_> {
         directories.sort();
 
         for name in files {
-            let path = canonical.join(&name);
+            let path = directory.join(&name);
             let text = forward_slashes_of(&path);
 
             if !self
@@ -239,7 +239,7 @@ impl Walk<'_> {
         }
 
         for name in directories {
-            let path = canonical.join(&name);
+            let path = directory.join(&name);
             let text = forward_slashes_of(&path);
             let segments: Vec<&str> = text.split('/').collect();
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use oxc_allocator::Allocator;
@@ -34,7 +34,7 @@ pub struct Project<'a> {
     pub files: Vec<SourceFile<'a>>,
     by_path: HashMap<PathBuf, FileId>,
     resolver: Resolver,
-    package_resolver: Resolver,
+    configless_resolver: Resolver,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,10 +66,20 @@ pub struct Site {
     pub line: u32,
 }
 
-struct OpenFile<'a> {
-    file: SourceFile<'a>,
-    imports: Vec<(PathBuf, bool)>,
-    next: usize,
+enum Frame<'a> {
+    Open {
+        file: Box<SourceFile<'a>>,
+        next: usize,
+    },
+    Rewalk {
+        path: PathBuf,
+        next: usize,
+    },
+}
+
+struct Import {
+    target: PathBuf,
+    external: bool,
 }
 
 const PARSED_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -83,7 +93,7 @@ impl<'a> Project<'a> {
             path: tsconfig.to_path_buf(),
             source,
         })?;
-        let package_resolver = Resolver::new(ResolveOptions {
+        let configless_resolver = Resolver::new(ResolveOptions {
             tsconfig: None,
             ..resolve_options_of(&tsconfig_path)
         });
@@ -94,39 +104,51 @@ impl<'a> Project<'a> {
             files: Vec::new(),
             by_path: HashMap::new(),
             resolver,
-            package_resolver,
+            configless_resolver,
         };
         let allow_js = selection.allow_js;
-        let mut seen: HashSet<PathBuf> = HashSet::new();
-        let mut stack: Vec<OpenFile<'a>> = Vec::new();
+        let mut imports: HashMap<PathBuf, Vec<Import>> = HashMap::new();
+        let mut stack: Vec<Frame<'a>> = Vec::new();
 
         for root in selection.files {
-            if !is_parsed_path(&root, allow_js) || !seen.insert(root.clone()) {
-                continue;
+            if is_parsed_path(&root, allow_js) {
+                project.visit(allocator, root, false, allow_js, &mut imports, &mut stack)?;
             }
 
-            stack.push(project.open(allocator, root, false, allow_js)?);
-
             while let Some(top) = stack.last_mut() {
-                match top.imports.get(top.next).cloned() {
+                let (path, external, next) = match top {
+                    Frame::Open { file, next } => (file.path.clone(), file.external_library, next),
+                    Frame::Rewalk { path, next } => (path.clone(), false, next),
+                };
+                let import = imports
+                    .get(&path)
+                    .and_then(|found| found.get(*next))
+                    .map(|import| (import.target.clone(), external || import.external));
+
+                match import {
                     Some((target, external)) => {
-                        top.next += 1;
+                        *next += 1;
 
-                        if seen.insert(target.clone()) {
-                            let opened = project.open(allocator, target, external, allow_js)?;
-
-                            stack.push(opened);
-                        }
+                        project.visit(
+                            allocator,
+                            target,
+                            external,
+                            allow_js,
+                            &mut imports,
+                            &mut stack,
+                        )?;
                     }
                     None => {
-                        let Some(OpenFile { mut file, .. }) = stack.pop() else {
-                            break;
-                        };
+                        if let Some(Frame::Open { mut file, .. }) = stack.pop() {
+                            file.id = FileId(project.files.len() as u32);
 
-                        file.id = FileId(project.files.len() as u32);
+                            if let Ok(canonical) = canonical_path_of(&file.path) {
+                                project.by_path.insert(canonical, file.id);
+                            }
 
-                        project.by_path.insert(file.path.clone(), file.id);
-                        project.files.push(file);
+                            project.by_path.insert(file.path.clone(), file.id);
+                            project.files.push(*file);
+                        }
                     }
                 }
             }
@@ -135,47 +157,89 @@ impl<'a> Project<'a> {
         Ok(project)
     }
 
-    fn open(
-        &self,
+    fn visit(
+        &mut self,
         allocator: &'a Allocator,
         path: PathBuf,
-        external_library: bool,
+        external: bool,
         allow_js: bool,
-    ) -> Result<OpenFile<'a>, ProjectError> {
+        imports: &mut HashMap<PathBuf, Vec<Import>>,
+        stack: &mut Vec<Frame<'a>>,
+    ) -> Result<(), ProjectError> {
+        if let Some(id) = self.by_path.get(&path).copied() {
+            let file = &mut self.files[id.0 as usize];
+
+            if file.external_library && !external {
+                file.external_library = false;
+
+                stack.push(Frame::Rewalk { path, next: 0 });
+            }
+
+            return Ok(());
+        }
+
+        let open = stack.iter_mut().find_map(|frame| match frame {
+            Frame::Open { file, .. } if file.path == path => Some(file),
+            _ => None,
+        });
+
+        if let Some(file) = open {
+            if file.external_library && !external {
+                file.external_library = false;
+
+                stack.push(Frame::Rewalk { path, next: 0 });
+            }
+
+            return Ok(());
+        }
+
         let mut file = parse_file(allocator, path, &self.root)?;
+
+        file.external_library = external;
+
+        imports.insert(file.path.clone(), self.imports_of(&file, allow_js));
+        stack.push(Frame::Open {
+            file: Box::new(file),
+            next: 0,
+        });
+
+        Ok(())
+    }
+
+    fn imports_of(&self, file: &SourceFile<'a>, allow_js: bool) -> Vec<Import> {
         let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let tsconfig = self.resolver.resolve_tsconfig(&self.tsconfig_path).ok();
 
-        file.external_library = external_library;
-
-        let imports = import_specifiers_of(&file)
+        import_specifiers_of(file)
             .into_iter()
             .filter_map(|specifier| {
                 let resolution = self.resolver.resolve(&directory, &specifier).ok()?;
                 let target = strip_verbatim_prefix(resolution.path());
                 let target = canonical_path_of(&target).unwrap_or(target);
-                let from_packages = is_package_specifier(&specifier)
-                    && self
-                        .package_resolver
-                        .resolve(&directory, &specifier)
-                        .is_ok_and(|package| {
-                            let package = strip_verbatim_prefix(package.path());
+                let mapped = tsconfig.as_ref().is_some_and(|tsconfig| {
+                    tsconfig
+                        .resolve_path_alias_or_base_url(&specifier)
+                        .iter()
+                        .filter_map(|candidate| {
+                            self.configless_resolver
+                                .resolve(&directory, &candidate.to_string_lossy())
+                                .ok()
+                        })
+                        .any(|candidate| {
+                            let candidate = strip_verbatim_prefix(candidate.path());
 
-                            canonical_path_of(&package).unwrap_or(package) == target
-                        });
-                let external = external_library || from_packages;
+                            canonical_path_of(&candidate).unwrap_or(candidate) == target
+                        })
+                });
+                let package_lookup = is_package_specifier(&specifier) && !mapped;
+                let external =
+                    package_lookup || forward_slashes_of(&target).contains("/node_modules/");
 
                 (is_parsed_path(&target, allow_js)
-                    && !(external && is_javascript_path(&target))
-                    && !forward_slashes_of(&target).contains("/node_modules/"))
-                .then_some((target, external))
+                    && !(package_lookup && is_javascript_path(&target)))
+                .then_some(Import { target, external })
             })
-            .collect();
-
-        Ok(OpenFile {
-            file,
-            imports,
-            next: 0,
-        })
+            .collect()
     }
 
     pub fn file(&self, id: FileId) -> &SourceFile<'a> {
