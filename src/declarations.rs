@@ -6,7 +6,7 @@ use oxc_ast::ast::{
     ArrowFunctionExpression, Class, ClassElement, ExportDefaultDeclarationKind, Expression,
     FormalParameter, FormalParameterRest, Function, IdentifierReference, MemberExpression,
     MethodDefinitionKind, ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
-    TSInterfaceDeclaration, TSTypeAliasDeclaration, TSTypeName, TSTypeParameter,
+    TSInterfaceDeclaration, TSModuleReference, TSTypeAliasDeclaration, TSTypeName, TSTypeParameter,
     VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast::AstKind;
@@ -18,7 +18,7 @@ use oxc_syntax::module_record::{
 };
 use oxc_syntax::symbol::SymbolId;
 
-use crate::project::{FileId, Project, Resolved};
+use crate::project::{FileId, Project, Resolved, SourceFile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Binding {
@@ -148,6 +148,7 @@ enum Target {
 
 pub struct Declarations<'a> {
     followed: RefCell<HashMap<(FileId, String), Option<Target>>>,
+    globals: RefCell<HashMap<String, Option<(FileId, SymbolId)>>>,
     member_writes: RefCell<HashMap<FileId, HashSet<String>>>,
     module_records: Vec<&'a ModuleRecord<'a>>,
 }
@@ -156,6 +157,7 @@ impl<'a> Declarations<'a> {
     pub fn new(project: &Project<'a>) -> Self {
         Declarations {
             followed: RefCell::new(HashMap::new()),
+            globals: RefCell::new(HashMap::new()),
             member_writes: RefCell::new(HashMap::new()),
             module_records: project
                 .files
@@ -171,7 +173,7 @@ impl<'a> Declarations<'a> {
         file: FileId,
         reference: &IdentifierReference<'a>,
     ) -> Option<Declaration<'a>> {
-        let symbol = symbol_of_reference(project, file, reference)?;
+        let (file, symbol) = self.symbol_of_reference(project, file, reference)?;
         let target = self.target_of_symbol(project, file, symbol);
 
         declaration_of_target(project, target)
@@ -183,7 +185,7 @@ impl<'a> Declarations<'a> {
         file: FileId,
         reference: &IdentifierReference<'a>,
     ) -> Option<Binding> {
-        let symbol = symbol_of_reference(project, file, reference)?;
+        let (file, symbol) = self.symbol_of_reference(project, file, reference)?;
 
         match self.target_of_symbol(project, file, symbol) {
             Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
@@ -380,6 +382,47 @@ impl<'a> Declarations<'a> {
         }
     }
 
+    fn symbol_of_reference(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &IdentifierReference<'a>,
+    ) -> Option<(FileId, SymbolId)> {
+        let reference_id = reference.reference_id.get()?;
+
+        if let Some(symbol) = project
+            .file(file)
+            .semantic
+            .scoping()
+            .get_reference(reference_id)
+            .symbol_id()
+        {
+            return Some((file, symbol));
+        }
+
+        let name = reference.name.as_str();
+
+        if let Some(found) = self.globals.borrow().get(name) {
+            return *found;
+        }
+
+        let found = project
+            .files
+            .iter()
+            .filter(|source| !is_module_file(source))
+            .find_map(|source| {
+                source
+                    .semantic
+                    .scoping()
+                    .get_root_binding(name.into())
+                    .map(|symbol| (source.id, symbol))
+            });
+
+        self.globals.borrow_mut().insert(name.to_string(), found);
+
+        found
+    }
+
     fn target_of_symbol(&self, project: &Project<'a>, file: FileId, symbol: SymbolId) -> Target {
         let semantic = &project.file(file).semantic;
         let node = semantic.scoping().symbol_declaration(symbol);
@@ -529,6 +572,18 @@ impl<'a> Declarations<'a> {
     }
 }
 
+fn is_module_file(source: &SourceFile<'_>) -> bool {
+    source.module_record.has_module_syntax
+        || source.program.body.iter().any(|statement| match statement {
+            Statement::TSImportEqualsDeclaration(declaration) => matches!(
+                declaration.module_reference,
+                TSModuleReference::ExternalModuleReference(_)
+            ),
+            Statement::TSExportAssignment(_) => true,
+            _ => false,
+        })
+}
+
 fn exported_function_statements_of(project: &Project<'_>, file: FileId) -> HashSet<Span> {
     project
         .file(file)
@@ -573,21 +628,6 @@ fn star_targets_of(
             },
         )
         .collect()
-}
-
-fn symbol_of_reference(
-    project: &Project<'_>,
-    file: FileId,
-    reference: &IdentifierReference<'_>,
-) -> Option<SymbolId> {
-    let reference_id = reference.reference_id.get()?;
-
-    project
-        .file(file)
-        .semantic
-        .scoping()
-        .get_reference(reference_id)
-        .symbol_id()
 }
 
 fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<Declaration<'a>> {

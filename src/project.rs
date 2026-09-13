@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use oxc_allocator::Allocator;
@@ -77,6 +77,12 @@ enum Frame<'a> {
     },
 }
 
+struct Walk<'a> {
+    imports: HashMap<PathBuf, Vec<Import>>,
+    externally_walked: HashSet<PathBuf>,
+    stack: Vec<Frame<'a>>,
+}
+
 struct Import {
     target: PathBuf,
     external: bool,
@@ -107,20 +113,25 @@ impl<'a> Project<'a> {
             configless_resolver,
         };
         let allow_js = selection.allow_js;
-        let mut imports: HashMap<PathBuf, Vec<Import>> = HashMap::new();
-        let mut stack: Vec<Frame<'a>> = Vec::new();
+        let mut walk = Walk {
+            imports: HashMap::new(),
+            externally_walked: HashSet::new(),
+            stack: Vec::new(),
+        };
 
         for root in selection.files {
-            if is_parsed_path(&root, allow_js) && !is_declaration_path(&root) {
-                project.visit(allocator, root, false, allow_js, &mut imports, &mut stack)?;
+            if is_parsed_path(&root, allow_js) {
+                project.visit(allocator, root, false, allow_js, &mut walk)?;
             }
 
-            while let Some(top) = stack.last_mut() {
-                let (path, external, next) = match top {
-                    Frame::Open { file, next } => (file.path.clone(), file.external_library, next),
-                    Frame::Rewalk { path, next } => (path.clone(), false, next),
+            while let Some(top) = walk.stack.last_mut() {
+                let (path, next) = match top {
+                    Frame::Open { file, next } => (file.path.clone(), next),
+                    Frame::Rewalk { path, next } => (path.clone(), next),
                 };
-                let import = imports
+                let external = walk.externally_walked.contains(&path);
+                let import = walk
+                    .imports
                     .get(&path)
                     .and_then(|found| found.get(*next))
                     .map(|import| (import.target.clone(), external || import.external));
@@ -129,17 +140,10 @@ impl<'a> Project<'a> {
                     Some((target, external)) => {
                         *next += 1;
 
-                        project.visit(
-                            allocator,
-                            target,
-                            external,
-                            allow_js,
-                            &mut imports,
-                            &mut stack,
-                        )?;
+                        project.visit(allocator, target, external, allow_js, &mut walk)?;
                     }
                     None => {
-                        if let Some(Frame::Open { mut file, .. }) = stack.pop() {
+                        if let Some(Frame::Open { mut file, .. }) = walk.stack.pop() {
                             file.id = FileId(project.files.len() as u32);
 
                             if let Ok(canonical) = canonical_path_of(&file.path) {
@@ -167,39 +171,38 @@ impl<'a> Project<'a> {
         path: PathBuf,
         external: bool,
         allow_js: bool,
-        imports: &mut HashMap<PathBuf, Vec<Import>>,
-        stack: &mut Vec<Frame<'a>>,
+        walk: &mut Walk<'a>,
     ) -> Result<(), ProjectError> {
         let declaration = is_declaration_path(&path);
-        let resets = !external && !declaration;
         let stored = self
             .by_path
             .get(&path)
             .copied()
             .filter(|id| is_same_written_path(&self.files[id.0 as usize].path, &path));
+        let open = stored.is_none()
+            && walk
+                .stack
+                .iter()
+                .any(|frame| matches!(frame, Frame::Open { file, .. } if file.path == path));
 
-        if let Some(id) = stored {
-            let file = &mut self.files[id.0 as usize];
+        if stored.is_some() || open {
+            if !external && walk.externally_walked.remove(&path) {
+                if !declaration {
+                    match stored {
+                        Some(id) => self.files[id.0 as usize].external_library = false,
+                        None => {
+                            for frame in &mut walk.stack {
+                                if let Frame::Open { file, .. } = frame {
+                                    if file.path == path {
+                                        file.external_library = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
-            if file.external_library && resets {
-                file.external_library = false;
-
-                stack.push(Frame::Rewalk { path, next: 0 });
-            }
-
-            return Ok(());
-        }
-
-        let open = stack.iter_mut().find_map(|frame| match frame {
-            Frame::Open { file, .. } if file.path == path => Some(file),
-            _ => None,
-        });
-
-        if let Some(file) = open {
-            if file.external_library && resets {
-                file.external_library = false;
-
-                stack.push(Frame::Rewalk { path, next: 0 });
+                walk.stack.push(Frame::Rewalk { path, next: 0 });
             }
 
             return Ok(());
@@ -213,8 +216,13 @@ impl<'a> Project<'a> {
 
         file.external_library = external || declaration;
 
-        imports.insert(file.path.clone(), self.imports_of(&file, allow_js));
-        stack.push(Frame::Open {
+        if external {
+            walk.externally_walked.insert(file.path.clone());
+        }
+
+        walk.imports
+            .insert(file.path.clone(), self.imports_of(&file, allow_js));
+        walk.stack.push(Frame::Open {
             file: Box::new(file),
             next: 0,
         });

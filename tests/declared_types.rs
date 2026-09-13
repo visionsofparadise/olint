@@ -4,16 +4,18 @@ mod support;
 
 use support::probe_results_of;
 
+fn declared_types_in(files: &[(&str, &str)]) -> Vec<DeclaredType> {
+    probe_results_of(files, |analysis, file, probe| {
+        analysis.declared_type_of_expression(file, probe)
+    })
+}
+
 fn declared_types_of(types: &str, index: &str) -> Vec<DeclaredType> {
-    let files = [
+    declared_types_in(&[
         ("tsconfig.json", "{}"),
         ("types.ts", types),
         ("index.ts", index),
-    ];
-
-    probe_results_of(&files, |analysis, file, probe| {
-        analysis.declared_type_of_expression(file, probe)
-    })
+    ])
 }
 
 fn expected_type_of(kind: Kind, tuple: bool, closed: bool) -> DeclaredType {
@@ -100,9 +102,7 @@ fn package_declaration_aliases_resolve_and_lib_globals_read_as_other() {
     ];
 
     assert_eq!(
-        probe_results_of(&files, |analysis, file, probe| {
-            analysis.declared_type_of_expression(file, probe)
-        }),
+        declared_types_in(&files),
         vec![
             expected_type_of(Kind::Array, false, false),
             expected_type_of(Kind::Other, false, true),
@@ -110,6 +110,35 @@ fn package_declaration_aliases_resolve_and_lib_globals_read_as_other() {
             expected_type_of(Kind::Other, false, false),
             expected_type_of(Kind::Other, false, false),
             expected_type_of(Kind::Other, false, false),
+        ]
+    );
+}
+
+#[test]
+fn ambient_declarations_in_a_script_root_resolve() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "ambient.d.ts",
+            "type AmbientList = string[];
+interface AmbientShape {
+	a: number;
+}",
+        ),
+        (
+            "index.ts",
+            "export function f(list: AmbientList, shape: AmbientShape) {
+	probe(list);
+	probe(shape);
+}",
+        ),
+    ];
+
+    assert_eq!(
+        declared_types_in(&files),
+        vec![
+            expected_type_of(Kind::Array, false, false),
+            expected_type_of(Kind::Other, false, true),
         ]
     );
 }

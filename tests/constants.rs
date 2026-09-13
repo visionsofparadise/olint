@@ -61,3 +61,22 @@ fn declared_types_casts_and_static_placement_decide_member_constants() {
 
     assert_eq!(found, vec![false, false, true, true, false]);
 }
+
+#[test]
+fn a_cast_receiver_resolves_members_through_its_class() {
+    let found = constant_sizes_of(
+        "class Holder {
+	readonly SIZES = [1, 2];
+}
+interface Shape {
+	readonly SIZES: number[];
+}
+export function f(box: unknown) {
+	probe((box as Holder).SIZES);
+	probe((<Holder>box).SIZES);
+	probe((box as Shape).SIZES);
+}",
+    );
+
+    assert_eq!(found, vec![true, true, false]);
+}

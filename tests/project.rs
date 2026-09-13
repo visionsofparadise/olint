@@ -138,7 +138,10 @@ fn resolve_loads_a_package_declaration_file_outside_the_project() {
             panic!("the package's declaration file is loaded");
         };
 
-        assert_eq!(project.files.len(), 2);
+        let global = file_of(project, root, "types/global.d.ts");
+
+        assert_eq!(project.files.len(), 3);
+        assert!(!project.is_project_file(global));
         assert!(project.file(package).external_library);
         assert!(!project.is_project_file(package));
         assert!(matches!(
@@ -371,14 +374,21 @@ fn linked_tree_of(
     (directory, root, linked)
 }
 
+fn project_flags_of<'p>(project: &'p olint::project::Project<'_>) -> Vec<(&'p str, bool)> {
+    project
+        .files
+        .iter()
+        .map(|file| (file.relative.as_str(), project.is_project_file(file.id)))
+        .collect()
+}
+
 fn loaded_files_of(tsconfig: &std::path::Path) -> Vec<(String, bool)> {
     let allocator = oxc_allocator::Allocator::default();
     let project = olint::project::Project::load(&allocator, tsconfig).expect("project loads");
 
-    project
-        .files
-        .iter()
-        .map(|file| (file.relative.clone(), project.is_project_file(file.id)))
+    project_flags_of(&project)
+        .into_iter()
+        .map(|(relative, flag)| (relative.to_string(), flag))
         .collect()
 }
 
@@ -485,11 +495,7 @@ fn load_marks_typescript_under_node_modules_external() {
 
     run_in_project(&files, |project, root| {
         let index = file_of(project, root, "src/index.ts");
-        let loaded: Vec<(&str, bool)> = project
-            .files
-            .iter()
-            .map(|file| (file.relative.as_str(), project.is_project_file(file.id)))
-            .collect();
+        let loaded = project_flags_of(project);
 
         assert_eq!(
             loaded,
@@ -641,4 +647,43 @@ fn select_files_keeps_files_under_a_symlinked_directory() {
     } else {
         assert_eq!(relatives, vec!["src/x.ts"]);
     }
+}
+
+#[test]
+fn load_walks_a_declaration_file_with_its_importer_flag() {
+    let files = [
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "include": ["src"] }"#,
+        ),
+        (
+            "src/index.ts",
+            "import type { Shape } from \"./shapes\";
+export function area(s: Shape) { return s.w; }",
+        ),
+        (
+            "src/shapes.d.ts",
+            "export { helper } from \"../extra/helper\";
+export interface Shape { w: number }",
+        ),
+        (
+            "extra/helper.ts",
+            "export function helper(xs: number[]) { return xs.map((x) => x); }",
+        ),
+        ("src/ambient.d.ts", "type AmbientList = string[];"),
+    ];
+
+    run_in_project(&files, |project, _| {
+        let loaded = project_flags_of(project);
+
+        assert_eq!(
+            loaded,
+            vec![
+                ("src/ambient.d.ts", false),
+                ("extra/helper.ts", true),
+                ("src/shapes.d.ts", false),
+                ("src/index.ts", true)
+            ]
+        );
+    });
 }

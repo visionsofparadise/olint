@@ -42,6 +42,24 @@ impl<'a> Declarations<'a> {
             return self.inherited_member_of(project, target, class, &name, Placement::Instance);
         }
 
+        let cast = match object {
+            Expression::TSAsExpression(cast) => Some(&cast.type_annotation),
+            Expression::TSTypeAssertion(cast) => Some(&cast.type_annotation),
+            _ => None,
+        };
+
+        if let Some(cast) = cast {
+            let (class_file, class) = self.class_of_type(project, file, cast)?;
+
+            return self.inherited_member_of(
+                project,
+                class_file,
+                class,
+                &name,
+                Placement::Instance,
+            );
+        }
+
         let Expression::Identifier(reference) = object else {
             return None;
         };
