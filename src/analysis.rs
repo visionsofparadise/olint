@@ -5,7 +5,9 @@ use oxc_semantic::NodeId;
 
 use crate::annotations::PerfTag;
 use crate::declarations::Declarations;
+use crate::oracle::{OracleAnswer, Query};
 use crate::project::{FileId, Project};
+use crate::types::{OraclePass, QueryKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum TypeMode {
@@ -48,6 +50,10 @@ pub struct Analysis<'p, 'a> {
     pub options: Options,
     pub stats: Stats,
     pub(crate) tag_cache: HashMap<(FileId, NodeId), Vec<PerfTag>>,
+    pub pass: OraclePass,
+    pub needed: IndexMap<(FileId, u32, u32, QueryKind), Query>,
+    pub answers: HashMap<(FileId, u32, u32, QueryKind), Option<OracleAnswer>>,
+    pub oracle_info: String,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -58,6 +64,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             options,
             stats: Stats::default(),
             tag_cache: HashMap::new(),
+            pass: OraclePass::Off,
+            needed: IndexMap::new(),
+            answers: HashMap::new(),
+            oracle_info: String::new(),
         }
     }
 }

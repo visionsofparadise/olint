@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use oxc_ast::ast::{
     ArrowFunctionExpression, Class, ClassElement, ExportDefaultDeclarationKind, Expression,
     FormalParameter, FormalParameterRest, Function, IdentifierReference, MemberExpression,
-    MethodDefinitionKind, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
+    MethodDefinitionKind, ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
     TSInterfaceDeclaration, TSTypeAliasDeclaration, TSTypeName, TSTypeParameter,
     VariableDeclarationKind, VariableDeclarator,
 };
@@ -80,6 +80,10 @@ pub enum Declaration<'a> {
     },
     Namespace {
         file: FileId,
+    },
+    Property {
+        file: FileId,
+        property: &'a ObjectProperty<'a>,
     },
     External,
 }
@@ -325,6 +329,9 @@ impl<'a> Declarations<'a> {
                 }
                 _ => None,
             },
+            Declaration::Property { file, property } => {
+                function_of_initializer(Some(&property.value)).map(|function| (file, function))
+            }
             Declaration::Class { file, class } => {
                 class.body.body.iter().find_map(|element| match element {
                     ClassElement::MethodDefinition(method)
@@ -622,7 +629,7 @@ fn declaration_nodes_of(project: &Project<'_>, file: FileId, symbol: SymbolId) -
     declarations
 }
 
-fn declaration_of_node<'a>(
+pub(crate) fn declaration_of_node<'a>(
     project: &Project<'a>,
     file: FileId,
     node: NodeId,
@@ -630,6 +637,31 @@ fn declaration_of_node<'a>(
     let nodes = project.file(file).semantic.nodes();
 
     match nodes.kind(node) {
+        AstKind::ObjectProperty(property) => Some(Declaration::Property { file, property }),
+        AstKind::MethodDefinition(method) => {
+            let class = class_of_element_node(project, file, node)?;
+            let element = class.body.body.iter().find(|element| {
+                matches!(element, ClassElement::MethodDefinition(candidate) if std::ptr::eq(&**candidate, method))
+            })?;
+
+            Some(Declaration::Member {
+                file,
+                class,
+                element,
+            })
+        }
+        AstKind::PropertyDefinition(property) => {
+            let class = class_of_element_node(project, file, node)?;
+            let element = class.body.body.iter().find(|element| {
+                matches!(element, ClassElement::PropertyDefinition(candidate) if std::ptr::eq(&**candidate, property))
+            })?;
+
+            Some(Declaration::Member {
+                file,
+                class,
+                element,
+            })
+        }
         AstKind::Function(function) => Some(Declaration::Function {
             file,
             function: FunctionNode::Function(function),
@@ -672,6 +704,21 @@ fn declaration_of_node<'a>(
         | AstKind::TSImportEqualsDeclaration(_) => Some(Declaration::External),
         _ => None,
     }
+}
+
+fn class_of_element_node<'a>(
+    project: &Project<'a>,
+    file: FileId,
+    element: NodeId,
+) -> Option<&'a Class<'a>> {
+    let nodes = project.file(file).semantic.nodes();
+
+    nodes
+        .ancestors(element)
+        .find_map(|ancestor| match ancestor.kind() {
+            AstKind::Class(class) => Some(class),
+            _ => None,
+        })
 }
 
 fn function_of_parameter<'a>(
@@ -756,7 +803,7 @@ fn imported_name_of<'b>(
     imported
 }
 
-fn element_name_of(element: &ClassElement<'_>) -> Option<String> {
+pub(crate) fn element_name_of(element: &ClassElement<'_>) -> Option<String> {
     let key = match element {
         ClassElement::MethodDefinition(method) => &method.key,
         ClassElement::PropertyDefinition(property) => &property.key,

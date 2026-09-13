@@ -3,9 +3,12 @@
 use std::fs;
 use std::path::Path;
 
+use olint::analysis::{Analysis, Options, TypeMode};
 use olint::project::{FileId, Project};
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{CallExpression, Expression, MemberExpression};
 use oxc_ast::AstKind;
+use oxc_span::GetSpan;
 use tempfile::TempDir;
 
 pub const TYPED_PACKAGE: [(&str, &str); 2] = [
@@ -45,6 +48,71 @@ pub fn file_of(project: &Project<'_>, root: &Path, relative: &str) -> FileId {
     project
         .file_by_path(&root.join(relative))
         .unwrap_or_else(|| panic!("{relative} is loaded"))
+}
+
+pub const SYNTACTIC: Options = Options {
+    strings_linear: true,
+    callbacks: true,
+    minimum_exponent: 2,
+    types: TypeMode::Syntactic,
+};
+
+pub fn probes_of<'a>(project: &Project<'a>, file: FileId) -> Vec<&'a Expression<'a>> {
+    project
+        .file(file)
+        .semantic
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            AstKind::CallExpression(call)
+                if matches!(&call.callee, Expression::Identifier(callee) if callee.name == "probe") =>
+            {
+                call.arguments.first().and_then(|argument| argument.as_expression())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn probe_results_of<T>(
+    files: &[(&str, &str)],
+    evaluate: impl for<'p, 'a> Fn(&mut Analysis<'p, 'a>, FileId, &'a Expression<'a>) -> T,
+) -> Vec<T> {
+    let mut found = Vec::new();
+
+    run_in_project(files, |project, root| {
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+        let file = file_of(project, root, "index.ts");
+
+        found = probes_of(project, file)
+            .into_iter()
+            .map(|probe| evaluate(&mut analysis, file, probe))
+            .collect();
+    });
+
+    found
+}
+
+pub fn call_of<'a>(project: &Project<'a>, file: FileId, callee: &str) -> &'a CallExpression<'a> {
+    let text = project.file(file).text;
+
+    first_node_of(project, file, |kind| match kind {
+        AstKind::CallExpression(call) if call.callee.span().source_text(text) == callee => {
+            Some(call)
+        }
+        _ => None,
+    })
+}
+
+pub fn member_callee_of<'a>(
+    project: &Project<'a>,
+    file: FileId,
+    callee: &str,
+) -> &'a MemberExpression<'a> {
+    call_of(project, file, callee)
+        .callee
+        .as_member_expression()
+        .unwrap_or_else(|| panic!("{callee} is a member callee"))
 }
 
 pub fn first_node_of<'a, T>(

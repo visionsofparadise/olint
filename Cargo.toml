@@ -31,4 +31,4 @@ indexmap = "=2.14.2"
 tempfile = "=3.27.0"
 
 [package.metadata.cargo-machete]
-ignored = ["oxc_ast_visit", "serde", "serde_json"]
+ignored = []
