@@ -3,9 +3,9 @@ use std::path::Path;
 use olint::analysis::Analysis;
 use olint::declarations::Declaration;
 use olint::declared_types::Kind;
-use olint::oracle::{ask, CalleeAnswer, OracleAnswer, OracleError, OracleReply, Query, TypeAnswer};
 use olint::project::Project;
-use olint::types::OraclePass;
+use olint::tsc::{ask, CalleeAnswer, Query, TscAnswer, TscError, TscReply, TypeAnswer};
+use olint::types::TscPass;
 use oxc_allocator::Allocator;
 
 mod support;
@@ -34,14 +34,14 @@ fn type_query_of(file: &str, needle: &str) -> Query {
     }
 }
 
-fn reply_of(tsconfig: &Path, queries: &[Query]) -> OracleReply {
+fn reply_of(tsconfig: &Path, queries: &[Query]) -> TscReply {
     match ask(Path::new(env!("CARGO_MANIFEST_DIR")), tsconfig, queries) {
         Ok(reply) => reply,
-        Err(OracleError::NodeUnavailable(error)) => panic!("node is unavailable: {error}"),
-        Err(OracleError::TypescriptUnavailable(message)) => {
+        Err(TscError::NodeUnavailable(error)) => panic!("node is unavailable: {error}"),
+        Err(TscError::TypescriptUnavailable(message)) => {
             panic!("typescript is unavailable: {message}")
         }
-        Err(error) => panic!("the oracle failed: {error:?}"),
+        Err(error) => panic!("tsc failed: {error:?}"),
     }
 }
 
@@ -97,14 +97,14 @@ fn byte_order_marks_keep_answers_on_their_utf8_spans() {
 
     assert!(matches!(
         reply.answers[0],
-        Some(OracleAnswer::Type(TypeAnswer {
+        Some(TscAnswer::Type(TypeAnswer {
             kind: Kind::Array,
             ..
         }))
     ));
     assert!(matches!(
         &reply.answers[1],
-        Some(OracleAnswer::Callee(CalleeAnswer { file, start, end }))
+        Some(TscAnswer::Callee(CalleeAnswer { file, start, end }))
             if file.ends_with("src/lib.ts") && (*start, *end) == (method_start, method_end)
     ));
 
@@ -114,12 +114,12 @@ fn byte_order_marks_keep_answers_on_their_utf8_spans() {
     let parse = call_of(&project, file, "JSON.parse");
     let mut analysis = Analysis::new(&project, SYNTACTIC);
 
-    analysis.set_pass(OraclePass::Recording);
+    analysis.set_pass(TscPass::Recording);
     analysis.callee_declaration_of(file, parse);
     analysis
         .take_answers(reply_of(&project.tsconfig_path, &analysis.needed_queries()))
         .expect("the reply answers every query");
-    analysis.set_pass(OraclePass::Answering);
+    analysis.set_pass(TscPass::Answering);
 
     assert!(matches!(
         analysis.callee_declaration_of(file, parse),
@@ -156,7 +156,7 @@ fn the_sidecar_answers_types_and_callees_in_utf8_offsets() {
     assert_eq!(reply.answers.len(), 4);
     assert_eq!(
         reply.answers[0],
-        Some(OracleAnswer::Type(TypeAnswer {
+        Some(TscAnswer::Type(TypeAnswer {
             kind: Kind::Array,
             tuple: false,
             closed: false,
@@ -164,14 +164,14 @@ fn the_sidecar_answers_types_and_callees_in_utf8_offsets() {
     );
     assert!(matches!(
         reply.answers[1],
-        Some(OracleAnswer::Type(TypeAnswer { tuple: true, .. }))
+        Some(TscAnswer::Type(TypeAnswer { tuple: true, .. }))
     ));
     assert!(matches!(
         reply.answers[2],
-        Some(OracleAnswer::Type(TypeAnswer { closed: true, .. }))
+        Some(TscAnswer::Type(TypeAnswer { closed: true, .. }))
     ));
 
-    let Some(OracleAnswer::Callee(CalleeAnswer { file, start, end })) = &reply.answers[3] else {
+    let Some(TscAnswer::Callee(CalleeAnswer { file, start, end })) = &reply.answers[3] else {
         panic!(
             "the callee query answers a declaration: {:?}",
             reply.answers[3]

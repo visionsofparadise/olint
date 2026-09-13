@@ -6,10 +6,10 @@ use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::{read_config, ConfigError, LIMIT_FORMS};
-use olint::oracle::{ask, OracleError};
 use olint::project::{Project, ProjectError};
 use olint::public::public_functions;
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
+use olint::tsc::{ask, TscError};
 use oxc_allocator::Allocator;
 
 #[derive(Parser)]
@@ -33,7 +33,7 @@ struct Cli {
 enum Failure {
     Project(ProjectError),
     Config(ConfigError),
-    Oracle(OracleError),
+    Tsc(TscError),
     Usage(String),
 }
 
@@ -69,7 +69,7 @@ impl fmt::Display for Failure {
             Failure::Config(ConfigError::Ignore { pattern }) => {
                 format!("ignore pattern {pattern} is not a valid glob")
             }
-            Failure::Oracle(error) => format!("types oracle unavailable: {}", reason_of(error)),
+            Failure::Tsc(error) => format!("tsc unavailable: {}", reason_of(error)),
             Failure::Usage(message) => message.clone(),
         };
 
@@ -77,15 +77,15 @@ impl fmt::Display for Failure {
     }
 }
 
-fn reason_of(error: &OracleError) -> String {
+fn reason_of(error: &TscError) -> String {
     match error {
-        OracleError::NodeUnavailable(source) => format!("node did not start: {source}"),
-        OracleError::TypescriptUnavailable(stderr) => single_line_of(stderr),
-        OracleError::Failed { status, stderr } => match status {
-            Some(status) => format!("the oracle exited {status}: {}", single_line_of(stderr)),
-            None => format!("the oracle failed: {}", single_line_of(stderr)),
+        TscError::NodeUnavailable(source) => format!("node did not start: {source}"),
+        TscError::TypescriptUnavailable(stderr) => single_line_of(stderr),
+        TscError::Failed { status, stderr } => match status {
+            Some(status) => format!("tsc exited {status}: {}", single_line_of(stderr)),
+            None => format!("tsc failed: {}", single_line_of(stderr)),
         },
-        OracleError::Malformed(message) => format!("the oracle replied malformed: {message}"),
+        TscError::Malformed(message) => format!("tsc replied malformed: {message}"),
     }
 }
 
@@ -125,12 +125,12 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
         match gathered {
             Ok(rounds) => eprintln!(
-                "oracle: {} sites asked in {} rounds, {}",
-                rounds.sites, rounds.rounds, analysis.oracle_info
+                "tsc: {} sites asked in {} rounds, {}",
+                rounds.sites, rounds.rounds, analysis.tsc_info
             ),
-            Err(
-                error @ (OracleError::NodeUnavailable(_) | OracleError::TypescriptUnavailable(_)),
-            ) if analysis.options.types == TypeMode::Auto => {
+            Err(error @ (TscError::NodeUnavailable(_) | TscError::TypescriptUnavailable(_)))
+                if analysis.options.types == TypeMode::Auto =>
+            {
                 eprintln!(
                     "olint: types from declarations only ({})",
                     reason_of(&error)
@@ -138,7 +138,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
                 analysis.fall_back_to_declarations();
             }
-            Err(error) => return Err(Failure::Oracle(error)),
+            Err(error) => return Err(Failure::Tsc(error)),
         }
     }
 

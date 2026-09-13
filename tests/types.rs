@@ -1,9 +1,9 @@
 use olint::analysis::Analysis;
 use olint::declarations::{Declaration, FunctionNode};
 use olint::declared_types::Kind;
-use olint::oracle::{CalleeAnswer, OracleAnswer, OracleError, OracleReply, Query, TypeAnswer};
 use olint::project::{FileId, Project};
-use olint::types::OraclePass;
+use olint::tsc::{CalleeAnswer, Query, TscAnswer, TscError, TscReply, TypeAnswer};
+use olint::types::TscPass;
 use oxc_ast::ast::Expression;
 
 mod support;
@@ -16,8 +16,8 @@ fn receiver_of<'a>(project: &Project<'a>, file: FileId, callee: &str) -> &'a Exp
     member_callee_of(project, file, callee).object()
 }
 
-fn reply_of(answers: Vec<Option<OracleAnswer>>) -> OracleReply {
-    OracleReply {
+fn reply_of(answers: Vec<Option<TscAnswer>>) -> TscReply {
+    TscReply {
         typescript: "5.9.3".to_string(),
         from: "typescript.js".to_string(),
         answers,
@@ -43,7 +43,7 @@ fn recording_asks_only_for_sites_syntax_leaves_open() {
     run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
 
-        analysis.set_pass(OraclePass::Recording);
+        analysis.set_pass(TscPass::Recording);
 
         assert_eq!(
             analysis.kind_of(file, receiver_of(project, file, "loose.map"), "map"),
@@ -76,24 +76,24 @@ fn answering_takes_recorded_answers_and_counts_misses() {
         let loose = receiver_of(project, file, "loose.map");
         let other = receiver_of(project, file, "other.map");
 
-        analysis.set_pass(OraclePass::Recording);
+        analysis.set_pass(TscPass::Recording);
         analysis.kind_of(file, loose, "map");
         analysis
-            .take_answers(reply_of(vec![Some(OracleAnswer::Type(TypeAnswer {
+            .take_answers(reply_of(vec![Some(TscAnswer::Type(TypeAnswer {
                 kind: Kind::Array,
                 tuple: false,
                 closed: false,
             }))]))
             .expect("the reply answers every query");
-        analysis.set_pass(OraclePass::Answering);
+        analysis.set_pass(TscPass::Answering);
 
         assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Array);
         assert_eq!(analysis.kind_of(file, other, "map"), Kind::Unknown);
         assert!(analysis
             .stats
             .lines()
-            .contains(&format!("{:>5}  oracle: miss", 1)));
-        assert_eq!(analysis.oracle_info, "typescript 5.9.3 at typescript.js");
+            .contains(&format!("{:>5}  tsc: miss", 1)));
+        assert_eq!(analysis.tsc_info, "typescript 5.9.3 at typescript.js");
     });
 }
 
@@ -105,24 +105,24 @@ fn callee_answers_map_to_the_declaration_they_span() {
         let (function_start, function_end) = byte_span_of("export function run() {}");
         let (method_start, method_end) = byte_span_of("go() {}");
 
-        analysis.set_pass(OraclePass::Recording);
+        analysis.set_pass(TscPass::Recording);
         analysis.callee_declaration_of(file, call_of(project, file, "make().run"));
         analysis.callee_declaration_of(file, call_of(project, file, "make().go"));
         analysis
             .take_answers(reply_of(vec![
-                Some(OracleAnswer::Callee(CalleeAnswer {
+                Some(TscAnswer::Callee(CalleeAnswer {
                     file: path.clone(),
                     start: function_start,
                     end: function_end,
                 })),
-                Some(OracleAnswer::Callee(CalleeAnswer {
+                Some(TscAnswer::Callee(CalleeAnswer {
                     file: path,
                     start: method_start,
                     end: method_end,
                 })),
             ]))
             .expect("the reply answers every query");
-        analysis.set_pass(OraclePass::Answering);
+        analysis.set_pass(TscPass::Answering);
 
         let function = analysis.callee_declaration_of(file, call_of(project, file, "make().run"));
         let method = analysis.callee_declaration_of(file, call_of(project, file, "make().go"));
@@ -146,10 +146,10 @@ fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
         let mut analysis = Analysis::new(project, SYNTACTIC);
         let loose = receiver_of(project, file, "loose.map");
 
-        analysis.set_pass(OraclePass::Recording);
+        analysis.set_pass(TscPass::Recording);
         analysis.kind_of(file, loose, "map");
         analysis
-            .take_answers(reply_of(vec![Some(OracleAnswer::Type(TypeAnswer {
+            .take_answers(reply_of(vec![Some(TscAnswer::Type(TypeAnswer {
                 kind: Kind::Set,
                 tuple: false,
                 closed: false,
@@ -159,14 +159,14 @@ fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
         assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Unknown);
         assert!(analysis.needed_queries().is_empty());
 
-        analysis.set_pass(OraclePass::Answering);
+        analysis.set_pass(TscPass::Answering);
 
         assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Set);
         assert!(!analysis
             .stats
             .lines()
             .iter()
-            .any(|line| line.ends_with("oracle: miss")));
+            .any(|line| line.ends_with("tsc: miss")));
     });
 }
 
@@ -184,7 +184,7 @@ fn a_reply_missing_answers_ends_the_rounds_as_malformed() {
             Ok(reply_of(Vec::new()))
         });
 
-        assert!(matches!(gathered, Err(OracleError::Malformed(_))));
+        assert!(matches!(gathered, Err(TscError::Malformed(_))));
         assert_eq!(asked, 1);
     });
 }

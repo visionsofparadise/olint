@@ -7,15 +7,15 @@ use crate::annotations::PerfTag;
 use crate::budgets::BudgetContext;
 use crate::cost::{Part, Reading};
 use crate::declarations::{Binding, Declarations};
-use crate::oracle::{OracleAnswer, Query};
 use crate::project::{FileId, Project};
 use crate::summaries::{Substitutions, SummaryKey};
-use crate::types::{OraclePass, QueryKind};
+use crate::tsc::{Query, TscAnswer};
+use crate::types::{QueryKind, TscPass};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum TypeMode {
     Auto,
-    Oracle,
+    Tsc,
     Syntactic,
 }
 
@@ -53,10 +53,10 @@ pub struct Analysis<'p, 'a> {
     pub options: Options,
     pub stats: Stats,
     pub(crate) tag_cache: HashMap<(FileId, NodeId), Vec<PerfTag>>,
-    pub(crate) pass: OraclePass,
+    pub(crate) pass: TscPass,
     pub(crate) needed: IndexMap<(FileId, u32, u32, QueryKind), Query>,
-    pub(crate) answers: HashMap<(FileId, u32, u32, QueryKind), Option<OracleAnswer>>,
-    pub oracle_info: String,
+    pub(crate) answers: HashMap<(FileId, u32, u32, QueryKind), Option<TscAnswer>>,
+    pub tsc_info: String,
     pub(crate) summaries: HashMap<SummaryKey, Reading>,
     pub(crate) stack: Vec<SummaryKey>,
     pub(crate) minimum_hit: usize,
@@ -78,10 +78,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             options,
             stats: Stats::default(),
             tag_cache: HashMap::new(),
-            pass: OraclePass::Off,
+            pass: TscPass::Off,
             needed: IndexMap::new(),
             answers: HashMap::new(),
-            oracle_info: String::new(),
+            tsc_info: String::new(),
             summaries: HashMap::new(),
             stack: Vec::new(),
             minimum_hit: usize::MAX,

@@ -9,10 +9,10 @@ use crate::analysis::{Analysis, Stats};
 use crate::annotations::{cost_tag_of, skip_tag_of, PerfTag};
 use crate::cost::{Cost, Factor, Part, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
-use crate::oracle::{OracleError, OracleReply, Query};
 use crate::project::{FileId, Site};
 use crate::syntax::{is_identifier_pattern, unwrap};
-use crate::types::OraclePass;
+use crate::tsc::{Query, TscError, TscReply};
+use crate::types::TscPass;
 use crate::walker::tagged_reading_of;
 
 pub type Substitutions = HashMap<Binding, Part>;
@@ -24,7 +24,7 @@ pub struct SummaryKey {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OracleRounds {
+pub struct TscRounds {
     pub sites: usize,
     pub rounds: usize,
 }
@@ -564,11 +564,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
     pub fn gather_answers(
         &mut self,
         functions: &[(FileId, FunctionNode<'a>)],
-        mut ask: impl FnMut(&[Query]) -> Result<OracleReply, OracleError>,
-    ) -> Result<OracleRounds, OracleError> {
-        let mut rounds = OracleRounds::default();
+        mut ask: impl FnMut(&[Query]) -> Result<TscReply, TscError>,
+    ) -> Result<TscRounds, TscError> {
+        let mut rounds = TscRounds::default();
 
-        self.set_pass(OraclePass::Recording);
+        self.set_pass(TscPass::Recording);
 
         loop {
             self.summarize_reportable(functions);
@@ -602,7 +602,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        self.set_pass(OraclePass::Answering);
+        self.set_pass(TscPass::Answering);
 
         Ok(rounds)
     }

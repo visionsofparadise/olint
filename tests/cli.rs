@@ -63,19 +63,19 @@ fn fixtures_print_the_reference_output() {
 
         differences.extend(differences_of(
             fixture,
-            &["--types=oracle"],
+            &["--types=tsc"],
             "expected-lint.txt",
             exit,
         ));
         differences.extend(differences_of(
             fixture,
-            &["--types=oracle", "--report"],
+            &["--types=tsc", "--report"],
             "expected-report.txt",
             Some(0),
         ));
         differences.extend(differences_of(
             fixture,
-            &["--types=oracle", "--report", "--min=0"],
+            &["--types=tsc", "--report", "--min=0"],
             "expected-report-min0.txt",
             Some(0),
         ));

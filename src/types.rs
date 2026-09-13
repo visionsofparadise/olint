@@ -7,13 +7,13 @@ use oxc_span::{GetSpan, Span};
 use crate::analysis::Analysis;
 use crate::declarations::{declaration_of_node, Declaration};
 use crate::declared_types::{DeclaredType, Kind};
-use crate::oracle::{CalleeAnswer, OracleAnswer, OracleError, OracleReply, Query, TypeAnswer};
 use crate::project::FileId;
 use crate::syntax::{member_expression_of, unwrap};
 use crate::tables::method_matters;
+use crate::tsc::{CalleeAnswer, Query, TscAnswer, TscError, TscReply, TypeAnswer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OraclePass {
+pub enum TscPass {
     Recording,
     Answering,
     Off,
@@ -171,14 +171,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         match self.answer_of_site(site_key_of(file, span, QueryKind::Callee), query) {
-            Lookup::Answered(Some(OracleAnswer::Callee(answer))) => {
+            Lookup::Answered(Some(TscAnswer::Callee(answer))) => {
                 self.declaration_of_callee_answer(&answer)
             }
             _ => None,
         }
     }
 
-    pub fn set_pass(&mut self, pass: OraclePass) {
+    pub fn set_pass(&mut self, pass: TscPass) {
         self.pass = pass;
     }
 
@@ -186,9 +186,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.needed.values().cloned().collect()
     }
 
-    pub fn take_answers(&mut self, reply: OracleReply) -> Result<(), OracleError> {
+    pub fn take_answers(&mut self, reply: TscReply) -> Result<(), TscError> {
         if reply.answers.len() != self.needed.len() {
-            return Err(OracleError::Malformed(format!(
+            return Err(TscError::Malformed(format!(
                 "{} answers for {} queries",
                 reply.answers.len(),
                 self.needed.len()
@@ -201,7 +201,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.answers.insert(key, answer);
         }
 
-        self.oracle_info = format!("typescript {} at {}", reply.typescript, reply.from);
+        self.tsc_info = format!("typescript {} at {}", reply.typescript, reply.from);
 
         self.needed.clear();
 
@@ -214,7 +214,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.answers.clear();
 
         self.replays_type_answers = false;
-        self.pass = OraclePass::Off;
+        self.pass = TscPass::Off;
     }
 
     fn type_answer_of(&mut self, file: FileId, span: Span) -> Option<TypeAnswer> {
@@ -225,20 +225,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         match self.answer_of_site(site_key_of(file, span, QueryKind::Type), query) {
-            Lookup::Answered(Some(OracleAnswer::Type(answer))) => Some(answer),
+            Lookup::Answered(Some(TscAnswer::Type(answer))) => Some(answer),
             _ => None,
         }
     }
 
-    fn answer_of_site(&mut self, key: SiteKey, query: Query) -> Lookup<OracleAnswer> {
-        if self.pass == OraclePass::Off {
+    fn answer_of_site(&mut self, key: SiteKey, query: Query) -> Lookup<TscAnswer> {
+        if self.pass == TscPass::Off {
             return Lookup::Unanswered;
         }
 
-        let replaying = self.pass == OraclePass::Recording && self.replays_type_answers;
+        let replaying = self.pass == TscPass::Recording && self.replays_type_answers;
 
         if let Some(answer) = self.answers.get(&key) {
-            if self.pass == OraclePass::Recording && key.3 == QueryKind::Type && !replaying {
+            if self.pass == TscPass::Recording && key.3 == QueryKind::Type && !replaying {
                 return Lookup::Unanswered;
             }
 
@@ -246,12 +246,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         match self.pass {
-            OraclePass::Recording if replaying && key.3 == QueryKind::Type => {}
-            OraclePass::Recording => {
+            TscPass::Recording if replaying && key.3 == QueryKind::Type => {}
+            TscPass::Recording => {
                 self.needed.entry(key).or_insert(query);
             }
-            OraclePass::Answering => self.stats.count("oracle: miss"),
-            OraclePass::Off => {}
+            TscPass::Answering => self.stats.count("tsc: miss"),
+            TscPass::Off => {}
         }
 
         Lookup::Unanswered

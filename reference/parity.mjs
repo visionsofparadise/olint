@@ -9,10 +9,11 @@ const maxBuffer = 256 * 1024 * 1024;
 const args = process.argv.slice(2);
 const tsconfig = args.find((a) => !a.startsWith("--"));
 const typesArg = args.find((a) => a.startsWith("--types="));
-const types = typesArg ? typesArg.slice("--types=".length) : "oracle";
+const types = typesArg ? typesArg.slice("--types=".length) : "tsc";
+const referenceTypes = types === "tsc" ? "oracle" : types;
 
 if (!tsconfig) {
-	console.error("olint: usage: parity.mjs <tsconfig> [--types=oracle|syntactic]");
+	console.error("olint: usage: parity.mjs <tsconfig> [--types=tsc|syntactic]");
 	process.exit(2);
 }
 
@@ -22,7 +23,7 @@ if (!fs.existsSync(olintBin)) {
 	process.exit(2);
 }
 
-const referenceResult = spawnSync("node", [path.join(repo, "reference", "perfLint.ts"), tsconfig, "--report", `--types=${types}`], {
+const referenceResult = spawnSync("node", [path.join(repo, "reference", "perfLint.ts"), tsconfig, "--report", `--types=${referenceTypes}`], {
 	encoding: "utf8",
 	maxBuffer,
 });
