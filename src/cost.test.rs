@@ -2,9 +2,9 @@ use super::*;
 use crate::project::{FileId, Site};
 
 fn part_of(cost: Cost, label: &str) -> Part {
-    Part {
+    Part::unmarked(
         cost,
-        chain: vec![Factor {
+        vec![Factor {
             label: label.to_string(),
             site: Site {
                 file: FileId(0),
@@ -13,7 +13,7 @@ fn part_of(cost: Cost, label: &str) -> Part {
             cost,
             inner: Vec::new(),
         }],
-    }
+    )
 }
 
 #[test]
@@ -52,6 +52,17 @@ fn part_max_keeps_the_first_on_ties() {
     let second = part_of(Cost::N, "second");
 
     assert_eq!(first.clone().max(second), first);
+}
+
+#[test]
+fn part_max_prefers_hot_then_unmarked_then_cold_over_absent() {
+    let hot = part_of(Cost::ONE, "hot").preferred(Preference::Hot);
+    let unmarked = part_of(Cost::N, "unmarked");
+    let cold = part_of(Cost { n: 2, log: 0 }, "cold").preferred(Preference::Cold);
+
+    assert_eq!(unmarked.clone().max(hot.clone()), hot);
+    assert_eq!(cold.clone().max(unmarked.clone()), unmarked);
+    assert_eq!(Part::none().max(cold.clone()), cold);
 }
 
 #[test]

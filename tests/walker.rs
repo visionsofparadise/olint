@@ -81,13 +81,57 @@ fn a_set_of_a_parameter_is_linear() {
 }
 
 #[test]
-fn a_hot_branch_drops_the_other_branch() {
+fn a_cold_statement_yields_to_an_unmarked_sibling() {
+    let (reading, labels) = reading_of(
+        "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n\tfor (const row of rows) row.at(0);\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::N);
+    assert_eq!(labels, vec!["for-of"]);
+}
+
+#[test]
+fn an_all_cold_block_cascades_its_cold_maximum() {
+    let (reading, labels) = reading_of(
+        "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) row.at(0);\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost { n: 2, log: 0 });
+    assert_eq!(labels, vec!["for-of", "for-of"]);
+}
+
+#[test]
+fn a_hot_constant_branch_beats_a_linear_branch() {
     let (reading, _) = reading_of(
         "export function f(flag: boolean, xs: number[]) {\n\tif (flag) {\n\t\t// @perf hot\n\t\tflag = false;\n\t} else {\n\t\txs.indexOf(1);\n\t}\n}",
         "f",
     );
 
     assert_eq!(reading.total().cost, Cost::ONE);
+}
+
+#[test]
+fn a_cold_else_branch_yields_to_the_other_branch() {
+    let (reading, labels) = reading_of(
+        "export function f(flag: boolean, rows: number[][]) {\n\tif (flag) {\n\t\trows.indexOf([]);\n\t} else {\n\t\t// @perf cold\n\t\tfor (const row of rows) row.indexOf(1);\n\t}\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::N);
+    assert_eq!(labels, vec!["rows.indexOf()"]);
+}
+
+#[test]
+fn an_ignored_statement_contributes_nothing() {
+    let (reading, labels) = reading_of(
+        "export function f(rows: number[][]) {\n\t// @perf ignore\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n\t// @perf cold\n\tfor (const row of rows) row.at(0);\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::N);
+    assert_eq!(labels, vec!["for-of"]);
 }
 
 #[test]

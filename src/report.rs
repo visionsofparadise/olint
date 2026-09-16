@@ -2,7 +2,7 @@ use crate::analysis::Analysis;
 use crate::config::Config;
 use crate::cost::{Cost, Factor, Part};
 use crate::declarations::FunctionNode;
-use crate::directives::{cost_tag_of, PerfTag};
+use crate::directives::cost_tag_of;
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
@@ -125,11 +125,7 @@ pub fn report_rows_of<'a>(
 
     for (file, function) in functions.iter().copied() {
         let tags = analysis.function_tags(file, function);
-        let mark = if tags.contains(&PerfTag::Cold) {
-            Some("cold".to_string())
-        } else {
-            cost_tag_of(&tags).map(|(_, text)| text)
-        };
+        let mark = cost_tag_of(&tags).map(|(_, text)| text);
         let part = match mark {
             Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
             None => analysis.summarize(file, function),

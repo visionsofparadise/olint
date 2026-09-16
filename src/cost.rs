@@ -98,10 +98,20 @@ pub struct Factor {
     pub inner: Vec<Factor>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Preference {
+    #[default]
+    Absent,
+    Cold,
+    Unmarked,
+    Hot,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Part {
     pub cost: Cost,
     pub chain: Vec<Factor>,
+    pub preference: Preference,
 }
 
 impl Part {
@@ -109,12 +119,35 @@ impl Part {
         Part::default()
     }
 
+    pub fn unmarked(cost: Cost, chain: Vec<Factor>) -> Part {
+        Part {
+            cost,
+            chain,
+            preference: Preference::Unmarked,
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self.preference {
+            Preference::Absent if self.cost.is_one() => 0,
+            Preference::Cold => 1,
+            Preference::Absent | Preference::Unmarked => 2,
+            Preference::Hot => 3,
+        }
+    }
+
     pub fn max(self, other: Part) -> Part {
-        if other.cost.exceeds(self.cost) {
+        let (mine, theirs) = (self.rank(), other.rank());
+
+        if theirs > mine || (theirs == mine && other.cost.exceeds(self.cost)) {
             other
         } else {
             self
         }
+    }
+
+    pub fn preferred(self, preference: Preference) -> Part {
+        Part { preference, ..self }
     }
 }
 
@@ -146,6 +179,33 @@ impl Reading {
         }
     }
 
+    pub fn preferred(self, preference: Preference) -> Reading {
+        let exit = |part: Part| {
+            if part.preference == Preference::Absent && part.cost.is_one() {
+                part
+            } else {
+                part.preferred(preference)
+            }
+        };
+
+        Reading {
+            main: self.main.preferred(preference),
+            function_exit: exit(self.function_exit),
+            loop_exit: exit(self.loop_exit),
+        }
+    }
+
+    pub fn sibling(self) -> Reading {
+        if self.main.preference != Preference::Absent {
+            return self;
+        }
+
+        Reading {
+            main: self.main.preferred(Preference::Unmarked),
+            ..self
+        }
+    }
+
     pub fn total(&self) -> Part {
         self.main
             .clone()
@@ -168,6 +228,7 @@ pub fn nest(label: String, site: Site, factor: Cost, inner: Part) -> Part {
     Part {
         cost: factor.multiply(inner.cost),
         chain,
+        preference: inner.preference.max(Preference::Unmarked),
     }
 }
 

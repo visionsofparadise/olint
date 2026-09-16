@@ -8,10 +8,10 @@ use oxc_span::GetSpan;
 
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
-use crate::cost::{nest, Cost, Factor, Part, Reading};
-use crate::declarations::{Declaration, FunctionNode, ParameterNode};
+use crate::cost::{nest, Cost, Factor, Part, Preference, Reading};
+use crate::declarations::{function_of_initializer, Declaration, FunctionNode, ParameterNode};
 use crate::declared_types::{DeclaredType, Kind};
-use crate::directives::{cost_tag_of, skip_tag_of, PerfTag};
+use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
@@ -175,13 +175,43 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let tags = self.perf_tags(file, kind).to_vec();
-        let iteration = is_iteration_kind(&kind);
 
-        if let Some(which) = skip_tag_of(&tags) {
-            self.stats.count(&format!("@perf {which}: statement"));
+        if tags.contains(&PerfTag::Ignore) {
+            self.stats.count("@perf ignore: statement");
 
             return Reading::empty();
         }
+
+        let preference = preference_of(&tags).filter(|_| !holds_function(&kind));
+        let Some(preference) = preference else {
+            return self.reading_of_node(file, kind, &tags);
+        };
+
+        self.stats.count(if preference == Preference::Hot {
+            "@perf hot: statement"
+        } else {
+            "@perf cold: statement"
+        });
+
+        let outer = std::mem::take(&mut self.pending_scoped);
+        let reading = self.reading_of_node(file, kind, &tags);
+        let inner = std::mem::replace(&mut self.pending_scoped, outer);
+
+        for (scope, part) in inner {
+            let pending = self
+                .pending_scoped
+                .remove(&scope)
+                .unwrap_or_default()
+                .max(part.preferred(preference));
+
+            self.pending_scoped.insert(scope, pending);
+        }
+
+        reading.preferred(preference)
+    }
+
+    fn reading_of_node(&mut self, file: FileId, kind: AstKind<'a>, tags: &[PerfTag]) -> Reading {
+        let iteration = is_iteration_kind(&kind);
 
         if tags.contains(&PerfTag::Bounded) && !iteration {
             self.stats.count("@perf bounded: statement");
@@ -189,7 +219,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Reading::empty();
         }
 
-        if let Some((cost, text)) = cost_tag_of(&tags) {
+        if let Some((cost, text)) = cost_tag_of(tags) {
             self.stats.count(if iteration {
                 "@perf O(...): loop"
             } else {
@@ -203,35 +233,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match kind {
             AstKind::IfStatement(statement) => {
+                let mut reading = self.cost_of_expression(file, &statement.test);
                 let mut branches = vec![&statement.consequent];
 
                 if let Some(alternate) = &statement.alternate {
                     branches.push(alternate);
                 }
 
-                let branches = self.hot_statements_of(file, branches, "branch");
-                let mut reading = self.cost_of_expression(file, &statement.test);
-
                 for branch in branches {
                     let part = self.branch_reading_of(file, branch, statement.node_id());
+                    let kind = self.kind_of_node(file, branch.node_id());
 
-                    reading = reading.merge(part);
+                    reading = reading.merge(self.sibling_of(file, kind, part));
                 }
 
                 reading
             }
             AstKind::SwitchStatement(statement) => {
                 let mut reading = self.cost_of_expression(file, &statement.discriminant);
-                let cases: Vec<AstKind<'a>> = statement
-                    .cases
-                    .iter()
-                    .map(|case| self.kind_of_node(file, case.node_id()))
-                    .collect();
 
-                for case in self.hot_kinds_of(file, cases, "case") {
+                for case in &statement.cases {
+                    let case = self.kind_of_node(file, case.node_id());
                     let part = self.cost_of_node(file, case);
 
-                    reading = reading.merge(part);
+                    reading = reading.merge(self.sibling_of(file, case, part));
                 }
 
                 reading
@@ -249,10 +274,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 let mut reading = Reading::empty();
 
-                for part in self.hot_kinds_of(file, parts, "try") {
+                for part in parts {
                     let cost = self.cost_of_node(file, part);
 
-                    reading = reading.merge(cost);
+                    reading = reading.merge(self.sibling_of(file, part, cost));
                 }
 
                 reading
@@ -289,52 +314,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn hot_kinds_of(
-        &mut self,
-        file: FileId,
-        kinds: Vec<AstKind<'a>>,
-        what: &str,
-    ) -> Vec<AstKind<'a>> {
-        let hot: Vec<AstKind<'a>> = kinds
-            .iter()
-            .copied()
-            .filter(|kind| self.is_hot_path(file, *kind))
-            .collect();
-
-        if hot.is_empty() {
-            return kinds;
-        }
-
-        self.stats.count(&format!("@perf hot: {what}"));
-
-        hot
-    }
-
-    fn hot_statements_of(
-        &mut self,
-        file: FileId,
-        statements: Vec<&'a Statement<'a>>,
-        what: &str,
-    ) -> Vec<&'a Statement<'a>> {
-        let hot: Vec<&'a Statement<'a>> = statements
-            .iter()
-            .copied()
-            .filter(|statement| {
-                let kind = self.kind_of_node(file, statement.node_id());
-
-                self.is_hot_path(file, kind)
-            })
-            .collect();
-
-        if hot.is_empty() {
-            return statements;
-        }
-
-        self.stats.count(&format!("@perf hot: {what}"));
-
-        hot
-    }
-
     fn cost_of_statements(
         &mut self,
         file: FileId,
@@ -345,29 +324,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Some(test) => self.cost_of_expression(file, test),
             None => Reading::empty(),
         };
-        let hot: Vec<&'a Statement<'a>> = statements
-            .iter()
-            .filter(|statement| {
-                let kind = self.kind_of_node(file, statement.node_id());
 
-                self.perf_tags(file, kind).contains(&PerfTag::Hot)
-            })
-            .collect();
-        let chosen: Vec<&'a Statement<'a>> = if hot.is_empty() {
-            statements.iter().collect()
-        } else {
-            self.stats.count("@perf hot: block");
+        for statement in statements {
+            let kind = self.kind_of_node(file, statement.node_id());
+            let cost = self.cost_of_node(file, kind);
 
-            hot
-        };
-
-        for statement in chosen {
-            let cost = self.cost_of_statement(file, statement);
-
-            reading = reading.merge(cost);
+            reading = reading.merge(self.sibling_of(file, kind, cost));
         }
 
         reading
+    }
+
+    fn sibling_of(&mut self, file: FileId, kind: AstKind<'a>, reading: Reading) -> Reading {
+        if is_opaque_kind(&kind) || self.perf_tags(file, kind).contains(&PerfTag::Ignore) {
+            return reading;
+        }
+
+        reading.sibling()
+    }
+
+    fn function_preference_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+    ) -> Option<Preference> {
+        let tags = self.function_tags(file, function);
+
+        if tags.contains(&PerfTag::Ignore) {
+            return None;
+        }
+
+        preference_of(&tags)
     }
 
     fn branch_reading_of(
@@ -398,6 +385,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let lifted = Part {
                     cost: reading.main.cost,
                     chain,
+                    preference: reading.main.preference,
                 };
 
                 if exit == crate::bounds::Exit::Break {
@@ -695,24 +683,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some((target, function)) = function {
             let callee = self.call_user(target, function, file, &new.arguments);
+            let preference = self.function_preference_of(target, function);
 
-            if callee.cost.is_one() {
-                return reading;
+            if !callee.cost.is_one() {
+                let name = self.name_of(target, function);
+                let name = name.strip_suffix(".constructor").unwrap_or(&name);
+                let site = self.site_of_node(file, new.node_id());
+
+                reading = reading.merge(Reading::of_part(Part::unmarked(
+                    callee.cost,
+                    vec![Factor {
+                        label: format!("new {name}()"),
+                        site,
+                        cost: callee.cost,
+                        inner: callee.chain,
+                    }],
+                )));
             }
 
-            let name = self.name_of(target, function);
-            let name = name.strip_suffix(".constructor").unwrap_or(&name);
-            let site = self.site_of_node(file, new.node_id());
-
-            return reading.merge(Reading::of_part(Part {
-                cost: callee.cost,
-                chain: vec![Factor {
-                    label: format!("new {name}()"),
-                    site,
-                    cost: callee.cost,
-                    inner: callee.chain,
-                }],
-            }));
+            return preferred_reading_of(reading, preference);
         }
 
         let constructor = match &new.callee {
@@ -807,15 +796,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 if let Some(part) = substituted {
                     if !part.cost.is_one() {
-                        return reading.merge(Reading::of_part(Part {
-                            cost: part.cost,
-                            chain: vec![Factor {
+                        return reading.merge(Reading::of_part(Part::unmarked(
+                            part.cost,
+                            vec![Factor {
                                 label: format!("call {}() [callback parameter]", reference.name),
                                 site,
                                 cost: part.cost,
                                 inner: part.chain,
                             }],
-                        }));
+                        )));
                     }
                 }
 
@@ -828,9 +817,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some((target, function)) = function {
             let called = self.call_user(target, function, file, &call.arguments);
+            let preference = self.function_preference_of(target, function);
 
             if called.cost.is_one() {
-                return reading;
+                return preferred_reading_of(reading, preference);
             }
 
             let recursive =
@@ -850,10 +840,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }]
             };
 
-            return reading.merge(Reading::of_part(Part {
-                cost: called.cost,
-                chain,
-            }));
+            return preferred_reading_of(
+                reading.merge(Reading::of_part(Part::unmarked(called.cost, chain))),
+                preference,
+            );
         }
 
         if let Some(member) = member {
@@ -1028,10 +1018,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 }
 
+fn holds_function(kind: &AstKind<'_>) -> bool {
+    match kind {
+        AstKind::VariableDeclaration(declaration) => {
+            declaration.declarations.len() == 1
+                && function_of_initializer(declaration.declarations[0].init.as_ref()).is_some()
+        }
+        AstKind::ObjectProperty(property) => {
+            function_of_initializer(Some(&property.value)).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn preferred_reading_of(reading: Reading, preference: Option<Preference>) -> Reading {
+    match preference {
+        Some(preference) => reading.preferred(preference),
+        None => reading,
+    }
+}
+
 fn tagged_part_of(cost: Cost, text: &str, site: Site) -> Part {
-    Part {
+    Part::unmarked(
         cost,
-        chain: if cost.is_one() {
+        if cost.is_one() {
             Vec::new()
         } else {
             vec![Factor {
@@ -1041,7 +1051,7 @@ fn tagged_part_of(cost: Cost, text: &str, site: Site) -> Part {
                 inner: Vec::new(),
             }]
         },
-    }
+    )
 }
 
 pub(crate) fn tagged_reading_of(cost: Cost, text: &str, site: Site) -> Reading {

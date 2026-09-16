@@ -82,7 +82,7 @@ fn perf_tags_belong_to_the_outermost_node_at_a_position() {
         assert_eq!(analysis.perf_tags(file, loop_statement), [PerfTag::Bounded]);
         assert_eq!(analysis.perf_tags(file, statement), [PerfTag::Hot]);
         assert!(analysis.perf_tags(file, call).is_empty());
-        assert!(analysis.is_hot_path(file, body));
+        assert!(analysis.perf_tags(file, body).is_empty());
     });
 }
 

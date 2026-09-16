@@ -1,10 +1,9 @@
-use oxc_ast::ast::Statement;
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
 
 use crate::analysis::Analysis;
-use crate::cost::Cost;
+use crate::cost::{Cost, Preference};
 use crate::declarations::FunctionNode;
 use crate::project::{FileId, Project};
 use crate::syntax::collapsed_text_of;
@@ -48,11 +47,11 @@ pub fn tags_in_comment(text: &str) -> Vec<PerfTag> {
     tags
 }
 
-pub fn skip_tag_of(tags: &[PerfTag]) -> Option<&'static str> {
-    if tags.contains(&PerfTag::Ignore) {
-        Some("ignore")
+pub fn preference_of(tags: &[PerfTag]) -> Option<Preference> {
+    if tags.contains(&PerfTag::Hot) {
+        Some(Preference::Hot)
     } else if tags.contains(&PerfTag::Cold) {
-        Some("cold")
+        Some(Preference::Cold)
     } else {
         None
     }
@@ -142,26 +141,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         leading_tags_of(project, file, start)
-    }
-
-    pub fn is_hot_path(&mut self, file: FileId, kind: AstKind<'a>) -> bool {
-        if self.perf_tags(file, kind).contains(&PerfTag::Hot) {
-            return true;
-        }
-
-        let statements: &'a [Statement<'a>] = match kind {
-            AstKind::BlockStatement(block) => &block.body,
-            AstKind::SwitchCase(case) => &case.consequent,
-            AstKind::CatchClause(clause) => &clause.body.body,
-            _ => return false,
-        };
-        let nodes = self.project.file(file).semantic.nodes();
-
-        statements.iter().any(|statement| {
-            let kind = nodes.kind(statement.node_id());
-
-            self.perf_tags(file, kind).contains(&PerfTag::Hot)
-        })
     }
 }
 

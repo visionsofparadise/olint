@@ -1,10 +1,17 @@
 # tsconfig.json  (27 functions in 3 files)
 
-O(N)               11
-O(N^3)              8
+O(N)                9
+O(N^3)              9
 O(N^2)              6
+O(N^4)              2
 O(1)                1
-O(N^4)              1
+
+O(N^4)         callsIgnoredAndCold  src/tags.ts:83
+    in loop for-of                                           src/tags.ts:85  x N
+        calls coldFn()                                     src/tags.ts:85  = O(N^3)
+        in loop for-of                                       src/tags.ts:79  x N
+            in loop for-of                                   src/tags.ts:79  x N
+                in loop for-of                               src/tags.ts:79  x N
 
 O(N^4)         hidden  src/internal/hidden.ts:1
     in loop for-of                                           src/internal/hidden.ts:3  x N
@@ -12,10 +19,16 @@ O(N^4)         hidden  src/internal/hidden.ts:1
             in loop for-of                                   src/internal/hidden.ts:3  x N
                 in loop for-of                               src/internal/hidden.ts:3  x N
 
-O(N^3)         coldFn [@perf cold]  src/tags.ts:77
+O(N^3)         coldFn  src/tags.ts:77
     in loop for-of                                           src/tags.ts:79  x N
         in loop for-of                                       src/tags.ts:79  x N
             in loop for-of                                   src/tags.ts:79  x N
+
+O(N^3)         Svc.run  src/tags.ts:97
+    in loop for-of                                           src/tags.ts:99  x N
+        calls Svc.rebuild()                                src/tags.ts:99  = O(N^2)
+        in loop for-of                                       src/tags.ts:93  x N
+            in loop for-of                                   src/tags.ts:93  x N
 
 O(N^3)         costFn [@perf O(N)]  src/tags.ts:129
     in loop for-of                                           src/tags.ts:131  x N
@@ -61,7 +74,7 @@ O(N^2)         plainNested  src/tags.ts:1
     in loop for-of                                           src/tags.ts:3  x N
         in loop for-of                                       src/tags.ts:3  x N
 
-O(N^2)         Svc.rebuild [@perf cold]  src/tags.ts:91
+O(N^2)         Svc.rebuild  src/tags.ts:91
     in loop for-of                                           src/tags.ts:93  x N
         in loop for-of                                       src/tags.ts:93  x N
 

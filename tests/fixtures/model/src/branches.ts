@@ -142,3 +142,72 @@ export function switchDiscriminantCost(xs: number[], target: number): string {
 			return "found";
 	}
 }
+
+export function coldBlockAllCold(xs: number[][]): void {
+	// @perf cold
+	for (const row of xs) for (const v of row) row.push(v);
+	// @perf cold
+	for (const row of xs) row.pop();
+}
+
+export function coldElseBranch(xs: number[][], fast: boolean): number {
+	let sum = 0;
+	if (fast) {
+		for (const row of xs) sum += row.length;
+	} else {
+		// @perf cold
+		for (const row of xs) for (const v of row) for (const w of row) sum += v * w;
+	}
+	return sum;
+}
+
+export function hotConstantBranch(xs: number[][], fast: boolean): number {
+	let sum = 0;
+	if (fast) {
+		// @perf hot
+		sum += xs.length;
+	} else {
+		for (const row of xs) sum += row.length;
+	}
+	return sum;
+}
+
+export function coldOnlyLoopBody(xs: number[][]): number {
+	let sum = 0;
+	for (const row of xs) {
+		// @perf cold
+		for (const v of row) sum += v;
+	}
+	return sum;
+}
+
+export function callsIgnoredFunction(xs: number[][]): number {
+	let sum = 0;
+	for (const row of xs) sum += ignoredFunctionTagged([row]);
+	return sum;
+}
+
+export function callsColdFunctionBesideLinear(xs: number[][]): number {
+	let sum = coldFunctionTagged(xs);
+	for (const row of xs) sum += row.length;
+	return sum;
+}
+
+/** @perf hot */
+function hotHelper(xs: number[][]): number {
+	return xs.length;
+}
+
+export function callsHotFunctionBesideQuadratic(xs: number[][]): number {
+	let sum = hotHelper(xs);
+	for (const row of xs) for (const v of row) sum += v;
+	return sum;
+}
+
+export function hotLocalFunctionDeclaration(xs: number[][]): number {
+	// @perf hot
+	const count = (rows: number[][]) => rows.length;
+	let sum = 0;
+	for (const row of xs) for (const v of row) sum += v;
+	return sum;
+}

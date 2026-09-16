@@ -1,5 +1,11 @@
 # tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 10 public functions
 
+O(N^3) > O(N^2)  Svc.run  src/tags.ts:97  via src/index.ts
+    in loop for-of                                           src/tags.ts:99  x N
+        calls Svc.rebuild()                                src/tags.ts:99  = O(N^2)
+        in loop for-of                                       src/tags.ts:93  x N
+            in loop for-of                                   src/tags.ts:93  x N
+
 O(N^3) > O(N^2)  cubic  src/public.ts:1  via src/index.ts
     in loop for-of                                           src/public.ts:3  x N
         in loop for-of                                       src/public.ts:3  x N
@@ -18,4 +24,4 @@ O(N^3) > O(N^2)  uses  src/public.ts:34  via src/index.ts
         in loop for-of                                       src/public.ts:3  x N
             in loop for-of                                   src/public.ts:3  x N
 
-3 over limit
+4 over limit

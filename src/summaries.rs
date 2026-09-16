@@ -8,7 +8,7 @@ use oxc_span::GetSpan;
 use crate::analysis::{Analysis, Stats};
 use crate::cost::{Cost, Factor, Part, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
-use crate::directives::{cost_tag_of, skip_tag_of, PerfTag};
+use crate::directives::{cost_tag_of, PerfTag};
 use crate::project::{FileId, Site};
 use crate::syntax::{is_identifier_pattern, unwrap};
 use crate::tsc::{Query, TscError, TscReply};
@@ -86,8 +86,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let tags = self.function_tags(file, function);
 
-            if let Some(which) = skip_tag_of(&tags) {
-                self.stats.count(&format!("@perf {which}: function"));
+            if tags.contains(&PerfTag::Ignore) {
+                self.stats.count("@perf ignore: function");
                 self.summaries.insert(key, Reading::empty());
 
                 return Reading::empty();
@@ -107,15 +107,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some(index) = self.stack.iter().position(|known| *known == key) {
             self.minimum_hit = self.minimum_hit.min(index);
 
-            return Reading::of_part(Part {
-                cost: Cost::N,
-                chain: vec![Factor {
+            return Reading::of_part(Part::unmarked(
+                Cost::N,
+                vec![Factor {
                     label: format!("recursive call {}()", self.name_of(file, function)),
                     site: self.function_site_of(file, function),
                     cost: Cost::N,
                     inner: Vec::new(),
                 }],
-            });
+            ));
         }
 
         let depth = self.stack.len();
@@ -198,10 +198,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         chain.extend(part.chain);
 
-        Part {
-            cost: part.cost,
-            chain,
-        }
+        Part { chain, ..part }
     }
 
     fn inherited_substitutions_of(&self, function: FunctionNode<'a>) -> Substitutions {
@@ -552,7 +549,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let tags = self.function_tags(*file, *function);
 
-            if tags.contains(&PerfTag::Cold) || cost_tag_of(&tags).is_some() {
+            if cost_tag_of(&tags).is_some() {
                 self.summarize_with(*file, *function, Substitutions::new(), true);
             }
         }

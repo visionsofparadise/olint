@@ -1,12 +1,12 @@
-# tsconfig.json  (150 functions in 15 files)
+# tsconfig.json  (160 functions in 15 files)
 
-O(N)               57
-O(1)               41
-O(N^2)             38
+O(N)               60
+O(1)               45
+O(N^2)             41
 O(N log N)         10
 O(N^3)              4
 
-O(N^3)         coldFunctionTagged [@perf cold]  src/branches.ts:53
+O(N^3)         coldFunctionTagged  src/branches.ts:53
     in loop for-of                                           src/branches.ts:55  x N
         in loop for-of                                       src/branches.ts:55  x N
             in loop for-of                                   src/branches.ts:55  x N
@@ -33,6 +33,18 @@ O(N^2)         labeledLoop  src/bounds.ts:78
 O(N^2)         boundedNonLoopStatement  src/branches.ts:81
     in loop for-of                                           src/branches.ts:85  x N
         in loop for-of                                       src/branches.ts:85  x N
+
+O(N^2)         coldBlockAllCold  src/branches.ts:146
+    in loop for-of                                           src/branches.ts:148  x N
+        in loop for-of                                       src/branches.ts:148  x N
+
+O(N^2)         coldOnlyLoopBody  src/branches.ts:175
+    in loop for-of                                           src/branches.ts:177  x N
+        in loop for-of                                       src/branches.ts:179  x N
+
+O(N^2)         hotLocalFunctionDeclaration  src/branches.ts:207
+    in loop for-of                                           src/branches.ts:211  x N
+        in loop for-of                                       src/branches.ts:211  x N
 
 O(N^2)         scopedBudget  src/budgets.ts:13
     in loop for                                              src/budgets.ts:15  x N
@@ -265,6 +277,15 @@ O(N)           boundedLoopStatement  src/branches.ts:74
 O(N)           switchDiscriminantCost  src/branches.ts:137
     does xs.indexOf()                                     src/branches.ts:138  x N
 
+O(N)           coldElseBranch  src/branches.ts:153
+    in loop for-of                                           src/branches.ts:156  x N
+
+O(N)           callsIgnoredFunction  src/branches.ts:184
+    in loop for-of                                           src/branches.ts:186  x N
+
+O(N)           callsColdFunctionBesideLinear  src/branches.ts:190
+    in loop for-of                                           src/branches.ts:192  x N
+
 O(N)           drainedBudget  src/budgets.ts:1
     in loop while [budget: i < n]                            src/budgets.ts:5  x N
 
@@ -417,6 +438,14 @@ O(1)           forOfTuple  src/bounds.ts:53
 O(1)           forInClosed  src/bounds.ts:59
 
 O(1)           singleIterationLoop  src/bounds.ts:71
+
+O(1)           hotConstantBranch  src/branches.ts:164
+
+O(1)           hotHelper  src/branches.ts:197
+
+O(1)           callsHotFunctionBesideQuadratic  src/branches.ts:201
+
+O(1)           count  src/branches.ts:209
 
 O(1)           makeAdder  src/calls.ts:31
 
