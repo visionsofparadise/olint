@@ -792,8 +792,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let declaration = self.callee_declaration_of(file, call);
         let site = self.site_of_node(file, call.node_id());
 
-        if let (true, Some(Declaration::Parameter { parameter, .. }), Some(reference)) =
-            (self.options.callbacks, declaration, identifier_of(callee))
+        if let (Some(Declaration::Parameter { parameter, .. }), Some(reference)) =
+            (declaration, identifier_of(callee))
         {
             let identifier = match parameter {
                 ParameterNode::Formal(formal) => is_identifier_pattern(&formal.pattern),
@@ -999,8 +999,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return reading.merge(Reading::of_part(nest(label(""), site, Cost::N, callback)));
         }
 
-        if self.options.strings_linear
-            && (kind == Kind::String || kind == Kind::Unknown)
+        if (kind == Kind::String || kind == Kind::Unknown)
             && is_listed(STRING_LINEAR, &method)
             && !bounded
         {
@@ -1012,8 +1011,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             )));
         }
 
-        if self.options.strings_linear && kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method)
-        {
+        if kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method) {
             if let Some(argument) = first {
                 if !self.is_constant_sized_argument(file, argument) {
                     return reading.merge(Reading::of_part(nest(

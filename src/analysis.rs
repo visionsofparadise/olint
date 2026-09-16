@@ -21,8 +21,6 @@ pub enum TypeMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    pub strings_linear: bool,
-    pub callbacks: bool,
     pub minimum_exponent: u32,
     pub types: TypeMode,
 }

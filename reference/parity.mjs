@@ -27,7 +27,7 @@ const referenceResult = spawnSync("node", [path.join(repo, "reference", "perfLin
 	encoding: "utf8",
 	maxBuffer,
 });
-const olintResult = spawnSync(olintBin, [tsconfig, "--report", `--types=${types}`], { encoding: "utf8", maxBuffer });
+const olintResult = spawnSync(olintBin, ["--tsconfig", tsconfig, "--report", `--types=${types}`], { encoding: "utf8", maxBuffer });
 
 const reportFailure = (label, result) => {
 	if (result.error) {

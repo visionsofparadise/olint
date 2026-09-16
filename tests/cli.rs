@@ -14,7 +14,7 @@ fn differences_of(
     exit: Option<i32>,
 ) -> Vec<String> {
     let output = Command::new(env!("CARGO_BIN_EXE_olint"))
-        .arg("tsconfig.json")
+        .args(["--tsconfig", "tsconfig.json"])
         .args(arguments)
         .current_dir(fixture)
         .output()
@@ -45,7 +45,7 @@ fn differences_of(
 }
 
 #[test]
-fn fixtures_print_the_reference_output() {
+fn fixtures_print_their_golden_output() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let mut directories: Vec<_> = std::fs::read_dir(&fixtures)
         .expect("fixtures directory")

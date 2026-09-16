@@ -293,34 +293,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Part {
         let mut substitutions = Substitutions::new();
 
-        if self.options.callbacks {
-            let (parameters, offset) = match function {
-                FunctionNode::Function(inner) => {
-                    (&inner.params, usize::from(inner.this_param.is_some()))
-                }
-                FunctionNode::Arrow(arrow) => (&arrow.params, 0),
+        let (parameters, offset) = match function {
+            FunctionNode::Function(inner) => {
+                (&inner.params, usize::from(inner.this_param.is_some()))
+            }
+            FunctionNode::Arrow(arrow) => (&arrow.params, 0),
+        };
+
+        if offset == 1 {
+            let _ = self.part_of_argument(call_file, arguments.first());
+        }
+
+        for (index, parameter) in parameters.items.iter().enumerate() {
+            let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                continue;
+            };
+            let Some(part) = self.part_of_argument(call_file, arguments.get(index + offset)) else {
+                continue;
             };
 
-            if offset == 1 {
-                let _ = self.part_of_argument(call_file, arguments.first());
+            if part.cost.is_one() {
+                continue;
             }
 
-            for (index, parameter) in parameters.items.iter().enumerate() {
-                let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
-                    continue;
-                };
-                let Some(part) = self.part_of_argument(call_file, arguments.get(index + offset))
-                else {
-                    continue;
-                };
-
-                if part.cost.is_one() {
-                    continue;
-                }
-
-                if let Some(symbol) = identifier.symbol_id.get() {
-                    substitutions.insert(Binding::Symbol { file, symbol }, part);
-                }
+            if let Some(symbol) = identifier.symbol_id.get() {
+                substitutions.insert(Binding::Symbol { file, symbol }, part);
             }
         }
 

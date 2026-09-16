@@ -111,3 +111,34 @@ fn a_method_on_a_constructed_instance_charges_its_summary() {
     assert_eq!(reading.total().cost, Cost::N);
     assert_eq!(labels, vec!["call Engine.run()"]);
 }
+
+#[test]
+fn a_string_method_on_a_literal_receiver_is_constant() {
+    let (reading, _) = reading_of(
+        "export function f() {\n\treturn \"a,b\".split(\",\");\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::ONE);
+}
+
+#[test]
+fn a_string_method_on_a_const_of_a_literal_is_constant() {
+    let (reading, _) = reading_of(
+        "const SEPARATED = `a,b`;\nenum Tone {\n\tLow = \"low\",\n}\nexport function f() {\n\tconst text = \"a,b\";\n\ttext.split(\",\");\n\tSEPARATED.split(\",\");\n\treturn Tone.Low.includes(\"o\");\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::ONE);
+}
+
+#[test]
+fn a_string_method_on_a_parameter_is_linear() {
+    let (reading, labels) = reading_of(
+        "export function f(text: string) {\n\treturn text.split(\",\");\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::N);
+    assert_eq!(labels, vec!["text.split() [string]"]);
+}

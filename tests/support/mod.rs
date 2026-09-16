@@ -52,8 +52,6 @@ pub fn file_of(project: &Project<'_>, root: &Path, relative: &str) -> FileId {
 }
 
 pub const SYNTACTIC: Options = Options {
-    strings_linear: true,
-    callbacks: true,
     minimum_exponent: 2,
     types: TypeMode::Syntactic,
 };

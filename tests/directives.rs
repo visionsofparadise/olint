@@ -9,8 +9,6 @@ mod support;
 use support::{file_of, first_node_of, run_in_project};
 
 const OPTIONS: Options = Options {
-    strings_linear: true,
-    callbacks: true,
     minimum_exponent: 2,
     types: TypeMode::Syntactic,
 };

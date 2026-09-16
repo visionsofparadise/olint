@@ -185,6 +185,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         if let Some(declaration) = declaration {
+            if let Declaration::EnumMember {
+                file: target,
+                member,
+            } = declaration
+            {
+                if let Some(initializer) = &member.initializer {
+                    if self.is_constant_sized(target, initializer) {
+                        return true;
+                    }
+                }
+            }
+
             if let Some((target, initializer)) = constant_initializer_of(declaration) {
                 if self.is_constant_sized(target, initializer) {
                     return true;

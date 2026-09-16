@@ -15,19 +15,16 @@ use oxc_allocator::Allocator;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    tsconfig: Option<PathBuf>,
-    #[arg(long)]
-    report: bool,
     #[arg(long, default_value_t = 2)]
     min: u32,
     #[arg(long)]
-    config: Option<PathBuf>,
+    report: bool,
     #[arg(long, value_enum, default_value_t = TypeMode::Auto)]
     types: TypeMode,
     #[arg(long)]
-    strings_constant: bool,
-    #[arg(long)]
-    no_callbacks: bool,
+    config: Option<PathBuf>,
+    #[arg(long, default_value = "./tsconfig.json")]
+    tsconfig: PathBuf,
 }
 
 enum Failure {
@@ -102,9 +99,7 @@ fn print_lines(lines: &[String]) {
 }
 
 fn run(cli: Cli) -> Result<i32, Failure> {
-    let tsconfig = cli
-        .tsconfig
-        .unwrap_or_else(|| PathBuf::from("tsconfig.json"));
+    let tsconfig = cli.tsconfig;
 
     if !tsconfig.is_file() {
         return Err(Failure::Usage(format!(
@@ -116,8 +111,6 @@ fn run(cli: Cli) -> Result<i32, Failure> {
     let allocator = Allocator::default();
     let project = Project::load(&allocator, &tsconfig).map_err(Failure::Project)?;
     let options = Options {
-        strings_linear: !cli.strings_constant,
-        callbacks: !cli.no_callbacks,
         minimum_exponent: cli.min,
         types: cli.types,
     };
