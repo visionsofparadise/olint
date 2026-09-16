@@ -1,8 +1,8 @@
 # tsconfig.json  (160 functions in 15 files)
 
 O(N)               60
-O(1)               45
-O(N^2)             41
+O(1)               46
+O(N^2)             40
 O(N log N)         10
 O(N^3)              4
 
@@ -37,10 +37,6 @@ O(N^2)         boundedNonLoopStatement  src/branches.ts:81
 O(N^2)         coldBlockAllCold  src/branches.ts:146
     in loop for-of                                           src/branches.ts:148  x N
         in loop for-of                                       src/branches.ts:148  x N
-
-O(N^2)         coldOnlyLoopBody  src/branches.ts:175
-    in loop for-of                                           src/branches.ts:177  x N
-        in loop for-of                                       src/branches.ts:179  x N
 
 O(N^2)         hotLocalFunctionDeclaration  src/branches.ts:207
     in loop for-of                                           src/branches.ts:211  x N
@@ -440,6 +436,8 @@ O(1)           forInClosed  src/bounds.ts:59
 O(1)           singleIterationLoop  src/bounds.ts:71
 
 O(1)           hotConstantBranch  src/branches.ts:164
+
+O(1)           coldOnlyLoopBody  src/branches.ts:175
 
 O(1)           hotHelper  src/branches.ts:197
 

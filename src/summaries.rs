@@ -6,7 +6,7 @@ use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
 
 use crate::analysis::{Analysis, Stats};
-use crate::cost::{Cost, Factor, Part, Reading};
+use crate::cost::{Cost, Factor, Part, Preference, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
 use crate::directives::{cost_tag_of, PerfTag};
 use crate::project::{FileId, Site};
@@ -20,7 +20,7 @@ pub type Substitutions = HashMap<Binding, Part>;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SummaryKey {
     pub function: FunctionId,
-    pub substitutions: Vec<(String, Cost)>,
+    pub substitutions: Vec<(String, Cost, Preference)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,13 +36,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         function: FunctionNode<'a>,
         substitutions: &Substitutions,
     ) -> SummaryKey {
-        let mut named: Vec<(String, Cost)> = substitutions
+        let mut named: Vec<(String, Cost, Preference)> = substitutions
             .iter()
-            .map(|(binding, part)| (self.binding_name_of(*binding), part.cost))
+            .map(|(binding, part)| (self.binding_name_of(*binding), part.cost, part.preference))
             .collect();
 
         named.sort_by(|left, right| {
-            (left.0.as_str(), left.1.text()).cmp(&(right.0.as_str(), right.1.text()))
+            (left.0.as_str(), left.1.text(), left.2).cmp(&(
+                right.0.as_str(),
+                right.1.text(),
+                right.2,
+            ))
         });
 
         SummaryKey {
@@ -223,22 +227,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match argument {
             Expression::FunctionExpression(function) => {
-                let function = FunctionNode::Function(function);
-                let inherited = self.inherited_substitutions_of(function);
-
-                return Some(
-                    self.summarize_with(file, function, inherited, false)
-                        .total(),
-                );
+                return Some(self.inline_callback_part_of(file, FunctionNode::Function(function)));
             }
             Expression::ArrowFunctionExpression(arrow) => {
-                let function = FunctionNode::Arrow(arrow);
-                let inherited = self.inherited_substitutions_of(function);
-
-                return Some(
-                    self.summarize_with(file, function, inherited, false)
-                        .total(),
-                );
+                return Some(self.inline_callback_part_of(file, FunctionNode::Arrow(arrow)));
             }
             _ => {}
         }
@@ -277,8 +269,51 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
         };
         let (target, function) = self.declarations.function_of(declaration?)?;
+        let (part, cyclic) =
+            self.within_cycle_of(|analysis| analysis.summarize(target, function).total());
 
-        Some(self.summarize(target, function).total())
+        Some(self.called_part_of(target, function, part, cyclic))
+    }
+
+    fn inline_callback_part_of(&mut self, file: FileId, function: FunctionNode<'a>) -> Part {
+        let inherited = self.inherited_substitutions_of(function);
+        let (part, cyclic) = self.within_cycle_of(|analysis| {
+            analysis
+                .summarize_with(file, function, inherited, false)
+                .total()
+        });
+
+        self.called_part_of(file, function, part, cyclic)
+    }
+
+    pub(crate) fn within_cycle_of<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> (T, bool) {
+        let before = std::mem::replace(&mut self.minimum_hit, usize::MAX);
+        let result = run(self);
+        let hit = self.minimum_hit;
+
+        self.minimum_hit = before.min(hit);
+
+        (result, hit < self.stack.len())
+    }
+
+    pub(crate) fn called_part_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        part: Part,
+        cyclic: bool,
+    ) -> Part {
+        let mark = if cyclic {
+            None
+        } else {
+            self.function_preference_of(file, function)
+        };
+
+        match mark {
+            Some(mark) => part.preferred(mark),
+            None if part.cost.is_one() => part.preferred(Preference::Absent),
+            None => part.preferred(Preference::Unmarked),
+        }
     }
 
     pub fn call_user(
@@ -309,7 +344,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             };
 
-            if part.cost.is_one() {
+            if part.cost.is_one() && part.preference == Preference::Absent {
                 continue;
             }
 

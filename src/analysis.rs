@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use oxc_semantic::NodeId;
 
 use crate::budgets::BudgetContext;
@@ -50,6 +50,7 @@ pub struct Analysis<'p, 'a> {
     pub declarations: Declarations<'a>,
     pub options: Options,
     pub stats: Stats,
+    pub warnings: IndexSet<String>,
     pub(crate) tag_cache: HashMap<(FileId, NodeId), Vec<PerfTag>>,
     pub(crate) pass: TscPass,
     pub(crate) needed: IndexMap<(FileId, u32, u32, QueryKind), Query>,
@@ -75,6 +76,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             declarations: Declarations::new(project),
             options,
             stats: Stats::default(),
+            warnings: IndexSet::new(),
             tag_cache: HashMap::new(),
             pass: TscPass::Off,
             needed: IndexMap::new(),

@@ -6,7 +6,7 @@ use oxc_ast::ast::{
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
 use oxc_semantic::NodeId;
-use oxc_syntax::operator::UnaryOperator;
+use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
@@ -119,6 +119,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Expression::ConditionalExpression(conditional) => {
                 return self.is_constant_sized(file, &conditional.consequent)
                     && self.is_constant_sized(file, &conditional.alternate);
+            }
+            Expression::BinaryExpression(binary)
+                if binary.operator == BinaryOperator::Addition
+                    && (self.is_constant_sized(file, &binary.left)
+                        || self.is_constant_sized(file, &binary.right)) =>
+            {
+                return (self.is_constant_sized(file, &binary.left)
+                    || self.is_numeric_constant(file, &binary.left))
+                    && (self.is_constant_sized(file, &binary.right)
+                        || self.is_numeric_constant(file, &binary.right));
             }
             _ => {}
         }

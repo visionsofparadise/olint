@@ -182,8 +182,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Reading::empty();
         }
 
-        let preference = preference_of(&tags).filter(|_| !holds_function(&kind));
-        let Some(preference) = preference else {
+        if holds_function(&kind) {
+            return self.reading_of_node(file, kind, &tags);
+        }
+
+        let site = self.site_of_node(file, kind.node_id());
+
+        self.warn_conflict(&tags, site);
+
+        let Some(preference) = preference_of(&tags) else {
             return self.reading_of_node(file, kind, &tags);
         };
 
@@ -245,6 +252,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     let kind = self.kind_of_node(file, branch.node_id());
 
                     reading = reading.merge(self.sibling_of(file, kind, part));
+                }
+
+                if statement.alternate.is_none() {
+                    reading = reading.merge(Reading::empty().sibling());
                 }
 
                 reading
@@ -341,20 +352,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         reading.sibling()
-    }
-
-    fn function_preference_of(
-        &mut self,
-        file: FileId,
-        function: FunctionNode<'a>,
-    ) -> Option<Preference> {
-        let tags = self.function_tags(file, function);
-
-        if tags.contains(&PerfTag::Ignore) {
-            return None;
-        }
-
-        preference_of(&tags)
     }
 
     fn branch_reading_of(
@@ -682,26 +679,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
             declaration.and_then(|declaration| self.declarations.function_of(declaration));
 
         if let Some((target, function)) = function {
-            let callee = self.call_user(target, function, file, &new.arguments);
-            let preference = self.function_preference_of(target, function);
-
-            if !callee.cost.is_one() {
+            let (callee, cyclic) = self.within_cycle_of(|analysis| {
+                analysis.call_user(target, function, file, &new.arguments)
+            });
+            let chain = if callee.cost.is_one() {
+                Vec::new()
+            } else {
                 let name = self.name_of(target, function);
                 let name = name.strip_suffix(".constructor").unwrap_or(&name);
                 let site = self.site_of_node(file, new.node_id());
 
-                reading = reading.merge(Reading::of_part(Part::unmarked(
-                    callee.cost,
-                    vec![Factor {
-                        label: format!("new {name}()"),
-                        site,
-                        cost: callee.cost,
-                        inner: callee.chain,
-                    }],
-                )));
-            }
+                vec![Factor {
+                    label: format!("new {name}()"),
+                    site,
+                    cost: callee.cost,
+                    inner: callee.chain,
+                }]
+            };
+            let part = Part {
+                cost: callee.cost,
+                chain,
+                preference: callee.preference,
+            };
 
-            return preferred_reading_of(reading, preference);
+            return reading.merge(Reading::of_part(
+                self.called_part_of(target, function, part, cyclic),
+            ));
         }
 
         let constructor = match &new.callee {
@@ -795,17 +798,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
                 if let Some(part) = substituted {
-                    if !part.cost.is_one() {
-                        return reading.merge(Reading::of_part(Part::unmarked(
-                            part.cost,
-                            vec![Factor {
-                                label: format!("call {}() [callback parameter]", reference.name),
-                                site,
-                                cost: part.cost,
-                                inner: part.chain,
-                            }],
-                        )));
-                    }
+                    let chain = if part.cost.is_one() {
+                        Vec::new()
+                    } else {
+                        vec![Factor {
+                            label: format!("call {}() [callback parameter]", reference.name),
+                            site,
+                            cost: part.cost,
+                            inner: part.chain,
+                        }]
+                    };
+
+                    return reading.merge(Reading::of_part(Part {
+                        cost: part.cost,
+                        chain,
+                        preference: part.preference,
+                    }));
                 }
 
                 return reading;
@@ -816,16 +824,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             declaration.and_then(|declaration| self.declarations.function_of(declaration));
 
         if let Some((target, function)) = function {
-            let called = self.call_user(target, function, file, &call.arguments);
-            let preference = self.function_preference_of(target, function);
-
-            if called.cost.is_one() {
-                return preferred_reading_of(reading, preference);
-            }
-
+            let (called, cyclic) = self.within_cycle_of(|analysis| {
+                analysis.call_user(target, function, file, &call.arguments)
+            });
             let recursive =
                 called.chain.len() == 1 && called.chain[0].label.starts_with("recursive call");
-            let chain = if recursive {
+            let chain = if called.cost.is_one() {
+                Vec::new()
+            } else if recursive {
                 let mut factor = called.chain[0].clone();
 
                 factor.site = site;
@@ -840,10 +846,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }]
             };
 
-            return preferred_reading_of(
-                reading.merge(Reading::of_part(Part::unmarked(called.cost, chain))),
-                preference,
-            );
+            let part = Part {
+                cost: called.cost,
+                chain,
+                preference: called.preference,
+            };
+
+            return reading.merge(Reading::of_part(
+                self.called_part_of(target, function, part, cyclic),
+            ));
         }
 
         if let Some(member) = member {
@@ -1028,13 +1039,6 @@ fn holds_function(kind: &AstKind<'_>) -> bool {
             function_of_initializer(Some(&property.value)).is_some()
         }
         _ => false,
-    }
-}
-
-fn preferred_reading_of(reading: Reading, preference: Option<Preference>) -> Reading {
-    match preference {
-        Some(preference) => reading.preferred(preference),
-        None => reading,
     }
 }
 

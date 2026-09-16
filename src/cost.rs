@@ -228,7 +228,11 @@ pub fn nest(label: String, site: Site, factor: Cost, inner: Part) -> Part {
     Part {
         cost: factor.multiply(inner.cost),
         chain,
-        preference: inner.preference.max(Preference::Unmarked),
+        preference: if inner.preference == Preference::Absent {
+            Preference::Unmarked
+        } else {
+            inner.preference
+        },
     }
 }
 

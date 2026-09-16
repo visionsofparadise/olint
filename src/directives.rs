@@ -5,7 +5,7 @@ use oxc_span::GetSpan;
 use crate::analysis::Analysis;
 use crate::cost::{Cost, Preference};
 use crate::declarations::FunctionNode;
-use crate::project::{FileId, Project};
+use crate::project::{FileId, Project, Site};
 use crate::syntax::collapsed_text_of;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,13 +48,15 @@ pub fn tags_in_comment(text: &str) -> Vec<PerfTag> {
 }
 
 pub fn preference_of(tags: &[PerfTag]) -> Option<Preference> {
-    if tags.contains(&PerfTag::Hot) {
-        Some(Preference::Hot)
-    } else if tags.contains(&PerfTag::Cold) {
-        Some(Preference::Cold)
-    } else {
-        None
+    match (tags.contains(&PerfTag::Hot), tags.contains(&PerfTag::Cold)) {
+        (true, false) => Some(Preference::Hot),
+        (false, true) => Some(Preference::Cold),
+        _ => None,
     }
+}
+
+pub fn is_conflicted(tags: &[PerfTag]) -> bool {
+    tags.contains(&PerfTag::Hot) && tags.contains(&PerfTag::Cold)
 }
 
 pub fn cost_tag_of(tags: &[PerfTag]) -> Option<(Cost, String)> {
@@ -87,6 +89,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         &self.tag_cache[&key]
+    }
+
+    pub(crate) fn warn_conflict(&mut self, tags: &[PerfTag], site: Site) {
+        if is_conflicted(tags) {
+            self.warnings.insert(format!(
+                "@perf hot and @perf cold conflict at {}:{}; the node takes no preference",
+                self.project.file(site.file).relative,
+                site.line
+            ));
+        }
+    }
+
+    pub(crate) fn function_preference_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+    ) -> Option<Preference> {
+        let tags = self.function_tags(file, function);
+
+        if tags.contains(&PerfTag::Ignore) {
+            return None;
+        }
+
+        let site = self.function_site_of(file, function);
+
+        self.warn_conflict(&tags, site);
+
+        preference_of(&tags)
     }
 
     pub fn function_tags(&mut self, file: FileId, function: FunctionNode<'a>) -> Vec<PerfTag> {

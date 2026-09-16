@@ -187,3 +187,83 @@ fn a_hot_function_call_wins_over_a_costlier_sibling() {
         },
     );
 }
+
+fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
+    let mut found = (Cost::ONE, Vec::new());
+
+    run_with_source(source, |analysis, file| {
+        let function = function_of_name(analysis.project, file, name);
+        let part = analysis.summarize(file, function).total();
+
+        found = (part.cost, labels_of(&part.chain));
+    });
+
+    found
+}
+
+const CALLBACK_SOURCE: &str = "/** @perf cold */\nfunction coldCubic(xs: number[][]): number {\n\tlet sum = 0;\n\tfor (const row of xs) for (const v of row) for (const w of row) sum += v * w;\n\treturn sum;\n}\n/** @perf hot */\nfunction hotConst(x: number[]): number {\n\treturn x.length;\n}\nfunction withHotInside(row: number[]): number {\n\t// @perf hot\n\treturn row.length;\n}\nfunction apply(f: (xs: number[][]) => number, xs: number[][]): number {\n\tconst a = f(xs);\n\tfor (const row of xs) row.at(0);\n\treturn a;\n}\nexport function coldViaMap(xss: number[][][]) {\n\tconst a = xss.map(coldCubic);\n\tfor (const xs of xss) xs.at(0);\n\treturn a;\n}\nexport function hotViaMap(xs: number[][]) {\n\tconst a = xs.map(hotConst);\n\tfor (const row of xs) for (const v of row) v.toFixed();\n\treturn a;\n}\nexport function bodyHotViaMap(xs: number[][]) {\n\tconst a = xs.map(withHotInside);\n\tfor (const row of xs) for (const v of row) v.toFixed();\n\treturn a;\n}\nexport function coldViaParameter(xs: number[][]) {\n\treturn apply(coldCubic, xs);\n}\n";
+
+#[test]
+fn a_cold_callback_through_a_stdlib_method_yields_to_a_linear_sibling() {
+    assert_eq!(
+        total_of(CALLBACK_SOURCE, "coldViaMap"),
+        (Cost::N, vec!["for-of".to_string()])
+    );
+}
+
+#[test]
+fn a_hot_callback_through_a_stdlib_method_wins_over_a_costlier_sibling() {
+    assert_eq!(
+        total_of(CALLBACK_SOURCE, "hotViaMap"),
+        (Cost::N, vec!["xs.map()".to_string()])
+    );
+}
+
+#[test]
+fn a_callback_keeps_its_body_preference_inside() {
+    assert_eq!(
+        total_of(CALLBACK_SOURCE, "bodyHotViaMap").0,
+        Cost { n: 2, log: 0 }
+    );
+}
+
+#[test]
+fn a_cold_callback_parameter_call_yields_inside_its_caller() {
+    assert_eq!(
+        total_of(CALLBACK_SOURCE, "coldViaParameter"),
+        (Cost::N, vec!["call apply()".to_string()])
+    );
+}
+
+#[test]
+fn a_cold_recursive_function_keeps_its_recursion_cost() {
+    let source = "/** @perf cold */\nexport function walk(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + walk(xs, n - 1);\n}\n";
+
+    assert_eq!(
+        total_of(source, "walk"),
+        (Cost::N, vec!["recursive call walk()".to_string()])
+    );
+}
+
+#[test]
+fn a_cold_cycle_member_keeps_the_cycle_cost() {
+    let source = "export function ping(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
+
+    run_with_source(source, |analysis, file| {
+        let ping = function_of_name(analysis.project, file, "ping");
+        let pong = function_of_name(analysis.project, file, "pong");
+
+        assert_eq!(analysis.summarize(file, ping).total().cost, Cost::N);
+        assert_eq!(analysis.summarize(file, pong).total().cost, Cost::N);
+    });
+}
+
+#[test]
+fn a_cold_call_leaves_its_argument_costs_unmarked() {
+    let source = "/** @perf cold */\nfunction rebuild(rows: number[][], at: number) {\n\tfor (const row of rows) row.indexOf(at);\n}\nexport function f(rows: number[][], xs: number[]) {\n\trebuild(rows, xs.indexOf(1));\n\treturn 0;\n}\n";
+
+    assert_eq!(
+        total_of(source, "f"),
+        (Cost::N, vec!["xs.indexOf()".to_string()])
+    );
+}

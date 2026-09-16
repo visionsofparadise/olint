@@ -179,6 +179,10 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         i32::from(!over.is_empty())
     };
 
+    for warning in &analysis.warnings {
+        eprintln!("olint: warning: {warning}");
+    }
+
     eprintln!("{}", analysis.stats.lines().join("\n"));
 
     Ok(code)
