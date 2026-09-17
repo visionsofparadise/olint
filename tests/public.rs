@@ -11,6 +11,36 @@ mod support;
 use support::SYNTACTIC;
 
 #[test]
+fn explicit_surfaces_override_names_while_ignore_still_wins() {
+    for source_path in ["part.d.worker.ts", "scripts/run.ts", "tests/run.spec.ts"] {
+        for ignored in [None, Some(source_path), Some("index.ts")] {
+            let config = serde_json::json!({"entrypoints":["index.ts",source_path],"ignore":ignored.into_iter().collect::<Vec<_>>()}).to_string();
+            let entry = format!(
+                "export {{ selected }} from './{}';",
+                source_path.trim_end_matches(".ts")
+            );
+
+            support::run_in_project(&[
+                ("tsconfig.json", "{}"),
+                ("index.ts", &entry),
+                (source_path, "export function selected(xs:number[]){for(const a of xs)for(const b of xs)for(const c of xs)void c}"),
+                ("olint.config.json", &config),
+            ], |project, _| {
+                let mut analysis = Analysis::new(project, SYNTACTIC);
+                let config = read_config(project, None).unwrap();
+                let public = public_functions(&mut analysis, &config).unwrap();
+
+                assert_eq!(public.len(), usize::from(ignored != Some(source_path)), "{source_path} {ignored:?}");
+
+                if let Some(function) = public.first() {
+                    assert_eq!(function.limits.len(), if ignored == Some("index.ts") {1} else {2});
+                }
+            });
+        }
+    }
+}
+
+#[test]
 fn invalid_direct_config_returns_before_summary_work() {
     support::run_in_project(
         &[

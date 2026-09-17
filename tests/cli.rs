@@ -2,6 +2,13 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+fn explicit_source_paths_override_heuristics_in_both_modes() {
+    assert_selection_cases(
+        &serde_json::from_str(include_str!("fixtures/source-paths.json")).unwrap(),
+    );
+}
+
+#[test]
 fn package_entry_mappings_select_costly_apis_and_diagnose_unknown_mappings() {
     assert_selection_cases(
         &serde_json::from_str(include_str!("fixtures/package-entries.json")).unwrap(),

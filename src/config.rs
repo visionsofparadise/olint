@@ -15,6 +15,7 @@ pub struct Limit {
 }
 
 pub struct Config {
+    pub explicit_entrypoints: bool,
     pub unknown: UnknownPolicy,
     pub max: Limit,
     pub entrypoints: Vec<(PathBuf, Vec<Limit>)>,
@@ -510,6 +511,7 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
     };
 
     Ok(Config {
+        explicit_entrypoints: raw.get("entrypoints").is_some(),
         unknown: unknown_policy_of(raw.get("unknown"))?,
         max,
         entrypoints,
@@ -533,7 +535,9 @@ pub fn validate_entries(project: &Project<'_>, config: &Config) -> Result<(), Co
             .file_by_path(path)
             .ok_or_else(|| invalid("entrypoint is not in the selected project"))?;
 
-        if !project.is_project_file(file) || project.is_test_path(file) {
+        if !project.is_project_file(file)
+            || (!config.explicit_entrypoints && project.is_test_path(file))
+        {
             return Err(invalid(
                 "entrypoint is excluded by the current implementation-source policy",
             ));

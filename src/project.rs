@@ -771,7 +771,6 @@ fn is_declaration_path(path: &Path) -> bool {
     [".d.ts", ".d.mts", ".d.cts"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
-        || (name.ends_with(".ts") && name.contains(".d."))
 }
 
 fn line_starts_of(text: &str) -> Vec<u32> {

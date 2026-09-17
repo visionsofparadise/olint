@@ -1,0 +1,197 @@
+[
+  {
+    "name": "ordinary_d_substring",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": [
+          "part.d.worker.ts"
+        ]
+      },
+      "part.d.worker.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "declaration_only",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": []
+      },
+      "types.d.ts": "export declare function declared(xs:number[]):void;",
+      "types.d.mts": "export declare function declared(xs:number[]):void;",
+      "types.d.cts": "export declare function declared(xs:number[]):void;"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {},
+    "expected_absent": {
+      "report": [
+        "declared"
+      ]
+    },
+    "kind": "valid-selection"
+  },
+  {
+    "name": "explicit_script",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": [
+          "scripts/run.ts"
+        ]
+      },
+      "scripts/run.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "explicit_test_reexport",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export {selected} from './tests/run.spec';",
+      "tests/run.spec.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "explicit_ignored_script",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": [
+          "scripts/run.ts"
+        ],
+        "ignore": [
+          "scripts/**"
+        ]
+      },
+      "scripts/run.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {},
+    "expected_absent": {
+      "report": [
+        " selected "
+      ]
+    },
+    "kind": "valid-selection"
+  },
+  {
+    "name": "unselected_script",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function ordinary(){void 0;}",
+      "scripts/run.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {},
+    "expected_absent": {
+      "report": [
+        " selected "
+      ]
+    },
+    "kind": "valid-selection"
+  },
+  {
+    "name": "shared_surface_strict_limit",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore",
+        "entrypoints": [
+          {
+            "path": "index.ts",
+            "max": "O(N^4)"
+          },
+          {
+            "path": "scripts/run.ts",
+            "max": "O(1)"
+          }
+        ]
+      },
+      "index.ts": "export {selected} from './scripts/run';",
+      "scripts/run.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  }
+]

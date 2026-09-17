@@ -8,6 +8,29 @@ mod support;
 use support::{file_of, first_node_of, project_of, run_in_project, TYPED_PACKAGE};
 
 #[test]
+fn declaration_suffixes_do_not_hide_implementation_names() {
+    run_in_project(
+        &[
+            ("tsconfig.json", "{}"),
+            ("part.d.worker.ts", "export function implementation() {}"),
+            ("types.d.ts", "export declare function typed(): void;"),
+            ("types.d.mts", "export declare function esm(): void;"),
+            ("types.d.cts", "export declare function common(): void;"),
+        ],
+        |project, root| {
+            assert!(project.is_project_file(file_of(project, root, "part.d.worker.ts")));
+
+            for path in ["types.d.ts", "types.d.mts", "types.d.cts"] {
+                assert!(
+                    !project.is_project_file(file_of(project, root, path)),
+                    "{path}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
 fn literal_selection_preserves_jsonc_overrides_and_empty_references() {
     for config in [
         "\u{feff}/* config */{\"files\":[\"index.ts\",],\"references\":[],}",

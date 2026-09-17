@@ -10,7 +10,7 @@ use olint::config::{
 };
 use olint::cost::CostComparison;
 use olint::project::{Project, ProjectError};
-use olint::public::public_functions;
+use olint::public::{public_functions, public_roots};
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
 use olint::tsc::{ask, Query, TscError, TscReply};
 use olint::unknowns::{SourceSpan, UnknownReason};
@@ -140,7 +140,20 @@ fn run_with_ask(
         types: cli.types,
     };
     let mut analysis = Analysis::new(&project, options);
-    let functions = analysis.reportable();
+    let mut functions = analysis.reportable();
+
+    if config.explicit_entrypoints {
+        let mut selected: std::collections::HashSet<_> = functions
+            .iter()
+            .map(|(file, function)| (*file, function.node_id()))
+            .collect();
+
+        for function in public_roots(&mut analysis, &config).map_err(Failure::Config)? {
+            if selected.insert((function.0, function.1.node_id())) {
+                functions.push(function);
+            }
+        }
+    }
 
     if analysis.options.types != TypeMode::Syntactic {
         let gathered = analysis.gather_answers(&functions, |queries| {

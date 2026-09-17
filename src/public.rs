@@ -73,7 +73,7 @@ fn declared_functions_of(declaration: Declaration<'_>) -> Vec<(FileId, FunctionN
     }
 }
 
-pub fn public_functions<'a>(
+fn discovered_functions<'a>(
     analysis: &mut Analysis<'_, 'a>,
     config: &Config,
 ) -> Result<Vec<PublicFunction<'a>>, ConfigError> {
@@ -86,6 +86,11 @@ pub fn public_functions<'a>(
 
     for (entry_path, limit) in &config.entrypoints {
         let entry = relative_path_of(&project.root, entry_path);
+
+        if config.is_ignored(&entry) {
+            continue;
+        }
+
         let entry_file = project
             .file_by_path(entry_path)
             .expect("validated entrypoint");
@@ -96,7 +101,7 @@ pub fn public_functions<'a>(
                     let source = project.file(file);
 
                     if !project.is_project_file(file)
-                        || project.is_test_path(file)
+                        || (!config.explicit_entrypoints && project.is_test_path(file))
                         || config.is_ignored(&source.relative)
                         || analysis
                             .function_tags(file, function)
@@ -137,6 +142,25 @@ pub fn public_functions<'a>(
             }
         }
     }
+
+    Ok(found)
+}
+
+pub fn public_roots<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    config: &Config,
+) -> Result<Vec<(FileId, FunctionNode<'a>)>, ConfigError> {
+    Ok(discovered_functions(analysis, config)?
+        .into_iter()
+        .map(|function| (function.file, function.function))
+        .collect())
+}
+
+pub fn public_functions<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    config: &Config,
+) -> Result<Vec<PublicFunction<'a>>, ConfigError> {
+    let mut found = discovered_functions(analysis, config)?;
 
     for public in &mut found {
         if let Some((cost, text)) =

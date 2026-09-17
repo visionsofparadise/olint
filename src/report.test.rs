@@ -171,6 +171,7 @@ fn config_of(entries: &[&str]) -> Config {
     };
 
     Config {
+        explicit_entrypoints: true,
         unknown: crate::config::UnknownPolicy::Warn,
         max: max.clone(),
         entrypoints: entries
