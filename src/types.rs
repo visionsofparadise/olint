@@ -213,7 +213,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.needed.clear();
         self.answers.clear();
 
-        self.replays_type_answers = false;
         self.pass = TscPass::Off;
     }
 
@@ -235,18 +234,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Lookup::Unanswered;
         }
 
-        let replaying = self.pass == TscPass::Recording && self.replays_type_answers;
-
         if let Some(answer) = self.answers.get(&key) {
-            if self.pass == TscPass::Recording && key.3 == QueryKind::Type && !replaying {
-                return Lookup::Unanswered;
-            }
-
             return Lookup::Answered(answer.clone());
         }
 
         match self.pass {
-            TscPass::Recording if replaying && key.3 == QueryKind::Type => {}
             TscPass::Recording => {
                 self.needed.entry(key).or_insert(query);
             }

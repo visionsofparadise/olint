@@ -66,7 +66,6 @@ pub struct Analysis<'p, 'a> {
     pub(crate) pending_scoped: HashMap<(FileId, NodeId), Part>,
     pub(crate) bound_seen: HashSet<(FileId, NodeId)>,
     pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
-    pub(crate) replays_type_answers: bool,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -92,7 +91,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             pending_scoped: HashMap::new(),
             bound_seen: HashSet::new(),
             children: HashMap::new(),
-            replays_type_answers: false,
         }
     }
 }

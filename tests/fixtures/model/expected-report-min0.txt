@@ -192,7 +192,7 @@ O(N^2)         newSetNonConst  src/methods.ts:59
 
 O(N^2)         unionCallback  src/methods.ts:80
     does s.union()                                        src/methods.ts:83  x N
-        does list.map()?                                  src/methods.ts:83  x N
+        does list.map()                                   src/methods.ts:83  x N
 
 O(N^2)         unionHidesCallee  src/methods.ts:112
     does s.union()                                        src/methods.ts:114  x N

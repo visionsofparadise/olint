@@ -141,7 +141,7 @@ fn callee_answers_map_to_the_declaration_they_span() {
 }
 
 #[test]
-fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
+fn recording_uses_types_from_earlier_rounds() {
     run_with_source(|project, file| {
         let mut analysis = Analysis::new(project, SYNTACTIC);
         let loose = receiver_of(project, file, "loose.map");
@@ -156,8 +156,19 @@ fn recording_keeps_declared_types_for_sites_earlier_rounds_answered() {
             }))]))
             .expect("the reply answers every query");
 
-        assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Unknown);
+        assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Set);
         assert!(analysis.needed_queries().is_empty());
+
+        let other = receiver_of(project, file, "other.map");
+
+        assert_eq!(analysis.kind_of(file, other, "map"), Kind::Unknown);
+
+        let needed = analysis.needed_queries();
+        let (start, end) = byte_span_of("other.map");
+
+        assert!(
+            matches!(needed.as_slice(), [Query::Type { pos, end: query_end, .. }] if *pos == start && *query_end == end - 4)
+        );
 
         analysis.set_pass(TscPass::Answering);
 
