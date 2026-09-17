@@ -1,5 +1,5 @@
+use crate::analysis::work::Event;
 use crate::analysis::Analysis;
-use crate::budgets::Subtree;
 use crate::declarations::Binding;
 use crate::declarations::Declaration;
 use crate::project::FileId;
@@ -46,14 +46,38 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub(crate) fn opaque_effects_in(&mut self, file: FileId, root: Root<'a>) -> bool {
-        self.opaque_effects_of(file, Subtree::of(root, true, false))
+        if self.fallback_active() || self.work_exhausted() {
+            self.current_effects.unknown_global = true;
+
+            return true;
+        }
+
+        let kinds = self.counted_subtree(file, root, Event::EffectPrepassNode);
+
+        if self.work_exhausted() {
+            self.current_effects.unknown_global = true;
+
+            return true;
+        }
+
+        self.opaque_effects_of(file, kinds)
     }
 
     pub(crate) fn opaque_effects_at(&mut self, file: FileId, node: oxc_semantic::NodeId) -> bool {
+        if self.fallback_active() || self.work_exhausted() {
+            self.current_effects.unknown_global = true;
+
+            return true;
+        }
+
         let mut pending = vec![node];
         let mut kinds = Vec::new();
 
         while let Some(node) = pending.pop() {
+            if !self.charge_work(Event::EffectPrepassNode, 1) {
+                return true;
+            }
+
             let kind = self.kind_of_node(file, node);
 
             if matches!(
@@ -72,6 +96,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn opaque_effects_of(&mut self, file: FileId, kinds: Vec<AstKind<'a>>) -> bool {
         for kind in kinds {
+            if !self.charge_work(Event::EffectPrepassNode, 1) {
+                return true;
+            }
+
             if matches!(
                 kind,
                 AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
@@ -92,13 +120,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
                         match facts {
-                            Some(facts) => self.apply_argument_effects(&facts),
+                            Some(facts) => {
+                                self.invoke_argument(&facts, file, call.span, &call.arguments);
+                            }
                             None => return true,
                         }
                     } else if let Some((target, function)) = declaration
                         .and_then(|declaration| self.declarations.function_of(declaration))
                     {
-                        self.call_user(target, function, file, &call.arguments);
+                        self.call_user(target, function, file, &call.arguments, call.span);
                     } else {
                         self.current_effects.unknown_global = true;
                     }

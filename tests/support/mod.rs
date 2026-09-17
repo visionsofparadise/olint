@@ -56,6 +56,49 @@ pub const SYNTACTIC: Options = Options {
     types: TypeMode::Syntactic,
 };
 
+pub fn assert_scheduler_terminal(stats: olint::summaries::SchedulerStats) {
+    assert_eq!(stats.ready, stats.tasks, "{stats:?}");
+    assert_eq!(stats.waiting, 0, "{stats:?}");
+    assert_eq!(stats.queued, 0, "{stats:?}");
+
+    for event in olint::analysis::work::EVENTS {
+        assert_eq!(
+            stats.work.reserved().count(event),
+            0,
+            "{event:?}: {stats:?}"
+        );
+    }
+}
+
+pub fn unknown_reasons(
+    analysis: &Analysis<'_, '_>,
+    root: Option<olint::unknowns::UnknownId>,
+) -> std::collections::BTreeSet<olint::unknowns::UnknownReason> {
+    use olint::unknowns::UnknownNode;
+
+    let mut pending: Vec<_> = root.into_iter().collect();
+    let mut visited = std::collections::HashSet::new();
+    let mut found = std::collections::BTreeSet::new();
+
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+
+        match analysis.unknowns.node(id) {
+            UnknownNode::Origin(unknown) => {
+                found.insert(unknown.reason);
+            }
+            UnknownNode::Call { child, .. } | UnknownNode::Scale { child, .. } => {
+                pending.push(*child)
+            }
+            UnknownNode::Join { children } => pending.extend(children),
+        }
+    }
+
+    found
+}
+
 pub fn probes_of<'a>(project: &Project<'a>, file: FileId) -> Vec<&'a Expression<'a>> {
     project
         .file(file)

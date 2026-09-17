@@ -14,6 +14,7 @@ use oxc_syntax::operator::{
 };
 use oxc_syntax::scope::ScopeFlags;
 
+use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
 use crate::project::FileId;
@@ -203,6 +204,45 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
+    pub(crate) fn counted_subtree(
+        &mut self,
+        file: FileId,
+        root: Root<'a>,
+        event: Event,
+    ) -> Vec<AstKind<'a>> {
+        let node = match root {
+            Root::Statement(node) => node.node_id(),
+            Root::Expression(node) => node.node_id(),
+            Root::Body(node) => node.node_id(),
+        };
+        let mut pending = vec![node];
+        let mut kinds = Vec::new();
+
+        while let Some(node) = pending.pop() {
+            if !self.charge_work(event, 1) {
+                break;
+            }
+
+            let kind = self.kind_of_node(file, node);
+
+            if matches!(
+                kind,
+                AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+            ) {
+                continue;
+            }
+
+            kinds.push(kind);
+
+            let mut children = self.children_of(file, node);
+
+            children.reverse();
+            pending.extend(children);
+        }
+
+        kinds
+    }
+
     pub fn collect_budgets(&mut self, file: FileId, function: FunctionNode<'a>) -> BudgetContext {
         let body = body_root_of(function);
         let writes = match body {
@@ -211,7 +251,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
         let mut budgets: HashMap<Binding, Budget> = HashMap::new();
         let kinds = body
-            .map(|body| Subtree::of(body, true, false))
+            .map(|body| self.counted_subtree(file, body, Event::BudgetPrepassNode))
             .unwrap_or_default();
 
         for kind in kinds {
@@ -380,6 +420,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut pending = vec![root];
 
         while let Some(node) = pending.pop() {
+            if !self.charge_work(Event::BudgetPrepassNode, 1) {
+                break;
+            }
+
             let kind = self.kind_of_node(file, node);
 
             if let AstKind::IdentifierReference(reference) = kind {
@@ -408,7 +452,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     fn writes_of(&mut self, file: FileId, body: Root<'a>) -> HashMap<Binding, Vec<WriteKind>> {
         let mut writes: HashMap<Binding, Vec<WriteKind>> = HashMap::new();
 
-        for kind in Subtree::of(body, true, false) {
+        for kind in self.counted_subtree(file, body, Event::BudgetPrepassNode) {
             match kind {
                 AstKind::AssignmentExpression(assignment) => match assignment.operator {
                     AssignmentOperator::Addition | AssignmentOperator::Subtraction => {

@@ -9,7 +9,7 @@ use crate::declarations::{Binding, Declarations};
 use crate::directives::PerfTag;
 use crate::effects::Effects;
 use crate::project::{FileId, Project};
-use crate::summaries::{Substitutions, SummaryId, SummaryKey, SummaryRecord};
+use crate::summaries::{Scheduler, Substitutions, SummaryId, SummaryKey, SummaryRecord};
 use crate::tsc::{Query, TscAnswer};
 use crate::types::{QueryKind, TscPass};
 use crate::unknowns::Unknowns;
@@ -33,7 +33,8 @@ pub struct Stats(IndexMap<String, u32>);
 
 impl Stats {
     pub fn count(&mut self, label: &str) {
-        *self.0.entry(label.to_string()).or_insert(0) += 1;
+        let count = self.0.entry(label.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
     pub fn lines(&self) -> Vec<String> {
@@ -47,6 +48,9 @@ impl Stats {
             .collect()
     }
 }
+
+#[path = "analysis_work.rs"]
+pub mod work;
 
 pub struct Analysis<'p, 'a> {
     pub project: &'p Project<'a>,
@@ -66,9 +70,7 @@ pub struct Analysis<'p, 'a> {
     pub values: Values,
     pub(crate) root_sizes: Option<Vec<crate::cost::Cost>>,
     pub current_effects: Effects,
-    pub(crate) stack: Vec<SummaryKey>,
-    pub(crate) minimum_hit: usize,
-    pub(crate) pending_cycle: Vec<SummaryKey>,
+    pub(crate) scheduler: Scheduler,
     pub(crate) current_substitutions: Substitutions,
     pub budget_context: Option<BudgetContext>,
     pub share_bindings: Vec<Binding>,
@@ -97,9 +99,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             values: Values::default(),
             root_sizes: None,
             current_effects: Effects::default(),
-            stack: Vec::new(),
-            minimum_hit: usize::MAX,
-            pending_cycle: Vec::new(),
+            scheduler: Scheduler::default(),
             current_substitutions: Substitutions::new(),
             budget_context: None,
             share_bindings: Vec::new(),

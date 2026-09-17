@@ -173,15 +173,14 @@ fn unrelated_named_assumptions_do_not_change_recursive_preference() {
             let source = format!("/** @perf {mark} */ export function walk(n:number):number {{ return n > 0 ? walk(n-1) : 0; }}\n{unrelated}");
 
             run_with_source(&source, |analysis, file| {
-                let function = function_of_name(analysis.project, file, "walk");
                 let part = summary_of(analysis, file, "walk");
-                let expected = analysis
-                    .bind_function_cost(file, function, &Cost::N)
-                    .unwrap();
+                let expected = Cost::ONE;
 
                 assert_eq!(part.cost.compare(&expected), CostComparison::Within);
                 assert_eq!(expected.compare(&part.cost), CostComparison::Within);
-                assert_eq!(part.chain[0].label, "recursive call walk()");
+                assert!(part.chain.is_empty());
+                assert!(!part.is_complete());
+                assert!(analysis.unknowns.semantic_key(part.unknowns).iter().any(|(id,_)|matches!(analysis.unknowns.node(*id),olint::unknowns::UnknownNode::Origin(unknown) if unknown.reason==olint::unknowns::UnknownReason::Recurrence)));
 
                 if !unrelated.is_empty() {
                     let other = function_of_name(analysis.project, file, "unrelated");

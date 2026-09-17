@@ -6,6 +6,7 @@ use oxc_ast::{AstKind, AstType};
 use oxc_semantic::NodeId;
 use oxc_span::{GetSpan, Span};
 
+use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
 use crate::cost::{nest, Cost, Factor, Part, Preference, Reading};
@@ -191,7 +192,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     pub(crate) fn children_of(&mut self, file: FileId, node: NodeId) -> Vec<NodeId> {
         let project = self.project;
-        let children = self.children.entry(file).or_insert_with(|| {
+
+        if !self.children.contains_key(&file)
+            && !self.charge_work(
+                Event::GraphNode,
+                project.file(file).semantic.nodes().len() as u64,
+            )
+        {
+            return Vec::new();
+        }
+
+        self.children.entry(file).or_insert_with(|| {
             let nodes = project.file(file).semantic.nodes();
             let mut children: Vec<Vec<NodeId>> = vec![Vec::new(); nodes.len()];
 
@@ -210,7 +221,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             children
         });
 
-        children[node.index()].clone()
+        let count = self.children[&file][node.index()].len();
+
+        if !self.charge_work(Event::TraversalEdge, count as u64) {
+            return Vec::new();
+        }
+
+        self.children[&file][node.index()].clone()
     }
 
     fn cost_of_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> Reading {
@@ -220,6 +237,35 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn cost_of_node(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
+        if !self.charge_work(Event::WalkerNode, 1) {
+            return Reading::of_part(self.deferred_unknown(
+                file,
+                kind.span(),
+                UnknownReason::ResourceExhaustion,
+            ));
+        }
+
+        let iteration = is_iteration_kind(&kind);
+
+        if iteration {
+            if let Some(reading) = self.stable_loop(file, kind.node_id()) {
+                return reading;
+            }
+        }
+
+        let serial = self.contribution_serial();
+        let diagnostics = (self.warnings.len(), self.errors.len());
+        let scoped = self.pending_scoped.is_empty() && self.share_bindings.is_empty();
+        let reading = self.cost_of_node_inner(file, kind);
+
+        if iteration && scoped {
+            self.retain_stable_loop(file, kind.node_id(), serial, diagnostics, &reading);
+        }
+
+        reading
+    }
+
+    fn cost_of_node_inner(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
         if is_opaque_kind(&kind) {
             return Reading::empty();
         }
@@ -558,11 +604,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if opaque_effects && !assumed_bound {
             let origin = self.source_span(file, kind.span());
-            let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
+            let mut unknown = Some(self.unknowns.origin(origin, UnknownReason::Bound));
+
+            if self.fallback_active() {
+                let resource = self
+                    .unknowns
+                    .origin(origin, UnknownReason::ResourceExhaustion);
+                unknown = self.unknowns.join(unknown, Some(resource));
+            }
+
             body.main.unknowns = self.unknowns.scale(body.main.unknowns, None);
 
             let unresolved = Part {
-                unknowns: self.unknowns.scale(Some(unknown), None),
+                unknowns: self.unknowns.scale(unknown, None),
                 preference: body.main.preference.max(Preference::Unmarked),
                 ..Part::unmarked(Cost::ONE, Vec::new())
             };
@@ -841,9 +895,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             declaration.and_then(|declaration| self.declarations.function_of(declaration));
 
         if let Some((target, function)) = function {
-            let (callee, cyclic) = self.within_cycle_of(|analysis| {
-                analysis.call_user(target, function, file, &new.arguments)
-            });
+            let (callee, cyclic) = self.call_user(target, function, file, &new.arguments, new.span);
             let chain = if callee.cost.is_one() {
                 Vec::new()
             } else {
@@ -980,11 +1032,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
                 if let Some(facts) = substituted {
-                    self.apply_argument_effects(&facts);
-
-                    let part = facts.callback.unwrap_or_else(|| {
-                        self.unknown_part(file, call.span, UnknownReason::Target)
-                    });
+                    let part = self.invoke_argument(&facts, file, call.span, &call.arguments);
                     let chain = if part.cost.is_one() {
                         Vec::new()
                     } else {
@@ -1026,19 +1074,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             declaration.and_then(|declaration| self.declarations.function_of(declaration));
 
         if let Some((target, function)) = function {
-            let (called, cyclic) = self.within_cycle_of(|analysis| {
-                analysis.call_user(target, function, file, &call.arguments)
-            });
-            let recursive =
-                called.chain.len() == 1 && called.chain[0].label.starts_with("recursive call");
+            let (called, cyclic) =
+                self.call_user(target, function, file, &call.arguments, call.span);
             let chain = if called.cost.is_one() {
                 Vec::new()
-            } else if recursive {
-                let mut factor = called.chain[0].clone();
-
-                factor.site = site;
-
-                vec![factor]
             } else {
                 vec![Factor {
                     label: format!("call {}()", self.name_of(target, function)),

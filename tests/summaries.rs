@@ -12,7 +12,7 @@ fn labels_of(chain: &[olint::cost::Factor]) -> Vec<String> {
 }
 
 #[test]
-fn self_recursion_charges_one_n() {
+fn self_recursion_retains_known_work_and_reports_recurrence() {
     run_with_source(
         "export function walk(n: number): number {\n\treturn n > 0 ? walk(n - 1) : 0;\n}",
         |analysis, file| {
@@ -21,9 +21,10 @@ fn self_recursion_charges_one_n() {
 
             assert_eq!(
                 support::legacy_class_of(analysis, file, walk, &part.cost),
-                Cost::N
+                Cost::ONE
             );
-            assert_eq!(labels_of(&part.chain), vec!["recursive call walk()"]);
+            assert!(part.chain.is_empty());
+            assert_recurrence(analysis, &part);
         },
     );
 }
@@ -38,13 +39,10 @@ fn separate_cycle_roots_keep_their_own_summary_context() {
             let root = analysis.summarize(file, ping).total(&mut analysis.unknowns);
             let member = analysis.summarize(file, pong).total(&mut analysis.unknowns);
 
-            assert_eq!(support::legacy_class_of(analysis, file, ping, &root.cost), Cost::N);
-            assert_eq!(support::legacy_class_of(analysis, file, pong, &member.cost), Cost::N);
-            assert_eq!(
-                labels_of(&member.chain)[0],
-                "recursive call pong()"
-            );
-            assert_eq!(labels_of(&root.chain), vec!["recursive call ping()"]);
+            assert_eq!(support::legacy_class_of(analysis, file, ping, &root.cost), Cost::ONE);
+            assert_eq!(support::legacy_class_of(analysis, file, pong, &member.cost), Cost::ONE);
+            assert_recurrence(analysis, &root);
+            assert_recurrence(analysis, &member);
         },
     );
 }
@@ -251,17 +249,19 @@ fn a_cold_callback_parameter_call_yields_inside_its_caller() {
 }
 
 #[test]
-fn a_cold_recursive_function_keeps_its_recursion_cost() {
+fn a_cold_recursive_function_keeps_its_recurrence_uncertainty() {
     let source = "/** @perf cold */\nexport function walk(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + walk(xs, n - 1);\n}\n";
 
-    assert_eq!(
-        total_of(source, "walk"),
-        (Cost::N, vec!["recursive call walk()".to_string()])
-    );
+    run_with_source(source, |analysis, file| {
+        let part = support::summary_of(analysis, file, "walk");
+
+        assert_eq!(part.cost, Cost::ONE);
+        assert_recurrence(analysis, &part);
+    });
 }
 
 #[test]
-fn a_cold_cycle_member_keeps_the_cycle_cost() {
+fn a_cold_cycle_member_keeps_the_cycle_uncertainty() {
     let source = "export function ping(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
 
     run_with_source(source, |analysis, file| {
@@ -269,17 +269,22 @@ fn a_cold_cycle_member_keeps_the_cycle_cost() {
         let pong = function_of_name(analysis.project, file, "pong");
 
         for function in [ping, pong] {
-            let cost = analysis
+            let part = analysis
                 .summarize(file, function)
-                .total(&mut analysis.unknowns)
-                .cost;
+                .total(&mut analysis.unknowns);
 
             assert_eq!(
-                support::legacy_class_of(analysis, file, function, &cost),
-                Cost::N
+                support::legacy_class_of(analysis, file, function, &part.cost),
+                Cost::ONE
             );
+            assert_recurrence(analysis, &part);
         }
     });
+}
+
+fn assert_recurrence(analysis: &Analysis<'_, '_>, part: &olint::cost::Part) {
+    assert!(!part.is_complete());
+    assert!(analysis.unknowns.semantic_key(part.unknowns).iter().any(|(id,_)|matches!(analysis.unknowns.node(*id),olint::unknowns::UnknownNode::Origin(unknown) if unknown.reason==olint::unknowns::UnknownReason::Recurrence)));
 }
 
 #[test]

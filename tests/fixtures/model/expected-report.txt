@@ -1,10 +1,9 @@
 # tsconfig.json  (160 functions in 15 files)
 
 O(1)               35
-O(1) [partial]     22
+O(1) [partial]     32
 O(xs)              14
 O(rows^2)          11
-O(n)                6
 O((xs * log(xs)))    5
 O(xs^2)             4
 O(rows^2) [partial]    4
@@ -12,7 +11,6 @@ O(o)                3
 O((xs * xs^2))      3
 O(x)                3
 O(N)                3
-O(max(n, xs)) [partial]    3
 O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
@@ -20,7 +18,6 @@ O(max(n, xs))       2
 O(max(1, n^2))      2
 O(xs) [partial]     2
 O(prefix)           2
-O(max(n, matrix)) [partial]    2
 O((max(o, matrix))^(2))    2
 O((log(max(matrix, target)) * max(matrix, target)))    1
 O(matrix^2)         1
@@ -42,6 +39,7 @@ O(max(s, cb)) [partial]    1
 O(max(m, cb)) [partial]    1
 O(max(strings, needle)) [partial]    1
 O(max(re, needles)) [partial]    1
+O(n)                1
 O(text)             1
 O(parts)            1
 O(items^2)          1
@@ -130,6 +128,16 @@ O((max(xs, other))^(2)) AccessorHolder.walk  src/classes.ts:160
         calls AccessorHolder.hidden()                      src/classes.ts:161  = O(max(xs, other))
         in loop for-of                                       src/classes.ts:148  x N
 
+O(rows^2)      WithStaticMethod.compute  src/classes.ts:54
+    in loop for-of                                           src/classes.ts:56  x N
+        in loop for-of                                       src/classes.ts:56  x N
+
+O(rows^2)      callsHashPrivateMethod  src/classes.ts:37 [partial]
+    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows^2)
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows^2)
+    in loop for-of                                           src/classes.ts:30  x N
+        in loop for-of                                       src/classes.ts:30  x N
+
 O(rows^2)      WithHashPrivateMethod.run  src/classes.ts:33
     calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows^2)
     in loop for-of                                           src/classes.ts:30  x N
@@ -167,13 +175,13 @@ O(xs^2)        hotLocalFunctionDeclaration  src/branches.ts:207
     in loop for-of                                           src/branches.ts:211  x N
         in loop for-of                                       src/branches.ts:211  x N
 
-O(rows^2)      reexportDefault  src/modules/reexports.ts:3
-    in loop for-of                                           src/modules/reexports.ts:5  x N
-        in loop for-of                                       src/modules/reexports.ts:5  x N
-
 O(N^2)         WithGetter.total  src/classes.ts:43
     in loop for-of                                           src/classes.ts:45  x N
         in loop for-of                                       src/classes.ts:45  x N
+
+O(rows^2)      reexportDefault  src/modules/reexports.ts:3
+    in loop for-of                                           src/modules/reexports.ts:5  x N
+        in loop for-of                                       src/modules/reexports.ts:5  x N
 
 O(xs^2)        a  src/modules/star.ts:1
     in loop for-of                                           src/modules/star.ts:3  x N
@@ -188,6 +196,10 @@ O(xs^2)        AccessorHolder.run  src/classes.ts:157
         calls AccessorHolder.sweep()                       src/classes.ts:158  = O(xs)
         in loop for-of                                       src/classes.ts:142  x N
 
+O(matrix^2)    labeledLoop  src/bounds.ts:78
+    in loop for-of                                           src/bounds.ts:80  x N
+        in loop for-of                                       src/bounds.ts:81  x N
+
 O(xs^2)        AccessorHolder.build  src/classes.ts:144
     in loop for-of                                           src/classes.ts:145  x N
         calls AccessorHolder.helper()                      src/classes.ts:145  = O(xs)
@@ -197,10 +209,6 @@ O(rows^2)      usesClassExpression  src/classes.ts:94 [partial]
     calls <class>.run()                                    src/classes.ts:95  = O(rows^2)
     in loop for-of                                           src/classes.ts:90  x N
         in loop for-of                                       src/classes.ts:90  x N
-
-O(matrix^2)    labeledLoop  src/bounds.ts:78
-    in loop for-of                                           src/bounds.ts:80  x N
-        in loop for-of                                       src/bounds.ts:81  x N
 
 O(rows^2)      <class>.run  src/classes.ts:88
     in loop for-of                                           src/classes.ts:90  x N
@@ -219,16 +227,6 @@ O(rows^2)      callsStaticMethod  src/classes.ts:60
     calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows^2)
     in loop for-of                                           src/classes.ts:56  x N
         in loop for-of                                       src/classes.ts:56  x N
-
-O(rows^2)      WithStaticMethod.compute  src/classes.ts:54
-    in loop for-of                                           src/classes.ts:56  x N
-        in loop for-of                                       src/classes.ts:56  x N
-
-O(rows^2)      callsHashPrivateMethod  src/classes.ts:37 [partial]
-    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows^2)
-    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows^2)
-    in loop for-of                                           src/classes.ts:30  x N
-        in loop for-of                                       src/classes.ts:30  x N
 
 O(max(1, n^2)) callbackSubstituted  src/calls.ts:13
     calls runNTimes()                                      src/calls.ts:14  = O(max(1, n^2))

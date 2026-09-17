@@ -39,6 +39,8 @@ pub struct ArgumentFacts {
 #[derive(Default)]
 pub struct Values {
     origins: HashMap<SourceSpan, ValueId>,
+    callbacks: HashMap<usize, ValueId>,
+    next_value: u32,
     quantities: HashMap<(ValueId, SizeQuantity), u64>,
     labels: Vec<String>,
 }
@@ -81,9 +83,43 @@ impl Values {
         }
     }
 
+    pub(crate) fn callback(&mut self, descriptor: usize) -> ValueFacts {
+        let value = if let Some(value) = self.callbacks.get(&descriptor) {
+            *value
+        } else {
+            let value = ValueId(self.next_value);
+            self.next_value = self
+                .next_value
+                .checked_add(1)
+                .expect("callback value arena fits u32");
+
+            self.callbacks.insert(descriptor, value);
+
+            value
+        };
+
+        ValueFacts {
+            value,
+            size: None,
+            targets: TargetSet::default(),
+            latent: None,
+        }
+    }
+
     pub fn at(&mut self, origin: SourceSpan) -> ValueFacts {
-        let next = ValueId(u32::try_from(self.origins.len()).expect("value arena fits u32"));
-        let value = *self.origins.entry(origin).or_insert(next);
+        let value = if let Some(value) = self.origins.get(&origin) {
+            *value
+        } else {
+            let value = ValueId(self.next_value);
+            self.next_value = self
+                .next_value
+                .checked_add(1)
+                .expect("value arena fits u32");
+
+            self.origins.insert(origin, value);
+
+            value
+        };
 
         ValueFacts {
             value,
