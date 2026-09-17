@@ -16,7 +16,7 @@ use crate::project::{FileId, Site};
 use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
-use crate::unknowns::{UnknownId, UnknownReason};
+use crate::unknowns::UnknownReason;
 use crate::values::{ArgumentFacts, SizeQuantity, ValueFacts, ValueId};
 use crate::walker::tagged_reading_of;
 
@@ -42,7 +42,7 @@ pub struct ArgumentKey {
     pub value: ValueFacts,
     pub cost: Option<Cost>,
     pub cost_error: Option<CostError>,
-    pub unknowns: Vec<(UnknownId, Option<Cost>)>,
+    pub unknowns: crate::unknowns::SemanticKeyId,
     pub preference: Preference,
     pub latent_effects: Option<Effects>,
 }
@@ -429,11 +429,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading
     }
     fn key_of(
-        &self,
+        &mut self,
         file: FileId,
         function: FunctionNode<'a>,
         substitutions: &Substitutions,
-    ) -> SummaryKey {
+    ) -> Result<SummaryKey, crate::unknowns::SemanticError> {
         let mut facts: Vec<_> = substitutions
             .iter()
             .map(|(binding, facts)| {
@@ -466,7 +466,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     });
                 value.latent = None;
 
-                ArgumentKey {
+                Ok(ArgumentKey {
                     binding: *binding,
                     value,
                     cost: facts.callback.as_ref().map(|part| part.cost.clone()),
@@ -474,20 +474,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         .callback
                         .as_ref()
                         .and_then(|part| part.cost_error.clone()),
-                    unknowns: self
-                        .unknowns
-                        .semantic_key(facts.callback.as_ref().and_then(|part| part.unknowns)),
+                    unknowns: self.unknowns.semantic_key(
+                        facts.callback.as_ref().and_then(|part| part.unknowns),
+                        &mut || {
+                            self.scheduler
+                                .work
+                                .admit(Charges::one(Event::SemanticIdentity, 1))
+                                .is_ok()
+                        },
+                    )?,
                     preference: facts.preference,
                     latent_effects,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::unknowns::SemanticError>>()?;
 
         facts.sort_by_key(|facts| match facts.binding {
             Binding::Symbol { file, symbol } => (file.0, symbol.index()),
         });
 
-        SummaryKey {
+        Ok(SummaryKey {
             generation: self.scheduler.generation,
             raw: false,
             root_sizes: self.root_sizes.clone().unwrap_or_default(),
@@ -496,7 +502,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 node: function.node_id(),
             },
             substitutions: facts,
-        }
+        })
     }
 
     fn store_summary(&mut self, key: SummaryKey, reading: Reading, effects: Effects) -> SummaryId {
@@ -947,7 +953,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         raw: bool,
     ) -> Reading {
         let substitutions = self.function_inputs(file, function, substitutions);
-        let mut key = self.key_of(file, function, &substitutions);
+        let Ok(mut key) = self.key_of(file, function, &substitutions) else {
+            self.scheduler.exhausted = true;
+
+            return self.unknown_reading(
+                file,
+                self.kind_of_node(file, function.node_id()).span(),
+                UnknownReason::ResourceExhaustion,
+            );
+        };
         key.raw = raw;
 
         self.request_reading(key, substitutions).0
@@ -1415,7 +1429,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let unknown = self
             .unknowns
             .origin(origin, UnknownReason::ResourceExhaustion);
-        let mut part = reading.total(&mut self.unknowns);
+        let mut part = reading.total(&mut self.unknowns, &mut self.traces);
         part.unknowns = self.unknowns.join(part.unknowns, Some(unknown));
 
         if part.preference == Preference::Absent {
@@ -1646,6 +1660,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     cost.unwrap_or(Cost::ONE),
                     &text,
                     self.function_site_of(file, function),
+                    self.source_span(file, self.kind_of_node(file, function.node_id()).span()),
+                    &mut self.traces,
+                    &mut self.unknowns,
                 );
 
                 if unresolved {
@@ -1654,7 +1671,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         self.kind_of_node(file, function.node_id()).span(),
                         UnknownReason::SizeRelation,
                     );
-                    reading.main.unknowns = unknown.main.unknowns;
+                    reading.main.unknowns = self
+                        .unknowns
+                        .join(reading.main.unknowns, unknown.main.unknowns);
                 }
 
                 let reading = self.finish_reading(file, function, reading, substitutions);
@@ -1850,7 +1869,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     preference: Preference::Unmarked,
                 };
             };
-            let key = self.key_of(target, function, &captured);
+            let Ok(key) = self.key_of(target, function, &captured) else {
+                self.scheduler.exhausted = true;
+
+                return ArgumentFacts {
+                    value,
+                    callback: Some(self.deferred_unknown(
+                        file,
+                        argument.span(),
+                        UnknownReason::ResourceExhaustion,
+                    )),
+                    preference: Preference::Unmarked,
+                };
+            };
             let descriptor = if let Some(id) = self.scheduler.callback_keys.get(&key) {
                 Some(*id)
             } else if self.charge_work(Event::CallbackDescriptor, 1) {
@@ -2104,7 +2135,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let substitutions = self.function_inputs(file, function, substitutions);
-        let key = self.key_of(file, function, &substitutions);
+        let Ok(key) = self.key_of(file, function, &substitutions) else {
+            self.scheduler.exhausted = true;
+
+            return (
+                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                false,
+            );
+        };
 
         self.observe_invocation(&key, call_file, span);
 
@@ -2120,7 +2158,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.current_effects.join(&effects);
 
-        (reading.total(&mut self.unknowns), cyclic)
+        (reading.total(&mut self.unknowns, &mut self.traces), cyclic)
     }
 
     fn observe_invocation(&mut self, key: &SummaryKey, file: FileId, span: oxc_span::Span) {
@@ -2193,7 +2231,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.current_effects.unknown_global = true;
 
             return (
-                self.local_resource_reading(id).total(&mut self.unknowns),
+                self.local_resource_reading(id)
+                    .total(&mut self.unknowns, &mut self.traces),
                 true,
             );
         }
@@ -2209,7 +2248,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .contains(&self.scheduler.tasks[parent.0].key.function)
             });
 
-            return (record.reading.total(&mut self.unknowns), cyclic);
+            return (
+                record.reading.total(&mut self.unknowns, &mut self.traces),
+                cyclic,
+            );
         }
 
         (
@@ -2240,127 +2282,128 @@ impl<'p, 'a> Analysis<'p, 'a> {
             ) && matches!(nodes.parent_kind(parent), AstKind::Program(_)))
     }
 
-    fn method_owner_of(&self, file: FileId, element: NodeId) -> String {
-        let nodes = self.project.file(file).semantic.nodes();
-        let body = nodes.parent_id(element);
-
-        match (nodes.kind(body), nodes.parent_kind(body)) {
-            (AstKind::ClassBody(_), AstKind::Class(class)) => {
-                let name = class
-                    .id
-                    .as_ref()
-                    .map(|id| id.name.to_string())
-                    .unwrap_or_else(|| "<class>".to_string());
-
-                format!("{name}.")
-            }
-            _ => String::new(),
-        }
-    }
-
-    fn key_text_of(
+    pub(crate) fn trace_name_of(
         &self,
         file: FileId,
-        key: &oxc_ast::ast::PropertyKey<'a>,
-        computed: bool,
-    ) -> String {
-        let span = key.span();
+        function: FunctionNode<'a>,
+    ) -> Result<String, std::fmt::Error> {
+        let mut out = crate::trace::BoundedText {
+            text: String::new(),
+            limit: self.traces.label_limit(),
+            exhausted: false,
+        };
 
-        if !computed {
-            return self.text_of(file, span).to_string();
-        }
+        self.write_name_of(file, function, &mut out)?;
 
-        let source = self.project.file(file).text;
-        let before = &source[..span.start as usize];
-        let after = &source[span.end as usize..];
-        let open = before.trim_end().strip_suffix('[').map(str::len);
-        let close = after
-            .find(|character: char| !character.is_whitespace())
-            .filter(|index| after[*index..].starts_with(']'));
-
-        match (open, close) {
-            (Some(open), Some(close)) => source[open..span.end as usize + close + 1].to_string(),
-            _ => format!("[{}]", self.text_of(file, span)),
-        }
-    }
-
-    fn field_name_of(
-        &self,
-        file: FileId,
-        field: NodeId,
-        key: &oxc_ast::ast::PropertyKey<'a>,
-        computed: bool,
-    ) -> String {
-        format!(
-            "{}{}",
-            self.method_owner_of(file, field),
-            self.key_text_of(file, key, computed)
-        )
+        Ok(out.text)
     }
 
     pub fn name_of(&self, file: FileId, function: FunctionNode<'a>) -> String {
+        let mut out = String::new();
+
+        self.write_name_of(file, function, &mut out)
+            .expect("String writer");
+
+        out
+    }
+
+    fn write_name_of(
+        &self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        out: &mut dyn std::fmt::Write,
+    ) -> std::fmt::Result {
         let nodes = self.project.file(file).semantic.nodes();
-        let node = function.node_id();
-        let parent = nodes.parent_id(node);
+        let parent = nodes.parent_id(function.node_id());
+        let owner = |out: &mut dyn std::fmt::Write| {
+            let body = nodes.parent_id(parent);
+
+            if let (AstKind::ClassBody(_), AstKind::Class(class)) =
+                (nodes.kind(body), nodes.parent_kind(body))
+            {
+                out.write_str(class.id.as_ref().map_or("<class>", |id| id.name.as_str()))?;
+                out.write_char('.')?;
+            }
+
+            Ok(())
+        };
+        let key = |property: &oxc_ast::ast::PropertyKey<'a>,
+                   computed: bool,
+                   out: &mut dyn std::fmt::Write| {
+            let span = property.span();
+
+            if !computed {
+                return out.write_str(self.text_of(file, span));
+            }
+
+            let source = self.project.file(file).text;
+            let open = source[..span.start as usize]
+                .trim_end()
+                .strip_suffix('[')
+                .map(str::len);
+            let after = &source[span.end as usize..];
+            let close = after
+                .find(|character: char| !character.is_whitespace())
+                .filter(|index| after[*index..].starts_with(']'));
+
+            match (open, close) {
+                (Some(open), Some(close)) => {
+                    out.write_str(&source[open..span.end as usize + close + 1])
+                }
+                _ => {
+                    out.write_char('[')?;
+                    out.write_str(self.text_of(file, span))?;
+
+                    out.write_char(']')
+                }
+            }
+        };
 
         if let FunctionNode::Function(inner) = function {
             if inner.is_declaration() {
-                return inner
-                    .id
-                    .as_ref()
-                    .map(|id| id.name.to_string())
-                    .unwrap_or_else(|| "<default>".to_string());
+                return out.write_str(inner.id.as_ref().map_or("<default>", |id| id.name.as_str()));
             }
 
-            match nodes.kind(parent) {
-                AstKind::MethodDefinition(method) => {
-                    let owner = self.method_owner_of(file, parent);
+            if let AstKind::MethodDefinition(method) = nodes.kind(parent) {
+                owner(out)?;
 
-                    if method.kind == MethodDefinitionKind::Constructor {
-                        return format!("{owner}constructor");
-                    }
-
-                    return format!(
-                        "{owner}{}",
-                        self.key_text_of(file, &method.key, method.computed)
-                    );
-                }
-                AstKind::ObjectProperty(property)
-                    if property.method || property.kind != PropertyKind::Init =>
-                {
-                    return self.key_text_of(file, &property.key, property.computed);
-                }
-                _ => {}
+                return if method.kind == MethodDefinitionKind::Constructor {
+                    out.write_str("constructor")
+                } else {
+                    key(&method.key, method.computed, out)
+                };
             }
         }
 
         match nodes.kind(parent) {
-            AstKind::VariableDeclarator(declarator) => {
-                return self.text_of(file, declarator.id.span()).to_string();
+            AstKind::VariableDeclarator(declaration) => {
+                return out.write_str(self.text_of(file, declaration.id.span()))
             }
-            AstKind::ObjectProperty(property) => {
-                return self.key_text_of(file, &property.key, property.computed);
-            }
+            AstKind::ObjectProperty(property) => return key(&property.key, property.computed, out),
             AstKind::PropertyDefinition(property) => {
-                return self.field_name_of(file, parent, &property.key, property.computed);
+                owner(out)?;
+
+                return key(&property.key, property.computed, out);
             }
             AstKind::AccessorProperty(property) => {
-                return self.field_name_of(file, parent, &property.key, property.computed);
+                owner(out)?;
+
+                return key(&property.key, property.computed, out);
             }
             _ => {}
         }
 
         if let FunctionNode::Function(inner) = function {
             if let Some(id) = &inner.id {
-                return id.name.to_string();
+                return out.write_str(id.name.as_str());
             }
         }
 
-        match nodes.kind(parent) {
-            AstKind::CallExpression(_) | AstKind::NewExpression(_) => "<callback>".to_string(),
-            AstKind::ReturnStatement(_) => "<returned fn>".to_string(),
-            _ => "<anonymous>".to_string(),
-        }
+        out.write_str(match nodes.kind(parent) {
+            AstKind::CallExpression(_) | AstKind::NewExpression(_) => "<callback>",
+            AstKind::ReturnStatement(_) => "<returned fn>",
+            _ => "<anonymous>",
+        })
     }
 
     pub(crate) fn function_start_of(&self, file: FileId, function: FunctionNode<'a>) -> u32 {

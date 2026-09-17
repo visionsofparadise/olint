@@ -341,7 +341,9 @@ fn captured_callback_facts_separate_impure_work_and_reuse_pure_work() {
             );
 
             for record in records {
-                let selected = record.reading.total(&mut analysis.unknowns);
+                let selected = record
+                    .reading
+                    .total(&mut analysis.unknowns, &mut analysis.traces);
                 let why = reasons(analysis, selected.unknowns);
 
                 assert_eq!(selected.cost, Cost::ONE);
@@ -410,7 +412,10 @@ fn recurrence_members_keep_local_work_and_cached_member_results() {
 
                 assert_eq!(records.len(), 1, "{name}");
 
-                let local = records[0].reading.clone().total(&mut analysis.unknowns);
+                let local = records[0]
+                    .reading
+                    .clone()
+                    .total(&mut analysis.unknowns, &mut analysis.traces);
                 let loop_line = analysis
                     .project
                     .line_of(file, source.find(loop_text).unwrap() as u32);
@@ -421,8 +426,7 @@ fn recurrence_members_keep_local_work_and_cached_member_results() {
                     "{name}"
                 );
                 assert!(
-                    local
-                        .chain
+                    support::trace_nodes(&analysis.traces, local.trace)
                         .iter()
                         .any(|factor| factor.site.line == loop_line),
                     "{name} lost its own loop origin"

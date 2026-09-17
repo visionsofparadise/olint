@@ -1,38 +1,75 @@
 use super::{lines_of_chain, lines_of_report, lint_header_of, ReportRow};
 use crate::config::{Config, Limit};
-use crate::cost::{Cost, Factor};
+use crate::cost::Cost;
 use crate::project::{FileId, Site};
+use crate::trace::TraceArena;
+use crate::unknowns::SourceSpan;
 use crate::values::Values;
-
-fn factor_of(label: &str, line: u32, cost: Cost, inner: Vec<Factor>) -> Factor {
-    Factor {
-        label: label.to_string(),
-        site: Site {
-            file: FileId(0),
-            line,
-        },
-        cost,
-        inner,
-    }
-}
 
 #[test]
 fn chains_pad_labels_and_nest_inner_calls() {
-    let chain = vec![
-        factor_of("for-of", 137, Cost::N, Vec::new()),
-        factor_of(
-            "call costFn()",
-            137,
+    let mut traces = TraceArena::default();
+    let tag = traces
+        .factor(
+            "@perf O(N)".into(),
+            Site {
+                file: FileId(0),
+                line: 129,
+            },
+            SourceSpan {
+                file: FileId(0),
+                start: 129,
+                end: 130,
+            },
             Cost::N,
-            vec![factor_of("@perf O(N)", 129, Cost::N, Vec::new())],
-        ),
-    ];
+            None,
+            None,
+        )
+        .unwrap();
+    let call = traces
+        .factor(
+            "call costFn()".into(),
+            Site {
+                file: FileId(0),
+                line: 137,
+            },
+            SourceSpan {
+                file: FileId(0),
+                start: 137,
+                end: 138,
+            },
+            Cost::N,
+            Some(tag),
+            None,
+        )
+        .unwrap();
+    let root = traces
+        .factor(
+            "for-of".into(),
+            Site {
+                file: FileId(0),
+                line: 137,
+            },
+            SourceSpan {
+                file: FileId(0),
+                start: 136,
+                end: 139,
+            },
+            Cost::N,
+            None,
+            Some(call),
+        )
+        .unwrap();
     let mut out = Vec::new();
 
-    lines_of_chain(&Values::default(), &chain, 1, &mut out, &|site| {
-        format!("src/tags.ts:{}", site.line)
-    });
-
+    lines_of_chain(
+        &Values::default(),
+        &traces,
+        Some(root),
+        1,
+        &mut out,
+        &|site, out| write!(out, "src/tags.ts:{}", site.line),
+    );
     assert_eq!(
         out,
         vec![
@@ -61,7 +98,7 @@ fn row_of(cost: Cost, name: &str, file: u32, line: u32) -> ReportRow {
             file: FileId(file),
             line,
         },
-        chain: Vec::new(),
+        trace: None,
     }
 }
 
@@ -74,9 +111,14 @@ fn report_histogram_orders_by_count_and_keeps_first_seen_ties() {
         row_of(Cost::ONE, "second", 1, 4),
         row_of(Cost::parse("O(N^2)").unwrap(), "square", 1, 5),
     ];
-    let lines = lines_of_report(&Values::default(), "tsconfig.json", &rows, 2, &|site| {
-        format!("src/{}.ts:{}", site.file.0, site.line)
-    });
+    let lines = lines_of_report(
+        &Values::default(),
+        &TraceArena::default(),
+        "tsconfig.json",
+        &rows,
+        2,
+        &|site, out| write!(out, "src/{}.ts:{}", site.file.0, site.line),
+    );
 
     assert_eq!(
         lines,
@@ -102,9 +144,14 @@ fn report_minimum_zero_flags_every_row() {
         row_of(Cost::ONE, "first", 0, 2),
         row_of(Cost::N, "linear", 0, 1),
     ];
-    let lines = lines_of_report(&Values::default(), "tsconfig.json", &rows, 0, &|site| {
-        format!("src/a.ts:{}", site.line)
-    });
+    let lines = lines_of_report(
+        &Values::default(),
+        &TraceArena::default(),
+        "tsconfig.json",
+        &rows,
+        0,
+        &|site, out| write!(out, "src/a.ts:{}", site.line),
+    );
 
     assert_eq!(
         &lines[5..],
@@ -163,9 +210,14 @@ fn incomparable_report_rows_have_a_total_order_independent_of_input_order() {
     let b = row_of(Cost::dimension(2, crate::cost::Domain::Size), "beta", 0, 2);
     let rows = vec![a, b];
     let render = |rows: &[ReportRow]| {
-        lines_of_report(&Values::default(), "tsconfig.json", rows, 0, &|site| {
-            format!("index.ts:{}", site.line)
-        })
+        lines_of_report(
+            &Values::default(),
+            &TraceArena::default(),
+            "tsconfig.json",
+            rows,
+            0,
+            &|site, out| write!(out, "index.ts:{}", site.line),
+        )
         .into_iter()
         .filter(|line| line.contains("alpha") || line.contains("beta"))
         .collect::<Vec<_>>()
@@ -190,9 +242,14 @@ fn high_minimum_keeps_only_the_qualified_logarithmic_exception() {
         ),
         row_of(Cost::parse("O(N^3 / log(N))").unwrap(), "inverse_log", 0, 5),
     ];
-    let lines = lines_of_report(&Values::default(), "tsconfig.json", &rows, 99, &|_| {
-        "index.ts:1".into()
-    });
+    let lines = lines_of_report(
+        &Values::default(),
+        &TraceArena::default(),
+        "tsconfig.json",
+        &rows,
+        99,
+        &|_, out| out.write_str("index.ts:1"),
+    );
     let text = lines.join("\n");
 
     assert!(text.contains("legacy_sorting"));
@@ -201,16 +258,26 @@ fn high_minimum_keeps_only_the_qualified_logarithmic_exception() {
     assert!(!text.contains("additive_log"));
     assert!(!text.contains("inverse_log"));
 
-    let zero = lines_of_report(&Values::default(), "tsconfig.json", &rows, 0, &|_| {
-        "index.ts:1".into()
-    })
+    let zero = lines_of_report(
+        &Values::default(),
+        &TraceArena::default(),
+        "tsconfig.json",
+        &rows,
+        0,
+        &|_, out| out.write_str("index.ts:1"),
+    )
     .join("\n");
 
     assert!(zero.contains("pure_cubic"));
 
-    let three = lines_of_report(&Values::default(), "tsconfig.json", &rows, 3, &|_| {
-        "index.ts:1".into()
-    })
+    let three = lines_of_report(
+        &Values::default(),
+        &TraceArena::default(),
+        "tsconfig.json",
+        &rows,
+        3,
+        &|_, out| out.write_str("index.ts:1"),
+    )
     .join("\n");
 
     assert!(three.contains("pure_cubic"));

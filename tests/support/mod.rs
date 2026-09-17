@@ -204,7 +204,7 @@ pub fn summary_of(analysis: &mut Analysis<'_, '_>, file: FileId, name: &str) -> 
 
     analysis
         .summarize(file, function)
-        .total(&mut analysis.unknowns)
+        .total(&mut analysis.unknowns, &mut analysis.traces)
 }
 
 pub fn legacy_class_of<'a>(
@@ -256,4 +256,34 @@ pub fn legacy_reading_of<'a>(
     }
 
     reading
+}
+
+pub fn trace_nodes(
+    traces: &olint::trace::TraceArena,
+    root: Option<olint::trace::TraceId>,
+) -> Vec<&olint::trace::TraceNode> {
+    let mut pending: Vec<_> = root.into_iter().collect();
+    let mut out = Vec::new();
+
+    while let Some(id) = pending.pop() {
+        let node = traces.node(id).unwrap();
+
+        match traces.layout(id).unwrap() {
+            olint::trace::TraceLayout::Group | olint::trace::TraceLayout::Sequence => {
+                pending.extend(node.children.iter().rev().copied())
+            }
+            olint::trace::TraceLayout::Factor { inner_children } => {
+                out.push(node);
+                pending.extend(
+                    node.children
+                        .iter()
+                        .skip(inner_children as usize)
+                        .rev()
+                        .copied(),
+                );
+            }
+        }
+    }
+
+    out
 }

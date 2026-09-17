@@ -1,17 +1,16 @@
 use crate::analysis::Analysis;
 use crate::config::Config;
-use crate::cost::{Cost, CostComparison, Factor, Part};
+use crate::cost::{Cost, CostComparison, Part};
 use crate::declarations::FunctionNode;
 use crate::directives::cost_tag_of;
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
 use crate::summaries::Substitutions;
+use crate::trace::{RenderBudget, TraceArena, TraceId};
 use crate::unknowns::UnknownId;
 use crate::values::Values;
 use oxc_span::GetSpan;
-
-const LOOP_LABELS: &[&str] = &["for", "for-of", "for-in", "while", "do-while"];
 
 fn padded_text_of(text: &str, width: usize) -> String {
     let length: usize = text.chars().map(char::len_utf16).sum();
@@ -29,76 +28,40 @@ fn location_of(project: &Project<'_>, site: Site) -> String {
 
 pub fn chain_lines(
     values: &Values,
+    traces: &TraceArena,
     project: &Project<'_>,
-    chain: &[Factor],
+    trace: Option<TraceId>,
     depth: usize,
     out: &mut Vec<String>,
 ) {
-    lines_of_chain(values, chain, depth, out, &|site| {
-        location_of(project, site)
+    lines_of_chain(values, traces, trace, depth, out, &|site, out| {
+        write!(out, "{}:{}", project.file(site.file).relative, site.line)
     });
 }
 
 fn lines_of_chain(
     values: &Values,
-    chain: &[Factor],
+    traces: &TraceArena,
+    trace: Option<TraceId>,
     depth: usize,
     out: &mut Vec<String>,
-    location: &dyn Fn(Site) -> String,
+    location: &dyn Fn(Site, &mut dyn std::fmt::Write) -> std::fmt::Result,
 ) {
-    let mut depth = depth;
+    let Some(trace) = trace else {
+        return;
+    };
+    let rendered = crate::trace::render(
+        traces,
+        trace,
+        depth,
+        RenderBudget::default(),
+        &|site, out| location(site, out),
+        &|cost, call, out| cost.write_with(out, call, &|id, out| values.write_label(id, out)),
+    );
 
-    for factor in chain {
-        let label = factor.label.as_str();
-        let is_loop = LOOP_LABELS.iter().any(|name| {
-            label == *name
-                || label
-                    .strip_prefix(name)
-                    .is_some_and(|rest| rest.starts_with(' '))
-        });
-        let is_tag = label.starts_with("@perf ");
-        let is_call = label.starts_with("call ")
-            || label.starts_with("new ")
-            || label.starts_with("recursive call ")
-            || is_tag;
-        let relation = if is_loop {
-            "in loop"
-        } else if is_tag {
-            "reads as"
-        } else if is_call {
-            "calls"
-        } else {
-            "does"
-        };
-        let cost = if factor.cost.is_one() {
-            String::new()
-        } else if is_call {
-            format!("  = {}", factor.cost.text_with(&|id| values.label(id)))
-        } else {
-            let text = factor.cost.text_with(&|id| values.label(id));
-
-            format!("  x {}", &text[2..text.len() - 1])
-        };
-        let shown = ["call ", "new ", "recursive call "]
-            .iter()
-            .find_map(|prefix| label.strip_prefix(prefix))
-            .unwrap_or(label);
-        let width = 52 - (depth * 4).min(32);
-
-        out.push(format!(
-            "{}{relation} {} {}{cost}",
-            "    ".repeat(depth),
-            padded_text_of(shown, width),
-            location(factor.site)
-        ));
-
-        if !factor.inner.is_empty() {
-            lines_of_chain(values, &factor.inner, depth, out, location);
-        }
-
-        if !is_call && !factor.cost.is_one() {
-            depth += 1;
-        }
+    match rendered {
+        Ok(rendered) => out.extend(rendered.text.lines().map(str::to_owned)),
+        Err(_) => out.push(crate::trace::TRUNCATION_MARKER.trim_end().to_owned()),
     }
 }
 
@@ -134,7 +97,7 @@ pub struct ReportRow {
     pub name: String,
     pub mark: Option<String>,
     pub site: Site,
-    pub chain: Vec<Factor>,
+    pub trace: Option<TraceId>,
 }
 
 pub fn report_rows_of<'a>(
@@ -164,7 +127,7 @@ pub fn report_rows_of<'a>(
             Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
             None => analysis.summarize(file, function),
         }
-        .total(&mut analysis.unknowns);
+        .total(&mut analysis.unknowns, &mut analysis.traces);
 
         let envelope = match analysis.bind_function_cost(file, function, &Cost::N) {
             Ok(cost) => Some(cost),
@@ -187,7 +150,7 @@ pub fn report_rows_of<'a>(
             name: analysis.name_of(file, function),
             mark,
             site: analysis.function_site_of(file, function),
-            chain: part.chain,
+            trace: part.trace,
         });
     }
 
@@ -215,6 +178,7 @@ fn lint_header_of(tsconfig: &str, config: &Config, entries: &[String], checked: 
 
 pub fn lint_lines(
     values: &Values,
+    traces: &TraceArena,
     project: &Project<'_>,
     config: &Config,
     checked: &[Finding<'_>],
@@ -249,7 +213,7 @@ pub fn lint_lines(
             ));
         }
 
-        chain_lines(values, project, &finding.part.chain, 1, &mut lines);
+        chain_lines(values, traces, project, finding.part.trace, 1, &mut lines);
 
         lines.push(String::new());
     }
@@ -270,25 +234,28 @@ pub fn lint_lines(
 
 pub fn report_lines(
     values: &Values,
+    traces: &TraceArena,
     project: &Project<'_>,
     rows: &[ReportRow],
     minimum_exponent: u32,
 ) -> Vec<String> {
     lines_of_report(
         values,
+        traces,
         &tsconfig_text_of(project),
         rows,
         minimum_exponent,
-        &|site| location_of(project, site),
+        &|site, out| write!(out, "{}:{}", project.file(site.file).relative, site.line),
     )
 }
 
 fn lines_of_report(
     values: &Values,
+    traces: &TraceArena,
     tsconfig: &str,
     rows: &[ReportRow],
     minimum_exponent: u32,
-    location: &dyn Fn(Site) -> String,
+    location: &dyn Fn(Site, &mut dyn std::fmt::Write) -> std::fmt::Result,
 ) -> Vec<String> {
     let mut files: Vec<FileId> = rows.iter().map(|row| row.site.file).collect();
 
@@ -363,7 +330,7 @@ fn lines_of_report(
             &row.cost,
             &row.name,
             row.mark.as_deref(),
-            &location(row.site),
+            &location_text(row.site, location),
         );
 
         lines.push(if row.unknowns.is_some() {
@@ -372,7 +339,7 @@ fn lines_of_report(
             row_text
         });
 
-        lines_of_chain(values, &row.chain, 1, &mut lines, location);
+        lines_of_chain(values, traces, row.trace, 1, &mut lines, location);
 
         lines.push(String::new());
     }
@@ -391,3 +358,20 @@ fn partial_text(values: &Values, cost: &Cost, unknowns: Option<UnknownId>) -> St
 #[cfg(test)]
 #[path = "report.test.rs"]
 mod tests;
+
+fn location_text(
+    site: Site,
+    location: &dyn Fn(Site, &mut dyn std::fmt::Write) -> std::fmt::Result,
+) -> String {
+    let mut out = crate::trace::BoundedText {
+        text: String::new(),
+        limit: 4096,
+        exhausted: false,
+    };
+
+    if location(site, &mut out).is_err() {
+        return "<location truncated>".into();
+    }
+
+    out.text
+}

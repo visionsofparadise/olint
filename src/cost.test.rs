@@ -25,11 +25,15 @@ fn grouped_factors_keep_canonical_presentation_order() {
 }
 #[test]
 fn originless_maximum_exhaustion_is_an_explicit_failure() {
+    let mut traces = TraceArena::default();
     let left = Cost::parse(&format!("O({})", "a".repeat(40_000))).unwrap();
     let right = Cost::parse(&format!("O({})", "b".repeat(40_000))).unwrap();
     let mut unknowns = Unknowns::default();
-    let result = Part::unmarked(left.clone(), Vec::new())
-        .max(Part::unmarked(right, Vec::new()), &mut unknowns);
+    let result = Part::unmarked(left.clone(), None).max(
+        Part::unmarked(right, None),
+        &mut unknowns,
+        &mut traces,
+    );
 
     assert_eq!(result.cost_error, Some(CostError::Resource));
     assert!(!result.is_complete());
@@ -40,6 +44,7 @@ fn originless_maximum_exhaustion_is_an_explicit_failure() {
 
 #[test]
 fn maximum_exhaustion_with_a_source_is_partial_and_cold_errors_stay_unselected() {
+    let mut traces = TraceArena::default();
     let left = Cost::parse(&format!("O({})", "a".repeat(40_000))).unwrap();
     let right = Cost::parse(&format!("O({})", "b".repeat(40_000))).unwrap();
     let origin = SourceSpan {
@@ -48,9 +53,9 @@ fn maximum_exhaustion_with_a_source_is_partial_and_cold_errors_stay_unselected()
         end: 20,
     };
     let mut unknowns = Unknowns::default();
-    let mut first = Part::unmarked(left, Vec::new());
+    let mut first = Part::unmarked(left, None);
     first.origin = Some(origin);
-    let result = first.max(Part::unmarked(right, Vec::new()), &mut unknowns);
+    let result = first.max(Part::unmarked(right, None), &mut unknowns, &mut traces);
 
     assert!(!result.is_complete());
 
@@ -60,9 +65,11 @@ fn maximum_exhaustion_with_a_source_is_partial_and_cold_errors_stay_unselected()
         matches!(unknowns.node(root), crate::unknowns::UnknownNode::Origin(value) if value.origin == origin && value.reason == UnknownReason::ResourceExhaustion)
     );
 
-    let selected = result
-        .preferred(Preference::Cold)
-        .max(Part::unmarked(Cost::ONE, Vec::new()), &mut unknowns);
+    let selected = result.preferred(Preference::Cold).max(
+        Part::unmarked(Cost::ONE, None),
+        &mut unknowns,
+        &mut traces,
+    );
 
     assert!(selected.is_complete());
 }
@@ -524,61 +531,105 @@ fn raw_nodes_are_guarded_at_public_operation_boundaries() {
 }
 
 use crate::project::{FileId, Site};
-fn part_of(cost: Cost, label: &str) -> Part {
-    Part::unmarked(
-        cost.clone(),
-        vec![Factor {
-            label: label.to_string(),
-            site: Site {
+
+#[test]
+fn streamed_cost_text_matches_existing_expression_format() {
+    for source in [
+        "O(1)",
+        "O(N)",
+        "O(log N)",
+        "O(N log N)",
+        "O(n+m)",
+        "O(n*m)",
+        "O(max(n,m))",
+        "O(log(n))",
+        "O(n!)",
+        "O(n^3)",
+        "O((n+m)^m)",
+        "O(n/2)",
+    ] {
+        let cost = Cost::parse(source).unwrap();
+        let mut out = String::new();
+
+        cost.write_with(&mut out, true, &|id, out| write!(out, "size_{id}"))
+            .unwrap();
+        assert_eq!(out, cost.text(), "{source}");
+    }
+}
+fn part_of(traces: &mut TraceArena, cost: Cost, label: &str) -> Part {
+    let trace = traces
+        .factor(
+            label.into(),
+            Site {
                 file: FileId(0),
                 line: 1,
             },
-            cost,
-            inner: Vec::new(),
-        }],
-    )
+            SourceSpan {
+                file: FileId(0),
+                start: 0,
+                end: 1,
+            },
+            cost.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+
+    Part::unmarked(cost, Some(trace))
 }
 
 #[test]
 fn part_max_keeps_the_first_on_ties() {
-    let first = part_of(Cost::N, "first");
-    let second = part_of(Cost::N, "second");
+    let mut traces = TraceArena::default();
+    let first = part_of(&mut traces, Cost::N, "first");
+    let second = part_of(&mut traces, Cost::N, "second");
 
-    assert_eq!(first.clone().max(second, &mut Unknowns::default()), first);
+    assert_eq!(
+        first
+            .clone()
+            .max(second, &mut Unknowns::default(), &mut traces),
+        first
+    );
 }
 
 #[test]
 fn part_max_prefers_hot_then_unmarked_then_cold_over_absent() {
-    let hot = part_of(Cost::ONE, "hot").preferred(Preference::Hot);
-    let unmarked = part_of(Cost::N, "unmarked");
-    let cold = part_of(Cost::parse("O(N^2)").unwrap(), "cold").preferred(Preference::Cold);
+    let mut traces = TraceArena::default();
+    let hot = part_of(&mut traces, Cost::ONE, "hot").preferred(Preference::Hot);
+    let unmarked = part_of(&mut traces, Cost::N, "unmarked");
+    let cold =
+        part_of(&mut traces, Cost::parse("O(N^2)").unwrap(), "cold").preferred(Preference::Cold);
 
     assert_eq!(
-        unmarked.clone().max(hot.clone(), &mut Unknowns::default()),
+        unmarked
+            .clone()
+            .max(hot.clone(), &mut Unknowns::default(), &mut traces),
         hot
     );
     assert_eq!(
-        cold.clone().max(unmarked.clone(), &mut Unknowns::default()),
+        cold.clone()
+            .max(unmarked.clone(), &mut Unknowns::default(), &mut traces),
         unmarked
     );
     assert_eq!(
-        Part::none().max(cold.clone(), &mut Unknowns::default()),
+        Part::none().max(cold.clone(), &mut Unknowns::default(), &mut traces),
         cold
     );
 }
 
 #[test]
 fn reading_total_takes_the_largest_part() {
+    let mut traces = TraceArena::default();
     let reading = Reading {
         phases: [ExecutionPhase::Immediate; 3],
-        main: part_of(Cost::N, "main"),
-        function_exit: part_of(Cost::LOG, "function exit"),
-        loop_exit: part_of(Cost::N_LOG_N, "loop exit"),
+        main: part_of(&mut traces, Cost::N, "main"),
+        function_exit: part_of(&mut traces, Cost::LOG, "function exit"),
+        loop_exit: part_of(&mut traces, Cost::N_LOG_N, "loop exit"),
     };
 
     assert_eq!(
-        reading.total(&mut Unknowns::default()),
-        part_of(Cost::N_LOG_N, "loop exit")
+        reading.total(&mut Unknowns::default(), &mut traces),
+        part_of(&mut traces, Cost::N_LOG_N, "loop exit")
     );
 }
 

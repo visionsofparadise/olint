@@ -129,7 +129,7 @@ fn raw_and_selected_tasks_survive_three_answer_generations_without_aliasing() {
 
         let retained = analysis.summaries_arena.clone();
         let old_unknown = raw
-            .total(&mut analysis.unknowns)
+            .total(&mut analysis.unknowns, &mut analysis.traces)
             .unknowns
             .map(|id| (id, analysis.unknowns.node(id).clone()));
         let answers = needed
@@ -170,7 +170,7 @@ fn raw_and_selected_tasks_survive_three_answer_generations_without_aliasing() {
 
             assert!(analysis.needed_queries().is_empty());
 
-            let part = raw_again.total(&mut analysis.unknowns);
+            let part = raw_again.total(&mut analysis.unknowns, &mut analysis.traces);
 
             if let Some(id) = part.unknowns {
                 assert!(!analysis
@@ -295,7 +295,7 @@ fn equivalent_latent_effect_sets_share_keys_but_different_effects_do_not() {
                 actual.latent = Some(latent);
                 let facts = ArgumentFacts {
                     value: actual,
-                    callback: Some(Part::unmarked(Cost::ONE, Vec::new())),
+                    callback: Some(Part::unmarked(Cost::ONE, None)),
                     preference: Preference::Unmarked,
                 };
 
@@ -326,7 +326,7 @@ fn published_callback_facts_and_unknown_handles_remain_valid_after_reset() {
         let callback = support::function_of_name(analysis.project, file, "callback");
         let invoke = support::function_of_name(analysis.project, file, "invoke");
         let reading = analysis.summarize(file, callback);
-        let part = reading.total(&mut analysis.unknowns);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
         let unknown = part.unknowns.expect("opaque callback is partial");
         let old_node = analysis.unknowns.node(unknown).clone();
         let index = analysis
@@ -356,7 +356,7 @@ fn published_callback_facts_and_unknown_handles_remain_valid_after_reset() {
                 Substitutions::from([(binding, facts.clone())]),
                 false,
             );
-            let part = result.total(&mut analysis.unknowns);
+            let part = result.total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert!(part.unknowns.is_some());
             assert!(
@@ -382,7 +382,7 @@ fn descriptor_admission_failure_keeps_resource_reason_for_a_known_callback() {
 
         let root = support::function_of_name(analysis.project, file, "root");
         let reading = analysis.summarize(file, root);
-        let part = reading.total(&mut analysis.unknowns);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
         let id = part.unknowns.expect("resource exhaustion is incomplete");
 
         assert!(analysis.unknowns.lines(analysis.project, id).iter().any(|line| line.contains("analysis resource limit")));

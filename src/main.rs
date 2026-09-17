@@ -162,6 +162,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         check_analysis_errors(&analysis)?;
         print_lines(&report_lines(
             &analysis.values,
+            &analysis.traces,
             &project,
             &rows,
             analysis.options.minimum_exponent,
@@ -174,7 +175,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         for public in public {
             let mut part = analysis
                 .summarize(public.file, public.function)
-                .total(&mut analysis.unknowns);
+                .total(&mut analysis.unknowns, &mut analysis.traces);
 
             for applicable in public.limits.iter().filter(|applicable| {
                 part.cost.compare(&applicable.limit.cost) == CostComparison::Inconclusive
@@ -230,6 +231,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         check_analysis_errors(&analysis)?;
         print_lines(&lint_lines(
             &analysis.values,
+            &analysis.traces,
             &project,
             &config,
             &checked,
@@ -259,10 +261,9 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         }
 
         for root in selected_unknowns {
-            for line in analysis
-                .unknowns
-                .lines_with(&project, root, &|id| analysis.values.label(id))
-            {
+            for line in analysis.unknowns.lines_with(&project, root, &|id, out| {
+                analysis.values.write_label(id, out)
+            }) {
                 if shown.insert(line.clone()) {
                     eprintln!("olint: {severity}: {line}");
                 }

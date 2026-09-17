@@ -73,6 +73,17 @@ impl Values {
             .unwrap_or_else(|| format!("size_{id}"))
     }
 
+    pub fn write_label(&self, id: u64, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        if id == u64::MAX {
+            return out.write_str("N");
+        }
+
+        match self.labels.get(id as usize) {
+            Some(label) => out.write_str(label),
+            None => write!(out, "size_{id}"),
+        }
+    }
+
     pub fn prefer_length_label(&mut self, value: ValueId) {
         if let Some(id) = self.quantities.get(&(value, SizeQuantity::Value)) {
             let label = &mut self.labels[*id as usize];

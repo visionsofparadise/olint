@@ -22,3 +22,5 @@ pub mod types;
 pub mod unknowns;
 pub mod values;
 pub mod walker;
+
+pub mod trace;

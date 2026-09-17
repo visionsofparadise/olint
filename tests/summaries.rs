@@ -7,8 +7,14 @@ mod support;
 
 use support::{file_of, function_of_name, run_in_project, run_with_source, SYNTACTIC};
 
-fn labels_of(chain: &[olint::cost::Factor]) -> Vec<String> {
-    chain.iter().map(|factor| factor.label.clone()).collect()
+fn labels_of(
+    traces: &olint::trace::TraceArena,
+    root: Option<olint::trace::TraceId>,
+) -> Vec<String> {
+    support::trace_nodes(traces, root)
+        .into_iter()
+        .map(|node| node.label.clone())
+        .collect()
 }
 
 #[test]
@@ -17,13 +23,15 @@ fn self_recursion_retains_known_work_and_reports_recurrence() {
         "export function walk(n: number): number {\n\treturn n > 0 ? walk(n - 1) : 0;\n}",
         |analysis, file| {
             let walk = function_of_name(analysis.project, file, "walk");
-            let part = analysis.summarize(file, walk).total(&mut analysis.unknowns);
+            let part = analysis
+                .summarize(file, walk)
+                .total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(
                 support::legacy_class_of(analysis, file, walk, &part.cost),
                 Cost::ONE
             );
-            assert!(part.chain.is_empty());
+            assert!(part.trace.is_none());
             assert_recurrence(analysis, &part);
         },
     );
@@ -36,8 +44,8 @@ fn separate_cycle_roots_keep_their_own_summary_context() {
         |analysis, file| {
             let ping = function_of_name(analysis.project, file, "ping");
             let pong = function_of_name(analysis.project, file, "pong");
-            let root = analysis.summarize(file, ping).total(&mut analysis.unknowns);
-            let member = analysis.summarize(file, pong).total(&mut analysis.unknowns);
+            let root = analysis.summarize(file, ping).total(&mut analysis.unknowns, &mut analysis.traces);
+            let member = analysis.summarize(file, pong).total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(support::legacy_class_of(analysis, file, ping, &root.cost), Cost::ONE);
             assert_eq!(support::legacy_class_of(analysis, file, pong, &member.cost), Cost::ONE);
@@ -56,11 +64,11 @@ fn a_costed_callback_multiplies_inside_its_caller() {
             let first = analysis.summarize(file, f);
             let second = analysis.summarize(file, f);
 
-            let actual = first.total(&mut analysis.unknowns).cost;
+            let actual = first.total(&mut analysis.unknowns, &mut analysis.traces).cost;
 
             assert_eq!(support::legacy_class_of(analysis, file, f, &actual), Cost::parse("O(N^2)").unwrap());
             assert_eq!(first, second);
-            assert_eq!(labels_of(&first.total(&mut analysis.unknowns).chain), vec!["call each()"]);
+            assert_eq!(labels_of(&analysis.traces,first.main.trace), vec!["call each()"]);
         },
     );
 }
@@ -153,7 +161,7 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
         let caller = function_of_name(project, file, "caller");
         let part = analysis
             .summarize(file, caller)
-            .total(&mut analysis.unknowns);
+            .total(&mut analysis.unknowns, &mut analysis.traces);
 
         assert_eq!(reportable, vec!["caller"]);
         assert_eq!(public, vec!["caller"]);
@@ -161,7 +169,7 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
             support::legacy_class_of(&mut analysis, file, caller, &part.cost),
             Cost::N
         );
-        assert_eq!(labels_of(&part.chain), vec!["for-of"]);
+        assert_eq!(labels_of(&analysis.traces, part.trace), vec!["for-of"]);
     });
 }
 
@@ -172,12 +180,12 @@ fn a_cold_function_called_beside_a_linear_statement_cascades_linear() {
         |analysis, file| {
             let rebuild = function_of_name(analysis.project, file, "rebuild");
             let f = function_of_name(analysis.project, file, "f");
-            let own = analysis.summarize(file, rebuild).total(&mut analysis.unknowns);
-            let part = analysis.summarize(file, f).total(&mut analysis.unknowns);
+            let own = analysis.summarize(file, rebuild).total(&mut analysis.unknowns, &mut analysis.traces);
+            let part = analysis.summarize(file, f).total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(support::legacy_class_of(analysis, file, rebuild, &own.cost), Cost::parse("O(N^2)").unwrap());
             assert_eq!(support::legacy_class_of(analysis, file, f, &part.cost), Cost::N);
-            assert_eq!(labels_of(&part.chain), vec!["rows.indexOf()"]);
+            assert_eq!(labels_of(&analysis.traces,part.trace), vec!["rows.indexOf()"]);
         },
     );
 }
@@ -188,10 +196,10 @@ fn a_hot_function_call_wins_over_a_costlier_sibling() {
         "/** @perf hot */\nconst lookup = (xs: number[]) => xs.indexOf(1);\nexport function f(rows: number[][], xs: number[]) {\n\tfor (const row of rows) for (const value of row) void value;\n\treturn lookup(xs);\n}",
         |analysis, file| {
             let f = function_of_name(analysis.project, file, "f");
-            let part = analysis.summarize(file, f).total(&mut analysis.unknowns);
+            let part = analysis.summarize(file, f).total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(support::legacy_class_of(analysis, file, f, &part.cost), Cost::N);
-            assert_eq!(labels_of(&part.chain), vec!["call lookup()"]);
+            assert_eq!(labels_of(&analysis.traces,part.trace), vec!["call lookup()"]);
         },
     );
 }
@@ -203,11 +211,11 @@ fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
         let function = function_of_name(analysis.project, file, name);
         let part = analysis
             .summarize(file, function)
-            .total(&mut analysis.unknowns);
+            .total(&mut analysis.unknowns, &mut analysis.traces);
 
         found = (
             support::legacy_class_of(analysis, file, function, &part.cost),
-            labels_of(&part.chain),
+            labels_of(&analysis.traces, part.trace),
         );
     });
 
@@ -271,7 +279,7 @@ fn a_cold_cycle_member_keeps_the_cycle_uncertainty() {
         for function in [ping, pong] {
             let part = analysis
                 .summarize(file, function)
-                .total(&mut analysis.unknowns);
+                .total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(
                 support::legacy_class_of(analysis, file, function, &part.cost),
@@ -284,7 +292,8 @@ fn a_cold_cycle_member_keeps_the_cycle_uncertainty() {
 
 fn assert_recurrence(analysis: &Analysis<'_, '_>, part: &olint::cost::Part) {
     assert!(!part.is_complete());
-    assert!(analysis.unknowns.semantic_key(part.unknowns).iter().any(|(id,_)|matches!(analysis.unknowns.node(*id),olint::unknowns::UnknownNode::Origin(unknown) if unknown.reason==olint::unknowns::UnknownReason::Recurrence)));
+    assert!(support::unknown_reasons(analysis, part.unknowns)
+        .contains(&olint::unknowns::UnknownReason::Recurrence));
 }
 
 #[test]

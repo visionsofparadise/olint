@@ -118,7 +118,7 @@ fn known_callback_specialization_resolves_generic_unknown_without_leaking_it() {
     run_with_source("function invoke(callback: () => void) { callback(); } export function f() { invoke(() => 1); }", |analysis, file| {
         let invoke = function_of_name(analysis.project, file, "invoke");
 
-        assert!(analysis.summarize(file, invoke).total(&mut analysis.unknowns).unknowns.is_some());
+        assert!(analysis.summarize(file, invoke).total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_some());
 
         let f = function_of_name(analysis.project, file, "f");
         let first = analysis.summarize(file, f);
@@ -126,7 +126,7 @@ fn known_callback_specialization_resolves_generic_unknown_without_leaking_it() {
 
         assert_eq!(first, second);
         assert_eq!(first.phases, [ExecutionPhase::Immediate; 3]);
-        assert!(first.total(&mut analysis.unknowns).unknowns.is_none());
+        assert!(first.total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_none());
         assert!(analysis.summaries_arena.iter().any(|record| record.effects == olint::effects::Effects::default()));
     });
 
@@ -169,10 +169,10 @@ fn unused_callbacks_are_complete_and_distinct_invocation_spans_are_retained() {
     run_with_source("export function unused(callback: () => void) { return 1; } export function used(callback: () => void) { callback(); callback(); }", |analysis, file| {
         let unused = function_of_name(analysis.project, file, "unused");
 
-        assert!(analysis.summarize(file, unused).total(&mut analysis.unknowns).unknowns.is_none());
+        assert!(analysis.summarize(file, unused).total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_none());
 
         let used = function_of_name(analysis.project, file, "used");
-        let part = analysis.summarize(file, used).total(&mut analysis.unknowns);
+        let part = analysis.summarize(file, used).total(&mut analysis.unknowns, &mut analysis.traces);
         let lines = unknown_lines(analysis, part);
 
         assert_eq!(lines.len(), 2);
@@ -244,9 +244,9 @@ fn equal_cost_callbacks_retain_different_effect_facts() {
         let pure = function_of_name(analysis.project, file, "pure");
         let impure = function_of_name(analysis.project, file, "impure");
 
-        assert!(analysis.summarize(file, pure).total(&mut analysis.unknowns).unknowns.is_none());
-        assert!(analysis.summarize(file, impure).total(&mut analysis.unknowns).unknowns.is_some());
-        assert!(analysis.summarize(file, pure).total(&mut analysis.unknowns).unknowns.is_none());
+        assert!(analysis.summarize(file, pure).total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_none());
+        assert!(analysis.summarize(file, impure).total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_some());
+        assert!(analysis.summarize(file, pure).total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_none());
     });
 }
 

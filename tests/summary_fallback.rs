@@ -26,9 +26,11 @@ fn first_body_fallback_reuses_ready_closed_callee() {
             let known = support::function_of_name(analysis.project, file, "known");
             let expected = analysis
                 .summarize(file, known)
-                .total(&mut analysis.unknowns);
+                .total(&mut analysis.unknowns, &mut analysis.traces);
             let root = support::function_of_name(analysis.project, file, "root");
-            let actual = analysis.summarize(file, root).total(&mut analysis.unknowns);
+            let actual = analysis
+                .summarize(file, root)
+                .total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(actual.cost, expected.cost);
             assert!(actual.is_complete());
@@ -65,7 +67,9 @@ fn first_body_lookup_rejects_other_envelopes_inputs_and_raw_records() {
             analysis.summarize_with(file, known, Default::default(), raw);
 
             let root = support::function_of_name(analysis.project, file, "root");
-            let part = analysis.summarize(file, root).total(&mut analysis.unknowns);
+            let part = analysis
+                .summarize(file, root)
+                .total(&mut analysis.unknowns, &mut analysis.traces);
 
             assert_eq!(part.cost, Cost::ONE, "{source}, raw={raw}");
             assert!(support::unknown_reasons(analysis, part.unknowns)
@@ -115,7 +119,7 @@ fn fallback_case(
         let before = analysis.scheduler_stats();
         let function = support::function_of_name(analysis.project, file, "root");
         let reading = analysis.summarize(file, function);
-        let part = reading.total(&mut analysis.unknowns);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
         let expected = analysis
             .bind_function_cost(file, function, &Cost::parse(expected).unwrap())
             .unwrap();
@@ -224,7 +228,7 @@ fn wide_observations(source: &str) -> (Snapshot, u64) {
     support::run_with_source(source, |analysis, file| {
         let function = support::function_of_name(analysis.project, file, "root");
         let reading = analysis.summarize(file, function);
-        let part = reading.total(&mut analysis.unknowns);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
 
         assert_eq!(part.cost, Cost::ONE);
         assert!(part.is_complete());
@@ -258,7 +262,7 @@ fn wide_observations(source: &str) -> (Snapshot, u64) {
             assert_eq!(stats.work.ordinary().count(Event::BodyPass), 0);
             assert_eq!(stats.work.fallback().count(Event::BodyPass), 1);
 
-            let part = reading.total(&mut probe.unknowns);
+            let part = reading.total(&mut probe.unknowns, &mut probe.traces);
 
             assert_eq!(part.cost, Cost::ONE);
             assert!(part.is_complete());

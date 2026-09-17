@@ -1,4 +1,5 @@
 use crate::project::Site;
+use crate::trace::{TraceArena, TraceId};
 use crate::unknowns::{SourceSpan, UnknownId, UnknownReason, Unknowns};
 
 use std::collections::BTreeMap;
@@ -156,6 +157,28 @@ impl Cost {
     }
     pub fn text_with(&self, name: &impl Fn(u64) -> String) -> String {
         self.0.text_with(name)
+    }
+    pub fn write_with(
+        &self,
+        out: &mut dyn std::fmt::Write,
+        full: bool,
+        name: &impl Fn(u64, &mut dyn std::fmt::Write) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        if full {
+            out.write_str("O(")?;
+        }
+
+        if self.0.check_budget().is_err() {
+            out.write_str("unknown")?;
+        } else {
+            self.0.write_inner(out, name)?;
+        }
+
+        if full {
+            out.write_char(')')?;
+        }
+
+        Ok(())
     }
     pub fn structural_key(&self) -> String {
         self.0.structural_key()
@@ -638,6 +661,82 @@ impl Expression {
         }
     }
 
+    fn write_inner(
+        &self,
+        out: &mut dyn std::fmt::Write,
+        name: &impl Fn(u64, &mut dyn std::fmt::Write) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        match self {
+            Self::Constant(number) => write!(out, "{number}"),
+            Self::LegacyN => out.write_str("N"),
+            Self::LegacyLog => out.write_str("log N"),
+            Self::LegacyNLog => out.write_str("N log N"),
+            Self::Name(text) => out.write_str(text),
+            Self::Dimension { id, .. } => name(*id, out),
+            Self::Sum(values) | Self::Product(values) | Self::Maximum(values) => {
+                let (prefix, separator) = match self {
+                    Self::Sum(_) => ("(", " + "),
+                    Self::Product(_) => ("(", " * "),
+                    _ => ("max(", ", "),
+                };
+
+                out.write_str(prefix)?;
+
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        out.write_str(separator)?;
+                    }
+
+                    value.write_inner(out, name)?;
+                }
+
+                out.write_char(')')
+            }
+            Self::Log(value) | Self::Factorial(value) => {
+                out.write_str(if matches!(self, Self::Log(_)) {
+                    "log("
+                } else {
+                    "("
+                })?;
+                value.write_inner(out, name)?;
+
+                out.write_str(if matches!(self, Self::Log(_)) {
+                    ")"
+                } else {
+                    ")!"
+                })
+            }
+            Self::Power(a, b) => {
+                if matches!(
+                    (a.as_ref(), b.as_ref()),
+                    (
+                        Self::LegacyN | Self::Dimension { .. } | Self::Name(_),
+                        Self::Constant(_)
+                    )
+                ) {
+                    a.write_inner(out, name)?;
+                    out.write_char('^')?;
+
+                    b.write_inner(out, name)
+                } else {
+                    out.write_char('(')?;
+                    a.write_inner(out, name)?;
+                    out.write_str(")^(")?;
+                    b.write_inner(out, name)?;
+
+                    out.write_char(')')
+                }
+            }
+            Self::Ratio(a, b) => {
+                out.write_char('(')?;
+                a.write_inner(out, name)?;
+                out.write_str(") / (")?;
+                b.write_inner(out, name)?;
+
+                out.write_char(')')
+            }
+        }
+    }
     pub fn compare(&self, limit: &Self) -> CostComparison {
         self.compare_with_budget(limit, COMPARISON_CREDITS).0
     }
@@ -1353,14 +1452,6 @@ impl Parser<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Factor {
-    pub label: String,
-    pub site: Site,
-    pub cost: Cost,
-    pub inner: Vec<Factor>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Preference {
     #[default]
@@ -1375,12 +1466,56 @@ pub struct Part {
     pub origin: Option<SourceSpan>,
     pub cost_error: Option<CostError>,
     pub cost: Cost,
-    pub chain: Vec<Factor>,
+    pub trace: Option<TraceId>,
     pub preference: Preference,
     pub unknowns: Option<UnknownId>,
 }
 
 impl Part {
+    pub fn called(mut self, origin: SourceSpan, unknowns: &mut Unknowns) -> Self {
+        self.origin = Some(origin);
+        self.unknowns = unknowns.called(self.unknowns, origin);
+
+        self
+    }
+
+    pub fn explanation_failed(mut self, origin: SourceSpan, unknowns: &mut Unknowns) -> Self {
+        self.cost_error = Some(CostError::Resource);
+        let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
+        self.unknowns = unknowns.join(self.unknowns, Some(failure));
+
+        self
+    }
+    pub fn explain(
+        mut self,
+        label: impl std::fmt::Display,
+        site: Site,
+        origin: SourceSpan,
+        inner: bool,
+        traces: &mut TraceArena,
+        unknowns: &mut Unknowns,
+    ) -> Self {
+        let (child, continuation) = if inner {
+            (self.trace, None)
+        } else {
+            (None, self.trace)
+        };
+        let cost = if inner { self.cost.clone() } else { Cost::ONE };
+
+        match traces.factor_format(label, site, origin, cost, child, continuation) {
+            Ok(trace) => self.trace = Some(trace),
+            Err(_) => {
+                self.cost_error = Some(CostError::Resource);
+                let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
+                self.unknowns = unknowns.join(self.unknowns, Some(failure));
+            }
+        }
+
+        self.origin = Some(origin);
+
+        self
+    }
+
     pub fn is_complete(&self) -> bool {
         self.unknowns.is_none() && self.cost_error.is_none()
     }
@@ -1388,12 +1523,12 @@ impl Part {
         Part::default()
     }
 
-    pub fn unmarked(cost: Cost, chain: Vec<Factor>) -> Part {
+    pub fn unmarked(cost: Cost, trace: Option<TraceId>) -> Part {
         Part {
             origin: None,
             cost_error: None,
             cost,
-            chain,
+            trace,
             preference: Preference::Unmarked,
             unknowns: None,
         }
@@ -1408,7 +1543,7 @@ impl Part {
         }
     }
 
-    pub fn max(self, other: Part, unknowns: &mut Unknowns) -> Part {
+    pub fn max(self, other: Part, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
         let (mine, theirs) = (self.rank(), other.rank());
         let selected_error = if mine == theirs {
             self.cost_error.clone().or(other.cost_error.clone())
@@ -1447,7 +1582,10 @@ impl Part {
                     }
                 }
 
-                combined.chain.extend(other.chain);
+                match traces.group(combined.trace, other.trace) {
+                    Ok(trace) => combined.trace = trace,
+                    Err(_) => combined.cost_error = Some(CostError::Resource),
+                }
 
                 combined
             } else {
@@ -1502,11 +1640,18 @@ impl Reading {
         }
     }
 
-    pub fn merge(self, other: Reading, unknowns: &mut Unknowns) -> Reading {
+    pub fn merge(
+        self,
+        other: Reading,
+        unknowns: &mut Unknowns,
+        traces: &mut TraceArena,
+    ) -> Reading {
         Reading {
-            main: self.main.max(other.main, unknowns),
-            function_exit: self.function_exit.max(other.function_exit, unknowns),
-            loop_exit: self.loop_exit.max(other.loop_exit, unknowns),
+            main: self.main.max(other.main, unknowns, traces),
+            function_exit: self
+                .function_exit
+                .max(other.function_exit, unknowns, traces),
+            loop_exit: self.loop_exit.max(other.loop_exit, unknowns, traces),
             phases: self.phases,
         }
     }
@@ -1539,11 +1684,11 @@ impl Reading {
         }
     }
 
-    pub fn total(&self, unknowns: &mut Unknowns) -> Part {
+    pub fn total(&self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
         self.main
             .clone()
-            .max(self.function_exit.clone(), unknowns)
-            .max(self.loop_exit.clone(), unknowns)
+            .max(self.function_exit.clone(), unknowns, traces)
+            .max(self.loop_exit.clone(), unknowns, traces)
     }
 }
 
@@ -1554,18 +1699,18 @@ pub fn nest(
     factor: Cost,
     inner: Part,
     unknowns: &mut Unknowns,
+    traces: &mut TraceArena,
 ) -> Part {
-    let mut chain = Vec::with_capacity(inner.chain.len() + 1);
-
-    chain.push(Factor {
-        label,
-        site,
-        cost: factor.clone(),
-        inner: Vec::new(),
-    });
-    chain.extend(inner.chain);
+    let trace = traces.factor(label, site, origin, factor.clone(), None, inner.trace);
+    let trace_error = trace.is_err();
 
     let mut selected_unknowns = unknowns.scale(inner.unknowns, Some(factor.clone()));
+
+    if trace_error {
+        let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
+        selected_unknowns = unknowns.join(selected_unknowns, Some(failure));
+    }
+
     let cost = match factor.multiply(&inner.cost) {
         Ok(cost) => cost,
         Err(_) => {
@@ -1578,10 +1723,12 @@ pub fn nest(
 
     Part {
         origin: Some(origin),
-        cost_error: inner.cost_error,
+        cost_error: inner
+            .cost_error
+            .or(trace_error.then_some(CostError::Resource)),
         unknowns: selected_unknowns,
         cost,
-        chain,
+        trace: trace.ok(),
         preference: if inner.preference == Preference::Absent {
             Preference::Unmarked
         } else {

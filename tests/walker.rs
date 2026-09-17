@@ -6,10 +6,14 @@ use std::ops::Deref;
 struct TestReading {
     reading: Reading,
     unknowns: RefCell<Unknowns>,
+    traces: RefCell<olint::trace::TraceArena>,
 }
 impl TestReading {
     fn total(&self) -> Part {
-        self.reading.total(&mut self.unknowns.borrow_mut())
+        self.reading.total(
+            &mut self.unknowns.borrow_mut(),
+            &mut self.traces.borrow_mut(),
+        )
     }
 }
 impl Deref for TestReading {
@@ -68,6 +72,7 @@ fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
         TestReading {
             reading: Reading::empty(),
             unknowns: RefCell::new(Unknowns::default()),
+            traces: RefCell::new(Default::default()),
         },
         Vec::new(),
     );
@@ -75,17 +80,17 @@ fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
     run_with_source(source, |analysis, file| {
         let function = function_of_name(analysis.project, file, name);
         let reading = support::legacy_reading_of(analysis, file, function);
-        let labels = reading
-            .total(&mut analysis.unknowns)
-            .chain
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+        let labels = support::trace_nodes(&analysis.traces, part.trace)
             .iter()
-            .map(|factor| factor.label.clone())
+            .map(|node| node.label.clone())
             .collect();
 
         found = (
             TestReading {
                 reading,
                 unknowns: RefCell::new(std::mem::take(&mut analysis.unknowns)),
+                traces: RefCell::new(std::mem::take(&mut analysis.traces)),
             },
             labels,
         );
@@ -113,7 +118,15 @@ fn a_return_inside_a_loop_moves_its_cost_to_the_function_exit() {
     );
 
     assert_eq!(reading.function_exit.cost, Cost::N);
-    assert_eq!(reading.function_exit.chain[0].label, "ys.indexOf()");
+    assert_eq!(
+        reading
+            .traces
+            .borrow()
+            .node(reading.function_exit.trace.unwrap())
+            .unwrap()
+            .label,
+        "ys.indexOf()"
+    );
 }
 
 #[test]
@@ -283,7 +296,7 @@ fn hot_and_cold_on_one_node_take_no_preference_and_warn() {
             let reading = support::legacy_reading_of(analysis, file, function);
             let warnings: Vec<String> = analysis.warnings.iter().cloned().collect();
 
-            assert_eq!(reading.total(&mut analysis.unknowns).cost, Cost::parse("O(N^2)").unwrap());
+            assert_eq!(reading.total(&mut analysis.unknowns, &mut analysis.traces).cost, Cost::parse("O(N^2)").unwrap());
             assert_eq!(
                 warnings,
                 vec!["@perf hot and @perf cold conflict at index.ts:4; the node takes no preference"]
@@ -320,8 +333,11 @@ fn a_string_method_on_a_readonly_field_is_constant() {
     );
 
     assert_eq!(reading.total().cost, Cost::N);
+
+    let trace = reading.total().trace.unwrap();
+
     assert_eq!(
-        reading.total().chain[0].label,
+        reading.traces.borrow().node(trace).unwrap().label,
         "holder.loose.split() [string]"
     );
 }
