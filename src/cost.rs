@@ -73,6 +73,10 @@ impl Cost {
     pub fn is_one(&self) -> bool {
         self.0.is_one()
     }
+    pub(crate) fn has_polynomial_log_growth(&self, envelope: &Self) -> bool {
+        envelope_growth(&self.0, &envelope.0)
+            .is_some_and(|(polynomial, logarithmic)| polynomial >= 1 && logarithmic >= 1)
+    }
     pub fn multiply(&self, other: &Self) -> Result<Self, CostError> {
         self.0.multiply(&other.0).map(Self)
     }
@@ -843,6 +847,40 @@ fn log_product(value: &Expression) -> Option<Expression> {
     )
     .ok()
 }
+fn envelope_growth(value: &Expression, base: &Expression) -> Option<(i128, i128)> {
+    if value == base {
+        return Some((1, 0));
+    }
+
+    match value {
+        Expression::Constant(value) if *value > 0 => Some((0, 0)),
+        Expression::Log(value) if value.as_ref() == base => Some((0, 1)),
+        Expression::Product(values) => values.iter().try_fold((0i128, 0i128), |(a, b), child| {
+            let (c, d) = envelope_growth(child, base)?;
+
+            Some((a.checked_add(c)?, b.checked_add(d)?))
+        }),
+        Expression::Power(value, exponent) => {
+            let Expression::Constant(exponent) = exponent.as_ref() else {
+                return None;
+            };
+            let (a, b) = envelope_growth(value, base)?;
+
+            Some((
+                a.checked_mul(i128::from(*exponent))?,
+                b.checked_mul(i128::from(*exponent))?,
+            ))
+        }
+        Expression::Ratio(left, right) => {
+            let (a, b) = envelope_growth(left, base)?;
+            let (c, d) = envelope_growth(right, base)?;
+
+            Some((a.checked_sub(c)?, b.checked_sub(d)?))
+        }
+        _ => None,
+    }
+}
+
 fn shared_envelope_growth(a: &Expression, b: &Expression) -> Option<((i128, i128), (i128, i128))> {
     let mut pending = vec![a, b];
     let base = loop {
@@ -875,43 +913,7 @@ fn shared_envelope_growth(a: &Expression, b: &Expression) -> Option<((i128, i128
         }
     };
 
-    fn growth(value: &Expression, base: &Expression) -> Option<(i128, i128)> {
-        if value == base {
-            return Some((1, 0));
-        }
-
-        match value {
-            Expression::Constant(value) if *value > 0 => Some((0, 0)),
-            Expression::Log(value) if value.as_ref() == base => Some((0, 1)),
-            Expression::Product(values) => {
-                values.iter().try_fold((0i128, 0i128), |(a, b), child| {
-                    let (c, d) = growth(child, base)?;
-
-                    Some((a.checked_add(c)?, b.checked_add(d)?))
-                })
-            }
-            Expression::Power(value, exponent) => {
-                let Expression::Constant(exponent) = exponent.as_ref() else {
-                    return None;
-                };
-                let (a, b) = growth(value, base)?;
-
-                Some((
-                    a.checked_mul(i128::from(*exponent))?,
-                    b.checked_mul(i128::from(*exponent))?,
-                ))
-            }
-            Expression::Ratio(left, right) => {
-                let (a, b) = growth(left, base)?;
-                let (c, d) = growth(right, base)?;
-
-                Some((a.checked_sub(c)?, b.checked_sub(d)?))
-            }
-            _ => None,
-        }
-    }
-
-    Some((growth(a, base)?, growth(b, base)?))
+    Some((envelope_growth(a, base)?, envelope_growth(b, base)?))
 }
 
 fn within(a: &Expression, b: &Expression, budget: &mut usize) -> bool {

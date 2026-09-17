@@ -175,3 +175,43 @@ fn incomparable_report_rows_have_a_total_order_independent_of_input_order() {
 
     assert_eq!(expected, render(&reversed));
 }
+
+#[test]
+fn high_minimum_keeps_only_the_qualified_logarithmic_exception() {
+    let rows = vec![
+        row_of(Cost::parse("O(N^3)").unwrap(), "pure_cubic", 0, 1),
+        row_of(Cost::N_LOG_N, "legacy_sorting", 0, 2),
+        row_of(Cost::parse("O(N^3 * log(N)^2)").unwrap(), "polylog", 0, 3),
+        row_of(
+            Cost::parse("O(N^3 + log(N))").unwrap(),
+            "additive_log",
+            0,
+            4,
+        ),
+        row_of(Cost::parse("O(N^3 / log(N))").unwrap(), "inverse_log", 0, 5),
+    ];
+    let lines = lines_of_report(&Values::default(), "tsconfig.json", &rows, 99, &|_| {
+        "index.ts:1".into()
+    });
+    let text = lines.join("\n");
+
+    assert!(text.contains("legacy_sorting"));
+    assert!(text.contains("polylog"));
+    assert!(!text.contains("pure_cubic"));
+    assert!(!text.contains("additive_log"));
+    assert!(!text.contains("inverse_log"));
+
+    let zero = lines_of_report(&Values::default(), "tsconfig.json", &rows, 0, &|_| {
+        "index.ts:1".into()
+    })
+    .join("\n");
+
+    assert!(zero.contains("pure_cubic"));
+
+    let three = lines_of_report(&Values::default(), "tsconfig.json", &rows, 3, &|_| {
+        "index.ts:1".into()
+    })
+    .join("\n");
+
+    assert!(three.contains("pure_cubic"));
+}

@@ -341,10 +341,9 @@ fn lines_of_report(
                 envelope.clone(),
                 Cost::constant(u64::from(minimum_exponent)),
             );
-            let log = Cost::logarithm(envelope.clone()).and_then(|log| envelope.multiply(&log));
 
             threshold.is_ok_and(|threshold| threshold.compare(&cost) == CostComparison::Within)
-                || log.is_ok_and(|threshold| threshold.compare(&cost) == CostComparison::Within)
+                || cost.has_polynomial_log_growth(envelope)
         })
         .collect();
 

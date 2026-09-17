@@ -591,3 +591,65 @@ fn kind_join_ranks_array_over_unknown_over_string() {
     assert_eq!(Kind::String.join(Kind::Unknown), Kind::Unknown);
     assert_eq!(Kind::Unknown.join(Kind::String), Kind::Unknown);
 }
+
+#[test]
+fn report_logarithmic_exception_uses_net_envelope_exponents() {
+    for roots in [
+        vec![Cost::dimension(101, Domain::Size)],
+        vec![
+            Cost::dimension(101, Domain::Size),
+            Cost::dimension(102, Domain::Size),
+        ],
+    ] {
+        let envelope = Cost::N.bind(&|_| None, &roots).unwrap();
+
+        for (text, expected) in [
+            ("O(N log N)", true),
+            ("O(N^3 * log(N)^2)", true),
+            ("O(N^3)", false),
+            ("O(log(N)^2)", false),
+            ("O(N^3 / log(N))", false),
+            ("O(N^2 * log(N)^2 / (N * log(N)))", true),
+            ("O(N * log(N) / log(N))", false),
+            ("O(N^3 + log(N))", false),
+            ("O(max(N^3, log(N)))", false),
+            ("O(N * log(N) + N)", false),
+            ("O(max(N * log(N), N))", false),
+        ] {
+            let cost = Cost::parse(text).unwrap().bind(&|_| None, &roots).unwrap();
+
+            assert_eq!(
+                cost.has_polynomial_log_growth(&envelope),
+                expected,
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn logarithmic_filter_keeps_independent_axes_and_rejects_exponent_overflow() {
+    let n = Cost::dimension(101, Domain::Size);
+    let m = Cost::dimension(102, Domain::Size);
+    let roots = [n.clone(), m.clone()];
+    let envelope = Cost::N.bind(&|_| None, &roots).unwrap();
+    let mixed = n.multiply(&Cost::logarithm(m.clone()).unwrap()).unwrap();
+    let one_axis = n.multiply(&Cost::logarithm(n.clone()).unwrap()).unwrap();
+
+    assert!(!mixed.has_polynomial_log_growth(&envelope));
+    assert!(!mixed.has_polynomial_log_growth(&n));
+    assert!(!one_axis.has_polynomial_log_growth(&envelope));
+    assert!(one_axis.has_polynomial_log_growth(&n));
+    assert!(!one_axis.has_polynomial_log_growth(&m));
+
+    let mut overflowing = n.0.clone();
+
+    for _ in 0..3 {
+        overflowing = Expression::Power(
+            Arc::new(overflowing),
+            Arc::new(Expression::Constant(u64::MAX)),
+        );
+    }
+
+    assert_eq!(envelope_growth(&overflowing, &n.0), None);
+}
