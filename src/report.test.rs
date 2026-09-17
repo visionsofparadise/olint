@@ -2,6 +2,7 @@ use super::{lines_of_chain, lines_of_report, lint_header_of, ReportRow};
 use crate::config::{Config, Limit};
 use crate::cost::{Cost, Factor};
 use crate::project::{FileId, Site};
+use crate::values::Values;
 
 fn factor_of(label: &str, line: u32, cost: Cost, inner: Vec<Factor>) -> Factor {
     Factor {
@@ -28,7 +29,7 @@ fn chains_pad_labels_and_nest_inner_calls() {
     ];
     let mut out = Vec::new();
 
-    lines_of_chain(&chain, 1, &mut out, &|site| {
+    lines_of_chain(&Values::default(), &chain, 1, &mut out, &|site| {
         format!("src/tags.ts:{}", site.line)
     });
 
@@ -44,6 +45,14 @@ fn chains_pad_labels_and_nest_inner_calls() {
 
 fn row_of(cost: Cost, name: &str, file: u32, line: u32) -> ReportRow {
     ReportRow {
+        envelope: Some(
+            Cost::N
+                .bind(
+                    &|_| None,
+                    &[Cost::dimension(u64::MAX, crate::cost::Domain::Size)],
+                )
+                .unwrap(),
+        ),
         unknowns: None,
         cost,
         name: name.to_string(),
@@ -63,9 +72,9 @@ fn report_histogram_orders_by_count_and_keeps_first_seen_ties() {
         row_of(Cost::ONE, "first", 0, 2),
         row_of(Cost::N_LOG_N, "sorting", 1, 3),
         row_of(Cost::ONE, "second", 1, 4),
-        row_of(Cost { n: 2, log: 0 }, "square", 1, 5),
+        row_of(Cost::parse("O(N^2)").unwrap(), "square", 1, 5),
     ];
-    let lines = lines_of_report("tsconfig.json", &rows, 2, &|site| {
+    let lines = lines_of_report(&Values::default(), "tsconfig.json", &rows, 2, &|site| {
         format!("src/{}.ts:{}", site.file.0, site.line)
     });
 
@@ -93,7 +102,7 @@ fn report_minimum_zero_flags_every_row() {
         row_of(Cost::ONE, "first", 0, 2),
         row_of(Cost::N, "linear", 0, 1),
     ];
-    let lines = lines_of_report("tsconfig.json", &rows, 0, &|site| {
+    let lines = lines_of_report(&Values::default(), "tsconfig.json", &rows, 0, &|site| {
         format!("src/a.ts:{}", site.line)
     });
 
@@ -110,7 +119,7 @@ fn report_minimum_zero_flags_every_row() {
 
 fn config_of(entries: &[&str]) -> Config {
     let max = Limit {
-        cost: Cost { n: 2, log: 0 },
+        cost: Cost::parse("O(N^2)").unwrap(),
         text: "O(N^2)".to_string(),
     };
 
@@ -119,7 +128,7 @@ fn config_of(entries: &[&str]) -> Config {
         max: max.clone(),
         entrypoints: entries
             .iter()
-            .map(|entry| (std::path::PathBuf::from(entry), max.clone()))
+            .map(|entry| (std::path::PathBuf::from(entry), vec![max.clone()]))
             .collect(),
         ignore: Vec::new(),
         source: "olint.config.json".to_string(),
@@ -146,4 +155,23 @@ fn lint_header_counts_entrypoints() {
         ),
         "# tsconfig.json  olint.config.json: max O(N^2), 2 entrypoints (src/index.ts, src/cli.ts), 0 public functions"
     );
+}
+
+#[test]
+fn incomparable_report_rows_have_a_total_order_independent_of_input_order() {
+    let a = row_of(Cost::dimension(1, crate::cost::Domain::Size), "alpha", 0, 1);
+    let b = row_of(Cost::dimension(2, crate::cost::Domain::Size), "beta", 0, 2);
+    let rows = vec![a, b];
+    let render = |rows: &[ReportRow]| {
+        lines_of_report(&Values::default(), "tsconfig.json", rows, 0, &|site| {
+            format!("index.ts:{}", site.line)
+        })
+        .into_iter()
+        .filter(|line| line.contains("alpha") || line.contains("beta"))
+        .collect::<Vec<_>>()
+    };
+    let expected = render(&rows);
+    let reversed = rows.into_iter().rev().collect::<Vec<_>>();
+
+    assert_eq!(expected, render(&reversed));
 }

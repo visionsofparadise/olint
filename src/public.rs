@@ -10,12 +10,17 @@ use crate::directives::{max_tag_of, PerfTag};
 use crate::paths::relative_path_of;
 use crate::project::FileId;
 
+#[derive(Clone)]
+pub struct ApplicableLimit {
+    pub limit: Limit,
+    pub entry: String,
+}
+
 pub struct PublicFunction<'a> {
     pub file: FileId,
     pub function: FunctionNode<'a>,
-    pub limit: Limit,
+    pub limits: Vec<ApplicableLimit>,
     pub own_limit: bool,
-    pub entry: String,
 }
 
 fn is_hidden(accessibility: Option<TSAccessibility>, key: &PropertyKey<'_>) -> bool {
@@ -103,19 +108,27 @@ pub fn public_functions<'a>(
                         Some(position) => {
                             let known = &mut found[*position];
 
-                            if known.limit.cost.exceeds(limit.cost) {
-                                known.limit = limit.clone();
-                                known.entry = entry.clone();
-                            }
+                            known.limits.extend(limit.iter().cloned().map(|limit| {
+                                ApplicableLimit {
+                                    limit,
+                                    entry: entry.clone(),
+                                }
+                            }));
                         }
                         None => {
                             positions.insert((file, function.node_id()), found.len());
                             found.push(PublicFunction {
                                 file,
                                 function,
-                                limit: limit.clone(),
+                                limits: limit
+                                    .iter()
+                                    .cloned()
+                                    .map(|limit| ApplicableLimit {
+                                        limit,
+                                        entry: entry.clone(),
+                                    })
+                                    .collect(),
                                 own_limit: false,
-                                entry: entry.clone(),
                             });
                         }
                     }
@@ -128,8 +141,28 @@ pub fn public_functions<'a>(
         if let Some((cost, text)) =
             max_tag_of(&analysis.function_tags(public.file, public.function))
         {
-            public.limit = Limit { cost, text };
+            public.limits = vec![ApplicableLimit {
+                limit: Limit { cost, text },
+                entry: public.limits[0].entry.clone(),
+            }];
             public.own_limit = true;
+        }
+    }
+
+    for public in &mut found {
+        for applicable in &mut public.limits {
+            match analysis.bind_function_cost(public.file, public.function, &applicable.limit.cost)
+            {
+                Ok(cost) => applicable.limit.cost = cost,
+                Err(crate::cost::CostError::UnresolvedQuantity(_)) => {}
+                Err(error) => {
+                    analysis.errors.insert(format!(
+                        "invalid limit {} for {}: {error:?}",
+                        applicable.limit.text,
+                        analysis.name_of(public.file, public.function)
+                    ));
+                }
+            }
         }
     }
 

@@ -1,209 +1,247 @@
 # tsconfig.json  (160 functions in 15 files)
 
-O(N)               42
 O(1)               35
-O(N^2)             25
 O(1) [partial]     22
-O(N) [partial]     15
-O(N log N)          8
-O(N^2) [partial]    6
-O(N^3)              4
-O(N log N) [partial]    2
-O(log N)            1
+O(xs)              14
+O(rows^2)          11
+O(n)                6
+O((xs * log(xs)))    5
+O(xs^2)             4
+O(rows^2) [partial]    4
+O(o)                3
+O((xs * xs^2))      3
+O(x)                3
+O(N)                3
+O(max(n, xs)) [partial]    3
+O((matrix * log(matrix)))    2
+O(max(xs, fast))    2
+O((xs * log(xs))) [partial]    2
+O(max(n, xs))       2
+O(max(1, n^2))      2
+O(xs) [partial]     2
+O(prefix)           2
+O(max(n, matrix)) [partial]    2
+O((max(o, matrix))^(2))    2
+O((log(max(matrix, target)) * max(matrix, target)))    1
+O(matrix^2)         1
+O(log(max(xs, target)))    1
+O(max(xs, mode))    1
+O(max(xs, channels))    1
+O(max(xs, target))    1
+O((max(rows, width))^(2))    1
+O(max(n, g, xs)) [partial]    1
+O((max(xs, n, next))^(2)) [partial]    1
+O((max(xs, n))^(2))    1
+O(max(1, rows)) [partial]    1
+O(max(base, xs)) [partial]    1
+O(obj)              1
+O(N^2)              1
+O((max(xs, other))^(2))    1
+O(max(xs, needle))    1
+O(max(s, cb)) [partial]    1
+O(max(m, cb)) [partial]    1
+O(max(strings, needle)) [partial]    1
+O(max(re, needles)) [partial]    1
+O(text)             1
+O(parts)            1
+O(items^2)          1
+O(rows) [partial]    1
+O(max(1, xs^2)) [partial]    1
+O((matrix * matrix^2))    1
 
-O(N^3)         coldFunctionTagged  src/branches.ts:53
-    in loop for-of                                           src/branches.ts:55  x N
-        in loop for-of                                       src/branches.ts:55  x N
-            in loop for-of                                   src/branches.ts:55  x N
+O((log(max(matrix, target)) * max(matrix, target))) whileHalvingMidpoint  src/bounds.ts:38
+    in loop for-of                                           src/bounds.ts:40  x N
+        in loop while [halving]                              src/bounds.ts:43  x log N
 
-O(N^3)         nlognFunctionTagged [@perf O(N log N)]  src/branches.ts:97
-    in loop for-of                                           src/branches.ts:99  x N
-        in loop for-of                                       src/branches.ts:99  x N
-            in loop for-of                                   src/branches.ts:99  x N
+O((matrix * log(matrix))) whileHalvingShift  src/bounds.ts:26
+    in loop for-of                                           src/bounds.ts:28  x N
+        in loop while [halving]                              src/bounds.ts:30  x log N
 
-O(N^3)         maxTaggedPublicFn  src/branches.ts:110
+O((xs * log(xs))) breakInsideLoop  src/branches.ts:126 [partial]
+    does [break branch: runs once per loop]               src/branches.ts:129
+    does row.sort() [n log n]                             src/branches.ts:130  x N log N
+
+O((xs * log(xs))) returnInsideLoop  src/branches.ts:116 [partial]
+    does [return branch: runs once per call]              src/branches.ts:118
+    does row.sort() [n log n]                             src/branches.ts:119  x N log N
+
+O((xs * xs^2)) maxTaggedPublicFn  src/branches.ts:110
     in loop for-of                                           src/branches.ts:112  x N
         in loop for-of                                       src/branches.ts:112  x N
             in loop for-of                                   src/branches.ts:112  x N
 
-O(N^3)         tripleNestedOverLimit  src/types.ts:70
+O((matrix * log(matrix))) geometricStepLoop  src/bounds.ts:18
+    in loop for-of                                           src/bounds.ts:20  x N
+        in loop for [geometric step]                         src/bounds.ts:21  x log N
+
+O((xs * log(xs))) nlognExpressionStatementTagged  src/branches.ts:103
+    reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))
+
+O((xs * xs^2)) nlognFunctionTagged [@perf O(N log N)]  src/branches.ts:97
+    in loop for-of                                           src/branches.ts:99  x N
+        in loop for-of                                       src/branches.ts:99  x N
+            in loop for-of                                   src/branches.ts:99  x N
+
+O((xs * log(xs))) nlognStatementTagged  src/branches.ts:89
+    reads as @perf O(N log N)                                 src/branches.ts:92  = O((xs * log(xs)))
+
+O((xs * xs^2)) coldFunctionTagged  src/branches.ts:53
+    in loop for-of                                           src/branches.ts:55  x N
+        in loop for-of                                       src/branches.ts:55  x N
+            in loop for-of                                   src/branches.ts:55  x N
+
+O((xs * log(xs))) usesPathAlias  src/modules/paths.ts:3
+    calls sharedFn()                                       src/modules/paths.ts:4  = O((xs * log(xs)))
+    does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
+
+O((xs * log(xs))) sharedFn  src/lib/shared.ts:1
+    does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
+
+O((matrix * matrix^2)) tripleNestedOverLimit  src/types.ts:70
     in loop for-of                                           src/types.ts:72  x N
         in loop for-of                                       src/types.ts:72  x N
             in loop for-of                                   src/types.ts:72  x N
 
-O(N^2)         labeledLoop  src/bounds.ts:78
-    in loop for-of                                           src/bounds.ts:80  x N
-        in loop for-of                                       src/bounds.ts:81  x N
+O((xs * log(xs))) sortMethodCall  src/methods.ts:5
+    does xs.sort() [n log n]                              src/methods.ts:6  x N log N
 
-O(N^2)         hotLocalFunctionDeclaration  src/branches.ts:207
-    in loop for-of                                           src/branches.ts:211  x N
-        in loop for-of                                       src/branches.ts:211  x N
-
-O(N^2)         scopedBudget  src/budgets.ts:13
-    in loop for                                              src/budgets.ts:15  x N
-        in loop while [budget: i < width, per for at 15]     src/budgets.ts:18  x N
-
-O(N^2)         shorthandDestructure  src/budgets.ts:47 [partial]
-    in loop for-of                                           src/budgets.ts:50  x N
-        in loop while                                        src/budgets.ts:51  x N
-
-O(N^2)         compoundBound  src/budgets.ts:74
+O((max(xs, n))^(2)) compoundBound  src/budgets.ts:74
     in loop for-of                                           src/budgets.ts:77  x N
         in loop while                                        src/budgets.ts:78  x N
 
-O(N^2)         callbackSubstituted  src/calls.ts:13
-    calls runNTimes()                                      src/calls.ts:14  = O(N^2)
-    in loop for                                              src/calls.ts:9  x N
-        calls cb() [callback parameter]                    src/calls.ts:9  = O(N)
-        in loop for                                          src/calls.ts:3  x N
+O((max(xs, n, next))^(2)) shorthandDestructure  src/budgets.ts:47 [partial]
+    in loop for-of                                           src/budgets.ts:50  x N
+        in loop while                                        src/budgets.ts:51  x N
 
-O(N^2)         CostedCtor.constructor  src/classes.ts:3
+O((max(rows, width))^(2)) scopedBudget  src/budgets.ts:13
+    in loop for                                              src/budgets.ts:15  x N
+        in loop while [budget: i < width, per for at 15]     src/budgets.ts:18  x N
+
+O((max(o, matrix))^(2)) typeAliasChain  src/types.ts:45
+    in loop for-of                                           src/types.ts:47  x N
+        in loop for-of                                       src/types.ts:47  x N
+
+O((max(o, matrix))^(2)) unionOfClosed  src/types.ts:18
+    in loop for-of                                           src/types.ts:20  x N
+        in loop for-of                                       src/types.ts:20  x N
+
+O((max(xs, other))^(2)) AccessorHolder.walk  src/classes.ts:160
+    in loop for-of                                           src/classes.ts:161  x N
+        calls AccessorHolder.hidden()                      src/classes.ts:161  = O(max(xs, other))
+        in loop for-of                                       src/classes.ts:148  x N
+
+O(rows^2)      WithHashPrivateMethod.run  src/classes.ts:33
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows^2)
+    in loop for-of                                           src/classes.ts:30  x N
+        in loop for-of                                       src/classes.ts:30  x N
+
+O(rows^2)      WithHashPrivateMethod.#compute  src/classes.ts:28
+    in loop for-of                                           src/classes.ts:30  x N
+        in loop for-of                                       src/classes.ts:30  x N
+
+O(rows^2)      callsPrivateMethod  src/classes.ts:23 [partial]
+    calls WithPrivateMethod.run()                          src/classes.ts:24  = O(rows^2)
+    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows^2)
+    in loop for-of                                           src/classes.ts:16  x N
+        in loop for-of                                       src/classes.ts:16  x N
+
+O(rows^2)      WithPrivateMethod.run  src/classes.ts:19
+    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows^2)
+    in loop for-of                                           src/classes.ts:16  x N
+        in loop for-of                                       src/classes.ts:16  x N
+
+O(rows^2)      WithPrivateMethod.compute  src/classes.ts:14
+    in loop for-of                                           src/classes.ts:16  x N
+        in loop for-of                                       src/classes.ts:16  x N
+
+O(rows^2)      instantiateCostedCtor  src/classes.ts:9
+    calls CostedCtor()                                     src/classes.ts:10  = O(rows^2)
     in loop for-of                                           src/classes.ts:5  x N
         in loop for-of                                       src/classes.ts:5  x N
 
-O(N^2)         instantiateCostedCtor  src/classes.ts:9
-    calls CostedCtor()                                     src/classes.ts:10  = O(N^2)
+O(rows^2)      CostedCtor.constructor  src/classes.ts:3
     in loop for-of                                           src/classes.ts:5  x N
         in loop for-of                                       src/classes.ts:5  x N
 
-O(N^2)         WithPrivateMethod.compute  src/classes.ts:14
-    in loop for-of                                           src/classes.ts:16  x N
-        in loop for-of                                       src/classes.ts:16  x N
+O(xs^2)        hotLocalFunctionDeclaration  src/branches.ts:207
+    in loop for-of                                           src/branches.ts:211  x N
+        in loop for-of                                       src/branches.ts:211  x N
 
-O(N^2)         WithPrivateMethod.run  src/classes.ts:19
-    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(N^2)
-    in loop for-of                                           src/classes.ts:16  x N
-        in loop for-of                                       src/classes.ts:16  x N
-
-O(N^2)         callsPrivateMethod  src/classes.ts:23 [partial]
-    calls WithPrivateMethod.run()                          src/classes.ts:24  = O(N^2)
-    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(N^2)
-    in loop for-of                                           src/classes.ts:16  x N
-        in loop for-of                                       src/classes.ts:16  x N
-
-O(N^2)         WithHashPrivateMethod.#compute  src/classes.ts:28
-    in loop for-of                                           src/classes.ts:30  x N
-        in loop for-of                                       src/classes.ts:30  x N
-
-O(N^2)         WithHashPrivateMethod.run  src/classes.ts:33
-    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(N^2)
-    in loop for-of                                           src/classes.ts:30  x N
-        in loop for-of                                       src/classes.ts:30  x N
-
-O(N^2)         callsHashPrivateMethod  src/classes.ts:37 [partial]
-    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(N^2)
-    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(N^2)
-    in loop for-of                                           src/classes.ts:30  x N
-        in loop for-of                                       src/classes.ts:30  x N
+O(rows^2)      reexportDefault  src/modules/reexports.ts:3
+    in loop for-of                                           src/modules/reexports.ts:5  x N
+        in loop for-of                                       src/modules/reexports.ts:5  x N
 
 O(N^2)         WithGetter.total  src/classes.ts:43
     in loop for-of                                           src/classes.ts:45  x N
         in loop for-of                                       src/classes.ts:45  x N
 
-O(N^2)         WithStaticMethod.compute  src/classes.ts:54
-    in loop for-of                                           src/classes.ts:56  x N
-        in loop for-of                                       src/classes.ts:56  x N
-
-O(N^2)         callsStaticMethod  src/classes.ts:60
-    calls WithStaticMethod.compute()                       src/classes.ts:61  = O(N^2)
-    in loop for-of                                           src/classes.ts:56  x N
-        in loop for-of                                       src/classes.ts:56  x N
-
-O(N^2)         WithArrowProperty.handler  src/classes.ts:65
-    in loop for-of                                           src/classes.ts:67  x N
-        in loop for-of                                       src/classes.ts:67  x N
-
-O(N^2)         callsArrowProperty  src/classes.ts:71 [partial]
-    calls WithArrowProperty.handler()                      src/classes.ts:72  = O(N^2)
-    in loop for-of                                           src/classes.ts:67  x N
-        in loop for-of                                       src/classes.ts:67  x N
-
-O(N^2)         <class>.run  src/classes.ts:88
-    in loop for-of                                           src/classes.ts:90  x N
-        in loop for-of                                       src/classes.ts:90  x N
-
-O(N^2)         usesClassExpression  src/classes.ts:94 [partial]
-    calls <class>.run()                                    src/classes.ts:95  = O(N^2)
-    in loop for-of                                           src/classes.ts:90  x N
-        in loop for-of                                       src/classes.ts:90  x N
-
-O(N^2)         AccessorHolder.build  src/classes.ts:144
-    in loop for-of                                           src/classes.ts:145  x N
-        calls AccessorHolder.helper()                      src/classes.ts:145  = O(N)
-        in loop for-of                                       src/classes.ts:151  x N
-
-O(N^2)         AccessorHolder.run  src/classes.ts:157
-    in loop for-of                                           src/classes.ts:158  x N
-        calls AccessorHolder.sweep()                       src/classes.ts:158  = O(N)
-        in loop for-of                                       src/classes.ts:142  x N
-
-O(N^2)         AccessorHolder.walk  src/classes.ts:160
-    in loop for-of                                           src/classes.ts:161  x N
-        calls AccessorHolder.hidden()                      src/classes.ts:161  = O(N)
-        in loop for-of                                       src/classes.ts:148  x N
-
-O(N^2)         structuredCloneCall  src/methods.ts:51
-    does items.map()                                      src/methods.ts:52  x N
-        does structuredClone()                            src/methods.ts:52  x N
-
-O(N^2)         setCallback  src/methods.ts:80
-    does s.forEach()                                      src/methods.ts:83  x N
-        does list.map()                                   src/methods.ts:83  x N
-
-O(N^2)         setCallbackCallsMethod  src/methods.ts:112 [partial]
-    does s.forEach()                                      src/methods.ts:114  x N
-        calls RoundEngine.run()                            src/methods.ts:114  = O(N)
-        does xs.indexOf()                                 src/methods.ts:104  x N
-
-O(N^2)         a  src/modules/star.ts:1
+O(xs^2)        a  src/modules/star.ts:1
     in loop for-of                                           src/modules/star.ts:3  x N
         in loop for-of                                       src/modules/star.ts:3  x N
 
-O(N^2)         unionOfClosed  src/types.ts:18
-    in loop for-of                                           src/types.ts:20  x N
-        in loop for-of                                       src/types.ts:20  x N
+O(items^2)     structuredCloneCall  src/methods.ts:51
+    does items.map()                                      src/methods.ts:52  x N
+        does structuredClone()                            src/methods.ts:52  x N
 
-O(N^2)         typeAliasChain  src/types.ts:45
-    in loop for-of                                           src/types.ts:47  x N
-        in loop for-of                                       src/types.ts:47  x N
+O(xs^2)        AccessorHolder.run  src/classes.ts:157
+    in loop for-of                                           src/classes.ts:158  x N
+        calls AccessorHolder.sweep()                       src/classes.ts:158  = O(xs)
+        in loop for-of                                       src/classes.ts:142  x N
 
-O(N^2)         reexportDefault  src/modules/reexports.ts:3
-    in loop for-of                                           src/modules/reexports.ts:5  x N
-        in loop for-of                                       src/modules/reexports.ts:5  x N
+O(xs^2)        AccessorHolder.build  src/classes.ts:144
+    in loop for-of                                           src/classes.ts:145  x N
+        calls AccessorHolder.helper()                      src/classes.ts:145  = O(xs)
+        in loop for-of                                       src/classes.ts:151  x N
 
-O(N log N)     geometricStepLoop  src/bounds.ts:18
-    in loop for-of                                           src/bounds.ts:20  x N
-        in loop for [geometric step]                         src/bounds.ts:21  x log N
+O(rows^2)      usesClassExpression  src/classes.ts:94 [partial]
+    calls <class>.run()                                    src/classes.ts:95  = O(rows^2)
+    in loop for-of                                           src/classes.ts:90  x N
+        in loop for-of                                       src/classes.ts:90  x N
 
-O(N log N)     whileHalvingShift  src/bounds.ts:26
-    in loop for-of                                           src/bounds.ts:28  x N
-        in loop while [halving]                              src/bounds.ts:30  x log N
+O(matrix^2)    labeledLoop  src/bounds.ts:78
+    in loop for-of                                           src/bounds.ts:80  x N
+        in loop for-of                                       src/bounds.ts:81  x N
 
-O(N log N)     whileHalvingMidpoint  src/bounds.ts:38
-    in loop for-of                                           src/bounds.ts:40  x N
-        in loop while [halving]                              src/bounds.ts:43  x log N
+O(rows^2)      <class>.run  src/classes.ts:88
+    in loop for-of                                           src/classes.ts:90  x N
+        in loop for-of                                       src/classes.ts:90  x N
 
-O(N log N)     nlognStatementTagged  src/branches.ts:89
-    reads as @perf O(N log N)                                 src/branches.ts:92  = O(N log N)
+O(rows^2)      callsArrowProperty  src/classes.ts:71 [partial]
+    calls WithArrowProperty.handler()                      src/classes.ts:72  = O(rows^2)
+    in loop for-of                                           src/classes.ts:67  x N
+        in loop for-of                                       src/classes.ts:67  x N
 
-O(N log N)     nlognExpressionStatementTagged  src/branches.ts:103
-    reads as @perf O(N log N)                                 src/branches.ts:105  = O(N log N)
+O(rows^2)      WithArrowProperty.handler  src/classes.ts:65
+    in loop for-of                                           src/classes.ts:67  x N
+        in loop for-of                                       src/classes.ts:67  x N
 
-O(N log N)     returnInsideLoop  src/branches.ts:116 [partial]
-    does [return branch: runs once per call]              src/branches.ts:118
-    does row.sort() [n log n]                             src/branches.ts:119  x N log N
+O(rows^2)      callsStaticMethod  src/classes.ts:60
+    calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows^2)
+    in loop for-of                                           src/classes.ts:56  x N
+        in loop for-of                                       src/classes.ts:56  x N
 
-O(N log N)     breakInsideLoop  src/branches.ts:126 [partial]
-    does [break branch: runs once per loop]               src/branches.ts:129
-    does row.sort() [n log n]                             src/branches.ts:130  x N log N
+O(rows^2)      WithStaticMethod.compute  src/classes.ts:54
+    in loop for-of                                           src/classes.ts:56  x N
+        in loop for-of                                       src/classes.ts:56  x N
 
-O(N log N)     sortMethodCall  src/methods.ts:5
-    does xs.sort() [n log n]                              src/methods.ts:6  x N log N
+O(rows^2)      callsHashPrivateMethod  src/classes.ts:37 [partial]
+    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows^2)
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows^2)
+    in loop for-of                                           src/classes.ts:30  x N
+        in loop for-of                                       src/classes.ts:30  x N
 
-O(N log N)     sharedFn  src/lib/shared.ts:1
-    does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
+O(max(1, n^2)) callbackSubstituted  src/calls.ts:13
+    calls runNTimes()                                      src/calls.ts:14  = O(max(1, n^2))
+    in loop for                                              src/calls.ts:9  x N
+        calls cb() [callback parameter]                    src/calls.ts:9  = O(n)
+        in loop for                                          src/calls.ts:3  x N
 
-O(N log N)     usesPathAlias  src/modules/paths.ts:3
-    calls sharedFn()                                       src/modules/paths.ts:4  = O(N log N)
-    does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
+O(max(1, xs^2)) setCallbackCallsMethod  src/methods.ts:112 [partial]
+    does s.forEach()                                      src/methods.ts:114  x N
+        calls RoundEngine.run()                            src/methods.ts:114  = O(xs)
+        does xs.indexOf()                                 src/methods.ts:104  x N
+
+O(max(1, n^2)) setCallback  src/methods.ts:80
+    does s.forEach()                                      src/methods.ts:83  x N
+        does list.map()                                   src/methods.ts:83  x N
 

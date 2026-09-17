@@ -293,7 +293,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let site = self.site_of_node(file, kind.node_id());
 
-            return Reading::of_part(tagged_part_of(cost, &text, site));
+            let (cost, unresolved) = match cost.bind_known(&mut |cost| self.bind_current_cost(cost))
+            {
+                Ok(bound) => bound,
+                Err(crate::cost::CostError::Resource | crate::cost::CostError::Overflow) => {
+                    return self.unknown_reading(
+                        file,
+                        kind.span(),
+                        UnknownReason::ResourceExhaustion,
+                    );
+                }
+                Err(error) => {
+                    self.errors.insert(format!(
+                        "invalid {text} at {}:{}: {error:?}",
+                        self.project.file(file).relative,
+                        site.line
+                    ));
+
+                    return self.unknown_reading(
+                        file,
+                        kind.span(),
+                        UnknownReason::UnsupportedModel,
+                    );
+                }
+            };
+
+            let mut reading =
+                Reading::of_part(tagged_part_of(cost.unwrap_or(Cost::ONE), &text, site));
+
+            if unresolved {
+                let unknown = self.unknown_reading(file, kind.span(), UnknownReason::SizeRelation);
+                reading.main.unknowns = unknown.main.unknowns;
+            }
+
+            return reading;
         }
 
         match kind {
@@ -438,6 +471,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 chain.extend(reading.main.chain.iter().cloned());
 
                 let lifted = Part {
+                    origin: reading.main.origin,
+                    cost_error: reading.main.cost_error,
                     cost: reading.main.cost,
                     chain,
                     preference: reading.main.preference,
@@ -598,7 +633,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let site = self.site_of_node(file, node);
-        let looped = nest(label, site, bound.factor, body.main, &mut self.unknowns);
+        let looped = nest(
+            label,
+            site,
+            self.source_span(file, kind.span()),
+            bound.factor,
+            body.main,
+            &mut self.unknowns,
+        );
 
         let mut result = Reading {
             main: sibling.main.max(body.loop_exit, &mut self.unknowns),
@@ -691,7 +733,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let site = self.site_of_node(file, spread.node_id());
 
         inner.merge(
-            Reading::of_part(nest(label, site, Cost::N, Part::none(), &mut self.unknowns)),
+            Reading::of_part(nest(
+                label,
+                site,
+                self.source_span(file, spread.span),
+                Cost::N,
+                Part::none(),
+                &mut self.unknowns,
+            )),
             &mut self.unknowns,
         )
     }
@@ -737,7 +786,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let site = self.site_of_node(file, rest.node_id());
 
         inner.merge(
-            Reading::of_part(nest(label, site, Cost::N, Part::none(), &mut self.unknowns)),
+            Reading::of_part(nest(
+                label,
+                site,
+                self.source_span(file, rest.span),
+                Cost::N,
+                Part::none(),
+                &mut self.unknowns,
+            )),
             &mut self.unknowns,
         )
     }
@@ -798,12 +854,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 vec![Factor {
                     label: format!("new {name}()"),
                     site,
-                    cost: callee.cost,
+                    cost: callee.cost.clone(),
                     inner: callee.chain,
                 }]
             };
             let part = Part {
-                cost: callee.cost,
+                cost: callee.cost.clone(),
+                origin: Some(self.source_span(file, new.span)),
+                cost_error: callee.cost_error,
                 chain,
                 preference: callee.preference,
                 unknowns: self
@@ -845,6 +903,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         Reading::of_part(nest(
                             label,
                             site,
+                            self.source_span(file, new.span),
                             Cost::N,
                             Part::none(),
                             &mut self.unknowns,
@@ -932,14 +991,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         vec![Factor {
                             label: format!("call {}() [callback parameter]", reference.name),
                             site,
-                            cost: part.cost,
+                            cost: part.cost.clone(),
                             inner: part.chain,
                         }]
                     };
 
                     return reading.merge(
                         Reading::of_part(Part {
-                            cost: part.cost,
+                            cost: part.cost.clone(),
+                            origin: Some(self.source_span(file, call.span)),
+                            cost_error: part.cost_error,
                             chain,
                             preference: part.preference,
                             unknowns: self
@@ -982,13 +1043,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 vec![Factor {
                     label: format!("call {}()", self.name_of(target, function)),
                     site,
-                    cost: called.cost,
+                    cost: called.cost.clone(),
                     inner: called.chain,
                 }]
             };
 
             let part = Part {
-                cost: called.cost,
+                cost: called.cost.clone(),
+                origin: Some(self.source_span(file, call.span)),
+                cost_error: called.cost_error,
                 chain,
                 preference: called.preference,
                 unknowns: self
@@ -1014,6 +1077,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Reading::of_part(nest(
                         format!("{}()", reference.name),
                         site,
+                        self.source_span(file, call.span),
                         Cost::N,
                         Part::none(),
                         &mut self.unknowns,
@@ -1084,6 +1148,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Reading::of_part(nest(
                         format!("{global_name}.{method}({argument_text})"),
                         site,
+                        self.source_span(file, call.span),
                         Cost::N,
                         callback,
                         &mut self.unknowns,
@@ -1142,6 +1207,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     nest(
                         label(" [n log n]"),
                         site,
+                        self.source_span(file, call.span),
                         Cost::N_LOG_N,
                         callback,
                         &mut self.unknowns,
@@ -1160,7 +1226,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let part = if bounded {
                     callback
                 } else {
-                    nest(label(""), site, Cost::N, callback, &mut self.unknowns)
+                    nest(
+                        label(""),
+                        site,
+                        self.source_span(file, call.span),
+                        Cost::N,
+                        callback,
+                        &mut self.unknowns,
+                    )
                 };
 
                 return reading.merge(Reading::of_part(part), &mut self.unknowns);
@@ -1177,7 +1250,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
 
             return reading.merge(
-                Reading::of_part(nest(label(""), site, Cost::N, callback, &mut self.unknowns)),
+                Reading::of_part(nest(
+                    label(""),
+                    site,
+                    self.source_span(file, call.span),
+                    Cost::N,
+                    callback,
+                    &mut self.unknowns,
+                )),
                 &mut self.unknowns,
             );
         }
@@ -1187,6 +1267,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Reading::of_part(nest(
                     label(" [string]"),
                     site,
+                    self.source_span(file, call.span),
                     Cost::N,
                     Part::none(),
                     &mut self.unknowns,
@@ -1202,6 +1283,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         Reading::of_part(nest(
                             label(" [regexp]"),
                             site,
+                            self.source_span(file, call.span),
                             Cost::N,
                             Part::none(),
                             &mut self.unknowns,
@@ -1244,7 +1326,7 @@ fn holds_function(kind: &AstKind<'_>) -> bool {
 
 fn tagged_part_of(cost: Cost, text: &str, site: Site) -> Part {
     Part::unmarked(
-        cost,
+        cost.clone(),
         if cost.is_one() {
             Vec::new()
         } else {

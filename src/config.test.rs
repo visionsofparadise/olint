@@ -33,17 +33,17 @@ fn unknown_policy_has_exact_values_and_warn_default() {
 
 #[test]
 fn limit_of_names_the_field_it_rejects() {
-    match limit_of("O(M)", "max") {
+    match limit_of("O(N+)", "max") {
         Err(ConfigError::Limit { field, text }) => {
             assert_eq!(field, "max");
-            assert_eq!(text, "\"O(M)\"");
+            assert_eq!(text, "\"O(N+)\"");
         }
-        _ => panic!("O(M) is rejected"),
+        _ => panic!("O(N+) is rejected"),
     }
 
     let limit = limit_of("O(N^3)", "max").expect("O(N^3) is a limit");
 
-    assert_eq!(limit.cost, Cost { n: 3, log: 0 });
+    assert_eq!(limit.cost, Cost::parse("O(N^3)").unwrap());
     assert_eq!(limit.text, "O(N^3)");
 }
 
@@ -88,7 +88,11 @@ fn entries_of(value: Value) -> Result<Vec<(String, String)>, ConfigError> {
     entrypoints_of(&value, root, &max).map(|entrypoints| {
         entrypoints
             .into_iter()
-            .map(|(path, limit)| (relative_path_of(root, &path), limit.text))
+            .flat_map(|(path, limits)| {
+                limits
+                    .into_iter()
+                    .map(move |limit| (relative_path_of(root, &path), limit.text))
+            })
             .collect()
     })
 }
@@ -144,7 +148,7 @@ fn entrypoint_strings_and_objects_mix_in_array_order() {
 }
 
 #[test]
-fn a_duplicate_entrypoint_keeps_its_first_position_and_the_stricter_limit() {
+fn a_duplicate_entrypoint_keeps_its_first_position_and_all_constraints() {
     let entries = entries_of(serde_json::json!([
         { "path": "src/a.ts", "max": "O(N^3)" },
         "src/b.ts",
@@ -155,7 +159,12 @@ fn a_duplicate_entrypoint_keeps_its_first_position_and_the_stricter_limit() {
 
     assert_eq!(
         entries,
-        pairs_of(&[("src/a.ts", "O(N)"), ("src/b.ts", "O(N^2)")])
+        pairs_of(&[
+            ("src/a.ts", "O(N^3)"),
+            ("src/a.ts", "O(N)"),
+            ("src/b.ts", "O(N^2)"),
+            ("src/b.ts", "O(N^4)")
+        ])
     );
 }
 
@@ -182,13 +191,13 @@ fn an_entrypoint_of_another_shape_names_its_item() {
 fn an_entrypoint_max_that_is_not_a_limit_names_its_item() {
     match entries_of(serde_json::json!([
         "src/z.ts",
-        { "path": "src/a.ts", "max": "O(M)" }
+        { "path": "src/a.ts", "max": "O(N+)" }
     ])) {
         Err(ConfigError::Limit { field, text }) => {
             assert_eq!(field, "entrypoints[1].max");
-            assert_eq!(text, "\"O(M)\"");
+            assert_eq!(text, "\"O(N+)\"");
         }
-        _ => panic!("O(M) is rejected"),
+        _ => panic!("O(N+) is rejected"),
     }
 }
 

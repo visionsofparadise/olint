@@ -63,14 +63,8 @@ fn wrapping_a_long_call_path_retains_one_node_per_edge() {
 fn unknown_scaling_overflow_stays_unknown() {
     let mut arena = Unknowns::default();
     let origin = arena.origin(span(0), UnknownReason::Multiplicity);
-    let first = arena.scale(
-        Some(origin),
-        Some(Cost {
-            n: u32::MAX,
-            log: 0,
-        }),
-    );
-    let second = arena.scale(first, Some(Cost::N));
+    let first = arena.scale(Some(origin), Some(Cost::constant(u64::MAX)));
+    let second = arena.scale(first, Some(Cost::constant(2)));
 
     assert_eq!(arena.semantic_key(second), vec![(origin, None)]);
 }

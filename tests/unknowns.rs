@@ -4,7 +4,19 @@ use olint::cost::{Cost, ExecutionPhase};
 use olint::unknowns::{UnknownNode, UnknownReason};
 
 mod support;
-use support::{function_of_name, project_of, run_with_source, summary_of};
+use support::{function_of_name, project_of, run_with_source};
+
+fn summary_of(
+    analysis: &mut olint::analysis::Analysis<'_, '_>,
+    file: olint::project::FileId,
+    name: &str,
+) -> olint::cost::Part {
+    let function = function_of_name(analysis.project, file, name);
+    let mut part = support::summary_of(analysis, file, name);
+    part.cost = support::legacy_class_of(analysis, file, function, &part.cost);
+
+    part
+}
 
 fn cli(source: &str, policy: Option<&str>, report: bool) -> std::process::Output {
     let mut config = serde_json::json!({ "entrypoints": ["index.ts"], "max": "O(N^2)" });
@@ -83,7 +95,11 @@ fn known_over_limit_fails_every_policy_even_with_unresolved_work() {
         let output = cli(source, Some(policy), false);
 
         assert_eq!(output.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("O(N^3) [partial]"));
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(stdout.contains("[partial] > O(N^2)"));
+        assert!(stdout.contains("@perf O(N^3)"));
     }
 }
 
@@ -92,7 +108,7 @@ fn cheap_unknown_sibling_survives_known_cost_maximum() {
     run_with_source("/** @perf O(N^2) */ function expensive() {} export function f(callback: () => void) { callback(); expensive(); }", |analysis, file| {
         let part = summary_of(analysis, file, "f");
 
-        assert_eq!(part.cost, Cost { n: 2, log: 0 });
+        assert_eq!(part.cost, Cost::parse("O(N^2)").unwrap());
         assert!(part.unknowns.is_some());
     });
 }
@@ -258,7 +274,7 @@ fn unsupported_methods_preserve_evaluated_argument_costs() {
         run_with_source(&source, |analysis, file| {
             let part = summary_of(analysis, file, "f");
 
-            assert_eq!(part.cost, Cost { n: 2, log: 0 });
+            assert_eq!(part.cost, Cost::parse("O(N^2)").unwrap());
 
             let lines = unknown_lines(analysis, part);
 
@@ -296,7 +312,7 @@ fn known_native_cost_does_not_prove_empty_effects() {
 
             let part = summary_of(analysis, file, "f");
 
-            assert_ne!(part.cost, Cost { n: 2, log: 0 });
+            assert_ne!(part.cost, Cost::parse("O(N^2)").unwrap());
 
             let lines = unknown_lines(analysis, part);
 

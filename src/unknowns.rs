@@ -20,6 +20,7 @@ pub enum UnknownReason {
     UnsupportedSyntax,
     UnsupportedModel,
     Comparison,
+    SizeRelation,
     ResourceExhaustion,
 }
 
@@ -34,6 +35,7 @@ impl UnknownReason {
             Self::UnsupportedSyntax => "syntax",
             Self::UnsupportedModel => "operation model",
             Self::Comparison => "limit comparison",
+            Self::SizeRelation => "input size relation",
             Self::ResourceExhaustion => "analysis resource limit",
         }
     }
@@ -136,30 +138,39 @@ impl Unknowns {
         let mut origins = Vec::new();
 
         while let Some((id, factor)) = pending.pop() {
-            if !visited.insert((id, factor)) {
+            if !visited.insert((id, factor.clone())) {
                 continue;
             }
 
             match self.node(id) {
                 UnknownNode::Call { child, .. } => pending.push((*child, factor)),
                 UnknownNode::Join { children } => {
-                    pending.extend(children.iter().map(|id| (*id, factor)))
+                    pending.extend(children.iter().map(|id| (*id, factor.clone())))
                 }
                 UnknownNode::Scale {
                     child,
                     factor: next,
-                } => pending.push((*child, multiply(factor, *next))),
+                } => pending.push((*child, multiply(factor, next.clone()))),
                 UnknownNode::Origin(_) => origins.push((id, factor)),
             }
         }
 
-        origins.sort_by_key(|(id, factor)| (*id, factor.map(|cost| (cost.n, cost.log))));
+        origins.sort_by_key(|(id, factor)| (*id, factor.as_ref().map(Cost::structural_key)));
         origins.dedup();
 
         origins
     }
 
     pub fn lines(&self, project: &Project<'_>, root: UnknownId) -> Vec<String> {
+        self.lines_with(project, root, &|id| format!("size_{id}"))
+    }
+
+    pub fn lines_with(
+        &self,
+        project: &Project<'_>,
+        root: UnknownId,
+        name: &impl Fn(u64) -> String,
+    ) -> Vec<String> {
         let mut pending = vec![(root, Some(Cost::ONE), Vec::<SourceSpan>::new())];
         let mut lines = Vec::new();
         let mut shown = HashSet::new();
@@ -167,7 +178,7 @@ impl Unknowns {
         while let Some((id, factor, calls)) = pending.pop() {
             match self.node(id) {
                 UnknownNode::Origin(unknown) => {
-                    let factor = multiply(factor, unknown.multiplicity);
+                    let factor = multiply(factor, unknown.multiplicity.clone());
                     let origin = unknown.origin;
                     let location = |span: SourceSpan| {
                         format!(
@@ -178,7 +189,9 @@ impl Unknowns {
                             span.end
                         )
                     };
-                    let frequency = factor.map_or_else(|| "unknown".to_string(), Cost::text);
+                    let frequency = factor
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_string(), |cost| cost.text_with(name));
                     let via = if calls.is_empty() {
                         String::new()
                     } else {
@@ -212,11 +225,11 @@ impl Unknowns {
                     factor: multiplier,
                     child,
                 } => {
-                    pending.push((*child, multiply(factor, *multiplier), calls));
+                    pending.push((*child, multiply(factor, multiplier.clone()), calls));
                 }
                 UnknownNode::Join { children } => {
                     for child in children.iter().rev() {
-                        pending.push((*child, factor, calls.clone()));
+                        pending.push((*child, factor.clone(), calls.clone()));
                     }
                 }
             }
@@ -229,10 +242,7 @@ impl Unknowns {
 fn multiply(left: Option<Cost>, right: Option<Cost>) -> Option<Cost> {
     let (left, right) = (left?, right?);
 
-    Some(Cost {
-        n: left.n.checked_add(right.n)?,
-        log: left.log.checked_add(right.log)?,
-    })
+    left.multiply(&right).ok()
 }
 
 #[cfg(test)]

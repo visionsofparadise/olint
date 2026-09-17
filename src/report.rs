@@ -1,6 +1,6 @@
 use crate::analysis::Analysis;
 use crate::config::Config;
-use crate::cost::{Cost, Factor, Part};
+use crate::cost::{Cost, CostComparison, Factor, Part};
 use crate::declarations::FunctionNode;
 use crate::directives::cost_tag_of;
 use crate::paths::relative_path_of;
@@ -8,6 +8,8 @@ use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
 use crate::summaries::Substitutions;
 use crate::unknowns::UnknownId;
+use crate::values::Values;
+use oxc_span::GetSpan;
 
 const LOOP_LABELS: &[&str] = &["for", "for-of", "for-in", "while", "do-while"];
 
@@ -25,11 +27,20 @@ fn location_of(project: &Project<'_>, site: Site) -> String {
     format!("{}:{}", project.file(site.file).relative, site.line)
 }
 
-pub fn chain_lines(project: &Project<'_>, chain: &[Factor], depth: usize, out: &mut Vec<String>) {
-    lines_of_chain(chain, depth, out, &|site| location_of(project, site));
+pub fn chain_lines(
+    values: &Values,
+    project: &Project<'_>,
+    chain: &[Factor],
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    lines_of_chain(values, chain, depth, out, &|site| {
+        location_of(project, site)
+    });
 }
 
 fn lines_of_chain(
+    values: &Values,
     chain: &[Factor],
     depth: usize,
     out: &mut Vec<String>,
@@ -62,9 +73,9 @@ fn lines_of_chain(
         let cost = if factor.cost.is_one() {
             String::new()
         } else if is_call {
-            format!("  = {}", factor.cost.text())
+            format!("  = {}", factor.cost.text_with(&|id| values.label(id)))
         } else {
-            let text = factor.cost.text();
+            let text = factor.cost.text_with(&|id| values.label(id));
 
             format!("  x {}", &text[2..text.len() - 1])
         };
@@ -82,7 +93,7 @@ fn lines_of_chain(
         ));
 
         if !factor.inner.is_empty() {
-            lines_of_chain(&factor.inner, depth, out, location);
+            lines_of_chain(values, &factor.inner, depth, out, location);
         }
 
         if !is_call && !factor.cost.is_one() {
@@ -91,7 +102,13 @@ fn lines_of_chain(
     }
 }
 
-fn row_text_of(cost: Cost, name: &str, mark: Option<&str>, location: &str) -> String {
+fn row_text_of(
+    values: &Values,
+    cost: &Cost,
+    name: &str,
+    mark: Option<&str>,
+    location: &str,
+) -> String {
     let mark = match mark {
         Some(mark) => format!(" [@perf {mark}]"),
         None => String::new(),
@@ -99,7 +116,7 @@ fn row_text_of(cost: Cost, name: &str, mark: Option<&str>, location: &str) -> St
 
     format!(
         "{} {name}{mark}  {location}",
-        padded_text_of(&cost.text(), 14)
+        padded_text_of(&cost.text_with(&|id| values.label(id)), 14)
     )
 }
 
@@ -111,6 +128,7 @@ pub struct Finding<'a> {
 }
 
 pub struct ReportRow {
+    pub envelope: Option<Cost>,
     pub unknowns: Option<UnknownId>,
     pub cost: Cost,
     pub name: String,
@@ -127,14 +145,43 @@ pub fn report_rows_of<'a>(
 
     for (file, function) in functions.iter().copied() {
         let tags = analysis.function_tags(file, function);
-        let mark = cost_tag_of(&tags).map(|(_, text)| text);
-        let part = match mark {
+        let mark = cost_tag_of(&tags).map(|(cost, text)| {
+            if let Err(error) = analysis.bind_function_cost(file, function, &cost) {
+                if matches!(error, crate::cost::CostError::UnresolvedQuantity(_)) {
+                    return text;
+                }
+
+                analysis.errors.insert(format!(
+                    "invalid {text} at {}:{}: {error:?}",
+                    analysis.project.file(file).relative,
+                    analysis.function_site_of(file, function).line
+                ));
+            }
+
+            text
+        });
+        let mut part = match mark {
             Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
             None => analysis.summarize(file, function),
         }
         .total(&mut analysis.unknowns);
 
+        let envelope = match analysis.bind_function_cost(file, function, &Cost::N) {
+            Ok(cost) => Some(cost),
+            Err(_) => {
+                let origin = analysis
+                    .source_span(file, analysis.kind_of_node(file, function.node_id()).span());
+                let unknown = analysis
+                    .unknowns
+                    .origin(origin, crate::unknowns::UnknownReason::ResourceExhaustion);
+                part.unknowns = analysis.unknowns.join(part.unknowns, Some(unknown));
+
+                None
+            }
+        };
+
         rows.push(ReportRow {
+            envelope,
             unknowns: part.unknowns,
             cost: part.cost,
             name: analysis.name_of(file, function),
@@ -151,14 +198,8 @@ fn tsconfig_text_of(project: &Project<'_>) -> String {
     relative_path_of(&project.root, &project.tsconfig_path)
 }
 
-pub fn order_by_cost_descending(left: Cost, right: Cost) -> std::cmp::Ordering {
-    if left.exceeds(right) {
-        std::cmp::Ordering::Less
-    } else if right.exceeds(left) {
-        std::cmp::Ordering::Greater
-    } else {
-        std::cmp::Ordering::Equal
-    }
+pub fn order_by_cost_descending(left: &Cost, right: &Cost) -> std::cmp::Ordering {
+    right.structural_key().cmp(&left.structural_key())
 }
 
 fn lint_header_of(tsconfig: &str, config: &Config, entries: &[String], checked: usize) -> String {
@@ -173,6 +214,7 @@ fn lint_header_of(tsconfig: &str, config: &Config, entries: &[String], checked: 
 }
 
 pub fn lint_lines(
+    values: &Values,
     project: &Project<'_>,
     config: &Config,
     checked: &[Finding<'_>],
@@ -189,21 +231,25 @@ pub fn lint_lines(
     ];
 
     for finding in over {
-        lines.push(format!(
-            "{} > {}{}  {}  {}  via {}",
-            partial_text(finding.part.cost, finding.part.unknowns),
-            finding.public.limit.text,
-            if finding.public.own_limit {
-                " [@perf max]"
-            } else {
-                ""
-            },
-            finding.name,
-            location_of(project, finding.site),
-            finding.public.entry
-        ));
+        for applicable in finding.public.limits.iter().filter(|applicable| {
+            finding.part.cost.compare(&applicable.limit.cost) == CostComparison::Exceeds
+        }) {
+            lines.push(format!(
+                "{} > {}{}  {}  {}  via {}",
+                partial_text(values, &finding.part.cost, finding.part.unknowns),
+                applicable.limit.text,
+                if finding.public.own_limit {
+                    " [@perf max]"
+                } else {
+                    ""
+                },
+                finding.name,
+                location_of(project, finding.site),
+                applicable.entry
+            ));
+        }
 
-        chain_lines(project, &finding.part.chain, 1, &mut lines);
+        chain_lines(values, project, &finding.part.chain, 1, &mut lines);
 
         lines.push(String::new());
     }
@@ -223,11 +269,13 @@ pub fn lint_lines(
 }
 
 pub fn report_lines(
+    values: &Values,
     project: &Project<'_>,
     rows: &[ReportRow],
     minimum_exponent: u32,
 ) -> Vec<String> {
     lines_of_report(
+        values,
         &tsconfig_text_of(project),
         rows,
         minimum_exponent,
@@ -236,6 +284,7 @@ pub fn report_lines(
 }
 
 fn lines_of_report(
+    values: &Values,
     tsconfig: &str,
     rows: &[ReportRow],
     minimum_exponent: u32,
@@ -249,7 +298,7 @@ fn lines_of_report(
     let mut buckets: Vec<(String, usize)> = Vec::new();
 
     for row in rows {
-        let text = partial_text(row.cost, row.unknowns);
+        let text = partial_text(values, &row.cost, row.unknowns);
 
         match buckets.iter_mut().find(|(known, _)| *known == text) {
             Some(bucket) => bucket.1 += 1,
@@ -276,14 +325,43 @@ fn lines_of_report(
 
     let mut flagged: Vec<&ReportRow> = rows
         .iter()
-        .filter(|row| row.cost.n >= minimum_exponent || (row.cost.n >= 1 && row.cost.log >= 1))
+        .filter(|row| {
+            if minimum_exponent == 0 {
+                return true;
+            }
+
+            let Some(envelope) = &row.envelope else {
+                return false;
+            };
+            let cost = row
+                .cost
+                .bind(&|_| None, std::slice::from_ref(envelope))
+                .unwrap_or_else(|_| row.cost.clone());
+            let threshold = Cost::power(
+                envelope.clone(),
+                Cost::constant(u64::from(minimum_exponent)),
+            );
+            let log = Cost::logarithm(envelope.clone()).and_then(|log| envelope.multiply(&log));
+
+            threshold.is_ok_and(|threshold| threshold.compare(&cost) == CostComparison::Within)
+                || log.is_ok_and(|threshold| threshold.compare(&cost) == CostComparison::Within)
+        })
         .collect();
 
-    flagged.sort_by(|left, right| order_by_cost_descending(left.cost, right.cost));
+    flagged.sort_by(|left, right| {
+        order_by_cost_descending(&left.cost, &right.cost).then_with(|| {
+            (left.site.file, left.site.line, &left.name).cmp(&(
+                right.site.file,
+                right.site.line,
+                &right.name,
+            ))
+        })
+    });
 
     for row in flagged {
         let row_text = row_text_of(
-            row.cost,
+            values,
+            &row.cost,
             &row.name,
             row.mark.as_deref(),
             &location(row.site),
@@ -295,7 +373,7 @@ fn lines_of_report(
             row_text
         });
 
-        lines_of_chain(&row.chain, 1, &mut lines, location);
+        lines_of_chain(values, &row.chain, 1, &mut lines, location);
 
         lines.push(String::new());
     }
@@ -303,11 +381,11 @@ fn lines_of_report(
     lines
 }
 
-fn partial_text(cost: Cost, unknowns: Option<UnknownId>) -> String {
+fn partial_text(values: &Values, cost: &Cost, unknowns: Option<UnknownId>) -> String {
     if unknowns.is_some() {
-        format!("{} [partial]", cost.text())
+        format!("{} [partial]", cost.text_with(&|id| values.label(id)))
     } else {
-        cost.text()
+        cost.text_with(&|id| values.label(id))
     }
 }
 

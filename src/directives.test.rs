@@ -35,5 +35,5 @@ fn cost_tag_of_skips_a_max_tag() {
 
 #[test]
 fn max_tag_of_rejects_an_unparsable_limit() {
-    assert_eq!(max_tag_of(&[PerfTag::Max("O(M)".to_string())]), None);
+    assert_eq!(max_tag_of(&[PerfTag::Max("O(N+)".to_string())]), None);
 }

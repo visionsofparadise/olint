@@ -163,3 +163,54 @@ pub fn summary_of(analysis: &mut Analysis<'_, '_>, file: FileId, name: &str) -> 
         .summarize(file, function)
         .total(&mut analysis.unknowns)
 }
+
+pub fn legacy_class_of<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    file: FileId,
+    function: FunctionNode<'a>,
+    cost: &olint::cost::Cost,
+) -> olint::cost::Cost {
+    use olint::cost::{Cost, CostComparison};
+
+    for text in [
+        "O(1)",
+        "O(log N)",
+        "O(N)",
+        "O(N log N)",
+        "O(N^2)",
+        "O(N^3)",
+        "O(N^4)",
+    ] {
+        let legacy = Cost::parse(text).unwrap();
+        let expected = analysis
+            .bind_function_cost(file, function, &legacy)
+            .unwrap();
+
+        if cost.compare(&expected) == CostComparison::Within
+            && expected.compare(cost) == CostComparison::Within
+        {
+            return legacy;
+        }
+    }
+
+    cost.clone()
+}
+
+pub fn legacy_reading_of<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    file: FileId,
+    function: FunctionNode<'a>,
+) -> olint::cost::Reading {
+    let mut reading =
+        analysis.summarize_with(file, function, olint::summaries::Substitutions::new(), true);
+
+    for part in [
+        &mut reading.main,
+        &mut reading.function_exit,
+        &mut reading.loop_exit,
+    ] {
+        part.cost = legacy_class_of(analysis, file, function, &part.cost);
+    }
+
+    reading
+}

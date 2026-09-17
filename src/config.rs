@@ -17,7 +17,7 @@ pub struct Limit {
 pub struct Config {
     pub unknown: UnknownPolicy,
     pub max: Limit,
-    pub entrypoints: Vec<(PathBuf, Limit)>,
+    pub entrypoints: Vec<(PathBuf, Vec<Limit>)>,
     pub ignore: Vec<GlobMatcher>,
     pub source: String,
 }
@@ -85,17 +85,17 @@ fn ignore_pattern_of(value: &Value) -> Result<GlobMatcher, ConfigError> {
         .map_err(|_| invalid())
 }
 
-pub const LIMIT_FORMS: &str = "O(1), O(log N), O(N), O(N log N) or O(N^k)";
+pub const LIMIT_FORMS: &str = "O(...) using constants, named input sizes, N, sums, products, max, log, powers, positive ratios or factorials";
 
 pub const ENTRYPOINT_FORMS: &str = r#"a path string or { "path": string, "max": string }"#;
 
 pub fn limit_of(text: &str, field: &str) -> Result<Limit, ConfigError> {
     match Cost::parse(text) {
-        Some(cost) => Ok(Limit {
+        Ok(cost) => Ok(Limit {
             cost,
             text: collapsed_text_of(text),
         }),
-        None => Err(ConfigError::Limit {
+        Err(_) => Err(ConfigError::Limit {
             field: field.to_string(),
             text: Value::String(text.to_string()).to_string(),
         }),
@@ -261,13 +261,13 @@ pub fn entrypoints_of(
     value: &Value,
     root: &Path,
     max: &Limit,
-) -> Result<Vec<(PathBuf, Limit)>, ConfigError> {
+) -> Result<Vec<(PathBuf, Vec<Limit>)>, ConfigError> {
     let Value::Array(items) = value else {
         return Err(ConfigError::Entrypoints {
             text: value.to_string(),
         });
     };
-    let mut entrypoints: Vec<(PathBuf, Limit)> = Vec::new();
+    let mut entrypoints: Vec<(PathBuf, Vec<Limit>)> = Vec::new();
 
     for (index, item) in items.iter().enumerate() {
         let (path, limit) = entrypoint_of(item, &format!("entrypoints[{index}]"), max)?;
@@ -275,11 +275,11 @@ pub fn entrypoints_of(
 
         match entrypoints.iter_mut().find(|(known, _)| *known == entry) {
             Some(known) => {
-                if known.1.cost.exceeds(limit.cost) {
-                    known.1 = limit;
+                if !known.1.iter().any(|old| old.cost == limit.cost) {
+                    known.1.push(limit);
                 }
             }
-            None => entrypoints.push((entry, limit)),
+            None => entrypoints.push((entry, vec![limit])),
         }
     }
 
@@ -320,7 +320,7 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
         Some(value) => entrypoints_of(value, &project.root, &max)?,
         None => package_entries(project)
             .into_iter()
-            .map(|entry| (entry, max.clone()))
+            .map(|entry| (entry, vec![max.clone()]))
             .collect(),
     };
 

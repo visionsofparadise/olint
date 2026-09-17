@@ -61,19 +61,32 @@ pub fn is_conflicted(tags: &[PerfTag]) -> bool {
 
 pub fn cost_tag_of(tags: &[PerfTag]) -> Option<(Cost, String)> {
     tags.iter().find_map(|tag| match tag {
-        PerfTag::Cost(text) => Cost::parse(text).map(|cost| (cost, text.clone())),
+        PerfTag::Cost(text) => Cost::parse(text).ok().map(|cost| (cost, text.clone())),
         _ => None,
     })
 }
 
 pub fn max_tag_of(tags: &[PerfTag]) -> Option<(Cost, String)> {
     tags.iter().find_map(|tag| match tag {
-        PerfTag::Max(text) => Cost::parse(text).map(|cost| (cost, text.clone())),
+        PerfTag::Max(text) => Cost::parse(text).ok().map(|cost| (cost, text.clone())),
         _ => None,
     })
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
+    fn validate_cost_tags(&mut self, tags: &[PerfTag], file: FileId, start: u32) {
+        for tag in tags {
+            if let PerfTag::Cost(text) | PerfTag::Max(text) = tag {
+                if let Err(error) = Cost::parse(text) {
+                    self.errors.insert(format!(
+                        "invalid {text} at {}:{}: {error:?}",
+                        self.project.file(file).relative,
+                        self.project.line_of(file, start)
+                    ));
+                }
+            }
+        }
+    }
     pub fn perf_tags(&mut self, file: FileId, kind: AstKind<'a>) -> &[PerfTag] {
         let key = (file, kind.node_id());
 
@@ -85,6 +98,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Vec::new()
             };
 
+            self.validate_cost_tags(&tags, file, start);
             self.tag_cache.insert(key, tags);
         }
 
@@ -170,7 +184,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             node = nodes.parent_id(node);
         }
 
-        leading_tags_of(project, file, start)
+        let tags = leading_tags_of(project, file, start);
+
+        self.validate_cost_tags(&tags, file, start);
+
+        tags
     }
 }
 
@@ -273,9 +291,25 @@ fn tag_and_length_of(text: &str) -> Option<(PerfTag, usize)> {
 }
 
 fn cost_length_of(text: &str) -> Option<usize> {
-    let rest = text.strip_prefix("O(")?;
+    text.strip_prefix("O(")?;
 
-    rest.find(')').map(|close| "O(".len() + close + 1)
+    let mut depth = 0usize;
+
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(text.find("@perf").unwrap_or(text.len()))
 }
 
 fn collapse_whitespace(text: &str) -> String {

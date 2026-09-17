@@ -74,7 +74,7 @@ fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
 
     run_with_source(source, |analysis, file| {
         let function = function_of_name(analysis.project, file, name);
-        let reading = analysis.cost_of_function_body(file, function);
+        let reading = support::legacy_reading_of(analysis, file, function);
         let labels = reading
             .total(&mut analysis.unknowns)
             .chain
@@ -101,7 +101,7 @@ fn nested_loops_multiply() {
         "f",
     );
 
-    assert_eq!(reading.total().cost, Cost { n: 2, log: 0 });
+    assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap());
     assert_eq!(labels, vec!["for-of", "for-of"]);
 }
 
@@ -185,7 +185,7 @@ fn an_all_cold_block_cascades_its_cold_maximum() {
         "f",
     );
 
-    assert_eq!(reading.total().cost, Cost { n: 2, log: 0 });
+    assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap());
     assert_eq!(labels, vec!["for-of", "for-of"]);
 }
 
@@ -280,10 +280,10 @@ fn hot_and_cold_on_one_node_take_no_preference_and_warn() {
         "export function f(rows: number[][]) {\n\t// @perf hot\n\t// @perf cold\n\tfor (const row of rows) void row;\n\tfor (const row of rows) for (const cell of row) void cell;\n}",
         |analysis, file| {
             let function = function_of_name(analysis.project, file, "f");
-            let reading = analysis.cost_of_function_body(file, function);
+            let reading = support::legacy_reading_of(analysis, file, function);
             let warnings: Vec<String> = analysis.warnings.iter().cloned().collect();
 
-            assert_eq!(reading.total(&mut analysis.unknowns).cost, Cost { n: 2, log: 0 });
+            assert_eq!(reading.total(&mut analysis.unknowns).cost, Cost::parse("O(N^2)").unwrap());
             assert_eq!(
                 warnings,
                 vec!["@perf hot and @perf cold conflict at index.ts:4; the node takes no preference"]
@@ -355,7 +355,7 @@ fn a_cold_scoped_budget_loop_yields_to_its_linear_sibling() {
         "f",
     );
 
-    assert_eq!(reading.total().cost, Cost { n: 2, log: 0 });
+    assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap());
     assert_eq!(labels, vec!["for", "for-of"]);
 }
 

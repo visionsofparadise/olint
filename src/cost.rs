@@ -1,93 +1,1353 @@
 use crate::project::Site;
-use crate::unknowns::{UnknownId, Unknowns};
+use crate::unknowns::{SourceSpan, UnknownId, UnknownReason, Unknowns};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Cost {
-    pub n: u32,
-    pub log: u32,
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+const MAX_DEPTH: usize = 64;
+const MAX_PARSE_DEPTH: usize = MAX_DEPTH * 8;
+const MAX_NODES: usize = 4096;
+const MAX_PARSE_NODES: usize = MAX_NODES * 4;
+const MAX_TEXT: usize = 65536;
+const PROOF_CREDITS_PER_NODE: usize = MAX_NODES * MAX_DEPTH * 32;
+const COMPARISON_CREDITS: usize = PROOF_CREDITS_PER_NODE * 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Domain {
+    PositiveReal,
+    Size,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Expression {
+    Constant(u64),
+    LegacyN,
+    LegacyLog,
+    LegacyNLog,
+    Name(Arc<str>),
+    Dimension { id: u64, domain: Domain },
+    Sum(Arc<[Expression]>),
+    Product(Arc<[Expression]>),
+    Maximum(Arc<[Expression]>),
+    Log(Arc<Expression>),
+    Power(Arc<Expression>, Arc<Expression>),
+    Ratio(Arc<Expression>, Arc<Expression>),
+    Factorial(Arc<Expression>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostComparison {
+    Within,
+    Exceeds,
+    Inconclusive,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CostError {
+    Syntax(usize),
+    Overflow,
+    Resource,
+    Domain,
+    UnknownName(String),
+    UnresolvedQuantity(String),
+    InvalidRoot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Cost(Expression);
+impl Default for Cost {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
 impl Cost {
-    pub const ONE: Cost = Cost { n: 0, log: 0 };
-    pub const N: Cost = Cost { n: 1, log: 0 };
-    pub const LOG: Cost = Cost { n: 0, log: 1 };
-    pub const N_LOG_N: Cost = Cost { n: 1, log: 1 };
-
-    pub fn is_one(self) -> bool {
-        self.n == 0 && self.log == 0
+    pub const ONE: Self = Self(Expression::ONE);
+    pub const N: Self = Self(Expression::N);
+    pub const LOG: Self = Self(Expression::LOG);
+    pub const N_LOG_N: Self = Self(Expression::N_LOG_N);
+    pub fn constant(value: u64) -> Self {
+        Self(Expression::Constant(value))
     }
+    pub fn dimension(id: u64, domain: Domain) -> Self {
+        Self(Expression::dimension(id, domain))
+    }
+    pub fn is_one(&self) -> bool {
+        self.0.is_one()
+    }
+    pub fn multiply(&self, other: &Self) -> Result<Self, CostError> {
+        self.0.multiply(&other.0).map(Self)
+    }
+    pub fn sum(values: Vec<Self>) -> Result<Self, CostError> {
+        Expression::sum(values.into_iter().map(|value| value.0).collect()).map(Self)
+    }
+    pub fn product(values: Vec<Self>) -> Result<Self, CostError> {
+        Expression::product(values.into_iter().map(|value| value.0).collect()).map(Self)
+    }
+    pub fn maximum(values: Vec<Self>) -> Result<Self, CostError> {
+        Expression::maximum(values.into_iter().map(|value| value.0).collect()).map(Self)
+    }
+    pub fn power(base: Self, exponent: Self) -> Result<Self, CostError> {
+        Expression::power(base.0, exponent.0).map(Self)
+    }
+    pub fn ratio(numerator: Self, denominator: Self) -> Result<Self, CostError> {
+        Expression::ratio(numerator.0, denominator.0).map(Self)
+    }
+    pub fn logarithm(argument: Self) -> Result<Self, CostError> {
+        Expression::logarithm(argument.0).map(Self)
+    }
+    pub fn factorial(argument: Self) -> Result<Self, CostError> {
+        Expression::factorial(argument.0).map(Self)
+    }
+    pub fn parse(text: &str) -> Result<Self, CostError> {
+        Expression::parse(text).map(Self)
+    }
+    pub fn bind(
+        &self,
+        resolve: &impl Fn(&str) -> Option<Self>,
+        roots: &[Self],
+    ) -> Result<Self, CostError> {
+        let roots: Vec<_> = roots.iter().map(|value| value.0.clone()).collect();
 
-    pub fn multiply(self, other: Cost) -> Cost {
-        Cost {
-            n: self.n + other.n,
-            log: self.log + other.log,
+        self.0
+            .bind(&|name| resolve(name).map(|value| value.0), &roots)
+            .map(Self)
+    }
+    pub fn compare(&self, limit: &Self) -> CostComparison {
+        self.0.compare(&limit.0)
+    }
+    pub(crate) fn bind_known(
+        &self,
+        bind: &mut impl FnMut(&Self) -> Result<Self, CostError>,
+    ) -> Result<(Option<Self>, bool), CostError> {
+        match bind(self) {
+            Ok(cost) => return Ok((Some(cost), false)),
+            Err(CostError::UnresolvedQuantity(_)) => {}
+            Err(error) => return Err(error),
         }
-    }
 
-    pub fn exceeds(self, other: Cost) -> bool {
-        if self.n != other.n {
-            self.n > other.n
+        let (Expression::Sum(children) | Expression::Maximum(children)) = &self.0 else {
+            return Ok((None, true));
+        };
+        let mut known = Vec::new();
+
+        for child in children.iter() {
+            if let (Some(cost), _) = Self(child.clone()).bind_known(bind)? {
+                known.push(cost);
+            }
+        }
+
+        if known.is_empty() {
+            return Ok((None, true));
+        }
+
+        let known = if matches!(self.0, Expression::Sum(_)) {
+            Self::sum(known)?
         } else {
-            self.log > other.log
-        }
+            Self::maximum(known)?
+        };
+
+        Ok((Some(known), true))
+    }
+    pub fn text(&self) -> String {
+        self.0.text()
+    }
+    pub fn text_with(&self, name: &impl Fn(u64) -> String) -> String {
+        self.0.text_with(name)
+    }
+    pub fn structural_key(&self) -> String {
+        self.0.structural_key()
     }
 
-    pub fn text(self) -> String {
-        if self.is_one() {
-            return "O(1)".to_string();
-        }
+    pub(crate) fn names(&self) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let mut pending = vec![&self.0];
 
-        let linear = match self.n {
-            0 => String::new(),
-            1 => "N".to_string(),
-            power => format!("N^{power}"),
-        };
-        let logarithm = match self.log {
-            0 => String::new(),
-            1 => "log N".to_string(),
-            power => format!("log^{power} N"),
-        };
-        let parts: Vec<String> = [linear, logarithm]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect();
-
-        format!("O({})", parts.join(" "))
-    }
-
-    pub fn parse(text: &str) -> Option<Cost> {
-        let compact: String = text
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        let inner = compact.strip_prefix("O(")?.strip_suffix(')')?;
-
-        if inner == "1" {
-            return Some(Cost::ONE);
-        }
-
-        if inner == "logN" {
-            return Some(Cost::LOG);
-        }
-
-        let after_linear = inner.strip_prefix('N')?;
-        let (power_text, log) = match after_linear.strip_suffix("logN") {
-            Some(rest) => (rest, 1),
-            None => (after_linear, 0),
-        };
-        let n = if power_text.is_empty() {
-            1
-        } else {
-            let digits = power_text.strip_prefix('^')?;
-
-            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
+        while let Some(value) = pending.pop() {
+            if let Expression::Name(name) = value {
+                names.insert(name.to_string());
             }
 
-            digits.parse().ok()?
+            pending.extend(value.children());
+        }
+
+        names.into_iter().collect()
+    }
+
+    pub(crate) fn compare_legacy(&self, limit: &Self) -> CostComparison {
+        let mut pending = vec![&self.0, &limit.0];
+
+        while let Some(expression) = pending.pop() {
+            if matches!(
+                expression,
+                Expression::Name(_) | Expression::Dimension { .. }
+            ) {
+                return self.compare(limit);
+            }
+
+            pending.extend(expression.children());
+        }
+
+        let roots = [Self::dimension(u64::MAX, Domain::Size)];
+
+        match (self.bind(&|_| None, &roots), limit.bind(&|_| None, &roots)) {
+            (Ok(cost), Ok(limit)) => cost.compare(&limit),
+            _ => CostComparison::Inconclusive,
+        }
+    }
+}
+
+impl Default for Expression {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+impl Expression {
+    fn children(&self) -> impl Iterator<Item = &Self> {
+        let (values, left, right): (&[Self], Option<&Self>, Option<&Self>) = match self {
+            Self::Sum(values) | Self::Product(values) | Self::Maximum(values) => {
+                (values, None, None)
+            }
+            Self::Log(value) | Self::Factorial(value) => (&[], Some(value), None),
+            Self::Power(left, right) | Self::Ratio(left, right) => (&[], Some(left), Some(right)),
+            _ => (&[], None, None),
         };
 
-        Some(Cost { n, log })
+        values.iter().chain(left).chain(right)
+    }
+
+    pub const ONE: Self = Self::Constant(1);
+    pub const N: Self = Self::LegacyN;
+    pub const LOG: Self = Self::LegacyLog;
+    pub const N_LOG_N: Self = Self::LegacyNLog;
+
+    pub fn dimension(id: u64, domain: Domain) -> Self {
+        Self::Dimension { id, domain }
+    }
+    pub fn is_one(&self) -> bool {
+        matches!(self, Self::Constant(1))
+    }
+    pub fn multiply(&self, other: &Self) -> Result<Self, CostError> {
+        Self::product(vec![self.clone(), other.clone()])
+    }
+    pub fn sum(values: Vec<Self>) -> Result<Self, CostError> {
+        Self::combine(values, 0)
+    }
+    pub fn product(values: Vec<Self>) -> Result<Self, CostError> {
+        Self::combine(values, 1)
+    }
+    pub fn maximum(values: Vec<Self>) -> Result<Self, CostError> {
+        Self::combine(values, 2)
+    }
+
+    fn combine(values: Vec<Self>, kind: u8) -> Result<Self, CostError> {
+        if values.is_empty() {
+            return Err(CostError::Domain);
+        }
+
+        let mut output = Vec::new();
+        let mut constant = if kind == 1 { 1u64 } else { 0 };
+        let mut stack = values;
+
+        while let Some(value) = stack.pop() {
+            value.check_budget()?;
+
+            if output.len() + stack.len() > MAX_NODES {
+                return Err(CostError::Resource);
+            }
+
+            match (&value, kind) {
+                (Self::Sum(children), 0)
+                | (Self::Product(children), 1)
+                | (Self::Maximum(children), 2) => stack.extend(children.iter().cloned()),
+                (Self::Constant(number), _) => {
+                    constant = match kind {
+                        0 => constant.checked_add(*number).ok_or(CostError::Overflow)?,
+                        1 => constant.checked_mul(*number).ok_or(CostError::Overflow)?,
+                        _ => constant.max(*number),
+                    };
+                }
+                _ => output.push(value),
+            }
+        }
+
+        if kind == 1 && constant == 0 && output.iter().all(Self::valid) {
+            return Ok(Self::Constant(0));
+        }
+
+        if constant != if kind == 1 { 1 } else { 0 } || output.is_empty() {
+            output.push(Self::Constant(constant));
+        }
+
+        output.sort_by_key(Self::structural_key);
+
+        if kind == 1 {
+            let mut grouped = Vec::new();
+            let mut cursor = 0;
+
+            while cursor < output.len() {
+                let mut end = cursor + 1;
+
+                while end < output.len() && output[end] == output[cursor] {
+                    end += 1;
+                }
+
+                let value = output[cursor].clone();
+
+                grouped.push(if end - cursor == 1 {
+                    value
+                } else {
+                    Self::power(value, Self::Constant((end - cursor) as u64))?
+                });
+
+                cursor = end;
+            }
+
+            output = grouped;
+
+            output.sort_by_key(Self::structural_key);
+        }
+
+        if kind == 2 {
+            output.dedup();
+        }
+
+        let result = if kind == 1
+            && output.len() == 2
+            && output.contains(&Self::LegacyN)
+            && output.contains(&Self::LegacyLog)
+        {
+            Self::LegacyNLog
+        } else if output.len() == 1 {
+            output.remove(0)
+        } else {
+            match kind {
+                0 => Self::Sum(output.into()),
+                1 => Self::Product(output.into()),
+                _ => Self::Maximum(output.into()),
+            }
+        };
+
+        result.check_budget()?;
+
+        Ok(result)
+    }
+
+    pub fn power(base: Self, exponent: Self) -> Result<Self, CostError> {
+        base.check_budget()?;
+        exponent.check_budget()?;
+
+        if exponent == Self::Constant(0) && base.positive() {
+            return Ok(Self::ONE);
+        }
+
+        if exponent.is_one() {
+            return Ok(base);
+        }
+
+        if let (Self::Constant(base), Self::Constant(exponent)) = (&base, &exponent) {
+            if *base == 0 && *exponent == 0 {
+                return Err(CostError::Domain);
+            }
+
+            let exponent: u32 = (*exponent).try_into().map_err(|_| CostError::Overflow)?;
+
+            return base
+                .checked_pow(exponent)
+                .map(Self::Constant)
+                .ok_or(CostError::Overflow);
+        }
+
+        let result = Self::Power(Arc::new(base), Arc::new(exponent));
+
+        result.check_budget()?;
+
+        Ok(result)
+    }
+
+    pub fn ratio(numerator: Self, denominator: Self) -> Result<Self, CostError> {
+        numerator.check_budget()?;
+        denominator.check_budget()?;
+
+        if !denominator.positive() {
+            return Err(CostError::Domain);
+        }
+
+        if numerator == denominator {
+            return Ok(Self::ONE);
+        }
+
+        if denominator.is_one() {
+            return Ok(numerator);
+        }
+
+        let result = Self::Ratio(Arc::new(numerator), Arc::new(denominator));
+
+        result.check_budget()?;
+
+        Ok(result)
+    }
+
+    pub fn logarithm(argument: Self) -> Result<Self, CostError> {
+        argument.check_budget()?;
+
+        if !argument.positive() {
+            return Err(CostError::Domain);
+        }
+
+        let result = Self::Log(Arc::new(argument));
+
+        result.check_budget()?;
+
+        Ok(result)
+    }
+
+    pub fn factorial(argument: Self) -> Result<Self, CostError> {
+        argument.check_budget()?;
+
+        if !argument.integer() {
+            return Err(CostError::Domain);
+        }
+
+        if let Self::Constant(value) = argument {
+            let mut result = 1u64;
+
+            for factor in 2..=value {
+                result = result.checked_mul(factor).ok_or(CostError::Overflow)?;
+            }
+
+            return Ok(Self::Constant(result));
+        }
+
+        let result = Self::Factorial(Arc::new(argument));
+
+        result.check_budget()?;
+
+        Ok(result)
+    }
+
+    fn integer(&self) -> bool {
+        match self {
+            Self::Constant(_)
+            | Self::Dimension {
+                domain: Domain::Size,
+                ..
+            } => true,
+            Self::Sum(values) | Self::Product(values) | Self::Maximum(values) => {
+                values.iter().all(Self::integer)
+            }
+            Self::Power(base, exponent) => base.integer() && exponent.integer(),
+            Self::Factorial(value) => value.integer(),
+            _ => false,
+        }
+    }
+    fn positive(&self) -> bool {
+        match self {
+            Self::Constant(value) => *value > 0,
+            Self::Dimension { .. } => true,
+            Self::Sum(values) | Self::Maximum(values) => {
+                values.iter().all(Self::nonnegative) && values.iter().any(Self::positive)
+            }
+            Self::Product(values) => values.iter().all(Self::positive),
+            Self::Log(value) => value.positive(),
+            Self::Power(base, exponent) => base.positive() && exponent.nonnegative(),
+            Self::Ratio(a, b) => a.positive() && b.positive(),
+            Self::Factorial(value) => value.integer(),
+            _ => false,
+        }
+    }
+    fn nonnegative(&self) -> bool {
+        matches!(self, Self::Constant(0)) || self.positive()
+    }
+    fn valid(&self) -> bool {
+        match self {
+            Self::Name(_) | Self::LegacyN | Self::LegacyLog | Self::LegacyNLog => false,
+            Self::Sum(values) | Self::Product(values) | Self::Maximum(values) => {
+                !values.is_empty() && values.iter().all(Self::valid)
+            }
+            Self::Log(value) => value.valid() && value.positive(),
+            Self::Power(a, b) => a.valid() && b.valid() && a.positive() && b.nonnegative(),
+            Self::Ratio(a, b) => a.valid() && b.valid() && a.nonnegative() && b.positive(),
+            Self::Factorial(value) => value.valid() && value.integer(),
+            _ => true,
+        }
+    }
+
+    fn check_budget(&self) -> Result<(), CostError> {
+        let mut stack = vec![(self, 0)];
+        let mut count = 0;
+        let mut text_bytes = 3usize;
+
+        while let Some((value, depth)) = stack.pop() {
+            count += 1;
+
+            if depth > MAX_DEPTH || count > MAX_NODES {
+                return Err(CostError::Resource);
+            }
+
+            let overhead = match value {
+                Self::Constant(number) => number.to_string().len(),
+                Self::LegacyN => 1,
+                Self::LegacyLog => 5,
+                Self::LegacyNLog => 7,
+                Self::Name(name) => name.len(),
+                Self::Dimension { id, .. } => 5 + id.to_string().len(),
+                Self::Sum(values) | Self::Product(values) => 2 + 3 * values.len().saturating_sub(1),
+                Self::Maximum(values) => 5 + 2 * values.len().saturating_sub(1),
+                Self::Log(_) => 5,
+                Self::Factorial(_) => 3,
+                Self::Power(_, _) => 5,
+                Self::Ratio(_, _) => 7,
+            };
+            text_bytes = text_bytes
+                .checked_add(overhead)
+                .ok_or(CostError::Resource)?;
+
+            if text_bytes > MAX_TEXT {
+                return Err(CostError::Resource);
+            }
+
+            match value {
+                Self::Sum(children) | Self::Product(children) | Self::Maximum(children) => {
+                    stack.extend(children.iter().map(|child| (child, depth + 1)))
+                }
+                Self::Log(child) | Self::Factorial(child) => stack.push((child, depth + 1)),
+                Self::Power(a, b) | Self::Ratio(a, b) => {
+                    stack.push((a, depth + 1));
+                    stack.push((b, depth + 1));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn bind(
+        &self,
+        resolve: &impl Fn(&str) -> Option<Self>,
+        roots: &[Self],
+    ) -> Result<Self, CostError> {
+        self.check_budget()?;
+
+        for root in roots {
+            root.check_budget()?;
+        }
+
+        if roots.iter().any(|root| !root.valid() || !root.integer()) {
+            return Err(CostError::InvalidRoot);
+        }
+
+        let mut envelope = roots.to_vec();
+
+        if !roots.iter().any(at_least_one) {
+            envelope.push(Self::ONE);
+        }
+
+        let envelope = Self::maximum(envelope)?;
+
+        self.bind_inner(resolve, &envelope)
+    }
+    fn bind_inner(
+        &self,
+        resolve: &impl Fn(&str) -> Option<Self>,
+        envelope: &Self,
+    ) -> Result<Self, CostError> {
+        let child = |cost: &Self| cost.bind_inner(resolve, envelope);
+        let result = match self {
+            Self::Name(name) => {
+                resolve(name).ok_or_else(|| CostError::UnknownName(name.to_string()))?
+            }
+            Self::LegacyN => envelope.clone(),
+            Self::LegacyLog => Self::logarithm(envelope.clone())?,
+            Self::LegacyNLog => envelope.multiply(&Self::logarithm(envelope.clone())?)?,
+            Self::Sum(values) => Self::sum(values.iter().map(child).collect::<Result<_, _>>()?)?,
+            Self::Product(values) => {
+                Self::product(values.iter().map(child).collect::<Result<_, _>>()?)?
+            }
+            Self::Maximum(values) => {
+                Self::maximum(values.iter().map(child).collect::<Result<_, _>>()?)?
+            }
+            Self::Log(value) => Self::logarithm(child(value)?)?,
+            Self::Factorial(value) => Self::factorial(child(value)?)?,
+            Self::Power(a, b) => Self::power(child(a)?, child(b)?)?,
+            Self::Ratio(a, b) => Self::ratio(child(a)?, child(b)?)?,
+            _ => self.clone(),
+        };
+
+        result.check_budget()?;
+
+        if !result.valid() {
+            return Err(CostError::Domain);
+        }
+
+        Ok(result)
+    }
+
+    pub fn structural_key(&self) -> String {
+        if self.check_budget().is_err() {
+            "ResourceExceeded".into()
+        } else {
+            format!("{self:?}")
+        }
+    }
+    pub fn text(&self) -> String {
+        self.text_with(&|id| format!("size_{id}"))
+    }
+    pub fn text_with(&self, name: &impl Fn(u64) -> String) -> String {
+        if self.check_budget().is_err() {
+            "O(unknown)".into()
+        } else {
+            format!("O({})", self.inner_text(name))
+        }
+    }
+    fn inner_text(&self, name: &impl Fn(u64) -> String) -> String {
+        let text = |value: &Self| value.inner_text(name);
+
+        match self {
+            Self::Constant(number) => number.to_string(),
+            Self::LegacyN => "N".into(),
+            Self::LegacyLog => "log N".into(),
+            Self::LegacyNLog => "N log N".into(),
+            Self::Name(name) => name.to_string(),
+            Self::Dimension { id, .. } => name(*id),
+            Self::Sum(values) => format!(
+                "({})",
+                values.iter().map(text).collect::<Vec<_>>().join(" + ")
+            ),
+            Self::Product(values) => format!(
+                "({})",
+                values.iter().map(text).collect::<Vec<_>>().join(" * ")
+            ),
+            Self::Maximum(values) => format!(
+                "max({})",
+                values.iter().map(text).collect::<Vec<_>>().join(", ")
+            ),
+            Self::Log(value) => format!("log({})", text(value)),
+            Self::Factorial(value) => format!("({})!", text(value)),
+            Self::Power(a, b) => match (a.as_ref(), b.as_ref()) {
+                (Self::LegacyN | Self::Dimension { .. } | Self::Name(_), Self::Constant(power)) => {
+                    format!("{}^{power}", text(a))
+                }
+                _ => format!("({})^({})", text(a), text(b)),
+            },
+            Self::Ratio(a, b) => format!("({}) / ({})", text(a), text(b)),
+        }
+    }
+
+    pub fn compare(&self, limit: &Self) -> CostComparison {
+        self.compare_with_budget(limit, COMPARISON_CREDITS).0
+    }
+
+    fn compare_with_budget(&self, limit: &Self, credits: usize) -> (CostComparison, usize) {
+        let mut budget = credits;
+
+        if !reserve_proof(self, limit, &mut budget) {
+            return (CostComparison::Inconclusive, credits - budget);
+        }
+
+        if self.check_budget().is_err()
+            || limit.check_budget().is_err()
+            || !self.valid()
+            || !limit.valid()
+        {
+            return (CostComparison::Inconclusive, credits - budget);
+        }
+
+        if within(self, limit, &mut budget) {
+            return (CostComparison::Within, credits - budget);
+        }
+
+        if budget == 0 {
+            return (CostComparison::Inconclusive, credits - budget);
+        }
+
+        let result =
+            if within(limit, self, &mut budget) && strictly_larger(self, limit, &mut budget) {
+                CostComparison::Exceeds
+            } else {
+                CostComparison::Inconclusive
+            };
+
+        (result, credits - budget)
+    }
+
+    pub fn parse(text: &str) -> Result<Self, CostError> {
+        if text.len() > MAX_TEXT {
+            return Err(CostError::Resource);
+        }
+
+        let mut parser = Parser {
+            source: text,
+            text: text.as_bytes(),
+            offset: 0,
+            nodes: 0,
+        };
+
+        parser.space();
+        parser.expect(b'O')?;
+        parser.expect(b'(')?;
+
+        let result = parser.expression(0)?;
+
+        parser.expect(b')')?;
+        parser.space();
+
+        if parser.offset != parser.text.len() {
+            return Err(CostError::Syntax(parser.offset));
+        }
+
+        result.check_budget()?;
+
+        Ok(result)
+    }
+}
+
+type Monomial = BTreeMap<u64, (i128, i128)>;
+fn reserve_walk(value: &Expression, budget: &mut usize, factor: usize) -> bool {
+    let mut stack = vec![value];
+
+    while let Some(value) = stack.pop() {
+        let Some(remaining) = budget.checked_sub(factor) else {
+            *budget = 0;
+
+            return false;
+        };
+        *budget = remaining;
+
+        stack.extend(value.children());
+    }
+
+    true
+}
+fn reserve_proof(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
+    reserve_walk(a, budget, PROOF_CREDITS_PER_NODE)
+        && reserve_walk(b, budget, PROOF_CREDITS_PER_NODE)
+}
+fn monomial(value: &Expression) -> Option<Monomial> {
+    match value {
+        Expression::Constant(number) if *number > 0 => Some(BTreeMap::new()),
+        Expression::Dimension {
+            id,
+            domain: Domain::Size,
+        } => Some(BTreeMap::from([(*id, (1, 0))])),
+        Expression::Log(value) => match value.as_ref() {
+            Expression::Dimension {
+                id,
+                domain: Domain::Size,
+            } => Some(BTreeMap::from([(*id, (0, 1))])),
+            _ => None,
+        },
+        Expression::Product(values) => {
+            let mut output = BTreeMap::new();
+
+            for child in values.iter() {
+                add_powers(&mut output, monomial(child)?, 1)?;
+            }
+
+            Some(output)
+        }
+        Expression::Ratio(a, b) => {
+            let mut output = monomial(a)?;
+
+            add_powers(&mut output, monomial(b)?, -1)?;
+
+            Some(output)
+        }
+        Expression::Power(base, exponent) => {
+            let Expression::Constant(exponent) = exponent.as_ref() else {
+                return None;
+            };
+            let mut output = BTreeMap::new();
+
+            add_powers(&mut output, monomial(base)?, (*exponent).into())?;
+
+            Some(output)
+        }
+        _ => None,
+    }
+}
+fn add_powers(output: &mut Monomial, values: Monomial, factor: i128) -> Option<()> {
+    for (id, (power, log)) in values {
+        let entry = output.entry(id).or_insert((0i128, 0i128));
+        entry.0 = entry.0.checked_add(power.checked_mul(factor)?)?;
+        entry.1 = entry.1.checked_add(log.checked_mul(factor)?)?;
+    }
+
+    Some(())
+}
+fn monomial_within(a: &Monomial, b: &Monomial) -> bool {
+    a.keys()
+        .chain(b.keys())
+        .all(|id| a.get(id).copied().unwrap_or_default() <= b.get(id).copied().unwrap_or_default())
+}
+fn scaled_dimension(value: &Expression) -> Option<(u64, u128)> {
+    match value {
+        Expression::Dimension {
+            id,
+            domain: Domain::Size,
+        } => Some((*id, 1)),
+        Expression::Product(values) => {
+            let mut dimension = None;
+            let mut coefficient = 1u128;
+
+            for value in values.iter() {
+                match value {
+                    Expression::Constant(number) => {
+                        coefficient = coefficient.checked_mul((*number).into())?
+                    }
+                    Expression::Dimension {
+                        id,
+                        domain: Domain::Size,
+                    } if dimension.is_none() => dimension = Some(*id),
+                    _ => return None,
+                }
+            }
+
+            Some((dimension?, coefficient))
+        }
+        _ => None,
+    }
+}
+fn at_least_one(value: &Expression) -> bool {
+    match value {
+        Expression::Constant(number) => *number >= 1,
+        Expression::Dimension {
+            domain: Domain::Size,
+            ..
+        }
+        | Expression::Log(_)
+        | Expression::Factorial(_) => true,
+        Expression::Sum(values) | Expression::Maximum(values) => values.iter().any(at_least_one),
+        Expression::Product(values) => values.iter().all(at_least_one),
+        Expression::Power(base, _) => at_least_one(base),
+        _ => false,
+    }
+}
+fn log_product(value: &Expression) -> Option<Expression> {
+    let Expression::Log(argument) = value else {
+        return None;
+    };
+    let Expression::Product(values) = argument.as_ref() else {
+        return None;
+    };
+
+    if !values.iter().all(at_least_one) {
+        return None;
+    }
+
+    Expression::sum(
+        values
+            .iter()
+            .map(|value| Expression::Log(Arc::new(value.clone())))
+            .collect(),
+    )
+    .ok()
+}
+fn shared_envelope_growth(a: &Expression, b: &Expression) -> Option<((i128, i128), (i128, i128))> {
+    let mut pending = vec![a, b];
+    let base = loop {
+        match pending.pop()? {
+            value @ Expression::Maximum(children)
+                if children.iter().all(|child| {
+                    matches!(
+                        child,
+                        Expression::Dimension {
+                            domain: Domain::Size,
+                            ..
+                        } | Expression::Constant(1)
+                    )
+                }) && children.iter().any(|child| {
+                    matches!(
+                        child,
+                        Expression::Dimension {
+                            domain: Domain::Size,
+                            ..
+                        }
+                    )
+                }) =>
+            {
+                break value
+            }
+            Expression::Product(children) => pending.extend(children.iter()),
+            Expression::Log(child) | Expression::Power(child, _) => pending.push(child),
+            Expression::Ratio(left, right) => pending.extend([left.as_ref(), right.as_ref()]),
+            _ => {}
+        }
+    };
+
+    fn growth(value: &Expression, base: &Expression) -> Option<(i128, i128)> {
+        if value == base {
+            return Some((1, 0));
+        }
+
+        match value {
+            Expression::Constant(value) if *value > 0 => Some((0, 0)),
+            Expression::Log(value) if value.as_ref() == base => Some((0, 1)),
+            Expression::Product(values) => {
+                values.iter().try_fold((0i128, 0i128), |(a, b), child| {
+                    let (c, d) = growth(child, base)?;
+
+                    Some((a.checked_add(c)?, b.checked_add(d)?))
+                })
+            }
+            Expression::Power(value, exponent) => {
+                let Expression::Constant(exponent) = exponent.as_ref() else {
+                    return None;
+                };
+                let (a, b) = growth(value, base)?;
+
+                Some((
+                    a.checked_mul(i128::from(*exponent))?,
+                    b.checked_mul(i128::from(*exponent))?,
+                ))
+            }
+            Expression::Ratio(left, right) => {
+                let (a, b) = growth(left, base)?;
+                let (c, d) = growth(right, base)?;
+
+                Some((a.checked_sub(c)?, b.checked_sub(d)?))
+            }
+            _ => None,
+        }
+    }
+
+    Some((growth(a, base)?, growth(b, base)?))
+}
+
+fn within(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
+    if !reserve_proof(a, b, budget) {
+        return false;
+    }
+
+    if a == b || matches!(a, Expression::Constant(0)) {
+        return true;
+    }
+
+    if let Some((left, right)) = shared_envelope_growth(a, b) {
+        if left <= right {
+            return true;
+        }
+    }
+
+    if let (Some(a), Some(b)) = (monomial(a), monomial(b)) {
+        if monomial_within(&a, &b) {
+            return true;
+        }
+    }
+
+    if let Some(expanded) = log_product(a) {
+        if within(&expanded, b, budget) {
+            return true;
+        }
+    }
+
+    if let Some(expanded) = log_product(b) {
+        if within(a, &expanded, budget) {
+            return true;
+        }
+    }
+
+    if exponential_order(a, b).is_some_and(|ordering| ordering.is_le()) {
+        return true;
+    }
+
+    match (a, b) {
+        (Expression::Sum(values) | Expression::Maximum(values), _)
+            if values.iter().all(|value| within(value, b, budget)) =>
+        {
+            return true
+        }
+        (_, Expression::Sum(values) | Expression::Maximum(values))
+            if values.iter().any(|value| within(a, value, budget)) =>
+        {
+            return true
+        }
+        (Expression::Product(values), Expression::Power(base, power))
+            if **power == Expression::Constant(values.len() as u64)
+                && values.iter().all(|value| within(value, base, budget)) =>
+        {
+            return true
+        }
+        (Expression::Power(x, e), Expression::Power(y, f)) => {
+            if let (Expression::Constant(left), Expression::Constant(right)) =
+                (e.as_ref(), f.as_ref())
+            {
+                if left <= right && at_least_one(y) && within(x, y, budget) {
+                    return true;
+                }
+            }
+
+            if e != f {
+                return false;
+            }
+
+            if let Expression::Constant(_) = e.as_ref() {
+                if within(x, y, budget) {
+                    return true;
+                }
+            }
+
+            if let (Expression::Constant(x), Expression::Constant(y)) = (x.as_ref(), y.as_ref()) {
+                return *x > 1 && x <= y;
+            }
+        }
+        (Expression::Power(base, exponent), Expression::Factorial(argument))
+            if exponent == argument
+                && matches!(base.as_ref(),Expression::Constant(value) if *value > 1) =>
+        {
+            return true
+        }
+        (Expression::Factorial(argument), Expression::Power(base, exponent))
+            if argument == base && base == exponent =>
+        {
+            return true
+        }
+        _ => {}
+    }
+
+    false
+}
+fn strictly_larger(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
+    if !reserve_proof(a, b, budget) {
+        return false;
+    }
+
+    if let Some((left, right)) = shared_envelope_growth(a, b) {
+        if left > right {
+            return true;
+        }
+    }
+
+    if let (Some(a), Some(b)) = (monomial(a), monomial(b)) {
+        return a != b && monomial_within(&b, &a);
+    }
+
+    if let (Some(a), Some(b)) = (witness_growth(a, None), witness_growth(b, None)) {
+        if a > b {
+            return true;
+        }
+    }
+
+    for id in dimension_ids(a).into_iter().chain(dimension_ids(b)) {
+        if !reserve_proof(a, b, budget) {
+            return false;
+        }
+
+        if let (Some(a), Some(b)) = (witness_growth(a, Some(id)), witness_growth(b, Some(id))) {
+            if a > b {
+                return true;
+            }
+        }
+    }
+
+    if exponential_order(a, b).is_some_and(|ordering| ordering.is_gt()) {
+        return true;
+    }
+
+    match (a, b) {
+        (Expression::Power(base, exponent), Expression::Power(other, same))
+            if exponent == same
+                && matches!(
+                    exponent.as_ref(),
+                    Expression::Dimension {
+                        domain: Domain::Size,
+                        ..
+                    }
+                ) =>
+        {
+            matches!((base.as_ref(),other.as_ref()),(Expression::Constant(a),Expression::Constant(b)) if a>b && *b>1)
+        }
+        (Expression::Factorial(argument), Expression::Power(base, exponent))
+            if argument == exponent
+                && matches!(
+                    argument.as_ref(),
+                    Expression::Dimension {
+                        domain: Domain::Size,
+                        ..
+                    }
+                ) =>
+        {
+            matches!(base.as_ref(),Expression::Constant(value) if *value>1)
+        }
+        (Expression::Power(base, exponent), Expression::Factorial(argument)) => {
+            base == exponent
+                && base == argument
+                && matches!(
+                    base.as_ref(),
+                    Expression::Dimension {
+                        domain: Domain::Size,
+                        ..
+                    }
+                )
+        }
+        _ => false,
+    }
+}
+fn exponential_order(a: &Expression, b: &Expression) -> Option<std::cmp::Ordering> {
+    let (Expression::Power(base, exponent), Expression::Power(other, next)) = (a, b) else {
+        return None;
+    };
+
+    if base != other || !matches!(base.as_ref(), Expression::Constant(number) if *number > 1) {
+        return None;
+    }
+
+    let ((x, a), (y, b)) = (scaled_dimension(exponent)?, scaled_dimension(next)?);
+
+    (x == y).then(|| a.cmp(&b))
+}
+fn dimension_ids(value: &Expression) -> Vec<u64> {
+    let mut stack = vec![value];
+    let mut ids = Vec::new();
+
+    while let Some(value) = stack.pop() {
+        if let Expression::Dimension {
+            id,
+            domain: Domain::Size,
+        } = value
+        {
+            ids.push(*id);
+        }
+
+        stack.extend(value.children());
+    }
+
+    ids.sort_unstable();
+    ids.dedup();
+
+    ids
+}
+fn witness_growth(value: &Expression, selected: Option<u64>) -> Option<(i128, i128)> {
+    if let Some(powers) = monomial(value) {
+        return powers
+            .iter()
+            .filter(|(id, _)| selected.is_none_or(|selected| selected == **id))
+            .try_fold((0i128, 0i128), |sum, (_, next)| {
+                Some((sum.0.checked_add(next.0)?, sum.1.checked_add(next.1)?))
+            });
+    }
+
+    match value {
+        Expression::Sum(values) | Expression::Maximum(values) => values
+            .iter()
+            .map(|value| witness_growth(value, selected))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max(),
+        _ => None,
+    }
+}
+
+struct Parser<'a> {
+    source: &'a str,
+    text: &'a [u8],
+    offset: usize,
+    nodes: usize,
+}
+impl Parser<'_> {
+    fn character(&self, offset: usize) -> Option<char> {
+        self.source.get(offset..)?.chars().next()
+    }
+
+    fn space(&mut self) {
+        while let Some(character) = self
+            .character(self.offset)
+            .filter(|character| character.is_whitespace())
+        {
+            self.offset += character.len_utf8();
+        }
+    }
+    fn take(&mut self, byte: u8) -> bool {
+        self.space();
+
+        if self.text.get(self.offset) == Some(&byte) {
+            self.offset += 1;
+
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, byte: u8) -> Result<(), CostError> {
+        if self.take(byte) {
+            Ok(())
+        } else {
+            Err(CostError::Syntax(self.offset))
+        }
+    }
+    fn expression(&mut self, depth: usize) -> Result<Expression, CostError> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(CostError::Resource);
+        }
+
+        let mut output = vec![self.product(depth + 1)?];
+
+        while self.take(b'+') {
+            output.push(self.product(depth + 1)?);
+        }
+
+        Expression::sum(output)
+    }
+    fn product(&mut self, depth: usize) -> Result<Expression, CostError> {
+        let mut output = self.power(depth + 1)?;
+
+        loop {
+            if self.take(b'*') {
+                output = output.multiply(&self.power(depth + 1)?)?;
+            } else if self.take(b'/') {
+                let denominator = self.power(depth + 1)?;
+
+                if denominator == Expression::Constant(0) {
+                    return Err(CostError::Domain);
+                }
+
+                output = Expression::Ratio(Arc::new(output), Arc::new(denominator));
+
+                output.check_budget()?;
+            } else {
+                self.space();
+
+                let keyword = self.text.get(self.offset..self.offset + 3) == Some(b"log")
+                    && self.character(self.offset + 3).is_none_or(|character| {
+                        !oxc_syntax::identifier::is_identifier_part(character) && character != '.'
+                    });
+                let compact = self.text.get(self.offset..self.offset + 4) == Some(b"logN")
+                    && self.character(self.offset + 4).is_none_or(|character| {
+                        !oxc_syntax::identifier::is_identifier_part(character) && character != '.'
+                    });
+
+                if keyword || compact {
+                    output = output.multiply(&self.power(depth + 1)?)?;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(output)
+    }
+    fn power(&mut self, depth: usize) -> Result<Expression, CostError> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(CostError::Resource);
+        }
+
+        let mut output = self.atom(depth + 1)?;
+
+        while self.take(b'!') {
+            output = Expression::Factorial(Arc::new(output));
+
+            output.check_budget()?;
+        }
+
+        if self.take(b'^') {
+            output = Expression::power(output, self.power(depth + 1)?)?;
+        }
+
+        Ok(output)
+    }
+    fn atom(&mut self, depth: usize) -> Result<Expression, CostError> {
+        self.nodes += 1;
+
+        if depth > MAX_PARSE_DEPTH || self.nodes > MAX_PARSE_NODES {
+            return Err(CostError::Resource);
+        }
+
+        if self.take(b'(') {
+            let output = self.expression(depth + 1)?;
+
+            self.expect(b')')?;
+
+            return Ok(output);
+        }
+
+        self.space();
+
+        let start = self.offset;
+
+        if self.text.get(start).is_some_and(u8::is_ascii_digit) {
+            while self.text.get(self.offset).is_some_and(u8::is_ascii_digit) {
+                self.offset += 1;
+            }
+
+            let text = std::str::from_utf8(&self.text[start..self.offset])
+                .map_err(|_| CostError::Syntax(start))?;
+
+            return text
+                .parse::<u64>()
+                .map(Expression::Constant)
+                .map_err(|_| CostError::Overflow);
+        }
+
+        loop {
+            let Some(first) = self
+                .character(self.offset)
+                .filter(|character| oxc_syntax::identifier::is_identifier_start(*character))
+            else {
+                return Err(CostError::Syntax(self.offset));
+            };
+            self.offset += first.len_utf8();
+
+            while let Some(character) = self
+                .character(self.offset)
+                .filter(|character| oxc_syntax::identifier::is_identifier_part(*character))
+            {
+                self.offset += character.len_utf8();
+            }
+
+            if self.text.get(self.offset) != Some(&b'.') {
+                break;
+            }
+
+            self.offset += 1;
+        }
+
+        let name = std::str::from_utf8(&self.text[start..self.offset])
+            .map_err(|_| CostError::Syntax(start))?;
+
+        if name == "max" {
+            self.expect(b'(')?;
+
+            let mut values = vec![self.expression(depth + 1)?];
+
+            while self.take(b',') {
+                values.push(self.expression(depth + 1)?);
+            }
+
+            self.expect(b')')?;
+
+            return Expression::maximum(values);
+        }
+
+        if name == "log" {
+            let exponent = if self.take(b'^') {
+                Some(self.atom(depth + 1)?)
+            } else {
+                None
+            };
+            let value = self.atom(depth + 1)?;
+
+            if value == Expression::Constant(0) {
+                return Err(CostError::Domain);
+            }
+
+            let logarithm = if value == Expression::LegacyN {
+                Expression::LegacyLog
+            } else {
+                Expression::Log(Arc::new(value))
+            };
+
+            return match exponent {
+                Some(exponent) => Expression::power(logarithm, exponent),
+                None => Ok(logarithm),
+            };
+        }
+
+        match name {
+            "N" => Ok(Expression::N),
+            "logN" => Ok(Expression::LOG),
+            "NlogN" => Ok(Expression::N_LOG_N),
+            _ => Ok(Expression::Name(name.into())),
+        }
     }
 }
 
@@ -110,6 +1370,8 @@ pub enum Preference {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Part {
+    pub origin: Option<SourceSpan>,
+    pub cost_error: Option<CostError>,
     pub cost: Cost,
     pub chain: Vec<Factor>,
     pub preference: Preference,
@@ -117,12 +1379,17 @@ pub struct Part {
 }
 
 impl Part {
+    pub fn is_complete(&self) -> bool {
+        self.unknowns.is_none() && self.cost_error.is_none()
+    }
     pub fn none() -> Part {
         Part::default()
     }
 
     pub fn unmarked(cost: Cost, chain: Vec<Factor>) -> Part {
         Part {
+            origin: None,
+            cost_error: None,
             cost,
             chain,
             preference: Preference::Unmarked,
@@ -141,6 +1408,18 @@ impl Part {
 
     pub fn max(self, other: Part, unknowns: &mut Unknowns) -> Part {
         let (mine, theirs) = (self.rank(), other.rank());
+        let selected_error = if mine == theirs {
+            self.cost_error.clone().or(other.cost_error.clone())
+        } else if theirs > mine {
+            other.cost_error.clone()
+        } else {
+            self.cost_error.clone()
+        };
+        let selected_origin = if theirs > mine {
+            other.origin
+        } else {
+            self.origin.or(other.origin)
+        };
         let selected_unknowns = if mine == theirs {
             unknowns.join(self.unknowns, other.unknowns)
         } else if theirs > mine {
@@ -149,12 +1428,39 @@ impl Part {
             self.unknowns
         };
 
-        let mut selected = if theirs > mine || (theirs == mine && other.cost.exceeds(self.cost)) {
-            other
-        } else {
-            self
-        };
+        let comparison = other.cost.compare_legacy(&self.cost);
+        let mut selected =
+            if theirs > mine || (theirs == mine && comparison == CostComparison::Exceeds) {
+                other
+            } else if theirs == mine
+                && comparison == CostComparison::Inconclusive
+                && self.cost != other.cost
+            {
+                let mut combined = self;
+
+                match Cost::maximum(vec![combined.cost.clone(), other.cost.clone()]) {
+                    Ok(cost) => combined.cost = cost,
+                    Err(error) => {
+                        combined.cost_error = Some(error);
+                    }
+                }
+
+                combined.chain.extend(other.chain);
+
+                combined
+            } else {
+                self
+            };
         selected.unknowns = selected_unknowns;
+        selected.cost_error = selected.cost_error.or(selected_error);
+        selected.origin = selected.origin.or(selected_origin);
+
+        if selected.cost_error.is_some() {
+            if let Some(origin) = selected.origin {
+                let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
+                selected.unknowns = unknowns.join(selected.unknowns, Some(failure));
+            }
+        }
 
         selected
     }
@@ -239,20 +1545,40 @@ impl Reading {
     }
 }
 
-pub fn nest(label: String, site: Site, factor: Cost, inner: Part, unknowns: &mut Unknowns) -> Part {
+pub fn nest(
+    label: String,
+    site: Site,
+    origin: SourceSpan,
+    factor: Cost,
+    inner: Part,
+    unknowns: &mut Unknowns,
+) -> Part {
     let mut chain = Vec::with_capacity(inner.chain.len() + 1);
 
     chain.push(Factor {
         label,
         site,
-        cost: factor,
+        cost: factor.clone(),
         inner: Vec::new(),
     });
     chain.extend(inner.chain);
 
+    let mut selected_unknowns = unknowns.scale(inner.unknowns, Some(factor.clone()));
+    let cost = match factor.multiply(&inner.cost) {
+        Ok(cost) => cost,
+        Err(_) => {
+            let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
+            selected_unknowns = unknowns.join(selected_unknowns, Some(failure));
+
+            inner.cost
+        }
+    };
+
     Part {
-        unknowns: unknowns.scale(inner.unknowns, Some(factor)),
-        cost: factor.multiply(inner.cost),
+        origin: Some(origin),
+        cost_error: inner.cost_error,
+        unknowns: selected_unknowns,
+        cost,
         chain,
         preference: if inner.preference == Preference::Absent {
             Preference::Unmarked

@@ -18,7 +18,7 @@ use crate::syntax::{
     unwrap, Root,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bound {
     pub factor: Cost,
     pub why: Option<&'static str>,
@@ -180,7 +180,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if self.bound_seen.insert((file, loop_kind.node_id())) {
             let reason = match bound.why {
                 Some(why) => why,
-                None if bound.factor.log > 0 => "log",
+                None if bound.factor == Cost::LOG => "log",
                 None => "N",
             };
 

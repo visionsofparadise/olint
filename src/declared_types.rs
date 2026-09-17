@@ -1049,7 +1049,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         DeclaredType::default()
     }
 
-    fn declared_type_of_binding(
+    pub(crate) fn declared_type_of_binding(
         &mut self,
         declaration: Declaration<'a>,
         depth: u32,

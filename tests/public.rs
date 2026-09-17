@@ -33,5 +33,6 @@ fn tags_fixture_public_functions_follow_exports_and_limits() {
         .expect("acceptedCubic is public");
 
     assert!(accepted.own_limit);
-    assert_eq!(accepted.limit.text, "O(N^3)");
+    assert_eq!(accepted.limits.len(), 1);
+    assert_eq!(accepted.limits[0].limit.text, "O(N^3)");
 }

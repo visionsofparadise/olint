@@ -19,14 +19,17 @@ fn self_recursion_charges_one_n() {
             let walk = function_of_name(analysis.project, file, "walk");
             let part = analysis.summarize(file, walk).total(&mut analysis.unknowns);
 
-            assert_eq!(part.cost, Cost::N);
+            assert_eq!(
+                support::legacy_class_of(analysis, file, walk, &part.cost),
+                Cost::N
+            );
             assert_eq!(labels_of(&part.chain), vec!["recursive call walk()"]);
         },
     );
 }
 
 #[test]
-fn a_cycle_member_takes_the_root_summary() {
+fn separate_cycle_roots_keep_their_own_summary_context() {
     run_with_source(
         "export function ping(n: number): number {\n\treturn n > 0 ? pong(n - 1) : 0;\n}\nexport function pong(n: number): number {\n\treturn n > 0 ? ping(n - 1) : 0;\n}",
         |analysis, file| {
@@ -35,13 +38,13 @@ fn a_cycle_member_takes_the_root_summary() {
             let root = analysis.summarize(file, ping).total(&mut analysis.unknowns);
             let member = analysis.summarize(file, pong).total(&mut analysis.unknowns);
 
-            assert_eq!(root.cost, Cost::N);
-            assert_eq!(member.cost, Cost::N);
+            assert_eq!(support::legacy_class_of(analysis, file, ping, &root.cost), Cost::N);
+            assert_eq!(support::legacy_class_of(analysis, file, pong, &member.cost), Cost::N);
             assert_eq!(
                 labels_of(&member.chain)[0],
-                "[recursion cycle with ping()]"
+                "recursive call pong()"
             );
-            assert_eq!(labels_of(&root.chain), labels_of(&member.chain)[1..]);
+            assert_eq!(labels_of(&root.chain), vec!["recursive call ping()"]);
         },
     );
 }
@@ -55,7 +58,9 @@ fn a_costed_callback_multiplies_inside_its_caller() {
             let first = analysis.summarize(file, f);
             let second = analysis.summarize(file, f);
 
-            assert_eq!(first.total(&mut analysis.unknowns).cost, Cost { n: 2, log: 0 });
+            let actual = first.total(&mut analysis.unknowns).cost;
+
+            assert_eq!(support::legacy_class_of(analysis, file, f, &actual), Cost::parse("O(N^2)").unwrap());
             assert_eq!(first, second);
             assert_eq!(labels_of(&first.total(&mut analysis.unknowns).chain), vec!["call each()"]);
         },
@@ -154,7 +159,10 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
 
         assert_eq!(reportable, vec!["caller"]);
         assert_eq!(public, vec!["caller"]);
-        assert_eq!(part.cost, Cost::N);
+        assert_eq!(
+            support::legacy_class_of(&mut analysis, file, caller, &part.cost),
+            Cost::N
+        );
         assert_eq!(labels_of(&part.chain), vec!["for-of"]);
     });
 }
@@ -169,8 +177,8 @@ fn a_cold_function_called_beside_a_linear_statement_cascades_linear() {
             let own = analysis.summarize(file, rebuild).total(&mut analysis.unknowns);
             let part = analysis.summarize(file, f).total(&mut analysis.unknowns);
 
-            assert_eq!(own.cost, Cost { n: 2, log: 0 });
-            assert_eq!(part.cost, Cost::N);
+            assert_eq!(support::legacy_class_of(analysis, file, rebuild, &own.cost), Cost::parse("O(N^2)").unwrap());
+            assert_eq!(support::legacy_class_of(analysis, file, f, &part.cost), Cost::N);
             assert_eq!(labels_of(&part.chain), vec!["rows.indexOf()"]);
         },
     );
@@ -184,7 +192,7 @@ fn a_hot_function_call_wins_over_a_costlier_sibling() {
             let f = function_of_name(analysis.project, file, "f");
             let part = analysis.summarize(file, f).total(&mut analysis.unknowns);
 
-            assert_eq!(part.cost, Cost::N);
+            assert_eq!(support::legacy_class_of(analysis, file, f, &part.cost), Cost::N);
             assert_eq!(labels_of(&part.chain), vec!["call lookup()"]);
         },
     );
@@ -199,7 +207,10 @@ fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
             .summarize(file, function)
             .total(&mut analysis.unknowns);
 
-        found = (part.cost, labels_of(&part.chain));
+        found = (
+            support::legacy_class_of(analysis, file, function, &part.cost),
+            labels_of(&part.chain),
+        );
     });
 
     found
@@ -227,7 +238,7 @@ fn a_hot_callback_through_a_stdlib_method_wins_over_a_costlier_sibling() {
 fn a_callback_keeps_its_body_preference_inside() {
     assert_eq!(
         total_of(CALLBACK_SOURCE, "bodyHotViaMap").0,
-        Cost { n: 2, log: 0 }
+        Cost::parse("O(N^2)").unwrap()
     );
 }
 
@@ -257,20 +268,17 @@ fn a_cold_cycle_member_keeps_the_cycle_cost() {
         let ping = function_of_name(analysis.project, file, "ping");
         let pong = function_of_name(analysis.project, file, "pong");
 
-        assert_eq!(
-            analysis
-                .summarize(file, ping)
+        for function in [ping, pong] {
+            let cost = analysis
+                .summarize(file, function)
                 .total(&mut analysis.unknowns)
-                .cost,
-            Cost::N
-        );
-        assert_eq!(
-            analysis
-                .summarize(file, pong)
-                .total(&mut analysis.unknowns)
-                .cost,
-            Cost::N
-        );
+                .cost;
+
+            assert_eq!(
+                support::legacy_class_of(analysis, file, function, &cost),
+                Cost::N
+            );
+        }
     });
 }
 

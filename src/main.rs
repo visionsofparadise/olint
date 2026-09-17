@@ -6,11 +6,14 @@ use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::{read_config, ConfigError, UnknownPolicy, ENTRYPOINT_FORMS, LIMIT_FORMS};
+use olint::cost::CostComparison;
 use olint::project::{Project, ProjectError};
 use olint::public::public_functions;
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
 use olint::tsc::{ask, TscError};
+use olint::unknowns::{SourceSpan, UnknownReason};
 use oxc_allocator::Allocator;
+use oxc_span::GetSpan;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -146,13 +149,19 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
     let config = read_config(&project, cli.config.as_deref()).map_err(Failure::Config)?;
     let public = public_functions(&mut analysis, &config);
+
+    check_analysis_errors(&analysis)?;
+
     let mut selected_unknowns = Vec::new();
+    let mut selected_comparisons = Vec::new();
     let code = if cli.report {
         let rows = report_rows_of(&mut analysis, &functions);
 
         selected_unknowns.extend(rows.iter().filter_map(|row| row.unknowns));
 
+        check_analysis_errors(&analysis)?;
         print_lines(&report_lines(
+            &analysis.values,
             &project,
             &rows,
             analysis.options.minimum_exponent,
@@ -163,9 +172,38 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         let mut checked = Vec::with_capacity(public.len());
 
         for public in public {
-            let part = analysis
+            let mut part = analysis
                 .summarize(public.file, public.function)
                 .total(&mut analysis.unknowns);
+
+            for applicable in public.limits.iter().filter(|applicable| {
+                part.cost.compare(&applicable.limit.cost) == CostComparison::Inconclusive
+            }) {
+                let span = project
+                    .file(public.file)
+                    .semantic
+                    .nodes()
+                    .kind(public.function.node_id())
+                    .span();
+                let unknown = analysis.unknowns.origin(
+                    SourceSpan {
+                        file: public.file,
+                        start: span.start,
+                        end: span.end,
+                    },
+                    UnknownReason::Comparison,
+                );
+                part.unknowns = analysis.unknowns.join(part.unknowns, Some(unknown));
+
+                selected_comparisons.push(format!(
+                    "unknown comparison for {} against {} via {} at {}:{}",
+                    analysis.name_of(public.file, public.function),
+                    applicable.limit.text,
+                    applicable.entry,
+                    project.file(public.file).relative,
+                    project.line_of(public.file, span.start)
+                ));
+            }
 
             checked.push(Finding {
                 name: analysis.name_of(public.file, public.function),
@@ -177,12 +215,26 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
         let mut over: Vec<&Finding> = checked
             .iter()
-            .filter(|finding| finding.part.cost.exceeds(finding.public.limit.cost))
+            .filter(|finding| {
+                finding.public.limits.iter().any(|applicable| {
+                    finding.part.cost.compare(&applicable.limit.cost) == CostComparison::Exceeds
+                })
+            })
             .collect();
 
-        over.sort_by(|left, right| order_by_cost_descending(left.part.cost, right.part.cost));
+        over.sort_by(|left, right| {
+            order_by_cost_descending(&left.part.cost, &right.part.cost)
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
-        print_lines(&lint_lines(&project, &config, &checked, &over));
+        check_analysis_errors(&analysis)?;
+        print_lines(&lint_lines(
+            &analysis.values,
+            &project,
+            &config,
+            &checked,
+            &over,
+        ));
 
         selected_unknowns.extend(checked.iter().filter_map(|finding| finding.part.unknowns));
 
@@ -200,8 +252,17 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         };
         let mut shown = std::collections::HashSet::new();
 
+        for comparison in selected_comparisons {
+            if shown.insert(comparison.clone()) {
+                eprintln!("olint: {severity}: {comparison}");
+            }
+        }
+
         for root in selected_unknowns {
-            for line in analysis.unknowns.lines(&project, root) {
+            for line in analysis
+                .unknowns
+                .lines_with(&project, root, &|id| analysis.values.label(id))
+            {
                 if shown.insert(line.clone()) {
                     eprintln!("olint: {severity}: {line}");
                 }
@@ -245,4 +306,19 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn check_analysis_errors(analysis: &Analysis<'_, '_>) -> Result<(), Failure> {
+    if analysis.errors.is_empty() {
+        return Ok(());
+    }
+
+    Err(Failure::Usage(
+        analysis
+            .errors
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
 }

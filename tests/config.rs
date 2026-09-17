@@ -25,11 +25,13 @@ fn with_config(files: &[(&str, &str)], body: impl FnOnce(&Config, Vec<(String, S
         let limits = config
             .entrypoints
             .iter()
-            .map(|(path, limit)| {
-                (
-                    olint::paths::relative_path_of(&project.root, path),
-                    limit.text.clone(),
-                )
+            .flat_map(|(path, limits)| {
+                limits.iter().map(move |limit| {
+                    (
+                        olint::paths::relative_path_of(&project.root, path),
+                        limit.text.clone(),
+                    )
+                })
             })
             .collect();
 

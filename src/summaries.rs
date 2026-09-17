@@ -6,7 +6,7 @@ use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
 
 use crate::analysis::{Analysis, Stats};
-use crate::cost::{Cost, Factor, Part, Preference, Reading};
+use crate::cost::{Cost, CostError, Factor, Part, Preference, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, TargetSet};
 use crate::directives::{cost_tag_of, PerfTag};
 use crate::effects::Effects;
@@ -15,7 +15,7 @@ use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
 use crate::unknowns::{UnknownId, UnknownReason};
-use crate::values::{ArgumentFacts, ValueFacts};
+use crate::values::{ArgumentFacts, SizeQuantity, ValueFacts};
 use crate::walker::tagged_reading_of;
 
 pub type Substitutions = HashMap<Binding, ArgumentFacts>;
@@ -35,12 +35,14 @@ pub struct ArgumentKey {
     pub binding: Binding,
     pub value: ValueFacts,
     pub cost: Option<Cost>,
+    pub cost_error: Option<CostError>,
     pub unknowns: Vec<(UnknownId, Option<Cost>)>,
     pub preference: Preference,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SummaryKey {
+    pub root_sizes: Vec<Cost>,
     pub function: FunctionId,
     pub substitutions: Vec<(String, ArgumentKey)>,
 }
@@ -52,6 +54,242 @@ pub struct TscRounds {
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
+    fn same_active_cycle(&self, left: &SummaryKey, right: &SummaryKey) -> bool {
+        if left.function != right.function || left.root_sizes != right.root_sizes {
+            return false;
+        }
+
+        let informative = |(_, facts): &&(String, ArgumentKey)| {
+            let own_parameter = matches!(self.declarations.of_binding(self.project, facts.binding), Some(Declaration::Parameter { file, function, .. }) if file == left.function.file && function.node_id() == left.function.node);
+
+            !own_parameter
+                || facts.cost.is_some()
+                || facts.cost_error.is_some()
+                || !facts.unknowns.is_empty()
+                || facts.value.latent.is_some()
+                || !facts.value.targets.open
+                || !facts.value.targets.known.is_empty()
+        };
+
+        left.substitutions
+            .iter()
+            .filter(informative)
+            .eq(right.substitutions.iter().filter(informative))
+    }
+    pub(crate) fn function_inputs(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        mut substitutions: Substitutions,
+    ) -> Substitutions {
+        let nodes = self.project.file(file).semantic.nodes();
+        let mut scopes = vec![function];
+
+        scopes.extend(nodes.ancestor_ids(function.node_id()).filter_map(|node| {
+            match nodes.kind(node) {
+                AstKind::Function(function) => Some(FunctionNode::Function(function)),
+                AstKind::ArrowFunctionExpression(function) => Some(FunctionNode::Arrow(function)),
+                _ => None,
+            }
+        }));
+
+        for scope in scopes {
+            let parameters = match scope {
+                FunctionNode::Function(inner) => &inner.params,
+                FunctionNode::Arrow(inner) => &inner.params,
+            };
+
+            let patterns = parameters
+                .items
+                .iter()
+                .map(|parameter| {
+                    (
+                        &parameter.pattern,
+                        matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)),
+                    )
+                })
+                .chain(
+                    parameters
+                        .rest
+                        .iter()
+                        .map(|rest| (&rest.rest.argument, false)),
+                );
+
+            for (pattern, plain) in patterns {
+                for identifier in pattern.get_binding_identifiers() {
+                    let Some(symbol) = identifier.symbol_id.get() else {
+                        continue;
+                    };
+                    let binding = Binding::Symbol { file, symbol };
+
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        substitutions.entry(binding)
+                    {
+                        let origin = self.source_span(file, identifier.span);
+                        let mut value = self.values.at(origin);
+
+                        if plain {
+                            value.size = self
+                                .values
+                                .quantity(
+                                    value.value,
+                                    SizeQuantity::Value,
+                                    identifier.name.to_string(),
+                                )
+                                .ok();
+                        }
+
+                        entry.insert(ArgumentFacts {
+                            value,
+                            callback: None,
+                            preference: Preference::Absent,
+                        });
+                    }
+                }
+            }
+        }
+
+        substitutions
+    }
+
+    pub fn bind_function_cost(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        cost: &Cost,
+    ) -> Result<Cost, CostError> {
+        let inputs = self.function_inputs(file, function, Substitutions::new());
+        let saved = self.root_sizes.take();
+        let result = self.bind_cost_in(cost, &inputs);
+        self.root_sizes = saved;
+
+        result
+    }
+
+    pub(crate) fn bind_cost_in(
+        &mut self,
+        cost: &Cost,
+        inputs: &Substitutions,
+    ) -> Result<Cost, CostError> {
+        let mut names = HashMap::new();
+        let mut available = std::collections::HashSet::new();
+        let referenced = cost.names();
+        let mut roots = Vec::new();
+        let mut inputs: Vec<_> = inputs.iter().collect();
+
+        inputs.sort_by_key(|(binding, _)| {
+            let depth = match self.declarations.of_binding(self.project, **binding) {
+                Some(Declaration::Parameter { file, function, .. }) => self
+                    .project
+                    .file(file)
+                    .semantic
+                    .nodes()
+                    .ancestor_ids(function.node_id())
+                    .count(),
+                _ => 0,
+            };
+
+            (depth, self.binding_name_of(**binding))
+        });
+
+        for (binding, facts) in inputs {
+            let name = self.binding_name_of(*binding);
+
+            names.remove(&name);
+            names.remove(&format!("{name}.length"));
+
+            let length_alias = self
+                .declarations
+                .of_binding(self.project, *binding)
+                .is_some_and(|declaration| {
+                    matches!(declaration, Declaration::Parameter { parameter: crate::declarations::ParameterNode::Formal(parameter), .. } if !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)))
+                        || matches!(self.declared_type_of_binding(declaration, 0).kind, crate::declared_types::Kind::String | crate::declared_types::Kind::Array)
+                });
+
+            available.insert(name.clone());
+
+            if length_alias {
+                available.insert(format!("{name}.length"));
+            } else {
+                available.remove(&format!("{name}.length"));
+            }
+
+            if let Some(size) = &facts.value.size {
+                names.insert(name.clone(), size.clone());
+
+                if length_alias {
+                    names.insert(format!("{name}.length"), size.clone());
+                }
+
+                if length_alias && referenced.contains(&format!("{name}.length")) {
+                    self.values.prefer_length_label(facts.value.value);
+                }
+
+                roots.push(size.clone());
+            }
+        }
+
+        if let Some(active) = &self.root_sizes {
+            roots = active.clone();
+        }
+
+        if roots.is_empty() {
+            roots.push(Cost::dimension(u64::MAX, crate::cost::Domain::Size));
+        }
+
+        if let Some(name) = referenced.iter().find(|name| !available.contains(*name)) {
+            return Err(CostError::UnknownName(name.clone()));
+        }
+
+        cost.bind(
+            &|_| Some(Cost::dimension(u64::MAX, crate::cost::Domain::Size)),
+            &[Cost::dimension(u64::MAX, crate::cost::Domain::Size)],
+        )?;
+
+        cost.bind(&|name| names.get(name).cloned(), &roots)
+            .map_err(|error| match error {
+                CostError::UnknownName(name) if available.contains(&name) => {
+                    CostError::UnresolvedQuantity(name)
+                }
+                error => error,
+            })
+    }
+
+    pub(crate) fn bind_current_cost(&mut self, cost: &Cost) -> Result<Cost, CostError> {
+        self.bind_cost_in(cost, &self.current_substitutions.clone())
+    }
+
+    fn finish_reading(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        mut reading: Reading,
+        inputs: &Substitutions,
+    ) -> Reading {
+        let origin = self.source_span(file, self.kind_of_node(file, function.node_id()).span());
+
+        for part in [
+            &mut reading.main,
+            &mut reading.function_exit,
+            &mut reading.loop_exit,
+        ] {
+            part.origin = part.origin.or(Some(origin));
+
+            match self.bind_cost_in(&part.cost, inputs) {
+                Ok(cost) => part.cost = cost,
+                Err(error) => part.cost_error = Some(error),
+            }
+
+            if part.cost_error.is_some() {
+                let failure = self
+                    .unknowns
+                    .origin(origin, UnknownReason::ResourceExhaustion);
+                part.unknowns = self.unknowns.join(part.unknowns, Some(failure));
+            }
+        }
+
+        reading
+    }
     fn key_of(
         &self,
         file: FileId,
@@ -73,7 +311,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     ArgumentKey {
                         binding: *binding,
                         value: facts.value.clone(),
-                        cost: facts.callback.as_ref().map(|part| part.cost),
+                        cost: facts.callback.as_ref().map(|part| part.cost.clone()),
+                        cost_error: facts
+                            .callback
+                            .as_ref()
+                            .and_then(|part| part.cost_error.clone()),
                         unknowns: self
                             .unknowns
                             .semantic_key(facts.callback.as_ref().and_then(|part| part.unknowns)),
@@ -90,6 +332,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         });
 
         SummaryKey {
+            root_sizes: self.root_sizes.clone().unwrap_or_default(),
             function: FunctionId {
                 file,
                 node: function.node_id(),
@@ -140,6 +383,42 @@ impl<'p, 'a> Analysis<'p, 'a> {
         substitutions: Substitutions,
         raw: bool,
     ) -> Reading {
+        let substitutions = self.function_inputs(file, function, substitutions);
+        let is_root = self.root_sizes.is_none();
+
+        if is_root {
+            let mut roots: Vec<_> = substitutions
+                .values()
+                .filter_map(|facts| facts.value.size.clone())
+                .collect();
+
+            roots.sort_by_key(Cost::structural_key);
+            roots.dedup();
+
+            if roots.is_empty() {
+                roots.push(Cost::dimension(u64::MAX, crate::cost::Domain::Size));
+            }
+
+            self.root_sizes = Some(roots);
+        }
+
+        let reading = self.summarize_in(file, function, substitutions, raw);
+
+        if is_root {
+            self.root_sizes = None;
+        }
+
+        reading
+    }
+
+    fn summarize_in(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        substitutions: Substitutions,
+        raw: bool,
+    ) -> Reading {
+        let substitutions = self.function_inputs(file, function, substitutions);
         let key = self.key_of(file, function, &substitutions);
 
         if !raw {
@@ -159,7 +438,50 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if let Some((cost, text)) = cost_tag_of(&tags) {
                 self.stats.count("@perf O(...): function");
 
-                let reading = tagged_reading_of(cost, &text, self.function_site_of(file, function));
+                let (cost, unresolved) =
+                    match cost.bind_known(&mut |cost| self.bind_cost_in(cost, &substitutions)) {
+                        Ok(bound) => bound,
+                        Err(CostError::Resource | CostError::Overflow) => {
+                            let reading = self.unknown_reading(
+                                file,
+                                self.kind_of_node(file, function.node_id()).span(),
+                                UnknownReason::ResourceExhaustion,
+                            );
+
+                            self.store_summary(key, reading.clone(), Effects::unknown());
+
+                            return reading;
+                        }
+                        Err(error) => {
+                            self.errors.insert(format!(
+                                "invalid {text} at {}:{}: {error:?}",
+                                self.project.file(file).relative,
+                                self.function_site_of(file, function).line
+                            ));
+
+                            return self.unknown_reading(
+                                file,
+                                self.kind_of_node(file, function.node_id()).span(),
+                                UnknownReason::UnsupportedModel,
+                            );
+                        }
+                    };
+                let mut reading = tagged_reading_of(
+                    cost.unwrap_or(Cost::ONE),
+                    &text,
+                    self.function_site_of(file, function),
+                );
+
+                if unresolved {
+                    let unknown = self.unknown_reading(
+                        file,
+                        self.kind_of_node(file, function.node_id()).span(),
+                        UnknownReason::SizeRelation,
+                    );
+                    reading.main.unknowns = unknown.main.unknowns;
+                }
+
+                let reading = self.finish_reading(file, function, reading, &substitutions);
 
                 self.store_summary(key, reading.clone(), Effects::unknown());
 
@@ -167,7 +489,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        if let Some(index) = self.stack.iter().position(|known| *known == key) {
+        if let Some(index) = self
+            .stack
+            .iter()
+            .position(|known| self.same_active_cycle(known, &key))
+        {
             self.minimum_hit = self.minimum_hit.min(index);
 
             return Reading::of_part(Part::unmarked(
@@ -186,7 +512,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.stack.push(key.clone());
 
         let saved_effects = std::mem::take(&mut self.current_effects);
-        let saved_substitutions = std::mem::replace(&mut self.current_substitutions, substitutions);
+        let saved_substitutions =
+            std::mem::replace(&mut self.current_substitutions, substitutions.clone());
         let has_body = match function {
             FunctionNode::Function(inner) => inner.body.is_some(),
             FunctionNode::Arrow(_) => true,
@@ -210,6 +537,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             )
         };
         let effects = std::mem::replace(&mut self.current_effects, saved_effects);
+        let reading = self.finish_reading(file, function, reading, &substitutions);
 
         self.current_substitutions = saved_substitutions;
         self.budget_context = saved_context;
@@ -271,13 +599,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Part { chain, ..part }
     }
 
-    fn inherited_substitutions_of(&self, function: FunctionNode<'a>) -> Substitutions {
+    fn inherited_substitutions_of(
+        &self,
+        target: FileId,
+        function: FunctionNode<'a>,
+    ) -> Substitutions {
         self.current_substitutions
             .iter()
             .filter(|(binding, _)| {
                 matches!(
                     self.declarations.of_binding(self.project, **binding),
-                    Some(Declaration::Parameter { function: owner, .. }) if owner != function
+                    Some(Declaration::Parameter { file, function: owner, .. }) if file == target && owner != function && self.project.file(file).semantic.nodes().ancestor_ids(function.node_id()).any(|id| id == owner.node_id())
                 )
             })
             .map(|(binding, part)| (*binding, part.clone()))
@@ -292,6 +624,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let origin = self.source_span(file, argument.span());
         let mut value = self.values.at(origin);
         let expression = argument.as_expression().map(unwrap);
+
+        if let Some(Expression::NumericLiteral(number)) = expression {
+            if number.value.is_finite()
+                && number.value >= 0.0
+                && number.value <= 9_007_199_254_740_991.0
+                && number.value.fract() == 0.0
+            {
+                value.size = Some(Cost::constant((number.value as u64).max(1)));
+            }
+        }
+
         let declaration = expression.and_then(|expression| match expression {
             Expression::Identifier(reference) => {
                 self.declarations
@@ -310,6 +653,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if let Some(Expression::StaticMemberExpression(member)) = expression {
+            if member.property.name == "length" {
+                if let Expression::Identifier(reference) = unwrap(&member.object) {
+                    let admitted = matches!(
+                        self.declared_type_of_identifier(file, reference).kind,
+                        crate::declared_types::Kind::String | crate::declared_types::Kind::Array
+                    );
+
+                    if let Some(binding) = self.binding_of_identifier(file, reference) {
+                        if let Some(facts) = self
+                            .current_substitutions
+                            .get(&binding)
+                            .filter(|_| admitted)
+                        {
+                            value.size = facts.value.size.clone();
+
+                            self.values.prefer_length_label(facts.value.value);
+                        }
+                    }
+                }
+            }
+        }
+
         let function = match expression {
             Some(Expression::FunctionExpression(function)) => {
                 Some((file, FunctionNode::Function(function)))
@@ -320,7 +686,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => declaration.and_then(|declaration| self.declarations.function_of(declaration)),
         };
         let callback = if let Some((target, function)) = function {
-            let inherited = self.inherited_substitutions_of(function);
+            let inherited = self.inherited_substitutions_of(target, function);
+            let inherited = self.function_inputs(target, function, inherited);
             let key = self.key_of(target, function, &inherited);
             let (part, cyclic) = self.within_cycle_of(|analysis| {
                 let reading = analysis.summarize_with(target, function, inherited, false);
@@ -416,7 +783,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         call_file: FileId,
         arguments: &'a [Argument<'a>],
     ) -> Part {
-        let mut substitutions = Substitutions::new();
+        let mut substitutions = self.inherited_substitutions_of(file, function);
 
         let (parameters, offset) = match function {
             FunctionNode::Function(inner) => {
@@ -433,16 +800,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
                 continue;
             };
-            let Some(argument) = arguments.get(index + offset) else {
-                continue;
+            let facts = match arguments.get(index + offset) {
+                Some(argument) => self.argument_facts_of(call_file, argument),
+                None => ArgumentFacts {
+                    value: self.values.at(self.source_span(file, identifier.span)),
+                    callback: None,
+                    preference: Preference::Unmarked,
+                },
             };
-            let facts = self.argument_facts_of(call_file, argument);
 
             if let Some(symbol) = identifier.symbol_id.get() {
                 substitutions.insert(Binding::Symbol { file, symbol }, facts);
             }
         }
 
+        let substitutions = self.function_inputs(file, function, substitutions);
         let key = self.key_of(file, function, &substitutions);
         let reading = self.summarize_with(file, function, substitutions, false);
         let effects = self
