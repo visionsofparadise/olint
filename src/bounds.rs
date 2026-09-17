@@ -6,7 +6,7 @@ use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
 use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
 
 use crate::analysis::Analysis;
 use crate::budgets::{is_less, sides_of, Subtree};
@@ -419,21 +419,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         target,
                     ) = &update.argument
                     {
-                        if names.iter().any(|known| known == target.name.as_str()) {
-                            found.push(AssignmentWrite::Other);
-                        }
-                    }
-                }
-                AstKind::UnaryExpression(unary)
-                    if matches!(
-                        unary.operator,
-                        UnaryOperator::UnaryPlus
-                            | UnaryOperator::UnaryNegation
-                            | UnaryOperator::LogicalNot
-                            | UnaryOperator::BitwiseNot
-                    ) =>
-                {
-                    if let Expression::Identifier(target) = &unary.argument {
                         if names.iter().any(|known| known == target.name.as_str()) {
                             found.push(AssignmentWrite::Other);
                         }

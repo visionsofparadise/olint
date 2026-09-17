@@ -96,3 +96,29 @@ fn a_while_counter_stepped_linearly_is_linear() {
         },
     );
 }
+
+#[test]
+fn unary_reads_preserve_bounds_while_updates_invalidate_them() {
+    for (expression, expected) in [
+        ("+n", "halving"),
+        ("-n", "halving"),
+        ("!n", "halving"),
+        ("~n", "halving"),
+        ("++n", "N"),
+        ("--n", "N"),
+        ("n++", "N"),
+        ("n--", "N"),
+    ] {
+        let source = format!(
+            "export function f(n: number) {{ while (n > 1) {{ consume({expression}); n >>= 1; }} }}"
+        );
+
+        run_with_source(&source, |analysis, file| {
+            assert_eq!(
+                loop_reasons_of(analysis, file),
+                vec![("f".to_string(), expected.to_string())],
+                "{expression}"
+            );
+        });
+    }
+}
