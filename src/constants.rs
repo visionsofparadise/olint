@@ -1,12 +1,11 @@
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, AssignmentTarget, ClassElement, Expression, Function,
-    IdentifierReference, MemberExpression, ReturnStatement, SimpleAssignmentTarget,
-    TSEnumMemberName,
+    Argument, ArrowFunctionExpression, ClassElement, Expression, Function, IdentifierReference,
+    MemberExpression, ReturnStatement,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
 use oxc_semantic::NodeId;
-use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
+use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
@@ -15,6 +14,11 @@ use crate::declared_types::{declarator_of_identifier, DeclaredType};
 use crate::project::FileId;
 use crate::syntax::{call_of, member_expression_of, unwrap, unwrap_to_cast};
 use crate::tables::{DERIVED_METHODS, OBJECT_KEYED, TYPED_ARRAYS};
+use crate::values::Primitive;
+
+#[path = "enum_values.rs"]
+mod enum_values;
+pub use enum_values::{evaluate_enum, EnumInitializer};
 
 fn argument_expression_of<'a>(argument: Option<&'a Argument<'a>>) -> Option<&'a Expression<'a>> {
     argument?.as_expression()
@@ -37,56 +41,9 @@ impl<'a> Visit<'a> for ReturnStatements {
 
 impl<'p, 'a> Analysis<'p, 'a> {
     pub fn is_numeric_constant(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
-        let e = unwrap(e);
-
-        match e {
-            Expression::NumericLiteral(_) => return true,
-            Expression::UnaryExpression(unary)
-                if matches!(
-                    unary.operator,
-                    UnaryOperator::UnaryPlus
-                        | UnaryOperator::UnaryNegation
-                        | UnaryOperator::LogicalNot
-                        | UnaryOperator::BitwiseNot
-                ) =>
-            {
-                return self.is_numeric_constant(file, &unary.argument);
-            }
-            Expression::UpdateExpression(update) if update.prefix => {
-                return match &update.argument {
-                    SimpleAssignmentTarget::AssignmentTargetIdentifier(reference) => {
-                        self.is_numeric_identifier(file, reference)
-                    }
-                    _ => false,
-                };
-            }
-            Expression::BinaryExpression(binary) => {
-                return self.is_numeric_constant(file, &binary.left)
-                    && self.is_numeric_constant(file, &binary.right);
-            }
-            Expression::LogicalExpression(logical) => {
-                return self.is_numeric_constant(file, &logical.left)
-                    && self.is_numeric_constant(file, &logical.right);
-            }
-            Expression::SequenceExpression(sequence) => {
-                return sequence
-                    .expressions
-                    .iter()
-                    .all(|expression| self.is_numeric_constant(file, expression));
-            }
-            Expression::AssignmentExpression(assignment) => {
-                return match &assignment.left {
-                    AssignmentTarget::AssignmentTargetIdentifier(reference) => {
-                        self.is_numeric_identifier(file, reference)
-                            && self.is_numeric_constant(file, &assignment.right)
-                    }
-                    _ => false,
-                };
-            }
-            Expression::Identifier(reference) => {
-                return self.is_numeric_identifier(file, reference)
-            }
-            _ => {}
+        if matches!(self.known_value(file, e).value.as_deref(), Ok(Primitive::Number(value)) if value.is_finite())
+        {
+            return true;
         }
 
         let Some(member) = member_expression_of(e) else {
@@ -99,9 +56,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let declaration = self.declaration_of_access(file, member);
-
-        self.is_numeric_declaration(declaration)
+        false
     }
 
     pub fn is_constant_sized(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
@@ -348,47 +303,51 @@ impl<'p, 'a> Analysis<'p, 'a> {
         matches!(declaration, Some(Declaration::Enum { .. }))
     }
 
-    fn is_numeric_identifier(
-        &mut self,
-        file: FileId,
-        reference: &'a IdentifierReference<'a>,
-    ) -> bool {
-        let declaration = self
-            .declarations
-            .of_reference(self.project, file, reference);
-
-        self.is_numeric_declaration(declaration)
-    }
-
-    fn is_numeric_declaration(&mut self, declaration: Option<Declaration<'a>>) -> bool {
-        let Some(declaration) = declaration else {
-            return false;
-        };
-
-        if let Declaration::EnumMember { .. } = declaration {
-            return true;
-        }
-
-        match constant_initializer_of(declaration) {
-            Some((target, initializer)) => self.is_numeric_constant(target, initializer),
-            None => false,
-        }
-    }
-
     pub(crate) fn declaration_of_access(
-        &self,
+        &mut self,
         file: FileId,
         member: &'a MemberExpression<'a>,
     ) -> Option<Declaration<'a>> {
-        if let MemberExpression::StaticMemberExpression(access) = member {
-            let object = unwrap_to_cast(&access.object);
+        self.declaration_of_access_at(file, member, 0)
+    }
+
+    fn declaration_of_access_at(
+        &mut self,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+        depth: usize,
+    ) -> Option<Declaration<'a>> {
+        if depth >= 64 {
+            return None;
+        }
+
+        let (object, name) = match member {
+            MemberExpression::StaticMemberExpression(access) => (
+                &access.object,
+                Some(std::borrow::Cow::Borrowed(access.property.name.as_str())),
+            ),
+            MemberExpression::ComputedMemberExpression(access) => (
+                &access.object,
+                self.known_key(file, &access.expression)
+                    .ok()
+                    .map(std::borrow::Cow::Owned),
+            ),
+            MemberExpression::PrivateFieldExpression(_) => {
+                return self
+                    .declarations
+                    .member_of_receiver(self.project, file, member)
+            }
+        };
+
+        if let Some(name) = name {
+            let object = unwrap_to_cast(object);
             let enumeration = match object {
                 Expression::Identifier(reference) => {
                     self.declarations
                         .of_reference(self.project, file, reference)
                 }
                 _ => member_expression_of(object)
-                    .and_then(|inner| self.declaration_of_access(file, inner)),
+                    .and_then(|inner| self.declaration_of_access_at(file, inner, depth + 1)),
             };
 
             if let Some(Declaration::Enum {
@@ -396,22 +355,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 declaration,
             }) = enumeration
             {
-                let name = access.property.name.as_str();
+                let semantic = &self.project.file(target).semantic;
+                let symbol = semantic
+                    .scoping()
+                    .get_binding(declaration.body.scope_id.get()?, name.as_ref().into())?;
 
-                return declaration
-                    .body
-                    .members
-                    .iter()
-                    .find(|enum_member| match &enum_member.id {
-                        TSEnumMemberName::Identifier(identifier) => identifier.name == name,
-                        TSEnumMemberName::String(literal)
-                        | TSEnumMemberName::ComputedString(literal) => literal.value == name,
-                        TSEnumMemberName::ComputedTemplateString(_) => false,
-                    })
-                    .map(|member| Declaration::EnumMember {
+                return match semantic
+                    .nodes()
+                    .kind(semantic.scoping().symbol_declaration(symbol))
+                {
+                    AstKind::TSEnumMember(member) => Some(Declaration::EnumMember {
                         file: target,
                         member,
-                    });
+                    }),
+                    _ => None,
+                };
             }
         }
 
@@ -420,7 +378,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 }
 
-fn constant_initializer_of<'a>(
+pub(crate) fn constant_initializer_of<'a>(
     declaration: Declaration<'a>,
 ) -> Option<(FileId, &'a Expression<'a>)> {
     if let Some((file, declarator, constant)) = declarator_of_identifier(&declaration) {

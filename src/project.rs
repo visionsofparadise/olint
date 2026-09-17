@@ -642,6 +642,7 @@ fn parse_file<'a>(
         .with_build_nodes(true)
         .with_cfg(true)
         .with_class_table(true)
+        .with_enum_eval(false)
         .with_check_syntax_error(true)
         .build(program);
     let diagnostics = parsed
