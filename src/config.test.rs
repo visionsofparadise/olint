@@ -17,26 +17,37 @@ fn limit_of_names_the_field_it_rejects() {
 }
 
 #[test]
-fn ignore_globs_read_as_the_reference_regular_expressions() {
-    let generated = IgnorePattern::parse("src/generated/**").expect("pattern");
+fn ignore_globs_distinguish_recursive_and_single_directory_wildcards() {
+    let generated = ignore_pattern_of(&serde_json::json!("src/generated/**")).expect("pattern");
 
-    assert!(generated.matches("src/generated/schema.ts"));
-    assert!(!generated.matches("src/generated/deep/schema.ts"));
-    assert!(!generated.matches("src/generated/"));
-    assert!(!generated.matches("src/other.ts"));
+    assert!(generated.is_match("src/generated/schema.ts"));
+    assert!(generated.is_match("src/generated/deep/schema.ts"));
+    assert!(!generated.is_match("src/other.ts"));
 
-    let nested = IgnorePattern::parse("**/*.gen.ts").expect("pattern");
+    let nested = ignore_pattern_of(&serde_json::json!("**/*.gen.ts")).expect("pattern");
 
-    assert!(nested.matches("a.gen.ts"));
-    assert!(nested.matches("src/a.gen.ts"));
-    assert!(!nested.matches("src/deep/a.gen.ts"));
-    assert!(!nested.matches("src/agen.ts"));
+    assert!(nested.is_match("a.gen.ts"));
+    assert!(nested.is_match("src/deep/a.gen.ts"));
 
-    let optional = IgnorePattern::parse("src/a?b.ts").expect("pattern");
+    let direct = ignore_pattern_of(&serde_json::json!("src/*.gen.ts")).expect("pattern");
 
-    assert!(optional.matches("src/b.ts"));
-    assert!(optional.matches("src/ab.ts"));
-    assert!(IgnorePattern::parse("?a").is_none());
+    assert!(direct.is_match("src/a.gen.ts"));
+    assert!(!direct.is_match("src/deep/a.gen.ts"));
+}
+
+#[test]
+fn ignore_globs_match_question_marks_as_one_character_and_allow_escaping() {
+    let single = ignore_pattern_of(&serde_json::json!("src/a?b.ts")).expect("pattern");
+
+    assert!(single.is_match("src/axb.ts"));
+    assert!(!single.is_match("src/ab.ts"));
+    assert!(!single.is_match("src/axyb.ts"));
+    assert!(!single.is_match("src/a/b.ts"));
+
+    let literal = ignore_pattern_of(&serde_json::json!(r"src/a\[b\].ts")).expect("pattern");
+
+    assert!(literal.is_match("src/a[b].ts"));
+    assert!(!literal.is_match("src/ab.ts"));
 }
 
 fn entries_of(value: Value) -> Result<Vec<(String, String)>, ConfigError> {

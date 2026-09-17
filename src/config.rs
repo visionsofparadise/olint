@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use globset::{GlobBuilder, GlobMatcher};
 use serde_json::{Map, Value};
 
 use crate::cost::Cost;
@@ -16,7 +17,7 @@ pub struct Limit {
 pub struct Config {
     pub max: Limit,
     pub entrypoints: Vec<(PathBuf, Limit)>,
-    pub ignore: Vec<IgnorePattern>,
+    pub ignore: Vec<GlobMatcher>,
     pub source: String,
 }
 
@@ -46,161 +47,18 @@ pub enum ConfigError {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Atom {
-    Unit(u16),
-    AnyUnit,
-    NonSlashRun,
-    OptionalDirectory,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Term {
-    atom: Atom,
-    optional: bool,
-    quantified: bool,
-    lazy: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IgnorePattern {
-    terms: Vec<Term>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Piece {
-    Star,
-    Slash,
-    Question,
-    Unit(u16),
-    Done(Atom),
-}
-
-const SLASH: u16 = b'/' as u16;
-
-impl IgnorePattern {
-    pub fn parse(glob: &str) -> Option<IgnorePattern> {
-        let mut pieces: Vec<Piece> = glob
-            .encode_utf16()
-            .map(|unit| match unit {
-                unit if unit == u16::from(b'*') => Piece::Star,
-                unit if unit == SLASH => Piece::Slash,
-                unit if unit == u16::from(b'?') => Piece::Question,
-                unit => Piece::Unit(unit),
-            })
-            .collect();
-
-        pieces = replaced_runs_of(
-            &pieces,
-            &[Piece::Star, Piece::Star, Piece::Slash],
-            &[Atom::OptionalDirectory],
-        );
-        pieces = replaced_runs_of(
-            &pieces,
-            &[Piece::Star, Piece::Star],
-            &[Atom::AnyUnit, Atom::NonSlashRun],
-        );
-        pieces = replaced_runs_of(&pieces, &[Piece::Star], &[Atom::NonSlashRun]);
-
-        let mut terms: Vec<Term> = Vec::new();
-
-        for piece in pieces {
-            let atom = match piece {
-                Piece::Question => {
-                    let last = terms.last_mut()?;
-
-                    if !last.quantified {
-                        last.optional = true;
-                        last.quantified = true;
-                    } else if !last.lazy {
-                        last.lazy = true;
-                    } else {
-                        return None;
-                    }
-
-                    continue;
-                }
-                Piece::Slash => Atom::Unit(SLASH),
-                Piece::Unit(unit) => Atom::Unit(unit),
-                Piece::Done(atom) => atom,
-                Piece::Star => Atom::NonSlashRun,
-            };
-
-            terms.push(Term {
-                atom,
-                optional: false,
-                quantified: matches!(atom, Atom::NonSlashRun | Atom::OptionalDirectory),
-                lazy: false,
-            });
-        }
-
-        Some(IgnorePattern { terms })
-    }
-
-    pub fn matches(&self, relative: &str) -> bool {
-        let units: Vec<u16> = relative.encode_utf16().collect();
-
-        matches_terms(&self.terms, &units)
-    }
-}
-
-fn replaced_runs_of(pieces: &[Piece], run: &[Piece], atoms: &[Atom]) -> Vec<Piece> {
-    let mut replaced = Vec::with_capacity(pieces.len());
-    let mut index = 0;
-
-    while index < pieces.len() {
-        if pieces[index..].starts_with(run) {
-            replaced.extend(atoms.iter().map(|atom| Piece::Done(*atom)));
-
-            index += run.len();
-        } else {
-            replaced.push(pieces[index]);
-
-            index += 1;
-        }
-    }
-
-    replaced
-}
-
-fn is_line_terminator(unit: u16) -> bool {
-    matches!(unit, 0x0a | 0x0d | 0x2028 | 0x2029)
-}
-
-fn matches_terms(terms: &[Term], units: &[u16]) -> bool {
-    let Some((term, rest)) = terms.split_first() else {
-        return units.is_empty();
+fn ignore_pattern_of(value: &Value) -> Result<GlobMatcher, ConfigError> {
+    let invalid = || ConfigError::Ignore {
+        pattern: value.to_string(),
     };
+    let pattern = value.as_str().ok_or_else(invalid)?;
 
-    if term.optional && matches_terms(rest, units) {
-        return true;
-    }
-
-    match term.atom {
-        Atom::Unit(unit) => units.first() == Some(&unit) && matches_terms(rest, &units[1..]),
-        Atom::AnyUnit => {
-            units.first().is_some_and(|unit| !is_line_terminator(*unit))
-                && matches_terms(rest, &units[1..])
-        }
-        Atom::NonSlashRun => {
-            let run = units.iter().take_while(|unit| **unit != SLASH).count();
-
-            (0..=run).any(|length| matches_terms(rest, &units[length..]))
-        }
-        Atom::OptionalDirectory => {
-            if matches_terms(rest, units) {
-                return true;
-            }
-
-            if !units.first().is_some_and(|unit| !is_line_terminator(*unit)) {
-                return false;
-            }
-
-            let run = units[1..].iter().take_while(|unit| **unit != SLASH).count();
-
-            units.get(1 + run) == Some(&SLASH) && matches_terms(rest, &units[2 + run..])
-        }
-    }
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|_| invalid())
 }
 
 pub const LIMIT_FORMS: &str = "O(1), O(log N), O(N), O(N log N) or O(N^k)";
@@ -445,15 +303,8 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
     let ignore = match raw.get("ignore") {
         Some(Value::Array(patterns)) => patterns
             .iter()
-            .map(|pattern| {
-                pattern
-                    .as_str()
-                    .and_then(IgnorePattern::parse)
-                    .ok_or_else(|| ConfigError::Ignore {
-                        pattern: pattern.to_string(),
-                    })
-            })
-            .collect::<Result<Vec<IgnorePattern>, ConfigError>>()?,
+            .map(ignore_pattern_of)
+            .collect::<Result<Vec<GlobMatcher>, ConfigError>>()?,
         _ => Vec::new(),
     };
     let source = match exists {
@@ -471,7 +322,7 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
 
 impl Config {
     pub fn is_ignored(&self, relative: &str) -> bool {
-        self.ignore.iter().any(|pattern| pattern.matches(relative))
+        self.ignore.iter().any(|pattern| pattern.is_match(relative))
     }
 }
 

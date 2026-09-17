@@ -96,6 +96,9 @@ fn read_config_keeps_entrypoints_in_array_order_with_their_limits() {
             ]
         );
         assert!(config.is_ignored("src/gen/types.ts"));
+        assert!(config.is_ignored("src/gen/deep/types.ts"));
+        assert!(config.is_ignored(&olint::paths::forward_slashes_of(r"src\gen\deep\types.ts")));
+        assert!(!config.is_ignored(&olint::paths::forward_slashes_of(r"src\a.ts")));
     });
 }
 
@@ -139,4 +142,18 @@ fn a_config_path_that_is_a_directory_fails_to_read() {
     ]);
 
     assert!(matches!(error, Some(ConfigError::Read { .. })));
+}
+
+#[test]
+fn an_invalid_ignore_glob_names_the_pattern() {
+    let error = read_error_of(&[
+        TSCONFIG,
+        ("olint.config.json", r#"{ "ignore": ["src/["] }"#),
+        ("src/a.ts", "export const a = 1;"),
+    ]);
+
+    assert!(matches!(
+        error,
+        Some(ConfigError::Ignore { pattern }) if pattern == r#""src/[""#
+    ));
 }
