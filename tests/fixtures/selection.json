@@ -1,0 +1,1210 @@
+[
+  {
+    "name": "missing_explicit_config",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      }
+    },
+    "args": [
+      "--config",
+      "missing.json"
+    ],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Explicitly requested absent configuration is an input error.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_root_array",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": []
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Configuration root must be an object.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_root_string",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": "\"bad\""
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Configuration root must be an object.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_root_number",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": 7
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Configuration root must be an object.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_root_boolean",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": false
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Configuration root must be an object.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_root_null",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": "null"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Configuration root must be an object.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_ignore_6",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "ignore": "index.ts"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present ignore has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_ignore_7",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "ignore": null
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present ignore has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_ignore_8",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "ignore": {}
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present ignore has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_ignore_9",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "ignore": [
+          7
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present ignore has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_max_10",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "max": null
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present max has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_max_11",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "max": 2
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present max has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_entrypoints_12",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": "index.ts"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present entrypoints has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_entrypoints_13",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": null
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present entrypoints has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_entrypoints_14",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          7
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present entrypoints has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_entrypoints_15",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          {
+            "path": 7
+          }
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present entrypoints has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_unknown_16",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "unknown": null
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present unknown has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "field_unknown_17",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "unknown": "strict"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Present unknown has an invalid type/value; absence is distinct.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "missing_entry",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "missing.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "mixed_missing_entry",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts",
+          "missing.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "unselected_entry",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "other.ts"
+        ]
+      },
+      "other.ts": "export function selected() { return 1; }\n"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Existing literal entry outside selected source coverage is invalid.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "directory_entry",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "folder"
+        ]
+      },
+      "folder/keep.txt": "directory fixture"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "missing_literal_root",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "missing.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "mixed_missing_literal_root",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts",
+          "missing.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "directory_literal_root",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "folder"
+        ]
+      },
+      "folder/keep.txt": "directory fixture"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "directory_config",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "folder/keep.txt": "directory fixture"
+    },
+    "args": [
+      "--config",
+      "folder"
+    ],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "directory_tsconfig",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "folder/keep.txt": "directory fixture"
+    },
+    "args": [
+      "--tsconfig",
+      "folder"
+    ],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "missing_tsconfig",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      }
+    },
+    "args": [
+      "--tsconfig",
+      "missing.json"
+    ],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "default_config_absent",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "1 public"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {},
+    "expectation": "Optional olint.config.json absence uses defaults.",
+    "kind": "control"
+  },
+  {
+    "name": "empty_entries",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": []
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "0 public"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {},
+    "expectation": "Intentional empty entry selection; raw report still covers source functions.",
+    "kind": "control"
+  },
+  {
+    "name": "empty_files",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": []
+      },
+      "olint.config.json": {
+        "entrypoints": []
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "0 public"
+      ]
+    },
+    "expected_absent": {
+      "report": [
+        "selected"
+      ]
+    },
+    "expectation": "",
+    "kind": "control"
+  },
+  {
+    "name": "empty_ignore",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "ignore": [],
+        "entrypoints": [
+          "index.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "1 public"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "control"
+  },
+  {
+    "name": "extends_relative_valid",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "extends": "./base/base.json"
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "base/src/actual.ts"
+        ]
+      },
+      "base/base.json": {
+        "files": [
+          "src/actual.ts"
+        ]
+      },
+      "base/src/actual.ts": "export function inherited() { return 1; }"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "1 public"
+      ],
+      "report": [
+        "inherited"
+      ]
+    },
+    "expected_absent": {
+      "report": [
+        "selected"
+      ]
+    },
+    "expectation": "Inherited files resolve relative to declaring config.",
+    "kind": "control"
+  },
+  {
+    "name": "extends_relative_missing",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "extends": "./base/base.json"
+      },
+      "base/base.json": {
+        "files": [
+          "src/missing.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "extends_missing",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "extends": "./base/missing.json"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "malformed_config",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": "{"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "tsconfig_root_array",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": []
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Explicit project configuration has an invalid structural type.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "tsconfig_files_string",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": "index.ts"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Explicit project configuration has an invalid structural type.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "tsconfig_files_number",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          7
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Explicit project configuration has an invalid structural type.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "tsconfig_include_number",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "include": 7
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "Explicit project configuration has an invalid structural type.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "solution_references",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [],
+        "references": [
+          {
+            "path": "./app"
+          }
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": []
+      },
+      "app/tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "app/index.ts": "export function selected() { return 1; }\n"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "expectation": "P1 rejects unsupported solution selection clearly; P2 later implements references.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "unknown_ignore",
+    "files": {
+      "index.ts": "declare function opaque(): void;\nexport function selected() { opaque(); }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "unknown": "ignore"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "partial"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "unknown call target"
+      ],
+      "report": [
+        "unknown call target"
+      ]
+    },
+    "expectation": "Existing unknown-policy exits and partial raw-report semantics remain intact.",
+    "kind": "control"
+  },
+  {
+    "name": "unknown_warn",
+    "files": {
+      "index.ts": "declare function opaque(): void;\nexport function selected() { opaque(); }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "unknown": "warn"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "partial"
+      ],
+      "lint": [
+        "unknown call target"
+      ]
+    },
+    "expected_absent": {},
+    "expectation": "Existing unknown-policy exits and partial raw-report semantics remain intact.",
+    "kind": "control"
+  },
+  {
+    "name": "unknown_error",
+    "files": {
+      "index.ts": "declare function opaque(): void;\nexport function selected() { opaque(); }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "unknown": "error"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "partial"
+      ],
+      "lint": [
+        "unknown call target"
+      ]
+    },
+    "expected_absent": {},
+    "expectation": "Existing unknown-policy exits and partial raw-report semantics remain intact.",
+    "kind": "control"
+  }
+]

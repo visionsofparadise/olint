@@ -6,6 +6,28 @@ use support::run_in_project;
 
 const TSCONFIG: (&str, &str) = ("tsconfig.json", r#"{ "include": ["src"] }"#);
 
+#[test]
+fn optional_absence_and_invalid_read_are_distinct() {
+    run_in_project(
+        &[
+            ("tsconfig.json", "{}"),
+            ("index.ts", "export const value=1"),
+        ],
+        |project, root| {
+            assert_eq!(read_config(project, None).unwrap().source, "defaults");
+            assert!(matches!(
+                read_config(project, Some(&root.join("missing.json"))),
+                Err(ConfigError::Read { .. })
+            ));
+            std::fs::create_dir(root.join("olint.config.json")).unwrap();
+            assert!(matches!(
+                read_config(project, None),
+                Err(ConfigError::Read { .. })
+            ));
+        },
+    );
+}
+
 fn entries_of(files: &[(&str, &str)]) -> Vec<String> {
     let mut entries = Vec::new();
 

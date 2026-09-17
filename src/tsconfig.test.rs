@@ -2,6 +2,29 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+#[test]
+fn object_root_guard_preserves_jsonc_and_rejects_scalar_roots() {
+    for text in [
+        "{}",
+        "\u{feff} // comment\n /*more*/ {\"files\":[],}",
+        "/*x*/\r\n{}",
+    ] {
+        assert!(starts_with_object(text));
+    }
+
+    for text in [
+        "[]",
+        " // x\n null",
+        "\"object\"",
+        "7",
+        "true",
+        "/*unclosed",
+        "",
+    ] {
+        assert!(!starts_with_object(text));
+    }
+}
+
 fn config_of(json: &str) -> TsConfig {
     let path = Path::new("/repo/tsconfig.json");
 

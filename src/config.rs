@@ -44,6 +44,14 @@ pub fn unknown_policy_of(value: Option<&Value>) -> Result<UnknownPolicy, ConfigE
 
 #[derive(Debug)]
 pub enum ConfigError {
+    Root {
+        path: PathBuf,
+        text: String,
+    },
+    Selection {
+        path: PathBuf,
+        message: String,
+    },
     Unknown {
         value: String,
     },
@@ -296,23 +304,28 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
             })?,
         None => project.root.join("olint.config.json"),
     };
-    let exists = path.exists();
-    let raw = match exists {
-        true => {
-            let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-                path: path.clone(),
-                source,
-            })?;
-
+    let (raw, exists) = match std::fs::read_to_string(&path) {
+        Ok(text) => (
             serde_json::from_str::<Value>(&text).map_err(|error| ConfigError::Json {
                 path: path.clone(),
                 message: error.to_string(),
-            })?
+            })?,
+            true,
+        ),
+        Err(source) if explicit.is_none() && source.kind() == std::io::ErrorKind::NotFound => {
+            (Value::Object(Map::new()), false)
         }
-        false => Value::Object(Map::new()),
+        Err(source) => return Err(ConfigError::Read { path, source }),
     };
-    let field_of = |name: &str| raw.get(name).filter(|value| !value.is_null());
-    let max = match field_of("max") {
+
+    if !raw.is_object() {
+        return Err(ConfigError::Root {
+            path,
+            text: raw.to_string(),
+        });
+    }
+
+    let max = match raw.get("max") {
         Some(value) => json_limit_of(value, "max")?,
         None => limit_of("O(N^2)", "max")?,
     };
@@ -329,7 +342,12 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
             .iter()
             .map(ignore_pattern_of)
             .collect::<Result<Vec<GlobMatcher>, ConfigError>>()?,
-        _ => Vec::new(),
+        None => Vec::new(),
+        Some(value) => {
+            return Err(ConfigError::Ignore {
+                pattern: value.to_string(),
+            })
+        }
     };
     let source = match exists {
         true => relative_path_of(&project.root, &path),
@@ -343,6 +361,31 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
         ignore,
         source,
     })
+}
+
+pub fn validate_entries(project: &Project<'_>, config: &Config) -> Result<(), ConfigError> {
+    for (path, _) in &config.entrypoints {
+        let invalid = |message: &str| ConfigError::Selection {
+            path: path.clone(),
+            message: message.to_string(),
+        };
+
+        if !path.is_file() {
+            return Err(invalid("entrypoint must be an existing regular file"));
+        }
+
+        let file = project
+            .file_by_path(path)
+            .ok_or_else(|| invalid("entrypoint is not in the selected project"))?;
+
+        if !project.is_project_file(file) || project.is_test_path(file) {
+            return Err(invalid(
+                "entrypoint is excluded by the current implementation-source policy",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 impl Config {

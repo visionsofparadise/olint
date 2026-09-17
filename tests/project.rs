@@ -7,6 +7,51 @@ mod support;
 
 use support::{file_of, first_node_of, project_of, run_in_project, TYPED_PACKAGE};
 
+#[test]
+fn literal_selection_preserves_jsonc_overrides_and_empty_references() {
+    for config in [
+        "\u{feff}/* config */{\"files\":[\"index.ts\",],\"references\":[],}",
+        r#"{"extends":"./base.json","files":["index.ts"]}"#,
+    ] {
+        let selected = selected_files_of(&[
+            ("tsconfig.json", config),
+            ("base.json", r#"{"files":["missing.ts"]}"#),
+            ("index.ts", "export const value=1"),
+        ]);
+
+        assert_eq!(selected, ["index.ts"]);
+    }
+}
+
+#[test]
+fn literal_roots_reject_unusable_suffixes_and_unsupported_references() {
+    for config in [
+        r#"{"files":["data.json"]}"#,
+        r#"{"files":["source.js"]}"#,
+        r#"{"files":["index.ts"],"references":[{"path":"./child"}]}"#,
+    ] {
+        let directory = project_of(&[
+            ("tsconfig.json", config),
+            ("index.ts", "export const value=1"),
+            ("source.js", "export const value=1"),
+            ("data.json", "{}"),
+        ]);
+
+        assert!(select_files(&directory.path().join("tsconfig.json")).is_err());
+    }
+
+    assert_eq!(
+        selected_files_of(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"allowJs":true},"files":["source.js"]}"#
+            ),
+            ("source.js", "export const value=1")
+        ]),
+        ["source.js"]
+    );
+}
+
 fn selected_files_of(files: &[(&str, &str)]) -> Vec<String> {
     let directory = project_of(files);
     let root = canonical_path_of(directory.path()).expect("root");

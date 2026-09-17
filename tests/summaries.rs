@@ -155,6 +155,7 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
             .map(|(target, function)| analysis.name_of(target, function))
             .collect();
         let public: Vec<String> = public_functions(&mut analysis, &config)
+            .expect("valid selection")
             .into_iter()
             .map(|public| analysis.name_of(public.file, public.function))
             .collect();

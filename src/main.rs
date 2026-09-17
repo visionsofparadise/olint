@@ -1,16 +1,18 @@
 use std::fmt;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
-use olint::config::{read_config, ConfigError, UnknownPolicy, ENTRYPOINT_FORMS, LIMIT_FORMS};
+use olint::config::{
+    read_config, validate_entries, ConfigError, UnknownPolicy, ENTRYPOINT_FORMS, LIMIT_FORMS,
+};
 use olint::cost::CostComparison;
 use olint::project::{Project, ProjectError};
 use olint::public::public_functions;
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
-use olint::tsc::{ask, TscError};
+use olint::tsc::{ask, Query, TscError, TscReply};
 use olint::unknowns::{SourceSpan, UnknownReason};
 use oxc_allocator::Allocator;
 use oxc_span::GetSpan;
@@ -48,6 +50,12 @@ fn single_line_of(text: &str) -> String {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Failure::Config(ConfigError::Root { path, text }) => {
+                format!("{} must contain an object, got {text}", path.display())
+            }
+            Failure::Config(ConfigError::Selection { path, message }) => {
+                format!("{}: {message}", path.display())
+            }
             Failure::Config(ConfigError::Unknown { value }) => {
                 format!("unknown must be ignore, warn or error, got {value}")
             }
@@ -105,6 +113,13 @@ fn print_lines(lines: &[String]) {
 }
 
 fn run(cli: Cli) -> Result<i32, Failure> {
+    run_with_ask(cli, ask)
+}
+
+fn run_with_ask(
+    cli: Cli,
+    mut compiler: impl FnMut(&Path, &Path, &[Query]) -> Result<TscReply, TscError>,
+) -> Result<i32, Failure> {
     let tsconfig = cli.tsconfig;
 
     if !tsconfig.is_file() {
@@ -116,6 +131,10 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
     let allocator = Allocator::default();
     let project = Project::load(&allocator, &tsconfig).map_err(Failure::Project)?;
+    let config = read_config(&project, cli.config.as_deref()).map_err(Failure::Config)?;
+
+    validate_entries(&project, &config).map_err(Failure::Config)?;
+
     let options = Options {
         minimum_exponent: cli.min,
         types: cli.types,
@@ -125,7 +144,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
     if analysis.options.types != TypeMode::Syntactic {
         let gathered = analysis.gather_answers(&functions, |queries| {
-            ask(&project.root, &project.tsconfig_path, queries)
+            compiler(&project.root, &project.tsconfig_path, queries)
         });
 
         match gathered {
@@ -147,8 +166,7 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         }
     }
 
-    let config = read_config(&project, cli.config.as_deref()).map_err(Failure::Config)?;
-    let public = public_functions(&mut analysis, &config);
+    let public = public_functions(&mut analysis, &config).map_err(Failure::Config)?;
 
     check_analysis_errors(&analysis)?;
 
@@ -323,3 +341,7 @@ fn check_analysis_errors(analysis: &Analysis<'_, '_>) -> Result<(), Failure> {
             .join("; "),
     ))
 }
+
+#[cfg(test)]
+#[path = "main.test.rs"]
+mod tests;

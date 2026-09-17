@@ -456,7 +456,7 @@ fn is_same_written_path(stored: &Path, path: &Path) -> bool {
     }
 }
 
-fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
+pub(crate) fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
     let extension = path
         .extension()
         .map(|extension| extension.to_string_lossy().into_owned())

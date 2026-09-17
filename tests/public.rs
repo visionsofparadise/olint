@@ -11,13 +11,57 @@ mod support;
 use support::SYNTACTIC;
 
 #[test]
+fn invalid_direct_config_returns_before_summary_work() {
+    support::run_in_project(
+        &[
+            ("tsconfig.json", "{}"),
+            ("index.ts", "export function selected() {}"),
+            ("olint.config.json", r#"{"entrypoints":["missing.ts"]}"#),
+        ],
+        |project, _| {
+            let mut analysis = Analysis::new(project, SYNTACTIC);
+            let before = analysis.scheduler_stats();
+            let config = read_config(project, None).unwrap();
+
+            assert!(public_functions(&mut analysis, &config).is_err());
+            assert_eq!(analysis.scheduler_stats().work, before.work);
+            assert_eq!(analysis.scheduler_stats().tasks, 0);
+        },
+    );
+}
+
+#[test]
+fn valid_ignored_or_nonexporting_entries_can_select_no_public_functions() {
+    for (source, ignored) in [
+        ("export function selected() {}", true),
+        ("function local() {}", false),
+    ] {
+        let config = serde_json::json!({"entrypoints":["index.ts"], "ignore":if ignored {vec!["index.ts"]} else {vec![]}}).to_string();
+
+        support::run_in_project(
+            &[
+                ("tsconfig.json", "{}"),
+                ("index.ts", source),
+                ("olint.config.json", &config),
+            ],
+            |project, _| {
+                let mut analysis = Analysis::new(project, SYNTACTIC);
+                let config = read_config(project, None).unwrap();
+
+                assert!(public_functions(&mut analysis, &config).unwrap().is_empty());
+            },
+        );
+    }
+}
+
+#[test]
 fn tags_fixture_public_functions_follow_exports_and_limits() {
     let tsconfig = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tags/tsconfig.json");
     let allocator = Allocator::default();
     let project = Project::load(&allocator, &tsconfig).expect("fixture loads");
     let mut analysis = Analysis::new(&project, SYNTACTIC);
     let config = read_config(&project, None).expect("config reads");
-    let public = public_functions(&mut analysis, &config);
+    let public = public_functions(&mut analysis, &config).expect("valid selection");
     let names: Vec<String> = public
         .iter()
         .map(|function| analysis.name_of(function.file, function.function))

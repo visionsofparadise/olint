@@ -1,6 +1,69 @@
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn explicit_selection_matrix_rejects_invalid_coverage_and_preserves_empty_controls() {
+    let cases: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/selection.json")).unwrap();
+
+    for case in cases.as_array().unwrap() {
+        let directory = tempfile::tempdir().unwrap();
+
+        for (name, value) in case["files"].as_object().unwrap() {
+            let path = directory.path().join(name);
+
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            let text = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+
+            std::fs::write(path, text).unwrap();
+        }
+
+        for mode in ["lint", "report"] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_olint"));
+
+            command.args(["--types", "syntactic"]);
+
+            for argument in case["args"].as_array().unwrap() {
+                command.arg(argument.as_str().unwrap());
+            }
+
+            if mode == "report" {
+                command.args(["--report", "--min", "0"]);
+            }
+
+            let output = command.current_dir(directory.path()).output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{stdout}\n{stderr}");
+            let name = case["name"].as_str().unwrap();
+
+            assert_eq!(
+                output.status.code(),
+                Some(case["expected_exits"][mode].as_i64().unwrap() as i32),
+                "{name} {mode}: {combined}"
+            );
+
+            if case["kind"] == "invalid-selection" {
+                assert!(!stderr.trim().is_empty(), "{name}");
+            }
+
+            for (field, present) in [("expected_contains", true), ("expected_absent", false)] {
+                for expected in case[field][mode].as_array().into_iter().flatten() {
+                    assert_eq!(
+                        combined.contains(expected.as_str().unwrap()),
+                        present,
+                        "{name} {mode}: {combined}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn golden_of(fixture: &Path, name: &str) -> String {
     std::fs::read_to_string(fixture.join(name))
         .unwrap_or_else(|error| panic!("{} {name}: {error}", fixture.display()))

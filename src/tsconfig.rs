@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use oxc_resolver::{ExtendsField, ResolveOptions, Resolver, TsConfig};
 
 use crate::paths::{canonical_path_of, forward_slashes_of, normalized_path_of};
-use crate::project::ProjectError;
+use crate::project::{is_parsed_path, ProjectError};
 
 pub struct TsconfigFiles {
     pub root_dir: PathBuf,
@@ -34,6 +34,32 @@ pub fn select_files(tsconfig: &Path) -> Result<TsconfigFiles, ProjectError> {
     })?;
     let mut visited = HashSet::new();
     let merged = load_tsconfig(&tsconfig_path, true, &mut visited)?;
+    let allow_js = merged.compiler_options.allow_js.unwrap_or(false);
+
+    if !merged.references.is_empty() {
+        return Err(ProjectError::Tsconfig {
+            path: tsconfig_path.clone(),
+            message: "project references are not supported by this selection mode".to_string(),
+        });
+    }
+
+    for file in merged.files.iter().flatten() {
+        let metadata = std::fs::metadata(file).map_err(|error| ProjectError::Tsconfig {
+            path: tsconfig_path.clone(),
+            message: format!("cannot read literal root {}: {error}", file.display()),
+        })?;
+
+        if !metadata.is_file() || !is_parsed_path(file, allow_js) {
+            return Err(ProjectError::Tsconfig {
+                path: tsconfig_path.clone(),
+                message: format!(
+                    "literal root {} must be a supported source file",
+                    file.display()
+                ),
+            });
+        }
+    }
+
     let root_dir = tsconfig_path
         .parent()
         .map(Path::to_path_buf)
@@ -61,7 +87,6 @@ pub fn select_files(tsconfig: &Path) -> Result<TsconfigFiles, ProjectError> {
         .map(|pattern| pattern.split('/').map(str::to_string).collect())
         .collect();
     let exclude_set = glob_set_of(&exclusion_patterns_of(&exclude_patterns), tsconfig)?;
-    let allow_js = merged.compiler_options.allow_js.unwrap_or(false);
     let groups = if allow_js {
         ALL_EXTENSION_GROUPS
     } else {
@@ -84,9 +109,7 @@ pub fn select_files(tsconfig: &Path) -> Result<TsconfigFiles, ProjectError> {
     for file in merged.files.iter().flatten() {
         let path = normalized_path_of(file);
 
-        if path.is_file() {
-            literal.insert(key_of(&path), path);
-        }
+        literal.insert(key_of(&path), path);
     }
 
     let mut wildcard: IndexMap<String, PathBuf> = IndexMap::new();
@@ -476,6 +499,25 @@ fn remove_lower_priority_files(
     }
 }
 
+fn starts_with_object(text: &str) -> bool {
+    let mut remaining = text.strip_prefix('\u{feff}').unwrap_or(text);
+
+    loop {
+        remaining = remaining.trim_start();
+
+        if let Some(comment) = remaining.strip_prefix("//") {
+            remaining = comment.find(['\r', '\n']).map_or("", |end| &comment[end..]);
+        } else if let Some(comment) = remaining.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return false;
+            };
+            remaining = &comment[end + 2..];
+        } else {
+            return remaining.starts_with('{');
+        }
+    }
+}
+
 fn load_tsconfig(
     path: &Path,
     root: bool,
@@ -492,11 +534,20 @@ fn load_tsconfig(
         path: path.to_path_buf(),
         source,
     })?;
+    let object_root = starts_with_object(&text);
     let mut config =
         TsConfig::parse(root, path, path, text).map_err(|error| ProjectError::Tsconfig {
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
+
+    if !object_root {
+        return Err(ProjectError::Tsconfig {
+            path: path.to_path_buf(),
+            message: "configuration root must be an object".to_string(),
+        });
+    }
+
     let directory = path.parent().map(forward_slashes_of).unwrap_or_default();
 
     absolutize(&mut config.include, &directory);

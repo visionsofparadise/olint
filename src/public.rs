@@ -4,7 +4,7 @@ use oxc_ast::ast::{BindingPattern, ClassElement, PropertyKey, TSAccessibility};
 use oxc_semantic::NodeId;
 
 use crate::analysis::Analysis;
-use crate::config::{Config, Limit};
+use crate::config::{validate_entries, Config, ConfigError, Limit};
 use crate::declarations::{function_of_initializer, Declaration, FunctionNode};
 use crate::directives::{max_tag_of, PerfTag};
 use crate::paths::relative_path_of;
@@ -76,18 +76,19 @@ fn declared_functions_of(declaration: Declaration<'_>) -> Vec<(FileId, FunctionN
 pub fn public_functions<'a>(
     analysis: &mut Analysis<'_, 'a>,
     config: &Config,
-) -> Vec<PublicFunction<'a>> {
+) -> Result<Vec<PublicFunction<'a>>, ConfigError> {
     let project = analysis.project;
+
+    validate_entries(project, config)?;
+
     let mut found: Vec<PublicFunction<'a>> = Vec::new();
     let mut positions: HashMap<(FileId, NodeId), usize> = HashMap::new();
 
     for (entry_path, limit) in &config.entrypoints {
         let entry = relative_path_of(&project.root, entry_path);
-        let Some(entry_file) = project.file_by_path(entry_path) else {
-            eprintln!("olint: entrypoint {entry} is not in the project");
-
-            continue;
-        };
+        let entry_file = project
+            .file_by_path(entry_path)
+            .expect("validated entrypoint");
 
         for (_, declarations) in analysis.declarations.exports_of(project, entry_file) {
             for declaration in declarations {
@@ -166,5 +167,5 @@ pub fn public_functions<'a>(
         }
     }
 
-    found
+    Ok(found)
 }
