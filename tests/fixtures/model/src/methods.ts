@@ -69,7 +69,7 @@ export function newMapConstant(): Map<string, number> {
 	]);
 }
 
-function makeUnionSet() {
+function makeCallbackSet() {
 	return new Set<number>();
 }
 
@@ -77,10 +77,10 @@ function makeDoubled() {
 	return [1, 2, 3].map((x) => x * 2);
 }
 
-export function unionCallback(n: number) {
-	const s = makeUnionSet();
+export function setCallback(n: number) {
+	const s = makeCallbackSet();
 	const list = makeDoubled();
-	return s.union(() => list.map((x) => x + n));
+	return s.forEach(() => list.map((x) => x + n));
 }
 
 export function spreadRestTupleSet(...rows: [number, number][]) {
@@ -109,7 +109,7 @@ function makeRoundEngine() {
 	return new RoundEngine();
 }
 
-export function unionHidesCallee(xs: number[]) {
-	const s = makeUnionSet();
-	return s.union(() => makeRoundEngine().run(xs));
+export function setCallbackCallsMethod(xs: number[]) {
+	const s = makeCallbackSet();
+	return s.forEach(() => makeRoundEngine().run(xs));
 }

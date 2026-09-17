@@ -995,7 +995,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if (kind == Kind::Set && is_listed(SET_LINEAR, &method))
             || (kind == Kind::Map && is_listed(MAP_LINEAR, &method))
         {
-            let callback = self.callback_part_of(file, first);
+            let callback = if is_listed(CALLBACK_METHODS, &method) {
+                self.callback_part_of(file, first)
+            } else {
+                Part::none()
+            };
 
             return reading.merge(Reading::of_part(nest(label(""), site, Cost::N, callback)));
         }

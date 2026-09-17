@@ -2,6 +2,46 @@ use olint::cost::{Cost, Reading};
 
 mod support;
 
+#[test]
+fn set_callback_fixture_declarations_typecheck() {
+    let script = r#"
+const path = require('node:path');
+const fs = require('node:fs');
+const root = process.argv[1];
+const ts = require(path.join(root, 'node_modules/typescript'));
+const file = path.join(root, 'tests/fixtures/model/src/methods.ts');
+const parsed = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.ES2022, true);
+const names = new Set(['makeCallbackSet', 'makeDoubled', 'setCallback', 'RoundEngine', 'makeRoundEngine', 'setCallbackCallsMethod']);
+const selected = parsed.statements.filter(node => node.name && names.has(node.name.text));
+if (selected.length !== names.size) throw new Error('callback fixture declarations missing');
+const source = selected.map(node => node.getText(parsed)).join('\n');
+const virtual = path.join(root, 'callback-fixture.ts');
+const options = { strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, types: [] };
+const host = ts.createCompilerHost(options);
+const read = host.readFile.bind(host);
+host.readFile = name => path.resolve(name) === virtual ? source : read(name);
+const program = ts.createProgram([virtual], options, host);
+const diagnostics = ts.getPreEmitDiagnostics(program);
+if (diagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+    getCanonicalFileName: name => name,
+    getCurrentDirectory: () => root,
+    getNewLine: () => '\n'
+}));
+"#;
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Node and TypeScript are required to verify callback fixtures");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 use support::{function_of_name, run_with_source};
 
 fn reading_of(source: &str, name: &str) -> (Reading, Vec<String>) {
@@ -78,6 +118,22 @@ fn a_set_of_a_parameter_is_linear() {
 
     assert_eq!(reading.total().cost, Cost::N);
     assert_eq!(labels, vec!["new Set(xs)"]);
+}
+
+#[test]
+fn set_union_uses_a_callable_set_like_object_as_data() {
+    let (reading, _) = reading_of(
+        r"export function f(s: Set<number>, xs: number[]) {
+            function other() { return xs.map(x => x); }
+            other.size = 0;
+            other.has = () => false;
+            other.keys = function* () {};
+            return s.union(other);
+        }",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::N);
 }
 
 #[test]
