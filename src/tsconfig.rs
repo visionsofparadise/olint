@@ -15,10 +15,46 @@ pub struct TsconfigFiles {
     pub projects: Vec<SelectedProject>,
 }
 
+#[derive(Clone)]
 pub struct SelectedProject {
     pub path: PathBuf,
     pub files: Vec<PathBuf>,
     pub allow_js: bool,
+    pub output: OutputOptions,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputOptions {
+    pub root_dir: Option<PathBuf>,
+    pub out_dir: Option<PathBuf>,
+    pub declaration_dir: Option<PathBuf>,
+    pub out_file: Option<PathBuf>,
+    pub composite: Option<bool>,
+    pub declaration: Option<bool>,
+    pub no_emit: Option<bool>,
+    pub emit_declaration_only: Option<bool>,
+    pub jsx: Option<String>,
+}
+
+impl OutputOptions {
+    fn inherit(&mut self, parent: &Self) {
+        macro_rules! inherit {
+            ($($field:ident),*) => {$(if self.$field.is_none() { self.$field.clone_from(&parent.$field); })*};
+        }
+
+        inherit!(
+            root_dir,
+            out_dir,
+            declaration_dir,
+            out_file,
+            composite,
+            declaration,
+            no_emit,
+            emit_declaration_only,
+            jsx
+        );
+    }
 }
 
 const TYPESCRIPT_EXTENSION_GROUPS: &[&[&str]] = &[
@@ -86,7 +122,27 @@ fn select_project(tsconfig: &Path) -> Result<(SelectedProject, Vec<PathBuf>), Pr
         source,
     })?;
     let mut visited = HashSet::new();
-    let merged = load_tsconfig(&tsconfig_path, true, &mut visited)?;
+    let (merged, mut output) = load_tsconfig(&tsconfig_path, true, &mut visited)?;
+
+    for option in [
+        &mut output.root_dir,
+        &mut output.out_dir,
+        &mut output.declaration_dir,
+        &mut output.out_file,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(relative) = option.to_string_lossy().strip_prefix("${configDir}") {
+            *option = normalized_path_of(
+                &tsconfig_path
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join(relative.trim_start_matches(['/', '\\'])),
+            );
+        }
+    }
+
     let allow_js = merged
         .compiler_options
         .allow_js
@@ -205,6 +261,7 @@ fn select_project(tsconfig: &Path) -> Result<(SelectedProject, Vec<PathBuf>), Pr
                 .chain(wildcard.into_values())
                 .collect(),
             allow_js,
+            output,
         },
         references,
     ))
@@ -598,7 +655,7 @@ fn load_tsconfig(
     path: &Path,
     root: bool,
     visited: &mut HashSet<PathBuf>,
-) -> Result<TsConfig, ProjectError> {
+) -> Result<(TsConfig, OutputOptions), ProjectError> {
     if !visited.insert(path.to_path_buf()) {
         return Err(ProjectError::Tsconfig {
             path: path.to_path_buf(),
@@ -611,6 +668,45 @@ fn load_tsconfig(
         source,
     })?;
     let object_root = starts_with_object(&text);
+    let mut json = text.as_bytes().to_vec();
+
+    json_strip_comments::strip_slice(&mut json).map_err(|error| ProjectError::Tsconfig {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+
+    let json = std::str::from_utf8(&json)
+        .unwrap_or("")
+        .trim_start_matches('\u{feff}');
+    let raw: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| ProjectError::Tsconfig {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    let mut output: OutputOptions = serde_json::from_value(
+        raw.get("compilerOptions")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .map_err(|error| ProjectError::Tsconfig {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+
+    for option in [
+        &mut output.root_dir,
+        &mut output.out_dir,
+        &mut output.declaration_dir,
+        &mut output.out_file,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !option.to_string_lossy().starts_with("${configDir}") {
+            *option = normalized_path_of(&path.parent().unwrap_or(Path::new("")).join(&*option));
+        }
+    }
+
     let mut config =
         TsConfig::parse(root, path, path, text).map_err(|error| ProjectError::Tsconfig {
             path: path.to_path_buf(),
@@ -640,23 +736,31 @@ fn load_tsconfig(
         Some(ExtendsField::Multiple(specifiers)) => specifiers,
         None => Vec::new(),
     };
-    let mut base: Option<TsConfig> = None;
+    let mut base: Option<(TsConfig, OutputOptions)> = None;
 
     for specifier in parents {
         let parent_path = extended_path_of(path, &specifier)?;
-        let parent = load_tsconfig(&parent_path, false, visited)?;
+        let (parent, mut parent_output) = load_tsconfig(&parent_path, false, visited)?;
 
         base = Some(match base {
-            Some(earlier) => merge_extends(parent, &earlier),
-            None => parent,
+            Some((earlier, earlier_output)) => {
+                parent_output.inherit(&earlier_output);
+
+                (merge_extends(parent, &earlier), parent_output)
+            }
+            None => (parent, parent_output),
         });
     }
 
     visited.remove(path);
 
     Ok(match base {
-        Some(parent) => merge_extends(config, &parent),
-        None => config,
+        Some((parent, parent_output)) => {
+            output.inherit(&parent_output);
+
+            (merge_extends(config, &parent), output)
+        }
+        None => (config, output),
     })
 }
 

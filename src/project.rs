@@ -17,7 +17,7 @@ use crate::unknowns::UnknownReason;
 use crate::paths::{
     canonical_path_of, forward_slashes_of, relative_path_of, strip_verbatim_prefix,
 };
-use crate::tsconfig::select_files;
+use crate::tsconfig::{select_files, SelectedProject};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(pub u32);
@@ -116,7 +116,7 @@ pub struct Project<'a> {
     pub files: Vec<SourceFile<'a>>,
     by_path: HashMap<PathBuf, FileId>,
     resolvers: Vec<Resolver>,
-    config_paths: Vec<PathBuf>,
+    pub configurations: Vec<SelectedProject>,
     configless_resolver: Resolver,
 }
 
@@ -192,22 +192,18 @@ impl<'a> Project<'a> {
             .iter()
             .map(|selected| Resolver::new(resolve_options_of(&selected.path)))
             .collect();
-        let config_paths = selection
-            .projects
-            .iter()
-            .map(|selected| selected.path.clone())
-            .collect();
         let mut project = Project {
             root: selection.root_dir,
             tsconfig_path,
             files: Vec::new(),
             by_path: HashMap::new(),
             resolvers,
-            config_paths,
+            configurations: selection.projects,
             configless_resolver,
         };
 
-        for (owner, selected) in selection.projects.into_iter().enumerate() {
+        for owner in 0..project.configurations.len() {
+            let selected = project.configurations[owner].clone();
             let allow_js = selected.allow_js;
             let mut walk = Walk {
                 owner,
@@ -360,7 +356,9 @@ impl<'a> Project<'a> {
     ) -> Result<Vec<Import>, ProjectError> {
         let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
         let resolver = &self.resolvers[owner];
-        let tsconfig = resolver.resolve_tsconfig(&self.config_paths[owner]).ok();
+        let tsconfig = resolver
+            .resolve_tsconfig(&self.configurations[owner].path)
+            .ok();
 
         let mut imports: Vec<Import> = import_specifiers_of(file)
             .into_iter()

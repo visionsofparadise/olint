@@ -2,10 +2,18 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn explicit_selection_matrix_rejects_invalid_coverage_and_preserves_empty_controls() {
-    let cases: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/selection.json")).unwrap();
+fn package_entry_mappings_select_costly_apis_and_diagnose_unknown_mappings() {
+    assert_selection_cases(
+        &serde_json::from_str(include_str!("fixtures/package-entries.json")).unwrap(),
+    );
+}
 
+#[test]
+fn explicit_selection_matrix_rejects_invalid_coverage_and_preserves_empty_controls() {
+    assert_selection_cases(&serde_json::from_str(include_str!("fixtures/selection.json")).unwrap());
+}
+
+fn assert_selection_cases(cases: &serde_json::Value) {
     for case in cases.as_array().unwrap() {
         let directory = tempfile::tempdir().unwrap();
 

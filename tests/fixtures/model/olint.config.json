@@ -1,4 +1,9 @@
 {
 	"max": "O(N^2)",
-	"ignore": ["src/lib/**"]
+	"ignore": [
+		"src/lib/**"
+	],
+	"entrypoints": [
+		"src/index.ts"
+	]
 }

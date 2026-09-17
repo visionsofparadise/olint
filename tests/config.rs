@@ -1,10 +1,160 @@
+use std::path::Path;
+
 use olint::config::{package_entries, read_config, Config, ConfigError};
 
 mod support;
 
 use support::run_in_project;
 
-const TSCONFIG: (&str, &str) = ("tsconfig.json", r#"{ "include": ["src"] }"#);
+const TSCONFIG: (&str, &str) = (
+    "tsconfig.json",
+    r#"{ "include": ["src"], "compilerOptions":{"rootDir":"src","outDir":"dist","declaration":true} }"#,
+);
+
+#[test]
+fn module_specific_and_pattern_exports_preserve_package_order() {
+    assert_eq!(
+        entries_of(&[
+            TSCONFIG,
+            (
+                "package.json",
+                r#"{"exports":{".":{"types":"./dist/z.d.mts","import":"./dist/z.mjs","require":"./dist/a.cjs"},"./*":"./dist/*.js","./private":null,"./package.json":"./package.json"}}"#
+            ),
+            ("src/z.mts", "export const z=1;"),
+            ("src/a.cts", "export const a=1;"),
+            ("src/deep/run.ts", "export const run=1;"),
+            ("src/private.ts", "export const hidden=1;"),
+        ]),
+        ["src/z.mts", "src/a.cts", "src/deep/run.ts"]
+    );
+}
+
+#[test]
+fn unproved_mappings_require_explicit_entries() {
+    for package in [
+        r#"{"main":"dist/x.js"}"#,
+        r#"{"exports":{"./*":"./missing/*.js"}}"#,
+        r#"{"exports":"./src/view.vue"}"#,
+    ] {
+        assert_unmapped(&[
+            TSCONFIG,
+            ("package.json", package),
+            ("src/x/index.ts", "export const x=1;"),
+            ("src/view.vue", "<script>export const x=1</script>"),
+        ]);
+    }
+
+    for options in [r#"{"noEmit":true}"#, r#"{"outFile":"dist/bundle.js"}"#] {
+        let config = format!(r#"{{"include":["src"],"compilerOptions":{options}}}"#);
+
+        assert_unmapped(&[
+            ("tsconfig.json", &config),
+            ("package.json", r#"{"main":"dist/index.js"}"#),
+            ("src/index.ts", "export const index=1;"),
+        ]);
+    }
+}
+
+fn assert_unmapped(files: &[(&str, &str)]) {
+    assert!(
+        matches!(read_error_of(files), Some(ConfigError::Selection { message, .. }) if message.contains("explicit entrypoints"))
+    );
+}
+
+#[test]
+fn direct_source_and_disabled_exports_preserve_intentional_selection() {
+    for (package, expected) in [
+        (r#"{"source":"src/index.ts"}"#, vec!["src/index.ts"]),
+        (r#"{"main":"missing.js","exports":null}"#, vec![]),
+        (r#"{"exports":{"./metadata":"./data.json"}}"#, vec![]),
+    ] {
+        assert_eq!(
+            entries_of(&[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions":{"noEmit":true},"include":["src"]}"#
+                ),
+                ("package.json", package),
+                ("src/index.ts", "export const index=1;"),
+            ]),
+            expected
+        );
+    }
+}
+
+#[test]
+fn colliding_project_outputs_require_explicit_sources() {
+    assert!(matches!(read_error_of(&[
+        ("tsconfig.json", r#"{"files":[],"references":[{"path":"left"},{"path":"right"}]}"#),
+        ("left/tsconfig.json", r#"{"files":["index.ts"],"compilerOptions":{"outDir":"../dist"}}"#),
+        ("right/tsconfig.json", r#"{"files":["index.ts"],"compilerOptions":{"outDir":"../dist"}}"#),
+        ("left/index.ts", "export const left=1;"),
+        ("right/index.ts", "export const right=1;"),
+        ("package.json", r#"{"main":"dist/index.js"}"#),
+    ]), Some(ConfigError::Selection { message, .. }) if message.contains("multiple source")));
+}
+
+#[test]
+fn inherited_output_metadata_matches_typescript_output_names() {
+    let configurations = [
+        r#"{"rootDir":"${configDir}/src","outDir":"${configDir}/build","declarationDir":"${configDir}/types","declaration":true}"#,
+        r#"{"rootDir":"../src","outDir":"../build","declarationDir":"../types","declaration":true,"jsx":"preserve"}"#,
+        r#"{"outDir":"../build","composite":true}"#,
+        r#"{"outDir":"../build","declaration":true,"emitDeclarationOnly":true}"#,
+    ];
+
+    for options in configurations {
+        let base = format!("/* options */{{\"compilerOptions\":{options},}}");
+
+        run_in_project(
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"extends":"./configs/base.json","include":["src"]}"#,
+                ),
+                ("configs/base.json", &base),
+                ("src/a.mts", "export const a=1;"),
+                ("src/b.cts", "export const b=1;"),
+                ("src/nested/c.tsx", "export const c=1;"),
+            ],
+            |project, root| {
+                let script = "const ts=require('typescript'); const p=ts.getParsedCommandLineOfConfigFile(process.argv[1],{}, {...ts.sys,onUnRecoverableConfigFileDiagnostic:d=>{throw d}}); console.log(JSON.stringify(p.fileNames.flatMap(source=>ts.getOutputFileNames(p,source,!ts.sys.useCaseSensitiveFileNames).filter(output=>!output.endsWith('.tsbuildinfo')).map(output=>({source,output})))));";
+                let output = std::process::Command::new("node")
+                    .args(["-e", script])
+                    .arg(root.join("tsconfig.json"))
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .output()
+                    .expect("static compiler output qualification");
+
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+
+                let pairs: Vec<serde_json::Value> =
+                    serde_json::from_slice(&output.stdout).expect("outputs");
+
+                assert!(!pairs.is_empty());
+
+                for pair in pairs {
+                    let package = serde_json::json!({"main":pair["output"]});
+
+                    std::fs::write(root.join("package.json"), package.to_string()).unwrap();
+
+                    let entries = package_entries(project).expect("qualified mapping");
+
+                    assert_eq!(
+                        entries,
+                        [olint::paths::normalized_path_of(Path::new(
+                            pair["source"].as_str().unwrap()
+                        ))]
+                    );
+                }
+            },
+        );
+    }
+}
 
 #[test]
 fn optional_absence_and_invalid_read_are_distinct() {
@@ -33,6 +183,7 @@ fn entries_of(files: &[(&str, &str)]) -> Vec<String> {
 
     run_in_project(files, |project, _| {
         entries = package_entries(project)
+            .expect("package entries")
             .iter()
             .map(|entry| olint::paths::relative_path_of(&project.root, entry))
             .collect();
@@ -87,10 +238,10 @@ fn package_exports_nested_by_condition_resolve_to_source() {
 }
 
 #[test]
-fn package_main_resolves_to_a_directory_index() {
+fn package_main_resolves_to_its_configured_directory_output() {
     let entries = entries_of(&[
         TSCONFIG,
-        ("package.json", r#"{ "main": "./dist/x.js" }"#),
+        ("package.json", r#"{ "main": "./dist/x/index.js" }"#),
         ("src/x/index.ts", "export const a = 1;"),
     ]);
 

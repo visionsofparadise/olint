@@ -648,6 +648,7 @@ dependencies = [
  "clap",
  "globset",
  "indexmap",
+ "json-strip-comments",
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",

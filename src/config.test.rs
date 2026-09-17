@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn package_patterns_capture_one_repeated_value_and_fence_exact_subpaths() {
+    assert_eq!(
+        pattern_capture("dist/*/copy-*.js", "dist/a/copy-a.js"),
+        Some("a")
+    );
+    assert_eq!(
+        pattern_capture("dist/*/copy-*.js", "dist/a/copy-b.js"),
+        None
+    );
+    assert_eq!(
+        pattern_capture("dist/*.js", "dist/deep/a.js"),
+        Some("deep/a")
+    );
+    assert_eq!(pattern_capture("dist/[x].js", "dist/x.js"), None);
+    assert_eq!(
+        winning_export(&["./*", "./private/*", "./private/a"], "./private/a"),
+        Some("./private/a")
+    );
+    assert_eq!(
+        winning_export(&["./*", "./private/*"], "./private/b"),
+        Some("./private/*")
+    );
+}
+
+#[test]
 fn unknown_policy_has_exact_values_and_warn_default() {
     assert_eq!(unknown_policy_of(None).unwrap(), UnknownPolicy::Warn);
 

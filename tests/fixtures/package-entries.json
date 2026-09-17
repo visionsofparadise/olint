@@ -1,0 +1,287 @@
+[
+  {
+    "name": "configured_mts",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist",
+          "declaration": true
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "exports": {
+          ".": {
+            "types": "./dist/index.d.mts",
+            "import": "./dist/index.mjs"
+          }
+        }
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/index.mts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "configured_cts",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist"
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "main": "./dist/index.cjs"
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/index.cts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "wildcard_exports",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist"
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "exports": {
+          "./*": {
+            "import": "./dist/*.js"
+          }
+        }
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}",
+      "src/second.ts": "export function second(){void 0;}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "unproved_directory_guess",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist"
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "main": "./dist/x.js"
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/x/index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "noemit_output",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist",
+          "noEmit": true
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "main": "./dist/index.js"
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {},
+    "expected_absent": {},
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "direct_source_noemit",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "noEmit": true
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "source": "./src/index.ts"
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "stricter_duplicate",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist"
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "main": "./dist/index.js"
+      },
+      "olint.config.json": {
+        "max": "O(N^4)",
+        "unknown": "ignore",
+        "entrypoints": [
+          {
+            "path": "src/index.ts",
+            "max": "O(N^4)"
+          },
+          {
+            "path": "src/index.ts",
+            "max": "O(1)"
+          }
+        ]
+      },
+      "src/index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  },
+  {
+    "name": "configured_directory_index",
+    "files": {
+      "tsconfig.json": {
+        "compilerOptions": {
+          "rootDir": "src",
+          "outDir": "dist"
+        },
+        "include": [
+          "src"
+        ]
+      },
+      "package.json": {
+        "main": "./dist/x/index.js"
+      },
+      "olint.config.json": {
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "src/x/index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "report": [
+        "O((xs * xs^2)) selected"
+      ]
+    },
+    "expected_absent": {},
+    "kind": "valid-selection"
+  }
+]
