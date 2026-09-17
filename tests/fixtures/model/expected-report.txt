@@ -1,8 +1,8 @@
 # tsconfig.json  (160 functions in 15 files)
 
-O(N)               60
+O(N)               55
 O(1)               46
-O(N^2)             40
+O(N^2)             45
 O(N log N)         10
 O(N^3)              4
 
@@ -46,9 +46,29 @@ O(N^2)         scopedBudget  src/budgets.ts:13
     in loop for                                              src/budgets.ts:15  x N
         in loop while [budget: i < width, per for at 15]     src/budgets.ts:18  x N
 
+O(N^2)         shorthandDestructure  src/budgets.ts:47
+    in loop for-of                                           src/budgets.ts:50  x N
+        in loop while                                        src/budgets.ts:51  x N
+
 O(N^2)         namespaceWrite  src/budgets.ts:62
     in loop for-of                                           src/budgets.ts:64  x N
         in loop while                                        src/budgets.ts:65  x N
+
+O(N^2)         compoundBound  src/budgets.ts:74
+    in loop for-of                                           src/budgets.ts:77  x N
+        in loop while                                        src/budgets.ts:78  x N
+
+O(N^2)         callBound  src/budgets.ts:86
+    in loop for-of                                           src/budgets.ts:88  x N
+        in loop while                                        src/budgets.ts:89  x N
+
+O(N^2)         swapPattern  src/budgets.ts:97
+    in loop for-of                                           src/budgets.ts:100  x N
+        in loop while                                        src/budgets.ts:101  x N
+
+O(N^2)         shorthandDefault  src/budgets.ts:109
+    in loop for-of                                           src/budgets.ts:111  x N
+        in loop while                                        src/budgets.ts:112  x N
 
 O(N^2)         nestedNamespaceWrite  src/budgets.ts:123
     in loop for-of                                           src/budgets.ts:125  x N

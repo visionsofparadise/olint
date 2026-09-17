@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentTarget, BindingIdentifier, DoWhileStatement, Expression,
-    ForInStatement, ForOfStatement, ForStatement, ForStatementInit, Function, IdentifierReference,
+    ArrowFunctionExpression, AssignmentTarget, DoWhileStatement, Expression, ForInStatement,
+    ForOfStatement, ForStatement, ForStatementInit, Function, IdentifierReference,
     SimpleAssignmentTarget, Statement, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast::AstKind;
@@ -365,58 +365,44 @@ impl<'p, 'a> Analysis<'p, 'a> {
         e: &'a Expression<'a>,
         writes: &HashMap<Binding, Vec<WriteKind>>,
     ) -> bool {
-        self.reads_of(file, e.node_id())
+        self.referenced_bindings_of(file, e.node_id(), false)
             .iter()
             .all(|binding| writes.get(binding).is_none_or(|found| found.is_empty()))
     }
 
-    pub(crate) fn reads_of(&mut self, file: FileId, root: NodeId) -> Vec<Binding> {
-        let mut reads = Vec::new();
-        let mut node = root;
+    fn referenced_bindings_of(
+        &mut self,
+        file: FileId,
+        root: NodeId,
+        writes_only: bool,
+    ) -> Vec<Binding> {
+        let mut bindings = Vec::new();
+        let mut pending = vec![root];
 
-        loop {
+        while let Some(node) = pending.pop() {
             let kind = self.kind_of_node(file, node);
-            let binding = match kind {
-                AstKind::IdentifierReference(reference) => {
-                    let shorthand = matches!(
-                        self.project.file(file).semantic.nodes().parent_kind(node),
-                        AstKind::AssignmentTargetPropertyIdentifier(_)
-                    );
 
-                    if shorthand {
-                        None
-                    } else {
-                        self.binding_of_identifier(file, reference)
+            if let AstKind::IdentifierReference(reference) = kind {
+                let is_write = reference.reference_id.get().is_some_and(|id| {
+                    self.project
+                        .file(file)
+                        .semantic
+                        .scoping()
+                        .get_reference(id)
+                        .is_write()
+                });
+
+                if !writes_only || is_write {
+                    if let Some(binding) = self.binding_of_identifier(file, reference) {
+                        bindings.push(binding);
                     }
                 }
-                AstKind::BindingIdentifier(identifier) => binding_identifier_of(file, identifier),
-                _ => None,
-            };
-
-            if let Some(binding) = binding {
-                reads.push(binding);
             }
 
-            let stops = match kind {
-                AstKind::ArrowFunctionExpression(arrow) => arrow.r#async,
-                AstKind::Function(function) => function.r#async || function.generator,
-                AstKind::YieldExpression(expression) => expression.delegate,
-                AstKind::FormalParameterRest(_) | AstKind::BindingRestElement(_) => true,
-                AstKind::ArrayAssignmentTarget(target) => {
-                    matches!(target.elements.first(), Some(None))
-                }
-                _ => false,
-            };
-
-            if stops {
-                return reads;
-            }
-
-            match self.children_of(file, node).first() {
-                Some(child) => node = *child,
-                None => return reads,
-            }
+            pending.extend(self.children_of(file, node));
         }
+
+        bindings
     }
 
     fn writes_of(&mut self, file: FileId, body: Root<'a>) -> HashMap<Binding, Vec<WriteKind>> {
@@ -455,7 +441,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                                 | AssignmentTarget::ObjectAssignmentTarget(_)
                         ) =>
                     {
-                        let bindings = self.reads_of(file, assignment.left.node_id());
+                        let bindings =
+                            self.referenced_bindings_of(file, assignment.left.node_id(), true);
 
                         for binding in bindings {
                             writes.entry(binding).or_default().push(WriteKind::Other);
@@ -827,16 +814,6 @@ struct Advance {
     binding: Binding,
     direction: Direction,
     identifier: Option<(String, Option<Binding>)>,
-}
-
-pub(crate) fn binding_identifier_of(
-    file: FileId,
-    identifier: &BindingIdentifier<'_>,
-) -> Option<Binding> {
-    identifier
-        .symbol_id
-        .get()
-        .map(|symbol| Binding::Symbol { file, symbol })
 }
 
 fn has_continue_at_level(body: &Statement<'_>) -> bool {

@@ -140,3 +140,51 @@ export namespace Space {
         }
     });
 }
+
+#[test]
+fn every_operand_and_call_argument_contributes_to_bound_invariance() {
+    for bound in ["n - k", "Math.min(n, k)"] {
+        let source = format!(
+            "export function f(n: number, k: number) {{ let i = 0; while (i < {bound}) {{ i++; k--; }} }}"
+        );
+
+        run_with_source(&source, |analysis, file| {
+            let function = function_of_name(analysis.project, file, "f");
+
+            assert!(
+                analysis.collect_budgets(file, function).budgets.is_empty(),
+                "{bound}"
+            );
+        });
+    }
+}
+
+#[test]
+fn destructuring_writes_every_target_and_preserves_default_reads() {
+    for assignment in [
+        "[other, n] = pair",
+        "[, n] = pair",
+        "({ n } = object)",
+        "[...n] = pair",
+    ] {
+        let source = format!(
+            "export function f(n: any, pair: any, object: any) {{ let i = 0, other; while (i < n) {{ i++; }} {assignment}; }}"
+        );
+
+        run_with_source(&source, |analysis, file| {
+            let function = function_of_name(analysis.project, file, "f");
+
+            assert!(
+                analysis.collect_budgets(file, function).budgets.is_empty(),
+                "{assignment}"
+            );
+        });
+    }
+
+    run_with_source(
+        "export function f(n: number, object: any) { let i = 0, other; while (i < n) { i++; } ({ other = n } = object); }",
+        |analysis, file| {
+            assert_eq!(single_budget_of(analysis, file).text, "i < n");
+        },
+    );
+}
