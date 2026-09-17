@@ -10,6 +10,87 @@ use oxc_allocator::Allocator;
 
 mod support;
 
+#[test]
+fn triple_path_reader_matches_typescript_leading_directives() {
+    let sources = [
+        "\u{85}/// <reference path='a.ts' />",
+        "/// <reference\u{feff}path='a.ts' />",
+        "// first\n\u{feff}/// <reference path='a.ts' />",
+        "/// <reference path='a.ts' />\nconst x=1",
+        "\u{feff}/* header */\n/// <REFERENCE preserve='true' PATH = \"a.ts\" />",
+        "#!/usr/bin/env node\n/// <reference path='a.ts' />",
+        "const x=1;\n/// <reference path='a.ts' />",
+        "/* /// <reference path='a.ts' /> */",
+        "// ordinary\n/// <reference path='a.ts' />\n/// <reference path='b.ts' />",
+        "//// <reference path='a.ts' />",
+        "/// <reference path='a.ts' >",
+        "/// <reference types='node' path='a.ts' />",
+        "/// <reference lib='es5' path='a.ts' />",
+        "/// <reference no-default-lib='true' path='a.ts' />",
+        "/// <reference path='a.ts' /> trailing path='b.ts'",
+        "/// <reference other=\" path='b.ts'\" path='a.ts' />",
+        "/// <reference path='a.ts' />\u{2028}const x=1",
+    ];
+    let script = "const ts=require('typescript'); const cases=JSON.parse(process.argv[1]); console.log(JSON.stringify(cases.map(source=>ts.preProcessFile(source).referencedFiles.map(file=>file.fileName))))";
+    let output = std::process::Command::new("node")
+        .args([
+            "-e",
+            script,
+            &serde_json::to_string(&sources).expect("sources"),
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("static TypeScript qualification");
+
+    assert!(output.status.success());
+
+    let expected: Vec<Vec<String>> = serde_json::from_slice(&output.stdout).expect("paths");
+
+    for (source, expected) in sources.iter().zip(expected) {
+        assert_eq!(
+            olint::project::reference_paths_of(source),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn referenced_programs_answer_child_types_and_reject_conflicts() {
+    let right_config = serde_json::json!({"files":["../shared.ts"],"compilerOptions":{"paths":{"@dep":["../b.ts"]}}}).to_string();
+    let directory = project_of(&[
+        (
+            "tsconfig.json",
+            r#"{"files":[],"references":[{"path":"./left"},{"path":"./right"}]}"#,
+        ),
+        (
+            "left/tsconfig.json",
+            r#"{"files":["index.ts","../shared.ts"],"compilerOptions":{"paths":{"@dep":["../a.ts"]}}}"#,
+        ),
+        ("right/tsconfig.json", &right_config),
+        ("left/index.ts", "export const child = [1]; child;"),
+        ("shared.ts", "import { value } from '@dep'; value;"),
+        ("a.ts", "export const value = [1];"),
+        ("b.ts", "export const value = 'text';"),
+    ]);
+    let queries =
+        [("left/index.ts", 26, 31), ("shared.ts", 29, 34)].map(|(file, pos, end)| Query::Type {
+            file: directory.path().join(file).to_string_lossy().into_owned(),
+            pos,
+            end,
+        });
+    let reply = reply_of(&directory.path().join("tsconfig.json"), &queries);
+
+    assert!(matches!(
+        reply.answers[0],
+        Some(TscAnswer::Type(TypeAnswer {
+            kind: Kind::Array,
+            ..
+        }))
+    ));
+    assert_eq!(reply.answers[1], None);
+}
+
 use support::{call_of, file_of, project_of, SYNTACTIC};
 
 const SOURCE: &str = "/* caf\u{e9} \u{1f600} */\nclass Engine {\n\trun() {\n\t\treturn 1;\n\t}\n}\ninterface Shape {\n\twidth: number;\n}\nfunction make() {\n\treturn new Engine();\n}\nexport function probe(xs: number[], pair: [number, string], shape: Shape) {\n\tmake().run();\n\treturn [xs, pair, shape];\n}\n";

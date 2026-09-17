@@ -24,7 +24,7 @@ fn literal_selection_preserves_jsonc_overrides_and_empty_references() {
 }
 
 #[test]
-fn literal_roots_reject_unusable_suffixes_and_unsupported_references() {
+fn literal_roots_reject_unusable_suffixes_and_missing_references() {
     for config in [
         r#"{"files":["data.json"]}"#,
         r#"{"files":["source.js"]}"#,
@@ -732,4 +732,168 @@ export interface Shape { w: number }",
             ]
         );
     });
+}
+
+#[test]
+fn check_js_is_inherited_and_explicit_allow_js_wins() {
+    for (options, expected) in [
+        (r#"{}"#, vec!["index.js"]),
+        (r#"{"checkJs":false}"#, vec![]),
+        (r#"{"allowJs":false}"#, vec![]),
+        (r#"{"checkJs":false,"allowJs":true}"#, vec!["index.js"]),
+    ] {
+        let config = format!(r#"{{"extends":"./base.json","compilerOptions":{options}}}"#);
+
+        assert_eq!(
+            selected_files_of(&[
+                ("tsconfig.json", &config),
+                ("base.json", r#"{"compilerOptions":{"checkJs":true}}"#),
+                ("index.js", "export function selected() {}"),
+            ]),
+            expected
+        );
+    }
+}
+
+#[test]
+fn references_enumerate_roots_and_terminate_cycles() {
+    run_in_project(
+        &[
+            (
+                "tsconfig.json",
+                r#"{"files":[],"references":[{"path":"./child"},{"path":"./child/tsconfig.json"}]}"#,
+            ),
+            (
+                "child/tsconfig.json",
+                r#"{"files":["index.js"],"compilerOptions":{"checkJs":true},"references":[{"path":".."}]}"#,
+            ),
+            ("child/index.js", "export function child() {}"),
+        ],
+        |project, _| {
+            assert_eq!(project.files.len(), 1);
+            assert_eq!(project.files[0].relative, "child/index.js");
+            assert_eq!(project.files[0].owners.len(), 1);
+        },
+    );
+}
+
+#[test]
+fn shared_sources_load_every_owner_dependency_and_require_agreement() {
+    run_in_project(
+        &[
+            (
+                "tsconfig.json",
+                r#"{"files":[],"references":[{"path":"./left"},{"path":"./right"}]}"#,
+            ),
+            (
+                "left/tsconfig.json",
+                r#"{"files":["../shared.ts"],"compilerOptions":{"paths":{"@dep":["../a.ts"]}}}"#,
+            ),
+            (
+                "right/tsconfig.json",
+                r#"{"files":["../shared.ts"],"compilerOptions":{"paths":{"@dep":["../b.ts"]}}}"#,
+            ),
+            (
+                "shared.ts",
+                "import { other } from '@dep'; export function selected(){other()}",
+            ),
+            ("a.ts", "export function other() {}"),
+            ("b.ts", "export function other() {}"),
+        ],
+        |project, _| {
+            let file = file_of(project, &project.root, "shared.ts");
+
+            assert_eq!(project.files.len(), 3);
+            assert_eq!(project.file(file).owners.len(), 2);
+            assert_eq!(project.resolve(file, "@dep"), Resolved::Unresolved);
+        },
+    );
+}
+
+#[test]
+fn triple_paths_load_outside_roots_and_keep_declarations_distinct() {
+    run_in_project(&[
+        ("tsconfig.json", r#"{"files":["index.ts"]}"#),
+        ("index.ts", "/// <reference path='./helper.ts' />\n/// <reference path='./types.d.ts' />\nexport function selected(){helper()}"),
+        ("helper.ts", "/// <reference path='./index.ts' />\nfunction helper() {}"),
+        ("types.d.ts", "declare const value: number;"),
+    ], |project, _| {
+        assert_eq!(project.files.len(), 3);
+        assert!(project.is_project_file(file_of(project, &project.root, "helper.ts")));
+        assert!(!project.is_project_file(file_of(project, &project.root, "types.d.ts")));
+    });
+
+    for reference in ["missing.ts", "data.json", "folder", "script.js", ".hidden"] {
+        let source = format!("/// <reference path='./{reference}' />\nexport const value=1;");
+        let directory = project_of(&[
+            ("tsconfig.json", r#"{"files":["index.ts"]}"#),
+            ("index.ts", &source),
+            ("data.json", "{}"),
+            ("script.js", "export const value=1;"),
+            (".hidden.ts", "export const hidden=1;"),
+            ("folder/child.ts", "export const child=1;"),
+        ]);
+        let allocator = oxc_allocator::Allocator::default();
+
+        assert!(
+            olint::project::Project::load(&allocator, &directory.path().join("tsconfig.json"))
+                .is_err(),
+            "{reference}"
+        );
+    }
+}
+
+#[test]
+fn extensionless_references_use_typescript_extension_priority() {
+    for (allow_js, expected) in [(false, "helper.ts"), (true, "helper.ts")] {
+        let config =
+            format!(r#"{{"files":["index.ts"],"compilerOptions":{{"allowJs":{allow_js}}}}}"#);
+
+        run_in_project(
+            &[
+                ("tsconfig.json", &config),
+                (
+                    "index.ts",
+                    "/// <reference path='./helper' />\nexport const value=1;",
+                ),
+                ("helper.ts", "const ts=1;"),
+                ("helper.tsx", "const tsx=1;"),
+                ("helper.d.ts", "declare const declaration: number;"),
+                ("helper.js", "const js=1;"),
+            ],
+            |project, _| {
+                assert_eq!(project.files.len(), 2);
+                assert_eq!(project.files[0].relative, expected);
+            },
+        );
+    }
+}
+
+#[test]
+fn global_lookup_is_scoped_to_every_applicable_project() {
+    run_in_project(
+        &[
+            (
+                "tsconfig.json",
+                r#"{"files":[],"references":[{"path":"./left"},{"path":"./right"}]}"#,
+            ),
+            ("left/tsconfig.json", r#"{"files":["index.ts"]}"#),
+            ("right/tsconfig.json", r#"{"files":["global.ts"]}"#),
+            ("left/index.ts", "export function selected(){other()}"),
+            ("right/global.ts", "function other() {}"),
+        ],
+        |project, _| {
+            let file = file_of(project, &project.root, "left/index.ts");
+            let call = support::call_of(project, file, "other");
+            let analysis = olint::analysis::Analysis::new(project, support::SYNTACTIC);
+            let oxc_ast::ast::Expression::Identifier(reference) = &call.callee else {
+                panic!("identifier")
+            };
+
+            assert!(analysis
+                .declarations
+                .of_reference(project, file, reference)
+                .is_none());
+        },
+    );
 }

@@ -1087,13 +1087,17 @@
     },
     "args": [],
     "expected_exits": {
-      "lint": 2,
-      "report": 2
+      "lint": 0,
+      "report": 0
     },
-    "expected_contains": {},
+    "expected_contains": {
+      "report": [
+        "selected"
+      ]
+    },
     "expected_absent": {},
-    "expectation": "P1 rejects unsupported solution selection clearly; P2 later implements references.",
-    "kind": "invalid-selection"
+    "expectation": "Referenced child roots are included; explicit empty entrypoints preserve empty lint selection.",
+    "kind": "valid-selection"
   },
   {
     "name": "unknown_ignore",

@@ -153,9 +153,11 @@ enum Target {
     External,
 }
 
+type GlobalBindings = HashMap<(FileId, String), Option<(FileId, SymbolId)>>;
+
 pub struct Declarations<'a> {
     followed: RefCell<HashMap<(FileId, String), Option<Target>>>,
-    globals: RefCell<HashMap<String, Option<(FileId, SymbolId)>>>,
+    globals: RefCell<GlobalBindings>,
     module_records: Vec<&'a ModuleRecord<'a>>,
 }
 
@@ -467,23 +469,40 @@ impl<'a> Declarations<'a> {
 
         let name = reference.name.as_str();
 
-        if let Some(found) = self.globals.borrow().get(name) {
+        let key = (file, name.to_string());
+
+        if let Some(found) = self.globals.borrow().get(&key) {
             return *found;
         }
 
-        let found = project
-            .files
-            .iter()
-            .filter(|source| !is_module_file(source))
-            .find_map(|source| {
-                source
-                    .semantic
-                    .scoping()
-                    .get_root_binding(name.into())
-                    .map(|symbol| (source.id, symbol))
-            });
+        let mut answers = project.file(file).owners.iter().map(|owner| {
+            let mut bindings = project
+                .files
+                .iter()
+                .filter(|source| source.owners.contains(owner) && !is_module_file(source))
+                .filter_map(|source| {
+                    source
+                        .semantic
+                        .scoping()
+                        .get_root_binding(name.into())
+                        .map(|symbol| (source.id, symbol))
+                });
+            let first = bindings.next();
 
-        self.globals.borrow_mut().insert(name.to_string(), found);
+            if bindings.all(|binding| Some(binding) == first) {
+                first
+            } else {
+                None
+            }
+        });
+        let first = answers.next().flatten();
+        let found = if answers.all(|answer| answer == first) {
+            first
+        } else {
+            None
+        };
+
+        self.globals.borrow_mut().insert(key, found);
 
         found
     }

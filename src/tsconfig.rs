@@ -12,6 +12,13 @@ pub struct TsconfigFiles {
     pub root_dir: PathBuf,
     pub files: Vec<PathBuf>,
     pub allow_js: bool,
+    pub projects: Vec<SelectedProject>,
+}
+
+pub struct SelectedProject {
+    pub path: PathBuf,
+    pub files: Vec<PathBuf>,
+    pub allow_js: bool,
 }
 
 const TYPESCRIPT_EXTENSION_GROUPS: &[&[&str]] = &[
@@ -28,20 +35,82 @@ const PACKAGE_FOLDERS: &[&str] = &["node_modules", "bower_components", "jspm_pac
 const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 
 pub fn select_files(tsconfig: &Path) -> Result<TsconfigFiles, ProjectError> {
+    let mut pending = vec![tsconfig.to_path_buf()];
+    let mut seen = HashSet::new();
+    let mut projects = Vec::new();
+    let mut files = IndexMap::new();
+
+    while let Some(path) = pending.pop() {
+        let path = canonical_path_of(&path).map_err(|source| ProjectError::Read {
+            path: path.clone(),
+            source,
+        })?;
+
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+
+        if projects.len() >= 1024 {
+            return Err(ProjectError::Tsconfig {
+                path,
+                message: "project reference graph exceeds 1024 configurations".into(),
+            });
+        }
+
+        let (selection, references) = select_project(&path)?;
+
+        for reference in references.into_iter().rev() {
+            pending.push(reference);
+        }
+
+        for file in &selection.files {
+            files.entry(key_of(file)).or_insert_with(|| file.clone());
+        }
+
+        projects.push(selection);
+    }
+
+    let root = &projects[0];
+
+    Ok(TsconfigFiles {
+        root_dir: root.path.parent().unwrap_or(Path::new("")).to_path_buf(),
+        allow_js: root.allow_js,
+        files: files.into_values().collect(),
+        projects,
+    })
+}
+
+fn select_project(tsconfig: &Path) -> Result<(SelectedProject, Vec<PathBuf>), ProjectError> {
     let tsconfig_path = canonical_path_of(tsconfig).map_err(|source| ProjectError::Read {
         path: tsconfig.to_path_buf(),
         source,
     })?;
     let mut visited = HashSet::new();
     let merged = load_tsconfig(&tsconfig_path, true, &mut visited)?;
-    let allow_js = merged.compiler_options.allow_js.unwrap_or(false);
+    let allow_js = merged
+        .compiler_options
+        .allow_js
+        .or(merged.compiler_options.check_js)
+        .unwrap_or(false);
+    let references = merged
+        .references
+        .iter()
+        .map(|reference| {
+            let path = tsconfig_path
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join(&reference.path);
 
-    if !merged.references.is_empty() {
-        return Err(ProjectError::Tsconfig {
-            path: tsconfig_path.clone(),
-            message: "project references are not supported by this selection mode".to_string(),
-        });
-    }
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                path
+            } else {
+                path.join("tsconfig.json")
+            }
+        })
+        .collect();
 
     for file in merged.files.iter().flatten() {
         let metadata = std::fs::metadata(file).map_err(|error| ProjectError::Tsconfig {
@@ -128,14 +197,17 @@ pub fn select_files(tsconfig: &Path) -> Result<TsconfigFiles, ProjectError> {
         }
     }
 
-    Ok(TsconfigFiles {
-        root_dir,
-        files: literal
-            .into_values()
-            .chain(wildcard.into_values())
-            .collect(),
-        allow_js,
-    })
+    Ok((
+        SelectedProject {
+            path: tsconfig_path,
+            files: literal
+                .into_values()
+                .chain(wildcard.into_values())
+                .collect(),
+            allow_js,
+        },
+        references,
+    ))
 }
 
 pub fn merge_extends(child: TsConfig, parent: &TsConfig) -> TsConfig {
@@ -158,6 +230,10 @@ pub fn merge_extends(child: TsConfig, parent: &TsConfig) -> TsConfig {
 
     if options.allow_js.is_none() {
         options.allow_js = parent_options.allow_js;
+    }
+
+    if options.check_js.is_none() {
+        options.check_js = parent_options.check_js;
     }
 
     if options.out_dir.is_none() {

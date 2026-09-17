@@ -21,18 +21,36 @@ if (!tsPath) {
 }
 const ts = (await import("file://" + tsPath)).default;
 
-const parsed = ts.getParsedCommandLineOfConfigFile(
-	tsconfig,
-	{},
-	{
-		...ts.sys,
-		onUnRecoverableConfigFileDiagnostic: (d) => {
-			throw new Error(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+const programs = [];
+const pending = [tsconfig];
+const visited = new Set();
+while (pending.length) {
+	const config = fs.realpathSync(pending.pop());
+	const key = ts.sys.useCaseSensitiveFileNames ? config : config.toLowerCase();
+	if (visited.has(key)) continue;
+	if (visited.size >= 1024) throw new Error("project reference graph exceeds 1024 configurations");
+	visited.add(key);
+	const parsed = ts.getParsedCommandLineOfConfigFile(
+		config,
+		{},
+		{
+			...ts.sys,
+			onUnRecoverableConfigFileDiagnostic: (d) => {
+				throw new Error(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+			},
 		},
-	},
-);
-const program = ts.createProgram(parsed.fileNames, parsed.options);
-const checker = program.getTypeChecker();
+	);
+	programs.push(
+		ts.createProgram({
+			rootNames: parsed.fileNames,
+			options: parsed.options,
+			projectReferences: parsed.projectReferences,
+		}),
+	);
+	for (const reference of [...(parsed.projectReferences ?? [])].reverse()) {
+		pending.push(ts.resolveProjectReferencePath(reference));
+	}
+}
 
 const TYPED_ARRAYS = new Set([
 	"Int8Array",
@@ -48,9 +66,10 @@ const TYPED_ARRAYS = new Set([
 	"BigUint64Array",
 ]);
 const rank = { array: 6, set: 5, map: 5, unknown: 4, string: 3, regexp: 2, other: 1 };
-const kindOfType = (t) => {
+const kindOfType = (checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return "unknown";
-	if (t.isUnion()) return t.types.map(kindOfType).reduce((a, b) => (rank[b] > rank[a] ? b : a), "other");
+	if (t.isUnion())
+		return t.types.map((type) => kindOfType(checker, type)).reduce((a, b) => (rank[b] > rank[a] ? b : a), "other");
 	if (t.flags & ts.TypeFlags.StringLike) return "string";
 	if (checker.isArrayType?.(t) || checker.isTupleType?.(t)) return "array";
 	const name = t.getSymbol()?.getName() ?? "";
@@ -61,20 +80,20 @@ const kindOfType = (t) => {
 	if (name === "RegExp") return "regexp";
 	if (t.isTypeParameter()) {
 		const base = t.getConstraint();
-		return base ? kindOfType(base) : "other";
+		return base ? kindOfType(checker, base) : "other";
 	}
 	return "other";
 };
-const isTuple = (t) => !!checker.isTupleType?.(t);
-const isClosedObject = (t) => {
+const isTuple = (checker, t) => !!checker.isTupleType?.(t);
+const isClosedObject = (checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) return false;
-	if (t.isUnion() || t.isIntersection()) return t.types.every(isClosedObject);
+	if (t.isUnion() || t.isIntersection()) return t.types.every((type) => isClosedObject(checker, type));
 	if (t.isTypeParameter()) {
 		const base = t.getConstraint();
-		return base ? isClosedObject(base) : false;
+		return base ? isClosedObject(checker, base) : false;
 	}
 	if (!(t.flags & ts.TypeFlags.Object)) return false;
-	if (kindOfType(t) !== "other") return false;
+	if (kindOfType(checker, t) !== "other") return false;
 	if (checker.getIndexInfosOfType(t).length > 0) return false;
 	if (t.getSymbol()?.getName() === "Object") return false;
 	return t.getProperties().length > 0;
@@ -141,26 +160,25 @@ const offsetsOf = (sf) => {
 	return entry;
 };
 
-const symbolOf = (node) => {
+const symbolOf = (checker, node) => {
 	let symbol = checker.getSymbolAtLocation(node);
 	if (!symbol) return undefined;
 	if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
 	return symbol;
 };
 
-const files = new Map();
-const answers = input.queries.map((q) => {
+const answerOf = (program, q) => {
+	const checker = program.getTypeChecker();
 	const file = path.resolve(q.file);
-	const sf = files.get(file) ?? program.getSourceFile(file);
+	const sf = program.getSourceFile(file);
 	if (!sf) return null;
-	files.set(file, sf);
 	const offset = offsetsOf(sf);
 	const n = findNode(sf, offset.toUtf16(q.pos), offset.toUtf16(q.end));
 	if (!n) return null;
 	if (q.query === "callee") {
 		const node = unwrapNode(n);
 		if (!node || !ts.isPropertyAccessExpression(node)) return null;
-		const declaration = symbolOf(node.name)?.declarations?.[0];
+		const declaration = symbolOf(checker, node.name)?.declarations?.[0];
 		if (!declaration) return null;
 		const declarationFile = declaration.getSourceFile();
 		const declarationOffset = offsetsOf(declarationFile);
@@ -174,9 +192,17 @@ const answers = input.queries.map((q) => {
 	const t = checker.getTypeAtLocation(unwrapNode(n) ?? n);
 	return {
 		query: "type",
-		kind: kindOfType(t),
-		tuple: isTuple(t) || (t.isUnion() && t.types.length > 0 && t.types.every(isTuple)),
-		closed: isClosedObject(t),
+		kind: kindOfType(checker, t),
+		tuple:
+			isTuple(checker, t) || (t.isUnion() && t.types.length > 0 && t.types.every((type) => isTuple(checker, type))),
+		closed: isClosedObject(checker, t),
 	};
+};
+const answers = input.queries.map((query) => {
+	const applicable = programs.filter((program) => program.getSourceFile(path.resolve(query.file)));
+	if (!applicable.length) return null;
+	const answers = applicable.map((program) => answerOf(program, query));
+	const first = JSON.stringify(answers[0]);
+	return answers.every((answer) => JSON.stringify(answer) === first) ? answers[0] : null;
 });
 process.stdout.write(JSON.stringify({ typescript: ts.version, from: tsPath, answers }));

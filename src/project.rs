@@ -32,6 +32,7 @@ pub struct SourceFile<'a> {
     pub module_record: &'a ModuleRecord<'a>,
     pub line_starts: Vec<u32>,
     pub external_library: bool,
+    pub owners: Vec<usize>,
     pub diagnostics: Vec<SourceDiagnostic>,
     flow_index: FlowIndex,
 }
@@ -114,7 +115,8 @@ pub struct Project<'a> {
     pub tsconfig_path: PathBuf,
     pub files: Vec<SourceFile<'a>>,
     by_path: HashMap<PathBuf, FileId>,
-    resolver: Resolver,
+    resolvers: Vec<Resolver>,
+    config_paths: Vec<PathBuf>,
     configless_resolver: Resolver,
 }
 
@@ -159,6 +161,7 @@ enum Frame<'a> {
 }
 
 struct Walk<'a> {
+    owner: usize,
     imports: HashMap<PathBuf, Vec<Import>>,
     externally_walked: HashSet<PathBuf>,
     stack: Vec<Frame<'a>>,
@@ -184,59 +187,73 @@ impl<'a> Project<'a> {
             tsconfig: None,
             ..resolve_options_of(&tsconfig_path)
         });
-        let resolver = Resolver::new(resolve_options_of(&tsconfig_path));
+        let resolvers = selection
+            .projects
+            .iter()
+            .map(|selected| Resolver::new(resolve_options_of(&selected.path)))
+            .collect();
+        let config_paths = selection
+            .projects
+            .iter()
+            .map(|selected| selected.path.clone())
+            .collect();
         let mut project = Project {
             root: selection.root_dir,
             tsconfig_path,
             files: Vec::new(),
             by_path: HashMap::new(),
-            resolver,
+            resolvers,
+            config_paths,
             configless_resolver,
         };
-        let allow_js = selection.allow_js;
-        let mut walk = Walk {
-            imports: HashMap::new(),
-            externally_walked: HashSet::new(),
-            stack: Vec::new(),
-        };
 
-        for root in selection.files {
-            if is_parsed_path(&root, allow_js) {
-                project.visit(allocator, root, false, allow_js, &mut walk)?;
-            }
+        for (owner, selected) in selection.projects.into_iter().enumerate() {
+            let allow_js = selected.allow_js;
+            let mut walk = Walk {
+                owner,
+                imports: HashMap::new(),
+                externally_walked: HashSet::new(),
+                stack: Vec::new(),
+            };
 
-            while let Some(top) = walk.stack.last_mut() {
-                let (path, next) = match top {
-                    Frame::Open { file, next } => (file.path.clone(), next),
-                    Frame::Rewalk { path, next } => (path.clone(), next),
-                };
-                let external = walk.externally_walked.contains(&path);
-                let import = walk
-                    .imports
-                    .get(&path)
-                    .and_then(|found| found.get(*next))
-                    .map(|import| (import.target.clone(), external || import.external));
+            for root in selected.files {
+                if is_parsed_path(&root, allow_js) {
+                    project.visit(allocator, root, false, allow_js, &mut walk)?;
+                }
 
-                match import {
-                    Some((target, external)) => {
-                        *next += 1;
+                while let Some(top) = walk.stack.last_mut() {
+                    let (path, next) = match top {
+                        Frame::Open { file, next } => (file.path.clone(), next),
+                        Frame::Rewalk { path, next } => (path.clone(), next),
+                    };
+                    let external = walk.externally_walked.contains(&path);
+                    let import = walk
+                        .imports
+                        .get(&path)
+                        .and_then(|found| found.get(*next))
+                        .map(|import| (import.target.clone(), external || import.external));
 
-                        project.visit(allocator, target, external, allow_js, &mut walk)?;
-                    }
-                    None => {
-                        if let Some(Frame::Open { mut file, .. }) = walk.stack.pop() {
-                            file.id = FileId(project.files.len() as u32);
+                    match import {
+                        Some((target, external)) => {
+                            *next += 1;
 
-                            if let Ok(canonical) = canonical_path_of(&file.path) {
-                                if canonical == file.path {
-                                    project.by_path.insert(canonical, file.id);
-                                } else {
-                                    project.by_path.entry(canonical).or_insert(file.id);
+                            project.visit(allocator, target, external, allow_js, &mut walk)?;
+                        }
+                        None => {
+                            if let Some(Frame::Open { mut file, .. }) = walk.stack.pop() {
+                                file.id = FileId(project.files.len() as u32);
+
+                                if let Ok(canonical) = canonical_path_of(&file.path) {
+                                    if canonical == file.path {
+                                        project.by_path.insert(canonical, file.id);
+                                    } else {
+                                        project.by_path.entry(canonical).or_insert(file.id);
+                                    }
                                 }
-                            }
 
-                            project.by_path.insert(file.path.clone(), file.id);
-                            project.files.push(*file);
+                                project.by_path.insert(file.path.clone(), file.id);
+                                project.files.push(*file);
+                            }
                         }
                     }
                 }
@@ -265,6 +282,26 @@ impl<'a> Project<'a> {
                 .stack
                 .iter()
                 .any(|frame| matches!(frame, Frame::Open { file, .. } if file.path == path));
+
+        if let Some(id) = stored {
+            if !self.files[id.0 as usize].owners.contains(&walk.owner) {
+                let imports = self.imports_of(&self.files[id.0 as usize], allow_js, walk.owner)?;
+                let file = &mut self.files[id.0 as usize];
+
+                file.owners.push(walk.owner);
+
+                file.external_library &= external || declaration;
+
+                if external {
+                    walk.externally_walked.insert(path.clone());
+                }
+
+                walk.imports.insert(path.clone(), imports);
+                walk.stack.push(Frame::Rewalk { path, next: 0 });
+
+                return Ok(());
+            }
+        }
 
         if stored.is_some() || open {
             if !external && walk.externally_walked.remove(&path) {
@@ -297,12 +334,16 @@ impl<'a> Project<'a> {
 
         file.external_library = external || declaration;
 
+        file.owners.push(walk.owner);
+
         if external {
             walk.externally_walked.insert(file.path.clone());
         }
 
-        walk.imports
-            .insert(file.path.clone(), self.imports_of(&file, allow_js));
+        walk.imports.insert(
+            file.path.clone(),
+            self.imports_of(&file, allow_js, walk.owner)?,
+        );
         walk.stack.push(Frame::Open {
             file: Box::new(file),
             next: 0,
@@ -311,14 +352,20 @@ impl<'a> Project<'a> {
         Ok(())
     }
 
-    fn imports_of(&self, file: &SourceFile<'a>, allow_js: bool) -> Vec<Import> {
+    fn imports_of(
+        &self,
+        file: &SourceFile<'a>,
+        allow_js: bool,
+        owner: usize,
+    ) -> Result<Vec<Import>, ProjectError> {
         let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
-        let tsconfig = self.resolver.resolve_tsconfig(&self.tsconfig_path).ok();
+        let resolver = &self.resolvers[owner];
+        let tsconfig = resolver.resolve_tsconfig(&self.config_paths[owner]).ok();
 
-        import_specifiers_of(file)
+        let mut imports: Vec<Import> = import_specifiers_of(file)
             .into_iter()
             .filter_map(|specifier| {
-                let resolution = self.resolver.resolve(&directory, &specifier).ok()?;
+                let resolution = resolver.resolve(&directory, &specifier).ok()?;
                 let target = strip_verbatim_prefix(resolution.path());
                 let target = canonical_path_of(&target).unwrap_or(target);
                 let mapped = tsconfig.as_ref().is_some_and(|tsconfig| {
@@ -344,7 +391,30 @@ impl<'a> Project<'a> {
                     && !(package_lookup && is_javascript_path(&target)))
                 .then_some(Import { target, external })
             })
-            .collect()
+            .collect();
+
+        for reference in reference_paths_of(file.text) {
+            let path = reference_target_of(&directory, reference, allow_js);
+            let target =
+                canonical_path_of(&path).map_err(|source| ProjectError::Read { path, source })?;
+
+            if !target.is_file() || !is_parsed_path(&target, allow_js) {
+                return Err(ProjectError::Parse {
+                    path: file.path.clone(),
+                    message: format!(
+                        "referenced path {} must be a supported source file",
+                        target.display()
+                    ),
+                });
+            }
+
+            imports.push(Import {
+                target,
+                external: false,
+            });
+        }
+
+        Ok(imports)
     }
 
     pub fn file(&self, id: FileId) -> &SourceFile<'a> {
@@ -364,21 +434,30 @@ impl<'a> Project<'a> {
     pub fn resolve(&self, from: FileId, specifier: &str) -> Resolved {
         let directory = self.file(from).path.parent().unwrap_or(Path::new(""));
 
-        let resolution = self
-            .resolver
-            .resolve(directory, specifier)
-            .or_else(|_| self.resolver.resolve_dts(&self.file(from).path, specifier));
+        let mut answers = self.file(from).owners.iter().map(|owner| {
+            let resolver = &self.resolvers[*owner];
 
-        match resolution {
-            Ok(resolution) => {
-                let target = strip_verbatim_prefix(resolution.path());
+            match resolver
+                .resolve(directory, specifier)
+                .or_else(|_| resolver.resolve_dts(&self.file(from).path, specifier))
+            {
+                Ok(resolution) => {
+                    let target = strip_verbatim_prefix(resolution.path());
 
-                match self.file_by_path(&target) {
-                    Some(id) => Resolved::File(id),
-                    None => Resolved::External(target),
+                    match self.file_by_path(&target) {
+                        Some(id) => Resolved::File(id),
+                        None => Resolved::External(target),
+                    }
                 }
+                Err(_) => Resolved::Unresolved,
             }
-            Err(_) => Resolved::Unresolved,
+        });
+        let first = answers.next().unwrap_or(Resolved::Unresolved);
+
+        if answers.all(|answer| answer == first) {
+            first
+        } else {
+            Resolved::Unresolved
         }
     }
 
@@ -454,6 +533,129 @@ fn is_same_written_path(stored: &Path, path: &Path) -> bool {
     } else {
         stored == path
     }
+}
+
+fn reference_target_of(directory: &Path, reference: &str, allow_js: bool) -> PathBuf {
+    let path = directory.join(reference);
+
+    if path
+        .file_name()
+        .is_some_and(|name| !name.to_string_lossy().contains('.'))
+    {
+        for extension in [".ts", ".tsx", ".d.ts", ".js", ".jsx"] {
+            if !allow_js && matches!(extension, ".js" | ".jsx") {
+                continue;
+            }
+
+            let mut candidate = path.as_os_str().to_os_string();
+
+            candidate.push(extension);
+
+            let candidate = PathBuf::from(candidate);
+
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    path
+}
+
+pub fn reference_paths_of(text: &str) -> Vec<&str> {
+    let mut text = text.trim_start_matches('\u{feff}');
+    let mut paths = Vec::new();
+
+    if text.starts_with("#!") {
+        text = text.find(['\r', '\n']).map_or("", |end| &text[end..]);
+    }
+
+    loop {
+        text = text.trim_start_matches(|character: char| {
+            character.is_whitespace() || character == '\u{feff}'
+        });
+
+        if text.starts_with("//") {
+            let end = text
+                .find(['\r', '\n', '\u{2028}', '\u{2029}'])
+                .unwrap_or(text.len());
+            let comment = &text[..end];
+
+            if let Some(directive) = comment
+                .strip_prefix("///")
+                .map(|value| value.trim_start_matches(reference_whitespace))
+                .and_then(|value| value.strip_prefix('<'))
+            {
+                let name_end = directive
+                    .find(reference_whitespace)
+                    .unwrap_or(directive.len());
+
+                if directive[..name_end].eq_ignore_ascii_case("reference")
+                    && directive[name_end..].contains("/>")
+                    && reference_attribute(comment, "types").is_none()
+                    && reference_attribute(comment, "lib").is_none()
+                    && reference_attribute(comment, "no-default-lib") != Some("true")
+                {
+                    if let Some(path) = reference_attribute(comment, "path") {
+                        paths.push(path);
+                    }
+                }
+            }
+
+            text = &text[end..];
+        } else if let Some(comment) = text.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                break;
+            };
+            text = &comment[end + 2..];
+        } else {
+            break;
+        }
+    }
+
+    paths
+}
+
+fn reference_attribute<'s>(text: &'s str, name: &str) -> Option<&'s str> {
+    for (offset, character) in text.char_indices() {
+        if !reference_whitespace(character) {
+            continue;
+        }
+
+        let rest = &text[offset + character.len_utf8()..];
+        let Some(prefix) = rest.get(..name.len()) else {
+            continue;
+        };
+
+        if !prefix.eq_ignore_ascii_case(name) {
+            continue;
+        }
+
+        let Some(value) = rest[name.len()..]
+            .trim_start_matches(reference_whitespace)
+            .strip_prefix('=')
+            .map(|value| value.trim_start_matches(reference_whitespace))
+        else {
+            continue;
+        };
+        let quote = value.chars().next()?;
+
+        if quote != '\'' && quote != '"' {
+            continue;
+        }
+
+        let value = &value[1..];
+
+        if let Some(end) = value.find(quote) {
+            return Some(&value[..end]);
+        }
+    }
+
+    None
+}
+
+fn reference_whitespace(character: char) -> bool {
+    matches!(character, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}')
 }
 
 pub(crate) fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
@@ -678,6 +880,7 @@ fn parse_file<'a>(
         module_record,
         line_starts: line_starts_of(text),
         external_library: false,
+        owners: Vec::new(),
         diagnostics,
         flow_index,
     })
