@@ -25,67 +25,7 @@ use crate::tables::{
 use crate::unknowns::{SourceSpan, UnknownReason};
 
 fn is_type_kind(ty: AstType) -> bool {
-    matches!(
-        ty,
-        AstType::TSThisParameter
-            | AstType::TSTypeAnnotation
-            | AstType::TSLiteralType
-            | AstType::TSConditionalType
-            | AstType::TSUnionType
-            | AstType::TSIntersectionType
-            | AstType::TSParenthesizedType
-            | AstType::TSTypeOperator
-            | AstType::TSArrayType
-            | AstType::TSIndexedAccessType
-            | AstType::TSTupleType
-            | AstType::TSNamedTupleMember
-            | AstType::TSOptionalType
-            | AstType::TSRestType
-            | AstType::TSAnyKeyword
-            | AstType::TSStringKeyword
-            | AstType::TSBooleanKeyword
-            | AstType::TSNumberKeyword
-            | AstType::TSNeverKeyword
-            | AstType::TSIntrinsicKeyword
-            | AstType::TSUnknownKeyword
-            | AstType::TSNullKeyword
-            | AstType::TSUndefinedKeyword
-            | AstType::TSVoidKeyword
-            | AstType::TSSymbolKeyword
-            | AstType::TSThisType
-            | AstType::TSObjectKeyword
-            | AstType::TSBigIntKeyword
-            | AstType::TSTypeReference
-            | AstType::TSQualifiedName
-            | AstType::TSTypeParameterInstantiation
-            | AstType::TSTypeParameter
-            | AstType::TSTypeParameterDeclaration
-            | AstType::TSTypeAliasDeclaration
-            | AstType::TSClassImplements
-            | AstType::TSInterfaceDeclaration
-            | AstType::TSInterfaceBody
-            | AstType::TSPropertySignature
-            | AstType::TSIndexSignature
-            | AstType::TSCallSignatureDeclaration
-            | AstType::TSMethodSignature
-            | AstType::TSConstructSignatureDeclaration
-            | AstType::TSIndexSignatureName
-            | AstType::TSInterfaceHeritage
-            | AstType::TSTypePredicate
-            | AstType::TSTypeLiteral
-            | AstType::TSInferType
-            | AstType::TSTypeQuery
-            | AstType::TSImportType
-            | AstType::TSImportTypeQualifiedName
-            | AstType::TSFunctionType
-            | AstType::TSConstructorType
-            | AstType::TSMappedType
-            | AstType::TSTemplateLiteralType
-            | AstType::JSDocNullableType
-            | AstType::JSDocNonNullableType
-            | AstType::JSDocUnknownType
-            | AstType::TSInstantiationExpression
-    )
+    crate::syntax::is_type_kind(ty) || ty == AstType::TSInstantiationExpression
 }
 
 fn is_opaque_kind(kind: &AstKind<'_>) -> bool {

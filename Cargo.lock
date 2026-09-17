@@ -574,6 +574,7 @@ dependencies = [
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",
+ "oxc_cfg",
  "oxc_parser",
  "oxc_resolver",
  "oxc_semantic",
@@ -649,6 +650,20 @@ dependencies = [
  "oxc_ast",
  "oxc_span",
  "oxc_syntax",
+]
+
+[[package]]
+name = "oxc_cfg"
+version = "0.149.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f725d57e3040d3f3b0f5656d816f20b91e3b1c6945a873377e6e9fa92c5414a"
+dependencies = [
+ "bitflags",
+ "itertools",
+ "oxc_index",
+ "oxc_syntax",
+ "petgraph",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -786,6 +801,7 @@ dependencies = [
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",
+ "oxc_cfg",
  "oxc_data_structures",
  "oxc_diagnostics",
  "oxc_ecmascript",

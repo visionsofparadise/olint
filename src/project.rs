@@ -7,9 +7,12 @@ use oxc_parser::Parser;
 use oxc_resolver::{
     ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
 };
-use oxc_semantic::{Semantic, SemanticBuilder};
-use oxc_span::{SourceType, Span};
+use oxc_semantic::{NodeId, Semantic, SemanticBuilder};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::module_record::ModuleRecord;
+
+use crate::flow::{FlowContext, FlowError, FlowIndex, FlowSummary};
+use crate::unknowns::UnknownReason;
 
 use crate::paths::{
     canonical_path_of, forward_slashes_of, relative_path_of, strip_verbatim_prefix,
@@ -29,6 +32,81 @@ pub struct SourceFile<'a> {
     pub module_record: &'a ModuleRecord<'a>,
     pub line_starts: Vec<u32>,
     pub external_library: bool,
+    pub diagnostics: Vec<SourceDiagnostic>,
+    flow_index: FlowIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticPhase {
+    Parse,
+    Semantic,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceDiagnostic {
+    pub phase: DiagnosticPhase,
+    pub message: String,
+    pub spans: Vec<Span>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowFailure {
+    pub file: FileId,
+    pub span: Span,
+    pub error: FlowError,
+}
+
+impl FlowFailure {
+    pub fn unknown_reason(&self) -> UnknownReason {
+        match self.error {
+            FlowError::ResourceLimit => UnknownReason::ResourceExhaustion,
+            _ => UnknownReason::UnsupportedSyntax,
+        }
+    }
+}
+
+impl<'a> SourceFile<'a> {
+    pub fn flow_context(&self) -> Result<FlowContext<'_, 'a>, FlowFailure> {
+        if !self.diagnostics.is_empty() {
+            return Err(self.flow_failure(FlowError::InvalidSource, self.program.span));
+        }
+
+        Ok(FlowContext::from_index(&self.semantic, &self.flow_index))
+    }
+
+    pub fn flow(&self, function: NodeId) -> Result<FlowSummary, FlowFailure> {
+        self.flow_with_limit(function, 20_000)
+    }
+
+    pub fn flow_with_limit(
+        &self,
+        function: NodeId,
+        limit: usize,
+    ) -> Result<FlowSummary, FlowFailure> {
+        self.flow_context()?
+            .build_with_limit(self.id, function, limit)
+            .map_err(|error| {
+                let node = match error {
+                    FlowError::InvalidTarget(node) | FlowError::Unsupported(node) => node,
+                    _ => function,
+                };
+                let span = if node.index() < self.semantic.nodes().len() {
+                    self.semantic.nodes().kind(node).span()
+                } else {
+                    self.program.span
+                };
+
+                self.flow_failure(error, span)
+            })
+    }
+
+    fn flow_failure(&self, error: FlowError, span: Span) -> FlowFailure {
+        FlowFailure {
+            file: self.id,
+            span,
+            error,
+        }
+    }
 }
 
 pub struct Project<'a> {
@@ -560,10 +638,34 @@ fn parse_file<'a>(
 
     let program: &'a Program<'a> = allocator.alloc(parsed.program);
     let module_record: &'a ModuleRecord<'a> = allocator.alloc(parsed.module_record);
-    let semantic = SemanticBuilder::new()
+    let built = SemanticBuilder::new()
         .with_build_nodes(true)
-        .build(program)
-        .semantic;
+        .with_cfg(true)
+        .with_class_table(true)
+        .with_check_syntax_error(true)
+        .build(program);
+    let diagnostics = parsed
+        .diagnostics
+        .iter()
+        .map(|diagnostic| (DiagnosticPhase::Parse, diagnostic))
+        .chain(
+            built
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (DiagnosticPhase::Semantic, diagnostic)),
+        )
+        .map(|(phase, diagnostic)| SourceDiagnostic {
+            phase,
+            message: diagnostic.to_string(),
+            spans: diagnostic
+                .labels
+                .iter()
+                .map(|label| Span::new(label.offset(), label.offset() + label.len()))
+                .collect(),
+        })
+        .collect();
+    let semantic = built.semantic;
+    let flow_index = FlowIndex::new(&semantic);
 
     Ok(SourceFile {
         id: FileId(u32::MAX),
@@ -575,6 +677,8 @@ fn parse_file<'a>(
         module_record,
         line_starts: line_starts_of(text),
         external_library: false,
+        diagnostics,
+        flow_index,
     })
 }
 
