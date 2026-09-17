@@ -1,0 +1,297 @@
+[
+  {
+    "name": "alias_shared_limits",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          {
+            "path": "barrel.ts",
+            "max": "O(N^4)"
+          },
+          {
+            "path": "index.ts",
+            "max": "O(1)"
+          }
+        ],
+        "unknown": "ignore"
+      },
+      "index.ts": "function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}} const alias=selected; export {alias};",
+      "barrel.ts": "export {alias} from './index';"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "selected"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "nested_object_member",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "export const api={nested:{selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}}};"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "selected"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "namespace_reexport_cycle",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "export * as api from './bridge';",
+      "bridge.ts": "export * as cycle from './index'; export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "selected"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "export_assignment",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}} const api={selected}; export = api;"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "selected"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "class_expression_inherited",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "class Base {selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}} export const API=class extends Base {};"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "selected"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "private_inherited_exclusion",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "class Base {private hidden(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}} protected guarded(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}}} export class API extends Base { public ordinary(){void 0;} }"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [],
+      "report": []
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "getter_invocation",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "declare const xs:number[]; export const api={get selected(){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}return 0;}};"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "selected"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "unresolved_export",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "declare const callable:()=>void; export {callable};"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "partial"
+      ],
+      "report": [
+        "partial"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "mixed_known_and_unresolved",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "max": "O(1)",
+        "unknown": "ignore"
+      },
+      "index.ts": "export function selected(xs:number[]){for(const a of xs){for(const b of xs){for(const c of xs){void c;}}}} declare const callable:()=>void; export {callable};"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "partial",
+        "selected"
+      ],
+      "report": [
+        "partial",
+        "selected"
+      ]
+    },
+    "expected_absent": {}
+  },
+  {
+    "name": "ignored_unresolved_surface",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "ignore": [
+          "index.ts"
+        ],
+        "unknown": "error",
+        "max": "O(1)"
+      },
+      "index.ts": "declare const callable:()=>void; export {callable};"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [],
+      "report": []
+    },
+    "expected_absent": {}
+  }
+]

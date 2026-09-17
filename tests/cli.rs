@@ -2,6 +2,69 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+fn public_value_surfaces_retain_known_functions_and_partial_coverage() {
+    assert_selection_cases(
+        &serde_json::from_str(include_str!("fixtures/public-surfaces.json")).unwrap(),
+    );
+}
+
+#[test]
+fn public_coverage_policy_survives_filtering_without_a_numeric_surcharge() {
+    for policy in ["ignore", "warn", "error"] {
+        for mixed in ["none", "constant", "cubic"] {
+            let directory = tempfile::tempdir().unwrap();
+
+            std::fs::write(directory.path().join("tsconfig.json"), "{}").unwrap();
+            std::fs::write(
+                directory.path().join("olint.config.json"),
+                serde_json::json!({"entrypoints":["index.ts"],"unknown":policy,"max":"O(1)"})
+                    .to_string(),
+            )
+            .unwrap();
+
+            let known = match mixed {
+                "constant" => "export function known() { void 0; }",
+                "cubic" => "export function known(xs:number[]) {for(const a of xs)for(const b of xs)for(const c of xs)void c;}",
+                _ => "",
+            };
+
+            std::fs::write(
+                directory.path().join("index.ts"),
+                format!("declare const unavailable:()=>void; export {{unavailable}}; {known}"),
+            )
+            .unwrap();
+
+            for report in [false, true] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_olint"));
+
+                command.args(["--types", "syntactic", "--min", "100"]);
+
+                if report {
+                    command.arg("--report");
+                }
+
+                let (exit, stdout, stderr) = captured(command.current_dir(directory.path()));
+
+                assert_eq!(
+                    exit,
+                    Some(i32::from(
+                        !report && (policy == "error" || mixed == "cubic")
+                    )),
+                    "{policy} {mixed} {report}: {stdout} {stderr}"
+                );
+                assert!(stdout.contains("public coverage [partial]"), "{stdout}");
+                assert_eq!(
+                    stderr.contains("olint: warning:") || stderr.contains("olint: error:"),
+                    policy != "ignore",
+                    "{stderr}"
+                );
+                assert!(!stdout.contains("exceeds"), "{stdout}");
+            }
+        }
+    }
+}
+
+#[test]
 fn explicit_source_paths_override_heuristics_in_both_modes() {
     assert_selection_cases(
         &serde_json::from_str(include_str!("fixtures/source-paths.json")).unwrap(),
@@ -50,14 +113,12 @@ fn assert_selection_cases(cases: &serde_json::Value) {
                 command.args(["--report", "--min", "0"]);
             }
 
-            let output = command.current_dir(directory.path()).output().unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let (exit, stdout, stderr) = captured(command.current_dir(directory.path()));
             let combined = format!("{stdout}\n{stderr}");
             let name = case["name"].as_str().unwrap();
 
             assert_eq!(
-                output.status.code(),
+                exit,
                 Some(case["expected_exits"][mode].as_i64().unwrap() as i32),
                 "{name} {mode}: {combined}"
             );
@@ -253,4 +314,14 @@ fn minimum_filter_preserves_logarithmic_exception_and_unknown_policy() {
             }
         }
     }
+}
+
+fn captured(command: &mut Command) -> (Option<i32>, String, String) {
+    let output = command.output().unwrap();
+
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }

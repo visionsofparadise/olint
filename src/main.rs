@@ -183,7 +183,13 @@ fn run_with_ask(
 
     check_analysis_errors(&analysis)?;
 
-    let mut selected_unknowns = Vec::new();
+    let mut selected_unknowns: Vec<_> = public.unknowns.into_iter().collect();
+
+    if public.unknowns.is_some() {
+        println!("public coverage [partial]");
+    }
+
+    let public = public.functions;
     let mut selected_comparisons = Vec::new();
     let code = if cli.report {
         let rows = report_rows_of(&mut analysis, &functions);

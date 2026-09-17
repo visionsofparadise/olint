@@ -181,6 +181,10 @@ pub(crate) struct FlowIndex {
 }
 
 impl FlowIndex {
+    pub(crate) fn children_of(&self, node: NodeId) -> &[NodeId] {
+        &self.children[node.index()]
+    }
+
     pub(crate) fn new(semantic: &Semantic<'_>) -> Self {
         let mut children = vec![Vec::new(); semantic.nodes().len()];
 

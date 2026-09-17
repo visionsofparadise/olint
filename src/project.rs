@@ -67,6 +67,10 @@ impl FlowFailure {
 }
 
 impl<'a> SourceFile<'a> {
+    pub(crate) fn children_of(&self, node: NodeId) -> &[NodeId] {
+        self.flow_index.children_of(node)
+    }
+
     pub fn flow_context(&self) -> Result<FlowContext<'_, 'a>, FlowFailure> {
         if !self.diagnostics.is_empty() {
             return Err(self.flow_failure(FlowError::InvalidSource, self.program.span));

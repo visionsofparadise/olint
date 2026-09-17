@@ -1,4 +1,5 @@
-# tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 128 public functions
+public coverage [partial]
+# tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 132 public functions
 
 O((xs * xs^2)) > O(N^2)  coldFunctionTagged  src/branches.ts:53  via src/index.ts
     in loop for-of                                           src/branches.ts:55  x N
@@ -11,4 +12,4 @@ O((matrix * matrix^2)) > O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src
             in loop for-of                                   src/types.ts:72  x N
 
 2 over limit
-37 partial results
+40 partial results

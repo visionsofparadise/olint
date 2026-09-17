@@ -1,3 +1,4 @@
+public coverage [partial]
 # tsconfig.json  (160 functions in 15 files)
 
 O(1)               35

@@ -130,6 +130,13 @@ pub struct FunctionId {
     pub node: NodeId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SurfaceTarget {
+    Node(FileId, NodeId),
+    Module(FileId),
+    Unresolved,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TargetSet {
     pub known: Vec<FunctionId>,
@@ -402,6 +409,135 @@ impl<'a> Declarations<'a> {
                 (!declarations.is_empty()).then_some((name, declarations))
             })
             .collect()
+    }
+
+    pub(crate) fn surface_exports(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+    ) -> Vec<(String, Vec<SurfaceTarget>)> {
+        let mut names = Vec::new();
+        let mut pending = vec![(file, true)];
+        let mut visited = HashSet::new();
+        let mut seen = HashSet::new();
+
+        while let Some((file, include_default)) = pending.pop() {
+            if !visited.insert(file) {
+                continue;
+            }
+
+            let record = self.module_records[file.0 as usize];
+            let functions = exported_function_statements_of(project, file);
+            let value_declarations: HashSet<_> = project
+                .file(file)
+                .program
+                .body
+                .iter()
+                .filter_map(|statement| match statement {
+                    Statement::ExportDeclaration(export)
+                        if matches!(
+                            export.declaration,
+                            oxc_ast::ast::Declaration::ClassDeclaration(_)
+                                | oxc_ast::ast::Declaration::FunctionDeclaration(_)
+                                | oxc_ast::ast::Declaration::VariableDeclaration(_)
+                                | oxc_ast::ast::Declaration::TSEnumDeclaration(_)
+                                | oxc_ast::ast::Declaration::TSNamespaceDeclaration(_)
+                        ) =>
+                    {
+                        Some(export.span)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut entries: Vec<_> = record
+                .local_export_entries
+                .iter()
+                .chain(&record.indirect_export_entries)
+                .filter(|entry| {
+                    !entry.is_type || value_declarations.contains(&entry.statement_span)
+                })
+                .collect();
+
+            entries.sort_by_key(|entry| {
+                (!functions.contains(&entry.statement_span), entry.span.start)
+            });
+
+            for entry in entries {
+                if let Some(name) = export_name_of(entry) {
+                    if (include_default || name != "default") && seen.insert(name.to_string()) {
+                        names.push((name.to_string(), file));
+                    }
+                }
+            }
+
+            for entry in record
+                .star_export_entries
+                .iter()
+                .rev()
+                .filter(|entry| !entry.is_type)
+            {
+                if let Some(request) = &entry.module_request {
+                    if let Resolved::File(target) = project.resolve(file, request.name.as_str()) {
+                        pending.push((target, false));
+                    }
+                }
+            }
+        }
+
+        names
+            .into_iter()
+            .map(|(name, provider)| {
+                if name == "default" {
+                    if let Some(node) =
+                        project
+                            .file(provider)
+                            .program
+                            .body
+                            .iter()
+                            .find_map(|statement| match statement {
+                                Statement::ExportDefaultDeclaration(export) => {
+                                    Some(export.declaration.node_id())
+                                }
+                                _ => None,
+                            })
+                    {
+                        return (name, vec![SurfaceTarget::Node(provider, node)]);
+                    }
+                }
+
+                let targets = self
+                    .surface_targets(project, self.followed_export_of(project, provider, &name));
+
+                (name, targets)
+            })
+            .collect()
+    }
+
+    pub(crate) fn surface_reference(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &IdentifierReference<'a>,
+    ) -> Vec<SurfaceTarget> {
+        let target = self
+            .symbol_of_reference(project, file, reference)
+            .map(|(file, symbol)| self.target_of_symbol(project, file, symbol));
+
+        self.surface_targets(project, target)
+    }
+
+    fn surface_targets(&self, project: &Project<'a>, target: Option<Target>) -> Vec<SurfaceTarget> {
+        match target {
+            Some(Target::Symbol(file, symbol)) => {
+                let nodes = declaration_nodes_of(project, file, symbol);
+                let implemented = nodes.iter().any(|node| matches!(project.file(file).semantic.nodes().kind(*node), AstKind::Function(function) if function.body.is_some()));
+
+                nodes.into_iter().filter(|node| !implemented || !matches!(project.file(file).semantic.nodes().kind(*node), AstKind::Function(function) if function.body.is_none())).map(|node| SurfaceTarget::Node(file, node)).collect()
+            }
+            Some(Target::Node(file, node)) => vec![SurfaceTarget::Node(file, node)],
+            Some(Target::Namespace(file)) => vec![SurfaceTarget::Module(file)],
+            _ => vec![SurfaceTarget::Unresolved],
+        }
     }
 
     pub fn function_of(&self, declaration: Declaration<'a>) -> Option<(FileId, FunctionNode<'a>)> {

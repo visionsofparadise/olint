@@ -1,14 +1,17 @@
-use std::collections::HashMap;
-
-use oxc_ast::ast::{BindingPattern, ClassElement, PropertyKey, TSAccessibility};
-use oxc_semantic::NodeId;
-
 use crate::analysis::Analysis;
-use crate::config::{validate_entries, Config, ConfigError, Limit};
-use crate::declarations::{function_of_initializer, Declaration, FunctionNode};
-use crate::directives::{max_tag_of, PerfTag};
-use crate::paths::relative_path_of;
+use crate::config::{Config, ConfigError, Limit};
+use crate::declarations::FunctionNode;
+use crate::directives::max_tag_of;
 use crate::project::FileId;
+use crate::unknowns::UnknownId;
+
+#[path = "public_surface.rs"]
+mod surface;
+
+pub struct PublicCoverage<'a> {
+    pub functions: Vec<PublicFunction<'a>>,
+    pub unknowns: Option<UnknownId>,
+}
 
 #[derive(Clone)]
 pub struct ApplicableLimit {
@@ -23,134 +26,12 @@ pub struct PublicFunction<'a> {
     pub own_limit: bool,
 }
 
-fn is_hidden(accessibility: Option<TSAccessibility>, key: &PropertyKey<'_>) -> bool {
-    matches!(
-        accessibility,
-        Some(TSAccessibility::Private | TSAccessibility::Protected)
-    ) || matches!(key, PropertyKey::PrivateIdentifier(_))
-}
-
-fn declared_functions_of(declaration: Declaration<'_>) -> Vec<(FileId, FunctionNode<'_>)> {
-    match declaration {
-        Declaration::Function { file, function } => match function {
-            FunctionNode::Function(inner) if inner.body.is_none() => Vec::new(),
-            _ => vec![(file, function)],
-        },
-        Declaration::Variable {
-            file, declarator, ..
-        } if matches!(declarator.id, BindingPattern::BindingIdentifier(_)) => {
-            function_of_initializer(declarator.init.as_ref())
-                .map(|function| vec![(file, function)])
-                .unwrap_or_default()
-        }
-        Declaration::Class { file, class } if class.is_declaration() => class
-            .body
-            .body
-            .iter()
-            .filter_map(|element| match element {
-                ClassElement::MethodDefinition(method)
-                    if !is_hidden(method.accessibility, &method.key)
-                        && method.value.body.is_some() =>
-                {
-                    Some((file, FunctionNode::Function(&method.value)))
-                }
-                ClassElement::PropertyDefinition(property)
-                    if !is_hidden(property.accessibility, &property.key) =>
-                {
-                    function_of_initializer(property.value.as_ref())
-                        .map(|function| (file, function))
-                }
-                ClassElement::AccessorProperty(property)
-                    if !is_hidden(property.accessibility, &property.key) =>
-                {
-                    function_of_initializer(property.value.as_ref())
-                        .map(|function| (file, function))
-                }
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn discovered_functions<'a>(
-    analysis: &mut Analysis<'_, 'a>,
-    config: &Config,
-) -> Result<Vec<PublicFunction<'a>>, ConfigError> {
-    let project = analysis.project;
-
-    validate_entries(project, config)?;
-
-    let mut found: Vec<PublicFunction<'a>> = Vec::new();
-    let mut positions: HashMap<(FileId, NodeId), usize> = HashMap::new();
-
-    for (entry_path, limit) in &config.entrypoints {
-        let entry = relative_path_of(&project.root, entry_path);
-
-        if config.is_ignored(&entry) {
-            continue;
-        }
-
-        let entry_file = project
-            .file_by_path(entry_path)
-            .expect("validated entrypoint");
-
-        for (_, declarations) in analysis.declarations.exports_of(project, entry_file) {
-            for declaration in declarations {
-                for (file, function) in declared_functions_of(declaration) {
-                    let source = project.file(file);
-
-                    if !project.is_project_file(file)
-                        || (!config.explicit_entrypoints && project.is_test_path(file))
-                        || config.is_ignored(&source.relative)
-                        || analysis
-                            .function_tags(file, function)
-                            .contains(&PerfTag::Ignore)
-                    {
-                        continue;
-                    }
-
-                    match positions.get(&(file, function.node_id())) {
-                        Some(position) => {
-                            let known = &mut found[*position];
-
-                            known.limits.extend(limit.iter().cloned().map(|limit| {
-                                ApplicableLimit {
-                                    limit,
-                                    entry: entry.clone(),
-                                }
-                            }));
-                        }
-                        None => {
-                            positions.insert((file, function.node_id()), found.len());
-                            found.push(PublicFunction {
-                                file,
-                                function,
-                                limits: limit
-                                    .iter()
-                                    .cloned()
-                                    .map(|limit| ApplicableLimit {
-                                        limit,
-                                        entry: entry.clone(),
-                                    })
-                                    .collect(),
-                                own_limit: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(found)
-}
-
 pub fn public_roots<'a>(
     analysis: &mut Analysis<'_, 'a>,
     config: &Config,
 ) -> Result<Vec<(FileId, FunctionNode<'a>)>, ConfigError> {
-    Ok(discovered_functions(analysis, config)?
+    Ok(surface::discover(analysis, config)?
+        .functions
         .into_iter()
         .map(|function| (function.file, function.function))
         .collect())
@@ -159,8 +40,16 @@ pub fn public_roots<'a>(
 pub fn public_functions<'a>(
     analysis: &mut Analysis<'_, 'a>,
     config: &Config,
-) -> Result<Vec<PublicFunction<'a>>, ConfigError> {
-    let mut found = discovered_functions(analysis, config)?;
+) -> Result<PublicCoverage<'a>, ConfigError> {
+    let discovery = surface::discover(analysis, config)?;
+    let mut found = discovery.functions;
+    let mut unknowns = None;
+
+    for (site, entry, reason) in discovery.issues {
+        let origin = analysis.unknowns.origin(site, reason);
+        let origin = analysis.unknowns.called(Some(origin), entry);
+        unknowns = analysis.unknowns.join(unknowns, origin);
+    }
 
     for public in &mut found {
         if let Some((cost, text)) =
@@ -191,5 +80,8 @@ pub fn public_functions<'a>(
         }
     }
 
-    Ok(found)
+    Ok(PublicCoverage {
+        functions: found,
+        unknowns,
+    })
 }

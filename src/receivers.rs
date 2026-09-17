@@ -253,7 +253,7 @@ impl<'a> Declarations<'a> {
         }
     }
 
-    fn class_of_expression(
+    pub(crate) fn class_of_expression(
         &self,
         project: &Project<'a>,
         file: FileId,
