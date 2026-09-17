@@ -4,7 +4,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast::{AstKind, AstType};
 use oxc_semantic::NodeId;
-use oxc_span::GetSpan;
+use oxc_span::{GetSpan, Span};
 
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
@@ -21,6 +21,7 @@ use crate::tables::{
     ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, GLOBAL_FUNCTIONS_LINEAR, GLOBAL_LINEAR,
     LINEAR_CONSTRUCTORS, MAP_LINEAR, OBJECT_KEYED, REGEXP_LINEAR, SET_LINEAR, STRING_LINEAR,
 };
+use crate::unknowns::{SourceSpan, UnknownReason};
 
 fn is_type_kind(ty: AstType) -> bool {
     matches!(
@@ -105,6 +106,55 @@ fn is_listed(table: &[&str], name: &str) -> bool {
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn source_span(&self, file: FileId, span: Span) -> SourceSpan {
+        SourceSpan {
+            file,
+            start: span.start,
+            end: span.end,
+        }
+    }
+
+    pub(crate) fn unknown_part(&mut self, file: FileId, span: Span, reason: UnknownReason) -> Part {
+        let origin = self.source_span(file, span);
+        let unknown = self.unknowns.origin(origin, reason);
+
+        Part {
+            unknowns: Some(unknown),
+            ..Part::unmarked(Cost::ONE, Vec::new())
+        }
+    }
+
+    pub(crate) fn unknown_reading(
+        &mut self,
+        file: FileId,
+        span: Span,
+        reason: UnknownReason,
+    ) -> Reading {
+        self.current_effects.unknown_global = true;
+
+        Reading::of_part(self.unknown_part(file, span, reason))
+    }
+
+    fn unknown_invocation(
+        &mut self,
+        file: FileId,
+        span: Span,
+        arguments: &[Argument<'a>],
+        reason: UnknownReason,
+    ) -> Reading {
+        for argument in arguments {
+            let origin = self.source_span(file, argument.span());
+            let value = self.values.at(origin).value;
+
+            if !self.current_effects.unknown_reachable.contains(&value) {
+                self.current_effects.unknown_reachable.push(value);
+                self.current_effects.escapes.push(value);
+            }
+        }
+
+        self.unknown_reading(file, span, reason)
+    }
+
     pub fn cost_of_statement(&mut self, file: FileId, s: &'a Statement<'a>) -> Reading {
         let kind = self.kind_of_node(file, s.node_id());
 
@@ -174,9 +224,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Reading::empty();
         }
 
+        self.record_write_effects(file, kind);
+
         let tags = self.perf_tags(file, kind).to_vec();
 
         if tags.contains(&PerfTag::Ignore) {
+            self.current_effects.unknown_global |= self.opaque_effects_at(file, kind.node_id());
+
             self.stats.count("@perf ignore: statement");
 
             return Reading::empty();
@@ -209,7 +263,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .pending_scoped
                 .remove(&scope)
                 .unwrap_or_default()
-                .max(part.preferred(preference));
+                .max(part.preferred(preference), &mut self.unknowns);
 
             self.pending_scoped.insert(scope, pending);
         }
@@ -221,12 +275,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let iteration = is_iteration_kind(&kind);
 
         if tags.contains(&PerfTag::Bounded) && !iteration {
+            self.current_effects.unknown_global |= self.opaque_effects_at(file, kind.node_id());
+
             self.stats.count("@perf bounded: statement");
 
             return Reading::empty();
         }
 
         if let Some((cost, text)) = cost_tag_of(tags) {
+            self.current_effects.unknown_global |= self.opaque_effects_at(file, kind.node_id());
+
             self.stats.count(if iteration {
                 "@perf O(...): loop"
             } else {
@@ -251,11 +309,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     let part = self.branch_reading_of(file, branch, statement.node_id());
                     let kind = self.kind_of_node(file, branch.node_id());
 
-                    reading = reading.merge(self.sibling_of(file, kind, part));
+                    reading = reading.merge(self.sibling_of(file, kind, part), &mut self.unknowns);
                 }
 
                 if statement.alternate.is_none() {
-                    reading = reading.merge(Reading::empty().sibling());
+                    reading = reading.merge(Reading::empty().sibling(), &mut self.unknowns);
                 }
 
                 reading
@@ -267,7 +325,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     let case = self.kind_of_node(file, case.node_id());
                     let part = self.cost_of_node(file, case);
 
-                    reading = reading.merge(self.sibling_of(file, case, part));
+                    reading = reading.merge(self.sibling_of(file, case, part), &mut self.unknowns);
                 }
 
                 reading
@@ -288,7 +346,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 for part in parts {
                     let cost = self.cost_of_node(file, part);
 
-                    reading = reading.merge(self.sibling_of(file, part, cost));
+                    reading = reading.merge(self.sibling_of(file, part, cost), &mut self.unknowns);
                 }
 
                 reading
@@ -317,7 +375,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     let child = self.kind_of_node(file, child);
                     let cost = self.cost_of_node(file, child);
 
-                    reading = reading.merge(cost);
+                    reading = reading.merge(cost, &mut self.unknowns);
                 }
 
                 reading
@@ -340,7 +398,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let kind = self.kind_of_node(file, statement.node_id());
             let cost = self.cost_of_node(file, kind);
 
-            reading = reading.merge(self.sibling_of(file, kind, cost));
+            reading = reading.merge(self.sibling_of(file, kind, cost), &mut self.unknowns);
         }
 
         reading
@@ -383,19 +441,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     cost: reading.main.cost,
                     chain,
                     preference: reading.main.preference,
+                    unknowns: reading.main.unknowns,
                 };
 
                 if exit == crate::bounds::Exit::Break {
                     return Reading {
+                        phases: [crate::cost::ExecutionPhase::Immediate; 3],
                         main: Part::none(),
                         function_exit: reading.function_exit,
-                        loop_exit: reading.loop_exit.max(lifted),
+                        loop_exit: reading.loop_exit.max(lifted, &mut self.unknowns),
                     };
                 }
 
                 return Reading {
+                    phases: [crate::cost::ExecutionPhase::Immediate; 3],
                     main: Part::none(),
-                    function_exit: reading.function_exit.max(lifted),
+                    function_exit: reading.function_exit.max(lifted, &mut self.unknowns),
                     loop_exit: reading.loop_exit,
                 };
             }
@@ -418,9 +479,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let child = self.kind_of_node(file, child);
             let cost = self.cost_of_node(file, child);
 
-            sibling = sibling.merge(cost);
+            sibling = sibling.merge(cost, &mut self.unknowns);
         }
 
+        let opaque_effects = self.opaque_effects_in(file, Root::Statement(body));
+        let assumed_bound = self.perf_tags(file, kind).contains(&PerfTag::Bounded);
+        let saved_budget = opaque_effects.then(|| self.budget_context.take());
+        let saved_shares = opaque_effects.then(|| std::mem::take(&mut self.share_bindings));
         let bound = self.bound_of(file, kind);
         let spend = if bound.factor.is_one() {
             None
@@ -439,19 +504,58 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.share_bindings.pop();
         }
 
+        if let Some(context) = saved_budget {
+            self.budget_context = context;
+        }
+
+        if let Some(shares) = saved_shares {
+            self.share_bindings = shares;
+        }
+
         let hoisted = self.pending_scoped.remove(&(file, node));
-        let body = match hoisted {
+        let mut body = match hoisted {
             Some(hoisted) => Reading {
-                main: body_raw.main.max(hoisted),
+                main: body_raw.main.max(hoisted, &mut self.unknowns),
                 ..body_raw
             },
             None => body_raw,
         };
 
+        if opaque_effects && !assumed_bound {
+            let origin = self.source_span(file, kind.span());
+            let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
+            body.main.unknowns = self.unknowns.scale(body.main.unknowns, None);
+
+            let unresolved = Part {
+                unknowns: self.unknowns.scale(Some(unknown), None),
+                preference: body.main.preference.max(Preference::Unmarked),
+                ..Part::unmarked(Cost::ONE, Vec::new())
+            };
+
+            body.main = body.main.max(unresolved, &mut self.unknowns);
+
+            let main = body.main.max(body.loop_exit, &mut self.unknowns);
+
+            return Reading {
+                main: sibling.main.max(main, &mut self.unknowns),
+                function_exit: sibling
+                    .function_exit
+                    .max(body.function_exit, &mut self.unknowns),
+                loop_exit: sibling.loop_exit,
+                phases: sibling.phases,
+            };
+        }
+
         if bound.factor.is_one() {
             return Reading {
-                main: sibling.main.max(body.main).max(body.loop_exit),
-                function_exit: sibling.function_exit.max(body.function_exit),
+                phases: [crate::cost::ExecutionPhase::Immediate; 3],
+                main: sibling
+                    .main
+                    .max(body.main, &mut self.unknowns)
+                    .max(body.loop_exit, &mut self.unknowns),
+                function_exit: sibling
+                    .function_exit
+                    .max(body.function_exit, &mut self.unknowns),
                 loop_exit: sibling.loop_exit,
             };
         }
@@ -494,37 +598,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let site = self.site_of_node(file, node);
-        let looped = nest(label, site, bound.factor, body.main);
+        let looped = nest(label, site, bound.factor, body.main, &mut self.unknowns);
+
+        let mut result = Reading {
+            main: sibling.main.max(body.loop_exit, &mut self.unknowns),
+            function_exit: sibling
+                .function_exit
+                .max(body.function_exit, &mut self.unknowns),
+            loop_exit: sibling.loop_exit,
+            phases: sibling.phases,
+        };
 
         if let (Some(_), Some(scope)) = (&budget, scope) {
             let pending = self
                 .pending_scoped
                 .remove(&(file, scope))
                 .unwrap_or_default()
-                .max(looped);
+                .max(looped, &mut self.unknowns);
 
             self.pending_scoped.insert((file, scope), pending);
-
-            return Reading {
-                main: sibling.main.max(body.loop_exit),
-                function_exit: sibling.function_exit.max(body.function_exit),
-                loop_exit: sibling.loop_exit,
-            };
+        } else if budget.is_some() && self.inside_loop(file, node) {
+            result.function_exit = result.function_exit.max(looped, &mut self.unknowns);
+        } else {
+            result.main = result.main.max(looped, &mut self.unknowns);
         }
 
-        if budget.is_some() && self.inside_loop(file, node) {
-            return Reading {
-                main: sibling.main.max(body.loop_exit),
-                function_exit: sibling.function_exit.max(body.function_exit).max(looped),
-                loop_exit: sibling.loop_exit,
-            };
-        }
-
-        Reading {
-            main: sibling.main.max(looped).max(body.loop_exit),
-            function_exit: sibling.function_exit.max(body.function_exit),
-            loop_exit: sibling.loop_exit,
-        }
+        result
     }
 
     fn is_ancestor(&self, file: FileId, ancestor: NodeId, node: NodeId) -> bool {
@@ -549,8 +648,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if self.inside_loop(file, node) {
             return Reading {
+                phases: [crate::cost::ExecutionPhase::Immediate; 3],
                 main: Part::none(),
-                function_exit: inner.total(),
+                function_exit: inner.total(&mut self.unknowns),
                 loop_exit: Part::none(),
             };
         }
@@ -590,7 +690,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         );
         let site = self.site_of_node(file, spread.node_id());
 
-        inner.merge(Reading::of_part(nest(label, site, Cost::N, Part::none())))
+        inner.merge(
+            Reading::of_part(nest(label, site, Cost::N, Part::none(), &mut self.unknowns)),
+            &mut self.unknowns,
+        )
     }
 
     fn cost_of_rest_target(&mut self, file: FileId, rest: &'a AssignmentTargetRest<'a>) -> Reading {
@@ -600,7 +703,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let child = self.kind_of_node(file, child);
             let cost = self.cost_of_node(file, child);
 
-            inner = inner.merge(cost);
+            inner = inner.merge(cost, &mut self.unknowns);
         }
 
         let target_span = rest.target.span();
@@ -633,7 +736,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         );
         let site = self.site_of_node(file, rest.node_id());
 
-        inner.merge(Reading::of_part(nest(label, site, Cost::N, Part::none())))
+        inner.merge(
+            Reading::of_part(nest(label, site, Cost::N, Part::none(), &mut self.unknowns)),
+            &mut self.unknowns,
+        )
     }
 
     pub(crate) fn member_declaration_of(
@@ -662,7 +768,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for argument in &new.arguments {
             let cost = self.cost_of_argument(file, argument);
 
-            reading = reading.merge(cost);
+            reading = reading.merge(cost, &mut self.unknowns);
         }
 
         let declaration = match &new.callee {
@@ -700,12 +806,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 cost: callee.cost,
                 chain,
                 preference: callee.preference,
+                unknowns: self
+                    .unknowns
+                    .called(callee.unknowns, self.source_span(file, new.span)),
             };
 
-            return reading.merge(Reading::of_part(
-                self.called_part_of(target, function, part, cyclic),
-            ));
+            return reading.merge(
+                Reading::of_part(self.called_part_of(target, function, part, cyclic)),
+                &mut self.unknowns,
+            );
         }
+
+        self.current_effects.unknown_global = true;
 
         let constructor = match &new.callee {
             Expression::Identifier(reference) => reference.name.as_str(),
@@ -729,17 +841,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     );
                     let site = self.site_of_node(file, new.node_id());
 
-                    return reading.merge(Reading::of_part(nest(
-                        label,
-                        site,
-                        Cost::N,
-                        Part::none(),
-                    )));
+                    return reading.merge(
+                        Reading::of_part(nest(
+                            label,
+                            site,
+                            Cost::N,
+                            Part::none(),
+                            &mut self.unknowns,
+                        )),
+                        &mut self.unknowns,
+                    );
                 }
             }
         }
 
-        reading
+        if is_listed(LINEAR_CONSTRUCTORS, constructor) {
+            return reading;
+        }
+
+        let unknown =
+            self.unknown_invocation(file, new.span, &new.arguments, UnknownReason::Target);
+
+        reading.merge(unknown, &mut self.unknowns)
     }
 
     fn is_share_sized_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
@@ -767,7 +890,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if !is_function_argument(argument) {
                 let cost = self.cost_of_argument(file, argument);
 
-                reading = reading.merge(cost);
+                reading = reading.merge(cost, &mut self.unknowns);
             }
         }
 
@@ -778,7 +901,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some(member) = member {
             let cost = self.cost_of_expression(file, member.object());
 
-            reading = reading.merge(cost);
+            reading = reading.merge(cost, &mut self.unknowns);
         }
 
         let declaration = self.callee_declaration_of(file, call);
@@ -797,7 +920,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .binding_of_identifier(file, reference)
                     .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
-                if let Some(part) = substituted {
+                if let Some(facts) = substituted {
+                    self.apply_argument_effects(&facts);
+
+                    let part = facts.callback.unwrap_or_else(|| {
+                        self.unknown_part(file, call.span, UnknownReason::Target)
+                    });
                     let chain = if part.cost.is_one() {
                         Vec::new()
                     } else {
@@ -809,14 +937,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         }]
                     };
 
-                    return reading.merge(Reading::of_part(Part {
-                        cost: part.cost,
-                        chain,
-                        preference: part.preference,
-                    }));
+                    return reading.merge(
+                        Reading::of_part(Part {
+                            cost: part.cost,
+                            chain,
+                            preference: part.preference,
+                            unknowns: self
+                                .unknowns
+                                .called(part.unknowns, self.source_span(file, call.span)),
+                        }),
+                        &mut self.unknowns,
+                    );
                 }
 
-                return reading;
+                let unknown = self.unknown_invocation(
+                    file,
+                    call.span,
+                    &call.arguments,
+                    UnknownReason::Target,
+                );
+
+                return reading.merge(unknown, &mut self.unknowns);
             }
         }
 
@@ -850,12 +991,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 cost: called.cost,
                 chain,
                 preference: called.preference,
+                unknowns: self
+                    .unknowns
+                    .called(called.unknowns, self.source_span(file, call.span)),
             };
 
-            return reading.merge(Reading::of_part(
-                self.called_part_of(target, function, part, cyclic),
-            ));
+            return reading.merge(
+                Reading::of_part(self.called_part_of(target, function, part, cyclic)),
+                &mut self.unknowns,
+            );
         }
+
+        self.current_effects.unknown_global = true;
 
         if let Some(member) = member {
             return self.cost_of_method_call(file, call, member, reading, site);
@@ -863,16 +1010,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(reference) = identifier_of(callee) {
             if is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str()) {
-                return reading.merge(Reading::of_part(nest(
-                    format!("{}()", reference.name),
-                    site,
-                    Cost::N,
-                    Part::none(),
-                )));
+                return reading.merge(
+                    Reading::of_part(nest(
+                        format!("{}()", reference.name),
+                        site,
+                        Cost::N,
+                        Part::none(),
+                        &mut self.unknowns,
+                    )),
+                    &mut self.unknowns,
+                );
             }
         }
 
-        reading
+        let unknown =
+            self.unknown_invocation(file, call.span, &call.arguments, UnknownReason::Target);
+
+        reading.merge(unknown, &mut self.unknowns)
     }
 
     fn cost_of_method_call(
@@ -918,7 +1072,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 ));
 
                 if bounded {
-                    return reading.merge(Reading::of_part(callback));
+                    return reading.merge(Reading::of_part(callback), &mut self.unknowns);
                 }
 
                 let argument_text = match first {
@@ -926,25 +1080,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     None => String::new(),
                 };
 
-                return reading.merge(Reading::of_part(nest(
-                    format!("{global_name}.{method}({argument_text})"),
-                    site,
-                    Cost::N,
-                    callback,
-                )));
+                return reading.merge(
+                    Reading::of_part(nest(
+                        format!("{global_name}.{method}({argument_text})"),
+                        site,
+                        Cost::N,
+                        callback,
+                        &mut self.unknowns,
+                    )),
+                    &mut self.unknowns,
+                );
             }
         }
 
         let kind = self.kind_of(file, receiver, &method);
-        let tag = if kind == Kind::Unknown { "?" } else { "" };
+
+        if kind == Kind::Unknown {
+            let unknown = self.unknown_invocation(
+                file,
+                call.span,
+                &call.arguments,
+                UnknownReason::UnsupportedModel,
+            );
+
+            return reading.merge(unknown, &mut self.unknowns);
+        }
+
         let receiver_text = short(self.text_of(file, receiver.span()));
-        let label = |suffix: &str| format!("{receiver_text}.{method}(){tag}{suffix}");
+        let label = |suffix: &str| format!("{receiver_text}.{method}(){suffix}");
         let shared = self.is_share_sized(file, receiver)
             || (method == "set"
                 && first.is_some_and(|argument| self.is_share_sized_argument(file, argument)))
             || self.is_share_sized_call(file, call);
         let bounded = self.is_constant_sized(file, receiver) || shared;
-        let array_like = kind == Kind::Array || kind == Kind::Unknown;
+        let array_like = kind == Kind::Array;
 
         if shared && array_like {
             self.stats.count("share: array method");
@@ -970,10 +1139,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let part = if bounded {
                     callback
                 } else {
-                    nest(label(" [n log n]"), site, Cost::N_LOG_N, callback)
+                    nest(
+                        label(" [n log n]"),
+                        site,
+                        Cost::N_LOG_N,
+                        callback,
+                        &mut self.unknowns,
+                    )
                 };
 
-                return reading.merge(Reading::of_part(part));
+                return reading.merge(Reading::of_part(part), &mut self.unknowns);
             }
 
             if is_listed(ARRAY_LINEAR, &method) {
@@ -985,10 +1160,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let part = if bounded {
                     callback
                 } else {
-                    nest(label(""), site, Cost::N, callback)
+                    nest(label(""), site, Cost::N, callback, &mut self.unknowns)
                 };
 
-                return reading.merge(Reading::of_part(part));
+                return reading.merge(Reading::of_part(part), &mut self.unknowns);
             }
         }
 
@@ -1001,35 +1176,56 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Part::none()
             };
 
-            return reading.merge(Reading::of_part(nest(label(""), site, Cost::N, callback)));
+            return reading.merge(
+                Reading::of_part(nest(label(""), site, Cost::N, callback, &mut self.unknowns)),
+                &mut self.unknowns,
+            );
         }
 
-        if (kind == Kind::String || kind == Kind::Unknown)
-            && is_listed(STRING_LINEAR, &method)
-            && !bounded
-        {
-            return reading.merge(Reading::of_part(nest(
-                label(" [string]"),
-                site,
-                Cost::N,
-                Part::none(),
-            )));
+        if kind == Kind::String && is_listed(STRING_LINEAR, &method) && !bounded {
+            return reading.merge(
+                Reading::of_part(nest(
+                    label(" [string]"),
+                    site,
+                    Cost::N,
+                    Part::none(),
+                    &mut self.unknowns,
+                )),
+                &mut self.unknowns,
+            );
         }
 
         if kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method) {
             if let Some(argument) = first {
                 if !self.is_constant_sized_argument(file, argument) {
-                    return reading.merge(Reading::of_part(nest(
-                        label(" [regexp]"),
-                        site,
-                        Cost::N,
-                        Part::none(),
-                    )));
+                    return reading.merge(
+                        Reading::of_part(nest(
+                            label(" [regexp]"),
+                            site,
+                            Cost::N,
+                            Part::none(),
+                            &mut self.unknowns,
+                        )),
+                        &mut self.unknowns,
+                    );
                 }
             }
+
+            return reading;
         }
 
-        reading
+        if kind == Kind::String && is_listed(STRING_LINEAR, &method) && bounded {
+            return reading;
+        }
+
+        let unknown = self.unknown_invocation(
+            file,
+            call.span,
+            &call.arguments,
+            UnknownReason::UnsupportedModel,
+        );
+
+        reading.merge(unknown, &mut self.unknowns)
     }
 }
 

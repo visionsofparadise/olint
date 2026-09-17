@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn unknown_policy_has_exact_values_and_warn_default() {
+    assert_eq!(unknown_policy_of(None).unwrap(), UnknownPolicy::Warn);
+
+    for (text, expected) in [
+        ("ignore", UnknownPolicy::Ignore),
+        ("warn", UnknownPolicy::Warn),
+        ("error", UnknownPolicy::Error),
+    ] {
+        assert_eq!(
+            unknown_policy_of(Some(&serde_json::json!(text))).unwrap(),
+            expected
+        );
+    }
+
+    for value in [
+        serde_json::json!("WARN"),
+        serde_json::json!("true"),
+        serde_json::json!(false),
+        Value::Null,
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!(1),
+    ] {
+        assert!(matches!(
+            unknown_policy_of(Some(&value)),
+            Err(ConfigError::Unknown { .. })
+        ));
+    }
+}
+
+#[test]
 fn limit_of_names_the_field_it_rejects() {
     match limit_of("O(M)", "max") {
         Err(ConfigError::Limit { field, text }) => {

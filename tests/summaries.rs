@@ -17,7 +17,7 @@ fn self_recursion_charges_one_n() {
         "export function walk(n: number): number {\n\treturn n > 0 ? walk(n - 1) : 0;\n}",
         |analysis, file| {
             let walk = function_of_name(analysis.project, file, "walk");
-            let part = analysis.summarize(file, walk).total();
+            let part = analysis.summarize(file, walk).total(&mut analysis.unknowns);
 
             assert_eq!(part.cost, Cost::N);
             assert_eq!(labels_of(&part.chain), vec!["recursive call walk()"]);
@@ -32,8 +32,8 @@ fn a_cycle_member_takes_the_root_summary() {
         |analysis, file| {
             let ping = function_of_name(analysis.project, file, "ping");
             let pong = function_of_name(analysis.project, file, "pong");
-            let root = analysis.summarize(file, ping).total();
-            let member = analysis.summarize(file, pong).total();
+            let root = analysis.summarize(file, ping).total(&mut analysis.unknowns);
+            let member = analysis.summarize(file, pong).total(&mut analysis.unknowns);
 
             assert_eq!(root.cost, Cost::N);
             assert_eq!(member.cost, Cost::N);
@@ -49,15 +49,15 @@ fn a_cycle_member_takes_the_root_summary() {
 #[test]
 fn a_costed_callback_multiplies_inside_its_caller() {
     run_with_source(
-        "function each(xs: number[], visit: (x: number) => void) {\n\tfor (const x of xs) visit(x);\n}\nexport function f(xs: number[], ys: number[]) {\n\teach(xs, (x) => {\n\t\tys.indexOf(x);\n\t});\n}",
+        "function each(xs: number[], visit: (x: number) => void) {\n\tfor (const x of xs) visit(x);\n}\nexport function f(xs: number[], ys: number[]) {\n\teach(xs, (x) => {\n\t\tfor (const y of ys) void y;\n\t});\n}",
         |analysis, file| {
             let f = function_of_name(analysis.project, file, "f");
             let first = analysis.summarize(file, f);
             let second = analysis.summarize(file, f);
 
-            assert_eq!(first.total().cost, Cost { n: 2, log: 0 });
+            assert_eq!(first.total(&mut analysis.unknowns).cost, Cost { n: 2, log: 0 });
             assert_eq!(first, second);
-            assert_eq!(labels_of(&first.total().chain), vec!["call each()"]);
+            assert_eq!(labels_of(&first.total(&mut analysis.unknowns).chain), vec!["call each()"]);
         },
     );
 }
@@ -130,7 +130,7 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
         ("olint.config.json", r#"{ "entrypoints": ["index.ts"] }"#),
         (
             "index.ts",
-            "// @perf ignore\nexport function skipped(xs: number[]) {\n\treturn xs.indexOf(1);\n}\nexport function caller(xs: number[]) {\n\tfor (const x of xs) skipped(xs);\n}\n",
+            "// @perf ignore\nexport function skipped(xs: number[]) {\n\treturn xs.indexOf(1);\n}\nexport function caller(xs: number[]) {\n\tfor (const x of xs) void x;\n\tskipped(xs);\n}\n",
         ),
     ];
 
@@ -148,7 +148,9 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
             .map(|public| analysis.name_of(public.file, public.function))
             .collect();
         let caller = function_of_name(project, file, "caller");
-        let part = analysis.summarize(file, caller).total();
+        let part = analysis
+            .summarize(file, caller)
+            .total(&mut analysis.unknowns);
 
         assert_eq!(reportable, vec!["caller"]);
         assert_eq!(public, vec!["caller"]);
@@ -160,12 +162,12 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
 #[test]
 fn a_cold_function_called_beside_a_linear_statement_cascades_linear() {
     run_with_source(
-        "/** @perf cold */\nfunction rebuild(rows: number[][]) {\n\tfor (const row of rows) row.indexOf(1);\n}\nexport function f(rows: number[][]) {\n\trebuild(rows);\n\trows.indexOf([]);\n}",
+        "/** @perf cold */\nfunction rebuild(rows: number[][]) {\n\tfor (const row of rows) for (const value of row) void value;\n}\nexport function f(rows: number[][]) {\n\trebuild(rows);\n\trows.indexOf([]);\n}",
         |analysis, file| {
             let rebuild = function_of_name(analysis.project, file, "rebuild");
             let f = function_of_name(analysis.project, file, "f");
-            let own = analysis.summarize(file, rebuild).total();
-            let part = analysis.summarize(file, f).total();
+            let own = analysis.summarize(file, rebuild).total(&mut analysis.unknowns);
+            let part = analysis.summarize(file, f).total(&mut analysis.unknowns);
 
             assert_eq!(own.cost, Cost { n: 2, log: 0 });
             assert_eq!(part.cost, Cost::N);
@@ -177,10 +179,10 @@ fn a_cold_function_called_beside_a_linear_statement_cascades_linear() {
 #[test]
 fn a_hot_function_call_wins_over_a_costlier_sibling() {
     run_with_source(
-        "/** @perf hot */\nconst lookup = (xs: number[]) => xs.indexOf(1);\nexport function f(rows: number[][], xs: number[]) {\n\tfor (const row of rows) row.indexOf(1);\n\treturn lookup(xs);\n}",
+        "/** @perf hot */\nconst lookup = (xs: number[]) => xs.indexOf(1);\nexport function f(rows: number[][], xs: number[]) {\n\tfor (const row of rows) for (const value of row) void value;\n\treturn lookup(xs);\n}",
         |analysis, file| {
             let f = function_of_name(analysis.project, file, "f");
-            let part = analysis.summarize(file, f).total();
+            let part = analysis.summarize(file, f).total(&mut analysis.unknowns);
 
             assert_eq!(part.cost, Cost::N);
             assert_eq!(labels_of(&part.chain), vec!["call lookup()"]);
@@ -193,7 +195,9 @@ fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
 
     run_with_source(source, |analysis, file| {
         let function = function_of_name(analysis.project, file, name);
-        let part = analysis.summarize(file, function).total();
+        let part = analysis
+            .summarize(file, function)
+            .total(&mut analysis.unknowns);
 
         found = (part.cost, labels_of(&part.chain));
     });
@@ -201,7 +205,7 @@ fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
     found
 }
 
-const CALLBACK_SOURCE: &str = "/** @perf cold */\nfunction coldCubic(xs: number[][]): number {\n\tlet sum = 0;\n\tfor (const row of xs) for (const v of row) for (const w of row) sum += v * w;\n\treturn sum;\n}\n/** @perf hot */\nfunction hotConst(x: number[]): number {\n\treturn x.length;\n}\nfunction withHotInside(row: number[]): number {\n\t// @perf hot\n\treturn row.length;\n}\nfunction apply(f: (xs: number[][]) => number, xs: number[][]): number {\n\tconst a = f(xs);\n\tfor (const row of xs) row.at(0);\n\treturn a;\n}\nexport function coldViaMap(xss: number[][][]) {\n\tconst a = xss.map(coldCubic);\n\tfor (const xs of xss) xs.at(0);\n\treturn a;\n}\nexport function hotViaMap(xs: number[][]) {\n\tconst a = xs.map(hotConst);\n\tfor (const row of xs) for (const v of row) v.toFixed();\n\treturn a;\n}\nexport function bodyHotViaMap(xs: number[][]) {\n\tconst a = xs.map(withHotInside);\n\tfor (const row of xs) for (const v of row) v.toFixed();\n\treturn a;\n}\nexport function coldViaParameter(xs: number[][]) {\n\treturn apply(coldCubic, xs);\n}\n";
+const CALLBACK_SOURCE: &str = "/** @perf cold */\nfunction coldCubic(xs: number[][]): number {\n\tlet sum = 0;\n\tfor (const row of xs) for (const v of row) for (const w of row) sum += v * w;\n\treturn sum;\n}\n/** @perf hot */\nfunction hotConst(x: number[]): number {\n\treturn x.length;\n}\nfunction withHotInside(row: number[]): number {\n\t// @perf hot\n\treturn row.length;\n}\nfunction apply(f: (xs: number[][]) => number, xs: number[][]): number {\n\tconst a = f(xs);\n\tfor (const row of xs) void row;\n\treturn a;\n}\nexport function coldViaMap(xss: number[][][]) {\n\tfor (const xs of xss) void xs;\n\tconst a = xss.map(coldCubic);\n\treturn a;\n}\nexport function hotViaMap(xs: number[][]) {\n\tfor (const row of xs) for (const v of row) void v;\n\tconst a = xs.map(hotConst);\n\treturn a;\n}\nexport function bodyHotViaMap(xs: number[][]) {\n\tfor (const row of xs) for (const v of row) void v;\n\tconst a = xs.map(withHotInside);\n\treturn a;\n}\nexport function coldViaParameter(xs: number[][]) {\n\treturn apply(coldCubic, xs);\n}\n";
 
 #[test]
 fn a_cold_callback_through_a_stdlib_method_yields_to_a_linear_sibling() {
@@ -253,8 +257,20 @@ fn a_cold_cycle_member_keeps_the_cycle_cost() {
         let ping = function_of_name(analysis.project, file, "ping");
         let pong = function_of_name(analysis.project, file, "pong");
 
-        assert_eq!(analysis.summarize(file, ping).total().cost, Cost::N);
-        assert_eq!(analysis.summarize(file, pong).total().cost, Cost::N);
+        assert_eq!(
+            analysis
+                .summarize(file, ping)
+                .total(&mut analysis.unknowns)
+                .cost,
+            Cost::N
+        );
+        assert_eq!(
+            analysis
+                .summarize(file, pong)
+                .total(&mut analysis.unknowns)
+                .cost,
+            Cost::N
+        );
     });
 }
 

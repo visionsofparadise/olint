@@ -19,3 +19,4 @@ O(N^3) > O(N^2)  uses  src/public.ts:34  via src/index.ts
             in loop for-of                                   src/public.ts:3  x N
 
 3 over limit
+1 partial results

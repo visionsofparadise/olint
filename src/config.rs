@@ -15,14 +15,38 @@ pub struct Limit {
 }
 
 pub struct Config {
+    pub unknown: UnknownPolicy,
     pub max: Limit,
     pub entrypoints: Vec<(PathBuf, Limit)>,
     pub ignore: Vec<GlobMatcher>,
     pub source: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnknownPolicy {
+    Ignore,
+    #[default]
+    Warn,
+    Error,
+}
+
+pub fn unknown_policy_of(value: Option<&Value>) -> Result<UnknownPolicy, ConfigError> {
+    match value {
+        None => Ok(UnknownPolicy::Warn),
+        Some(Value::String(value)) if value == "ignore" => Ok(UnknownPolicy::Ignore),
+        Some(Value::String(value)) if value == "warn" => Ok(UnknownPolicy::Warn),
+        Some(Value::String(value)) if value == "error" => Ok(UnknownPolicy::Error),
+        Some(value) => Err(ConfigError::Unknown {
+            value: value.to_string(),
+        }),
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
+    Unknown {
+        value: String,
+    },
     Read {
         path: PathBuf,
         source: std::io::Error,
@@ -313,6 +337,7 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
     };
 
     Ok(Config {
+        unknown: unknown_policy_of(raw.get("unknown"))?,
         max,
         entrypoints,
         ignore,

@@ -1,4 +1,5 @@
 use crate::project::Site;
+use crate::unknowns::{UnknownId, Unknowns};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Cost {
@@ -112,6 +113,7 @@ pub struct Part {
     pub cost: Cost,
     pub chain: Vec<Factor>,
     pub preference: Preference,
+    pub unknowns: Option<UnknownId>,
 }
 
 impl Part {
@@ -124,6 +126,7 @@ impl Part {
             cost,
             chain,
             preference: Preference::Unmarked,
+            unknowns: None,
         }
     }
 
@@ -136,14 +139,24 @@ impl Part {
         }
     }
 
-    pub fn max(self, other: Part) -> Part {
+    pub fn max(self, other: Part, unknowns: &mut Unknowns) -> Part {
         let (mine, theirs) = (self.rank(), other.rank());
+        let selected_unknowns = if mine == theirs {
+            unknowns.join(self.unknowns, other.unknowns)
+        } else if theirs > mine {
+            other.unknowns
+        } else {
+            self.unknowns
+        };
 
-        if theirs > mine || (theirs == mine && other.cost.exceeds(self.cost)) {
+        let mut selected = if theirs > mine || (theirs == mine && other.cost.exceeds(self.cost)) {
             other
         } else {
             self
-        }
+        };
+        selected.unknowns = selected_unknowns;
+
+        selected
     }
 
     pub fn preferred(self, preference: Preference) -> Part {
@@ -151,11 +164,20 @@ impl Part {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExecutionPhase {
+    #[default]
+    Immediate,
+    Scheduled,
+    Lazy,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reading {
     pub main: Part,
     pub function_exit: Part,
     pub loop_exit: Part,
+    pub phases: [ExecutionPhase; 3],
 }
 
 impl Reading {
@@ -168,14 +190,16 @@ impl Reading {
             main: part,
             function_exit: Part::none(),
             loop_exit: Part::none(),
+            phases: [ExecutionPhase::Immediate; 3],
         }
     }
 
-    pub fn merge(self, other: Reading) -> Reading {
+    pub fn merge(self, other: Reading, unknowns: &mut Unknowns) -> Reading {
         Reading {
-            main: self.main.max(other.main),
-            function_exit: self.function_exit.max(other.function_exit),
-            loop_exit: self.loop_exit.max(other.loop_exit),
+            main: self.main.max(other.main, unknowns),
+            function_exit: self.function_exit.max(other.function_exit, unknowns),
+            loop_exit: self.loop_exit.max(other.loop_exit, unknowns),
+            phases: self.phases,
         }
     }
 
@@ -192,6 +216,7 @@ impl Reading {
             main: self.main.preferred(preference),
             function_exit: exit(self.function_exit),
             loop_exit: exit(self.loop_exit),
+            phases: self.phases,
         }
     }
 
@@ -206,15 +231,15 @@ impl Reading {
         }
     }
 
-    pub fn total(&self) -> Part {
+    pub fn total(&self, unknowns: &mut Unknowns) -> Part {
         self.main
             .clone()
-            .max(self.function_exit.clone())
-            .max(self.loop_exit.clone())
+            .max(self.function_exit.clone(), unknowns)
+            .max(self.loop_exit.clone(), unknowns)
     }
 }
 
-pub fn nest(label: String, site: Site, factor: Cost, inner: Part) -> Part {
+pub fn nest(label: String, site: Site, factor: Cost, inner: Part, unknowns: &mut Unknowns) -> Part {
     let mut chain = Vec::with_capacity(inner.chain.len() + 1);
 
     chain.push(Factor {
@@ -226,6 +251,7 @@ pub fn nest(label: String, site: Site, factor: Cost, inner: Part) -> Part {
     chain.extend(inner.chain);
 
     Part {
+        unknowns: unknowns.scale(inner.unknowns, Some(factor)),
         cost: factor.multiply(inner.cost),
         chain,
         preference: if inner.preference == Preference::Absent {

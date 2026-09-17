@@ -4,13 +4,16 @@ use indexmap::{IndexMap, IndexSet};
 use oxc_semantic::NodeId;
 
 use crate::budgets::BudgetContext;
-use crate::cost::{Part, Reading};
+use crate::cost::Part;
 use crate::declarations::{Binding, Declarations};
 use crate::directives::PerfTag;
+use crate::effects::Effects;
 use crate::project::{FileId, Project};
-use crate::summaries::{Substitutions, SummaryKey};
+use crate::summaries::{Substitutions, SummaryId, SummaryKey, SummaryRecord};
 use crate::tsc::{Query, TscAnswer};
 use crate::types::{QueryKind, TscPass};
+use crate::unknowns::Unknowns;
+use crate::values::Values;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum TypeMode {
@@ -56,7 +59,11 @@ pub struct Analysis<'p, 'a> {
     pub(crate) needed: IndexMap<(FileId, u32, u32, QueryKind), Query>,
     pub(crate) answers: HashMap<(FileId, u32, u32, QueryKind), Option<TscAnswer>>,
     pub tsc_info: String,
-    pub(crate) summaries: HashMap<SummaryKey, Reading>,
+    pub(crate) summaries: HashMap<SummaryKey, SummaryId>,
+    pub summaries_arena: Vec<SummaryRecord>,
+    pub unknowns: Unknowns,
+    pub values: Values,
+    pub current_effects: Effects,
     pub(crate) stack: Vec<SummaryKey>,
     pub(crate) minimum_hit: usize,
     pub(crate) pending_cycle: Vec<SummaryKey>,
@@ -82,6 +89,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             answers: HashMap::new(),
             tsc_info: String::new(),
             summaries: HashMap::new(),
+            summaries_arena: Vec::new(),
+            unknowns: Unknowns::default(),
+            values: Values::default(),
+            current_effects: Effects::default(),
             stack: Vec::new(),
             minimum_hit: usize::MAX,
             pending_cycle: Vec::new(),

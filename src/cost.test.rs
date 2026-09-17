@@ -51,7 +51,7 @@ fn part_max_keeps_the_first_on_ties() {
     let first = part_of(Cost::N, "first");
     let second = part_of(Cost::N, "second");
 
-    assert_eq!(first.clone().max(second), first);
+    assert_eq!(first.clone().max(second, &mut Unknowns::default()), first);
 }
 
 #[test]
@@ -60,20 +60,33 @@ fn part_max_prefers_hot_then_unmarked_then_cold_over_absent() {
     let unmarked = part_of(Cost::N, "unmarked");
     let cold = part_of(Cost { n: 2, log: 0 }, "cold").preferred(Preference::Cold);
 
-    assert_eq!(unmarked.clone().max(hot.clone()), hot);
-    assert_eq!(cold.clone().max(unmarked.clone()), unmarked);
-    assert_eq!(Part::none().max(cold.clone()), cold);
+    assert_eq!(
+        unmarked.clone().max(hot.clone(), &mut Unknowns::default()),
+        hot
+    );
+    assert_eq!(
+        cold.clone().max(unmarked.clone(), &mut Unknowns::default()),
+        unmarked
+    );
+    assert_eq!(
+        Part::none().max(cold.clone(), &mut Unknowns::default()),
+        cold
+    );
 }
 
 #[test]
 fn reading_total_takes_the_largest_part() {
     let reading = Reading {
+        phases: [ExecutionPhase::Immediate; 3],
         main: part_of(Cost::N, "main"),
         function_exit: part_of(Cost::LOG, "function exit"),
         loop_exit: part_of(Cost::N_LOG_N, "loop exit"),
     };
 
-    assert_eq!(reading.total(), part_of(Cost::N_LOG_N, "loop exit"));
+    assert_eq!(
+        reading.total(&mut Unknowns::default()),
+        part_of(Cost::N_LOG_N, "loop exit")
+    );
 }
 
 #[test]

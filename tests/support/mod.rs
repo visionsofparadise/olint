@@ -155,3 +155,11 @@ pub fn run_with_source(source: &str, body: impl for<'p, 'a> FnOnce(&mut Analysis
         body(&mut analysis, file);
     });
 }
+
+pub fn summary_of(analysis: &mut Analysis<'_, '_>, file: FileId, name: &str) -> olint::cost::Part {
+    let function = function_of_name(analysis.project, file, name);
+
+    analysis
+        .summarize(file, function)
+        .total(&mut analysis.unknowns)
+}

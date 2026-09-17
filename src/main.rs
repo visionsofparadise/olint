@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
-use olint::config::{read_config, ConfigError, ENTRYPOINT_FORMS, LIMIT_FORMS};
+use olint::config::{read_config, ConfigError, UnknownPolicy, ENTRYPOINT_FORMS, LIMIT_FORMS};
 use olint::project::{Project, ProjectError};
 use olint::public::public_functions;
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
@@ -45,6 +45,9 @@ fn single_line_of(text: &str) -> String {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Failure::Config(ConfigError::Unknown { value }) => {
+                format!("unknown must be ignore, warn or error, got {value}")
+            }
             Failure::Project(ProjectError::Tsconfig { path, message }) => {
                 format!("{}: {message}", path.display())
             }
@@ -143,8 +146,11 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
     let config = read_config(&project, cli.config.as_deref()).map_err(Failure::Config)?;
     let public = public_functions(&mut analysis, &config);
+    let mut selected_unknowns = Vec::new();
     let code = if cli.report {
         let rows = report_rows_of(&mut analysis, &functions);
+
+        selected_unknowns.extend(rows.iter().filter_map(|row| row.unknowns));
 
         print_lines(&report_lines(
             &project,
@@ -157,7 +163,9 @@ fn run(cli: Cli) -> Result<i32, Failure> {
         let mut checked = Vec::with_capacity(public.len());
 
         for public in public {
-            let part = analysis.summarize(public.file, public.function).total();
+            let part = analysis
+                .summarize(public.file, public.function)
+                .total(&mut analysis.unknowns);
 
             checked.push(Finding {
                 name: analysis.name_of(public.file, public.function),
@@ -176,8 +184,30 @@ fn run(cli: Cli) -> Result<i32, Failure> {
 
         print_lines(&lint_lines(&project, &config, &checked, &over));
 
-        i32::from(!over.is_empty())
+        selected_unknowns.extend(checked.iter().filter_map(|finding| finding.part.unknowns));
+
+        i32::from(
+            !over.is_empty()
+                || (config.unknown == UnknownPolicy::Error && !selected_unknowns.is_empty()),
+        )
     };
+
+    if config.unknown != UnknownPolicy::Ignore {
+        let severity = if config.unknown == UnknownPolicy::Error {
+            "error"
+        } else {
+            "warning"
+        };
+        let mut shown = std::collections::HashSet::new();
+
+        for root in selected_unknowns {
+            for line in analysis.unknowns.lines(&project, root) {
+                if shown.insert(line.clone()) {
+                    eprintln!("olint: {severity}: {line}");
+                }
+            }
+        }
+    }
 
     for warning in &analysis.warnings {
         eprintln!("olint: warning: {warning}");

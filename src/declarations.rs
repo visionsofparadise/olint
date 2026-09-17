@@ -130,6 +130,21 @@ pub struct FunctionId {
     pub node: NodeId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TargetSet {
+    pub known: Vec<FunctionId>,
+    pub open: bool,
+}
+
+impl Default for TargetSet {
+    fn default() -> Self {
+        Self {
+            known: Vec::new(),
+            open: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     Symbol(FileId, SymbolId),

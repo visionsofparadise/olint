@@ -1,4 +1,23 @@
-use olint::cost::{Cost, Reading};
+use olint::cost::{Cost, Part, Reading};
+use olint::unknowns::Unknowns;
+use std::cell::RefCell;
+use std::ops::Deref;
+
+struct TestReading {
+    reading: Reading,
+    unknowns: RefCell<Unknowns>,
+}
+impl TestReading {
+    fn total(&self) -> Part {
+        self.reading.total(&mut self.unknowns.borrow_mut())
+    }
+}
+impl Deref for TestReading {
+    type Target = Reading;
+    fn deref(&self) -> &Reading {
+        &self.reading
+    }
+}
 
 mod support;
 
@@ -44,20 +63,32 @@ if (diagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(
 
 use support::{function_of_name, run_with_source};
 
-fn reading_of(source: &str, name: &str) -> (Reading, Vec<String>) {
-    let mut found = (Reading::empty(), Vec::new());
+fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
+    let mut found = (
+        TestReading {
+            reading: Reading::empty(),
+            unknowns: RefCell::new(Unknowns::default()),
+        },
+        Vec::new(),
+    );
 
     run_with_source(source, |analysis, file| {
         let function = function_of_name(analysis.project, file, name);
         let reading = analysis.cost_of_function_body(file, function);
         let labels = reading
-            .total()
+            .total(&mut analysis.unknowns)
             .chain
             .iter()
             .map(|factor| factor.label.clone())
             .collect();
 
-        found = (reading, labels);
+        found = (
+            TestReading {
+                reading,
+                unknowns: RefCell::new(std::mem::take(&mut analysis.unknowns)),
+            },
+            labels,
+        );
     });
 
     found
@@ -66,7 +97,7 @@ fn reading_of(source: &str, name: &str) -> (Reading, Vec<String>) {
 #[test]
 fn nested_loops_multiply() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][]) {\n\tfor (const row of rows) {\n\t\tfor (const cell of row) {\n\t\t\tcell.toFixed();\n\t\t}\n\t}\n}",
+        "export function f(rows: number[][]) {\n\tfor (const row of rows) {\n\t\tfor (const cell of row) {\n\t\t\tvoid cell;\n\t\t}\n\t}\n}",
         "f",
     );
 
@@ -139,7 +170,7 @@ fn set_union_uses_a_callable_set_like_object_as_data() {
 #[test]
 fn a_cold_statement_yields_to_an_unmarked_sibling() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n\tfor (const row of rows) row.at(0);\n}",
+        "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) void cell;\n\tfor (const row of rows) void row;\n}",
         "f",
     );
 
@@ -150,7 +181,7 @@ fn a_cold_statement_yields_to_an_unmarked_sibling() {
 #[test]
 fn an_all_cold_block_cascades_its_cold_maximum() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) row.at(0);\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n}",
+        "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) void row;\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) void cell;\n}",
         "f",
     );
 
@@ -171,7 +202,7 @@ fn a_hot_constant_branch_beats_a_linear_branch() {
 #[test]
 fn a_cold_else_branch_yields_to_the_other_branch() {
     let (reading, labels) = reading_of(
-        "export function f(flag: boolean, rows: number[][]) {\n\tif (flag) {\n\t\trows.indexOf([]);\n\t} else {\n\t\t// @perf cold\n\t\tfor (const row of rows) row.indexOf(1);\n\t}\n}",
+        "export function f(flag: boolean, rows: number[][]) {\n\tif (flag) {\n\t\trows.indexOf([]);\n\t} else {\n\t\t// @perf cold\n\t\tfor (const row of rows) for (const value of row) void value;\n\t}\n}",
         "f",
     );
 
@@ -182,7 +213,7 @@ fn a_cold_else_branch_yields_to_the_other_branch() {
 #[test]
 fn an_ignored_statement_contributes_nothing() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][]) {\n\t// @perf ignore\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n\t// @perf cold\n\tfor (const row of rows) row.at(0);\n}",
+        "export function f(rows: number[][]) {\n\t// @perf ignore\n\tfor (const row of rows) for (const cell of row) void cell;\n\t// @perf cold\n\tfor (const row of rows) void row;\n}",
         "f",
     );
 
@@ -193,7 +224,7 @@ fn an_ignored_statement_contributes_nothing() {
 #[test]
 fn a_cost_tag_on_a_loop_reads_as_its_tag() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][]) {\n\t// @perf O(N)\n\tfor (const row of rows) {\n\t\tfor (const cell of row) cell.toFixed();\n\t}\n}",
+        "export function f(rows: number[][]) {\n\t// @perf O(N)\n\tfor (const row of rows) {\n\t\tfor (const cell of row) void cell;\n\t}\n}",
         "f",
     );
 
@@ -246,13 +277,13 @@ fn a_string_method_on_a_parameter_is_linear() {
 #[test]
 fn hot_and_cold_on_one_node_take_no_preference_and_warn() {
     run_with_source(
-        "export function f(rows: number[][]) {\n\t// @perf hot\n\t// @perf cold\n\tfor (const row of rows) row.at(0);\n\tfor (const row of rows) for (const cell of row) cell.toFixed();\n}",
+        "export function f(rows: number[][]) {\n\t// @perf hot\n\t// @perf cold\n\tfor (const row of rows) void row;\n\tfor (const row of rows) for (const cell of row) void cell;\n}",
         |analysis, file| {
             let function = function_of_name(analysis.project, file, "f");
             let reading = analysis.cost_of_function_body(file, function);
             let warnings: Vec<String> = analysis.warnings.iter().cloned().collect();
 
-            assert_eq!(reading.total().cost, Cost { n: 2, log: 0 });
+            assert_eq!(reading.total(&mut analysis.unknowns).cost, Cost { n: 2, log: 0 });
             assert_eq!(
                 warnings,
                 vec!["@perf hot and @perf cold conflict at index.ts:4; the node takes no preference"]
@@ -298,7 +329,7 @@ fn a_string_method_on_a_readonly_field_is_constant() {
 #[test]
 fn a_loop_keeps_its_cold_body_mark_beside_a_linear_sibling() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][]) {\n\tfor (const row of rows) {\n\t\t// @perf cold\n\t\tfor (const cell of row) cell.toFixed();\n\t}\n\trows.indexOf([]);\n}",
+        "export function f(rows: number[][]) {\n\tfor (const row of rows) {\n\t\t// @perf cold\n\t\tfor (const cell of row) void cell;\n\t}\n\trows.indexOf([]);\n}",
         "f",
     );
 
@@ -309,7 +340,7 @@ fn a_loop_keeps_its_cold_body_mark_beside_a_linear_sibling() {
 #[test]
 fn an_if_without_else_yields_its_cold_branch_to_the_empty_else() {
     let (reading, labels) = reading_of(
-        "export function f(flag: boolean, rows: number[][]) {\n\tif (flag) {\n\t\t// @perf cold\n\t\tfor (const row of rows) row.indexOf(1);\n\t}\n}",
+        "export function f(flag: boolean, rows: number[][]) {\n\tif (flag) {\n\t\t// @perf cold\n\t\tfor (const row of rows) for (const value of row) void value;\n\t}\n}",
         "f",
     );
 

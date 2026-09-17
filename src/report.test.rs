@@ -44,6 +44,7 @@ fn chains_pad_labels_and_nest_inner_calls() {
 
 fn row_of(cost: Cost, name: &str, file: u32, line: u32) -> ReportRow {
     ReportRow {
+        unknowns: None,
         cost,
         name: name.to_string(),
         mark: None,
@@ -114,6 +115,7 @@ fn config_of(entries: &[&str]) -> Config {
     };
 
     Config {
+        unknown: crate::config::UnknownPolicy::Warn,
         max: max.clone(),
         entrypoints: entries
             .iter()

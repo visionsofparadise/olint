@@ -7,20 +7,42 @@ use oxc_span::GetSpan;
 
 use crate::analysis::{Analysis, Stats};
 use crate::cost::{Cost, Factor, Part, Preference, Reading};
-use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
+use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, TargetSet};
 use crate::directives::{cost_tag_of, PerfTag};
+use crate::effects::Effects;
 use crate::project::{FileId, Site};
-use crate::syntax::{is_identifier_pattern, unwrap};
+use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
+use crate::unknowns::{UnknownId, UnknownReason};
+use crate::values::{ArgumentFacts, ValueFacts};
 use crate::walker::tagged_reading_of;
 
-pub type Substitutions = HashMap<Binding, Part>;
+pub type Substitutions = HashMap<Binding, ArgumentFacts>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SummaryId(pub u32);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryRecord {
+    pub reading: Reading,
+    pub result: ValueFacts,
+    pub effects: Effects,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ArgumentKey {
+    pub binding: Binding,
+    pub value: ValueFacts,
+    pub cost: Option<Cost>,
+    pub unknowns: Vec<(UnknownId, Option<Cost>)>,
+    pub preference: Preference,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SummaryKey {
     pub function: FunctionId,
-    pub substitutions: Vec<(String, Cost, Preference)>,
+    pub substitutions: Vec<(String, ArgumentKey)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,17 +58,35 @@ impl<'p, 'a> Analysis<'p, 'a> {
         function: FunctionNode<'a>,
         substitutions: &Substitutions,
     ) -> SummaryKey {
-        let mut named: Vec<(String, Cost, Preference)> = substitutions
+        let mut named: Vec<(String, ArgumentKey)> = substitutions
             .iter()
-            .map(|(binding, part)| (self.binding_name_of(*binding), part.cost, part.preference))
+            .filter(|(_, facts)| {
+                facts.callback.is_some()
+                    || facts.value.size.is_some()
+                    || facts.value.latent.is_some()
+                    || !facts.value.targets.open
+                    || !facts.value.targets.known.is_empty()
+            })
+            .map(|(binding, facts)| {
+                (
+                    self.binding_name_of(*binding),
+                    ArgumentKey {
+                        binding: *binding,
+                        value: facts.value.clone(),
+                        cost: facts.callback.as_ref().map(|part| part.cost),
+                        unknowns: self
+                            .unknowns
+                            .semantic_key(facts.callback.as_ref().and_then(|part| part.unknowns)),
+                        preference: facts.preference,
+                    },
+                )
+            })
             .collect();
 
         named.sort_by(|left, right| {
-            (left.0.as_str(), left.1.text(), left.2).cmp(&(
-                right.0.as_str(),
-                right.1.text(),
-                right.2,
-            ))
+            left.0.cmp(&right.0).then_with(|| {
+                format!("{:?}", left.1.binding).cmp(&format!("{:?}", right.1.binding))
+            })
         });
 
         SummaryKey {
@@ -56,6 +96,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
             substitutions: named,
         }
+    }
+
+    fn store_summary(&mut self, key: SummaryKey, reading: Reading, effects: Effects) -> SummaryId {
+        let span = self
+            .kind_of_node(key.function.file, key.function.node)
+            .span();
+        let origin = self.source_span(key.function.file, span);
+        let result = self.values.at(origin);
+        let id =
+            SummaryId(u32::try_from(self.summaries_arena.len()).expect("summary arena fits u32"));
+
+        self.summaries_arena.push(SummaryRecord {
+            reading,
+            result,
+            effects,
+        });
+        self.summaries.insert(key, id);
+
+        id
     }
 
     fn binding_name_of(&self, binding: Binding) -> String {
@@ -85,14 +144,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if !raw {
             if let Some(known) = self.summaries.get(&key) {
-                return known.clone();
+                return self.summaries_arena[known.0 as usize].reading.clone();
             }
 
             let tags = self.function_tags(file, function);
 
             if tags.contains(&PerfTag::Ignore) {
                 self.stats.count("@perf ignore: function");
-                self.summaries.insert(key, Reading::empty());
+                self.store_summary(key, Reading::empty(), Effects::unknown());
 
                 return Reading::empty();
             }
@@ -102,7 +161,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 let reading = tagged_reading_of(cost, &text, self.function_site_of(file, function));
 
-                self.summaries.insert(key, reading.clone());
+                self.store_summary(key, reading.clone(), Effects::unknown());
 
                 return reading;
             }
@@ -126,6 +185,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.stack.push(key.clone());
 
+        let saved_effects = std::mem::take(&mut self.current_effects);
         let saved_substitutions = std::mem::replace(&mut self.current_substitutions, substitutions);
         let has_body = match function {
             FunctionNode::Function(inner) => inner.body.is_some(),
@@ -143,8 +203,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let reading = if has_body {
             self.cost_of_function_body(file, function)
         } else {
-            Reading::empty()
+            self.unknown_reading(
+                file,
+                self.kind_of_node(file, function.node_id()).span(),
+                UnknownReason::Target,
+            )
         };
+        let effects = std::mem::replace(&mut self.current_effects, saved_effects);
 
         self.current_substitutions = saved_substitutions;
         self.budget_context = saved_context;
@@ -170,19 +235,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return reading;
         }
 
-        self.summaries.insert(key, reading.clone());
+        self.store_summary(key, reading.clone(), effects.clone());
 
         for member in members {
             self.stats
                 .count("recursion cycle: member takes root summary");
 
             let tagged = Reading {
+                phases: reading.phases,
                 main: self.cycle_tag_of(reading.main.clone(), file, function),
                 function_exit: self.cycle_tag_of(reading.function_exit.clone(), file, function),
                 loop_exit: self.cycle_tag_of(reading.loop_exit.clone(), file, function),
             };
 
-            self.summaries.insert(member, tagged);
+            self.store_summary(member, tagged, effects.clone());
         }
 
         reading
@@ -218,72 +284,97 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .collect()
     }
 
+    pub(crate) fn argument_facts_of(
+        &mut self,
+        file: FileId,
+        argument: &'a Argument<'a>,
+    ) -> ArgumentFacts {
+        let origin = self.source_span(file, argument.span());
+        let mut value = self.values.at(origin);
+        let expression = argument.as_expression().map(unwrap);
+        let declaration = expression.and_then(|expression| match expression {
+            Expression::Identifier(reference) => {
+                self.declarations
+                    .of_reference(self.project, file, reference)
+            }
+            _ => expression
+                .as_member_expression()
+                .and_then(|member| self.member_declaration_of(file, member)),
+        });
+
+        if let Some(Expression::Identifier(reference)) = expression {
+            if let Some(binding) = self.binding_of_identifier(file, reference) {
+                if let Some(facts) = self.current_substitutions.get(&binding) {
+                    return facts.clone();
+                }
+            }
+        }
+
+        let function = match expression {
+            Some(Expression::FunctionExpression(function)) => {
+                Some((file, FunctionNode::Function(function)))
+            }
+            Some(Expression::ArrowFunctionExpression(arrow)) => {
+                Some((file, FunctionNode::Arrow(arrow)))
+            }
+            _ => declaration.and_then(|declaration| self.declarations.function_of(declaration)),
+        };
+        let callback = if let Some((target, function)) = function {
+            let inherited = self.inherited_substitutions_of(function);
+            let key = self.key_of(target, function, &inherited);
+            let (part, cyclic) = self.within_cycle_of(|analysis| {
+                let reading = analysis.summarize_with(target, function, inherited, false);
+
+                reading.total(&mut analysis.unknowns)
+            });
+            value.targets = TargetSet {
+                known: vec![FunctionId {
+                    file: target,
+                    node: function.node_id(),
+                }],
+                open: false,
+            };
+            value.latent = self.summaries.get(&key).copied();
+
+            Some(self.called_part_of(target, function, part, cyclic))
+        } else {
+            None
+        };
+        let preference = callback
+            .as_ref()
+            .map_or(Preference::Absent, |part| part.preference);
+
+        ArgumentFacts {
+            value,
+            callback,
+            preference,
+        }
+    }
+
     pub(crate) fn part_of_argument(
         &mut self,
         file: FileId,
         argument: Option<&'a Argument<'a>>,
     ) -> Option<Part> {
-        let argument = unwrap(argument?.as_expression()?);
+        let argument = argument?;
+        let facts = self.argument_facts_of(file, argument);
 
-        match argument {
-            Expression::FunctionExpression(function) => {
-                return Some(self.inline_callback_part_of(file, FunctionNode::Function(function)));
-            }
-            Expression::ArrowFunctionExpression(arrow) => {
-                return Some(self.inline_callback_part_of(file, FunctionNode::Arrow(arrow)));
-            }
-            _ => {}
-        }
+        self.apply_argument_effects(&facts);
 
-        let declaration = match argument {
-            Expression::Identifier(reference) => {
-                let declaration = self
-                    .declarations
-                    .of_reference(self.project, file, reference);
-
-                if let Some(Declaration::Parameter { parameter, .. }) = declaration {
-                    let identifier = match parameter {
-                        ParameterNode::Formal(formal) => is_identifier_pattern(&formal.pattern),
-                        ParameterNode::Rest(rest) => is_identifier_pattern(&rest.rest.argument),
-                    };
-
-                    if identifier {
-                        return self
-                            .binding_of_identifier(file, reference)
-                            .and_then(|binding| self.current_substitutions.get(&binding).cloned());
-                    }
-                }
-
-                declaration
-            }
-            _ => match argument.as_member_expression() {
-                Some(member)
-                    if !matches!(
-                        member,
-                        oxc_ast::ast::MemberExpression::ComputedMemberExpression(_)
-                    ) =>
-                {
-                    self.member_declaration_of(file, member)
-                }
-                _ => return None,
-            },
-        };
-        let (target, function) = self.declarations.function_of(declaration?)?;
-        let (part, cyclic) =
-            self.within_cycle_of(|analysis| analysis.summarize(target, function).total());
-
-        Some(self.called_part_of(target, function, part, cyclic))
+        facts
+            .callback
+            .or_else(|| Some(self.unknown_part(file, argument.span(), UnknownReason::Target)))
     }
 
-    fn inline_callback_part_of(&mut self, file: FileId, function: FunctionNode<'a>) -> Part {
-        let inherited = self.inherited_substitutions_of(function);
-        let (part, cyclic) = self.within_cycle_of(|analysis| {
-            analysis
-                .summarize_with(file, function, inherited, false)
-                .total()
-        });
+    pub(crate) fn apply_argument_effects(&mut self, facts: &ArgumentFacts) {
+        let effects = facts
+            .value
+            .latent
+            .and_then(|id| self.summaries_arena.get(id.0 as usize))
+            .map(|record| record.effects.clone())
+            .unwrap_or_else(Effects::unknown);
 
-        self.called_part_of(file, function, part, cyclic)
+        self.current_effects.join(&effects);
     }
 
     pub(crate) fn within_cycle_of<T>(&mut self, run: impl FnOnce(&mut Self) -> T) -> (T, bool) {
@@ -311,7 +402,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match mark {
             Some(mark) => part.preferred(mark),
-            None if part.cost.is_one() => part.preferred(Preference::Absent),
+            None if part.cost.is_one() && part.unknowns.is_none() => {
+                part.preferred(Preference::Absent)
+            }
             None => part.preferred(Preference::Unmarked),
         }
     }
@@ -340,25 +433,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
                 continue;
             };
-            let Some(part) = self.part_of_argument(call_file, arguments.get(index + offset)) else {
+            let Some(argument) = arguments.get(index + offset) else {
                 continue;
             };
-
-            if part.cost.is_one() && part.preference == Preference::Absent {
-                continue;
-            }
+            let facts = self.argument_facts_of(call_file, argument);
 
             if let Some(symbol) = identifier.symbol_id.get() {
-                substitutions.insert(Binding::Symbol { file, symbol }, part);
+                substitutions.insert(Binding::Symbol { file, symbol }, facts);
             }
         }
 
-        if substitutions.is_empty() {
-            self.summarize(file, function).total()
-        } else {
-            self.summarize_with(file, function, substitutions, false)
-                .total()
-        }
+        let key = self.key_of(file, function, &substitutions);
+        let reading = self.summarize_with(file, function, substitutions, false);
+        let effects = self
+            .summaries
+            .get(&key)
+            .map(|id| self.summaries_arena[id.0 as usize].effects.clone())
+            .unwrap_or_else(Effects::unknown);
+
+        self.current_effects.join(&effects);
+
+        reading.total(&mut self.unknowns)
     }
 
     fn method_owner_of(&self, file: FileId, element: NodeId) -> String {
@@ -575,6 +670,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.bound_seen.clear();
         self.pending_scoped.clear();
 
+        self.current_effects = Effects::default();
         self.stats = Stats::default();
     }
 

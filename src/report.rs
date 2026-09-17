@@ -7,6 +7,7 @@ use crate::paths::relative_path_of;
 use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
 use crate::summaries::Substitutions;
+use crate::unknowns::UnknownId;
 
 const LOOP_LABELS: &[&str] = &["for", "for-of", "for-in", "while", "do-while"];
 
@@ -110,6 +111,7 @@ pub struct Finding<'a> {
 }
 
 pub struct ReportRow {
+    pub unknowns: Option<UnknownId>,
     pub cost: Cost,
     pub name: String,
     pub mark: Option<String>,
@@ -130,9 +132,10 @@ pub fn report_rows_of<'a>(
             Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
             None => analysis.summarize(file, function),
         }
-        .total();
+        .total(&mut analysis.unknowns);
 
         rows.push(ReportRow {
+            unknowns: part.unknowns,
             cost: part.cost,
             name: analysis.name_of(file, function),
             mark,
@@ -188,7 +191,7 @@ pub fn lint_lines(
     for finding in over {
         lines.push(format!(
             "{} > {}{}  {}  {}  via {}",
-            finding.part.cost.text(),
+            partial_text(finding.part.cost, finding.part.unknowns),
             finding.public.limit.text,
             if finding.public.own_limit {
                 " [@perf max]"
@@ -206,6 +209,15 @@ pub fn lint_lines(
     }
 
     lines.push(format!("{} over limit", over.len()));
+
+    let incomplete = checked
+        .iter()
+        .filter(|finding| finding.part.unknowns.is_some())
+        .count();
+
+    if incomplete > 0 {
+        lines.push(format!("{incomplete} partial results"));
+    }
 
     lines
 }
@@ -237,7 +249,7 @@ fn lines_of_report(
     let mut buckets: Vec<(String, usize)> = Vec::new();
 
     for row in rows {
-        let text = row.cost.text();
+        let text = partial_text(row.cost, row.unknowns);
 
         match buckets.iter_mut().find(|(known, _)| *known == text) {
             Some(bucket) => bucket.1 += 1,
@@ -270,12 +282,18 @@ fn lines_of_report(
     flagged.sort_by(|left, right| order_by_cost_descending(left.cost, right.cost));
 
     for row in flagged {
-        lines.push(row_text_of(
+        let row_text = row_text_of(
             row.cost,
             &row.name,
             row.mark.as_deref(),
             &location(row.site),
-        ));
+        );
+
+        lines.push(if row.unknowns.is_some() {
+            format!("{row_text} [partial]")
+        } else {
+            row_text
+        });
 
         lines_of_chain(&row.chain, 1, &mut lines, location);
 
@@ -283,6 +301,14 @@ fn lines_of_report(
     }
 
     lines
+}
+
+fn partial_text(cost: Cost, unknowns: Option<UnknownId>) -> String {
+    if unknowns.is_some() {
+        format!("{} [partial]", cost.text())
+    } else {
+        cost.text()
+    }
 }
 
 #[cfg(test)]
