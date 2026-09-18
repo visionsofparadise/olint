@@ -10,6 +10,11 @@ if (input.version !== PROTOCOL_VERSION) {
 	process.stderr.write(`protocol version ${JSON.stringify(input.version)} where ${PROTOCOL_VERSION} is supported`);
 	process.exit(2);
 }
+if (input.counts !== undefined && typeof input.counts !== "boolean") {
+	process.stderr.write(`counts request ${JSON.stringify(input.counts)} is not a boolean`);
+	process.exit(2);
+}
+const counts = { programs: 0, checkers: 0, indexedFiles: 0, indexedNodes: 0, lookups: 0, visitedNodes: 0 };
 const tsconfig = path.resolve(input.tsconfig);
 const projectDir = path.dirname(tsconfig);
 
@@ -109,15 +114,27 @@ const isStructuralObject = (checker, t) => {
 	return t.getProperties().length > 0;
 };
 
-const findNode = (sf, pos, end) => {
-	let best;
-	const visit = (n) => {
-		if (n.getStart(sf) > pos || n.getEnd() < end) return;
-		if (n.getStart(sf) === pos && n.getEnd() === end) best = n;
-		n.forEachChild(visit);
-	};
-	visit(sf);
-	return best;
+const visitNodes = (node, onNode) => {
+	counts.visitedNodes++;
+	onNode(node);
+	node.forEachChild((child) => visitNodes(child, onNode));
+};
+const spanIndexes = new Map();
+const spanIndexOf = (sourceFile) => {
+	const cached = spanIndexes.get(sourceFile);
+	if (cached) return cached;
+	const index = new Map();
+	visitNodes(sourceFile, (node) => {
+		counts.indexedNodes++;
+		index.set(`${node.getStart(sourceFile)}:${node.getEnd()}`, node);
+	});
+	counts.indexedFiles++;
+	spanIndexes.set(sourceFile, index);
+	return index;
+};
+const findNode = (sourceFile, start, end) => {
+	counts.lookups++;
+	return spanIndexOf(sourceFile).get(`${start}:${end}`);
 };
 const unwrapNode = (n) => {
 	while (
@@ -250,8 +267,17 @@ const calleeAnswerOf = (checker, node) => {
 	return { query: "callee", targets: [...spans.values()], open: true };
 };
 
+const checked = new Set();
+const checkerOf = (program) => {
+	if (!checked.has(program)) {
+		checked.add(program);
+		counts.checkers++;
+	}
+	return program.getTypeChecker();
+};
+
 const answerOf = (program, q) => {
-	const checker = program.getTypeChecker();
+	const checker = checkerOf(program);
 	const file = path.resolve(q.file);
 	const sf = program.getSourceFile(file);
 	if (!sf) return null;
@@ -274,6 +300,7 @@ const answerOf = (program, q) => {
 };
 const answersOf = (queries) => {
 	const programs = programsOf();
+	counts.programs += programs.length;
 	return queries.map((query) => {
 		const applicable = programs.filter((program) => program.getSourceFile(path.resolve(query.file)));
 		if (!applicable.length) return null;
@@ -288,5 +315,6 @@ process.stdout.write(
 		typescript: ts.version,
 		from: tsPath,
 		answers: input.queries.length ? answersOf(input.queries) : [],
+		...(input.counts ? { counts } : {}),
 	}),
 );

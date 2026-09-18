@@ -386,22 +386,7 @@ fn the_helper_rejects_other_protocol_versions() {
         serde_json::json!({"tsconfig": directory.path().join("tsconfig.json"), "queries": []}),
         serde_json::json!({"version": 1, "tsconfig": directory.path().join("tsconfig.json"), "queries": []}),
     ] {
-        let mut child = std::process::Command::new("node")
-            .args(["--input-type=module", "--eval", olint::tsc::SCRIPT])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("node runs the static helper");
-
-        std::io::Write::write_all(
-            &mut child.stdin.take().expect("stdin"),
-            request.to_string().as_bytes(),
-        )
-        .expect("request is written");
-
-        let output = child.wait_with_output().expect("helper exits");
+        let output = helper_output_of(olint::tsc::SCRIPT, &request);
 
         assert!(!output.status.success(), "{request}");
         assert!(output.stdout.is_empty(), "{request}");
@@ -447,19 +432,7 @@ const CANDIDATE_LINES: [&str; 28] = [
 fn callee_answers_list_every_implementation_body_across_encodings() {
     for (prefix, line_ending) in [("", "\n"), ("\u{feff}", "\r\n")] {
         let source = format!("{prefix}{}{line_ending}", CANDIDATE_LINES.join(line_ending));
-        let directory = project_of(&[
-            (
-                "tsconfig.json",
-                r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
-            ),
-            ("index.ts", &source),
-        ]);
-        let tsconfig = directory.path().join("tsconfig.json");
-        let path = directory
-            .path()
-            .join("index.ts")
-            .to_string_lossy()
-            .into_owned();
+        let (directory, tsconfig, path) = strict_project_of(&source);
         let callees = [
             "engine().run",
             "make(flag).work",
@@ -687,4 +660,227 @@ fn compiler_member_callbacks_keep_the_open_remainder() {
     };
 
     assert!(targeted);
+}
+
+const PRE_INDEX_LOOKUP: &str = "const findNode = (sf, pos, end) => {\n\tlet best;\n\tconst visit = (n) => {\n\t\tif (n.getStart(sf) > pos || n.getEnd() < end) return;\n\t\tif (n.getStart(sf) === pos && n.getEnd() === end) best = n;\n\t\tn.forEachChild(visit);\n\t};\n\tvisit(sf);\n\treturn best;\n};\n";
+
+fn script_of_pre_index_lookup() -> String {
+    let start = olint::tsc::SCRIPT
+        .find("const findNode = ")
+        .expect("the helper defines its lookup");
+    let end = start
+        + olint::tsc::SCRIPT[start..]
+            .find("\n};\n")
+            .expect("the lookup ends")
+        + "\n};\n".len();
+
+    format!(
+        "{}{PRE_INDEX_LOOKUP}{}",
+        &olint::tsc::SCRIPT[..start],
+        &olint::tsc::SCRIPT[end..]
+    )
+}
+
+fn answers_of_script(script: &str, tsconfig: &Path, queries: &[Query]) -> serde_json::Value {
+    let request = serde_json::json!({"version": 2, "tsconfig": tsconfig, "queries": queries});
+    let output = helper_output_of(script, &request);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("reply")["answers"].clone()
+}
+
+const INDEXED_LINES: [&str; 17] = [
+    "/* caf\u{e9} \u{1f600} */",
+    "class Engine {",
+    "\trun(xs: number[]): number[] {",
+    "\t\treturn /* inner */ (xs as number[]).map((x) => x + 1);",
+    "\t}",
+    "}",
+    "type Pair = [number, ...string[]];",
+    "const table = { engine: new Engine(), pair: [1, \"a\"] as Pair };",
+    "function make(): number[] {",
+    "\treturn [1];",
+    "}",
+    "export function probe(xs: number[]) {",
+    "\t// \u{e9}\u{e9} comment",
+    "\ttable.engine.run(xs)!.length;",
+    "\tfor (const item of table.pair) void item;",
+    "}",
+    "make()",
+];
+
+#[test]
+fn indexed_lookups_answer_every_span_like_the_pre_index_search() {
+    let reference = script_of_pre_index_lookup();
+
+    for (prefix, line_ending) in [("", "\n"), ("\u{feff}", "\r\n")] {
+        let source = format!("{prefix}{}", INDEXED_LINES.join(line_ending));
+        let (directory, tsconfig, path) = strict_project_of(&source);
+        let allocator = Allocator::default();
+        let project = Project::load(&allocator, &tsconfig).expect("project loads");
+        let file = file_of(&project, directory.path(), "index.ts");
+        let mut spans: Vec<(u32, u32)> = project
+            .file(file)
+            .semantic
+            .nodes()
+            .iter()
+            .map(|node| oxc_span::GetSpan::span(&node.kind()))
+            .flat_map(|span| [(span.start, span.end), (span.start, span.end + 1)])
+            .collect();
+
+        spans.sort();
+        spans.dedup();
+
+        let queries: Vec<Query> = spans
+            .iter()
+            .flat_map(|(pos, end)| {
+                [
+                    Query::Type {
+                        file: path.clone(),
+                        pos: *pos,
+                        end: *end,
+                    },
+                    Query::Callee {
+                        file: path.clone(),
+                        pos: *pos,
+                        end: *end,
+                    },
+                ]
+            })
+            .collect();
+        let indexed = answers_of_script(olint::tsc::SCRIPT, &tsconfig, &queries);
+
+        assert_eq!(
+            indexed,
+            answers_of_script(&reference, &tsconfig, &queries),
+            "{line_ending:?}"
+        );
+
+        let answered = indexed
+            .as_array()
+            .expect("answers")
+            .iter()
+            .filter(|answer| !answer.is_null())
+            .count();
+
+        assert!(
+            answered * 5 > queries.len(),
+            "{answered} of {}",
+            queries.len()
+        );
+
+        let start = source.rfind("make()").expect("the final statement") as u32;
+        let end = start + "make()".len() as u32;
+        let reply = reply_of(
+            &tsconfig,
+            &[Query::Type {
+                file: path,
+                pos: start,
+                end,
+            }],
+        );
+
+        assert!(matches!(
+            reply.answers[0],
+            Some(TscAnswer::Type(TypeAnswer {
+                kind: Kind::Array,
+                ..
+            }))
+        ));
+    }
+}
+
+#[test]
+fn counts_appear_only_when_requested_and_are_validated() {
+    let counted = r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[],"counts":{"programs":0,"checkers":0,"indexedFiles":0,"indexedNodes":0,"lookups":0,"visitedNodes":0}}"#;
+    let plain = r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[]}"#;
+
+    assert_eq!(
+        olint::tsc::parse_counted_reply(counted.as_bytes(), &[])
+            .expect("requested counts parse")
+            .1,
+        olint::tsc::TscCounts::default()
+    );
+    assert!(parse_reply(plain.as_bytes(), &[]).is_ok());
+
+    for (reply, counted) in [
+        (counted, false),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[],"counts":null}"#,
+            false,
+        ),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[],"counts":null}"#,
+            true,
+        ),
+        (plain, true),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[],"counts":{"lookups":0}}"#,
+            true,
+        ),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[],"counts":{"programs":0,"checkers":0,"indexedFiles":0,"indexedNodes":0,"lookups":0,"visitedNodes":0,"visits":0}}"#,
+            true,
+        ),
+    ] {
+        let result = if counted {
+            olint::tsc::parse_counted_reply(reply.as_bytes(), &[]).map(|(reply, _)| reply)
+        } else {
+            parse_reply(reply.as_bytes(), &[])
+        };
+
+        assert!(
+            matches!(result, Err(TscError::Malformed(_))),
+            "{reply}: {result:?}"
+        );
+    }
+
+    let directory = project_of(&[("tsconfig.json", "{}"), ("index.ts", "export {};")]);
+    let request = serde_json::json!({"version": 2, "tsconfig": directory.path().join("tsconfig.json"), "queries": [], "counts": "yes"});
+    let output = helper_output_of(olint::tsc::SCRIPT, &request);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("counts request"));
+}
+
+fn helper_output_of(script: &str, request: &serde_json::Value) -> std::process::Output {
+    let mut child = std::process::Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("node runs the static helper");
+
+    std::io::Write::write_all(
+        &mut child.stdin.take().expect("stdin"),
+        request.to_string().as_bytes(),
+    )
+    .expect("request is written");
+
+    child.wait_with_output().expect("helper exits")
+}
+
+fn strict_project_of(source: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let directory = project_of(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
+        ),
+        ("index.ts", source),
+    ]);
+    let tsconfig = directory.path().join("tsconfig.json");
+    let path = directory
+        .path()
+        .join("index.ts")
+        .to_string_lossy()
+        .into_owned();
+
+    (directory, tsconfig, path)
 }

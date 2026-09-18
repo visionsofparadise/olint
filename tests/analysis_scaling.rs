@@ -943,3 +943,109 @@ fn failed_membership_union_runs_the_reserved_pass() {
         assert_terminal(stats);
     });
 }
+
+fn compiler_sites_of(count: usize) -> (String, Vec<(u32, u32)>) {
+    let mut source = String::new();
+    let mut sites = Vec::new();
+
+    for index in 0..count {
+        let line = format!(
+            "export function f{index}(xs: number[]) {{ return xs.map((x) => x + {index}); }}\n"
+        );
+        let offset = source.len() + line.find("xs.map").expect("call site");
+
+        sites.push((offset as u32, (offset + 2) as u32));
+        sites.push((offset as u32, (offset + 6) as u32));
+        source.push_str(&line);
+    }
+
+    (source, sites)
+}
+
+fn compiler_counts_of(
+    source: &str,
+    sites: &[(u32, u32)],
+) -> (Vec<Option<olint::tsc::TscAnswer>>, olint::tsc::TscCounts) {
+    let directory = support::project_of(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
+        ),
+        ("index.ts", source),
+    ]);
+    let file = directory
+        .path()
+        .join("index.ts")
+        .to_string_lossy()
+        .into_owned();
+    let queries: Vec<olint::tsc::Query> = sites
+        .iter()
+        .map(|(pos, end)| {
+            if end - pos == 2 {
+                olint::tsc::Query::Type {
+                    file: file.clone(),
+                    pos: *pos,
+                    end: *end,
+                }
+            } else {
+                olint::tsc::Query::Callee {
+                    file: file.clone(),
+                    pos: *pos,
+                    end: *end,
+                }
+            }
+        })
+        .collect();
+    let (reply, counts) = olint::tsc::ask_counted(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        &directory.path().join("tsconfig.json"),
+        &queries,
+    )
+    .expect("the compiler helper answers with counts");
+
+    (reply.answers, counts)
+}
+
+#[test]
+fn doubling_compiler_queries_reuses_one_span_index() {
+    let (source, sites) = compiler_sites_of(200);
+    let (half_answers, half) = compiler_counts_of(&source, &sites[..sites.len() / 2]);
+    let (answers, full) = compiler_counts_of(&source, &sites);
+
+    assert_eq!(answers[..half_answers.len()], half_answers[..]);
+    assert!(answers.iter().all(Option::is_some));
+    assert_eq!((half.programs, half.checkers), (1, 1));
+    assert_eq!((full.programs, full.checkers), (1, 1));
+    assert_eq!((half.indexed_files, full.indexed_files), (1, 1));
+    assert_eq!(half.indexed_nodes, full.indexed_nodes);
+    assert_eq!((half.lookups, full.lookups), (200, 400));
+
+    let (larger, larger_sites) = compiler_sites_of(400);
+    let (_, doubled) = compiler_counts_of(&larger, &larger_sites);
+
+    assert_eq!(doubled.lookups, 800);
+    assert!(doubled.indexed_nodes <= 2 * full.indexed_nodes + 1);
+
+    for counts in [half, full, doubled] {
+        assert_eq!(counts.visited_nodes, counts.indexed_nodes);
+    }
+
+    assert_eq!(half.visited_nodes, full.visited_nodes);
+
+    let misses: Vec<(u32, u32)> = sites.iter().map(|(pos, end)| (pos + 1, end + 1)).collect();
+    let (missed_answers, missed) = compiler_counts_of(&source, &misses);
+
+    assert!(missed_answers.iter().all(Option::is_none));
+    assert_eq!(missed.lookups, 400);
+    assert_eq!(missed.visited_nodes, full.visited_nodes);
+    assert!(doubled.visited_nodes <= 2 * full.visited_nodes + 1);
+}
+
+#[test]
+fn an_empty_compiler_batch_builds_no_index_or_checker() {
+    let (source, _) = compiler_sites_of(4);
+    let (answers, counts) = compiler_counts_of(&source, &[]);
+
+    assert!(answers.is_empty());
+    assert_eq!(counts, olint::tsc::TscCounts::default());
+}

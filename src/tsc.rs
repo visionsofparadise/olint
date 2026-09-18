@@ -57,11 +57,24 @@ pub enum TscError {
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TscCounts {
+    pub programs: u64,
+    pub checkers: u64,
+    pub indexed_files: u64,
+    pub indexed_nodes: u64,
+    pub lookups: u64,
+    pub visited_nodes: u64,
+}
+
 #[derive(Serialize)]
 struct Request<'q> {
     version: u32,
     tsconfig: String,
     queries: &'q [Query],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    counts: bool,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +84,14 @@ struct Reply {
     typescript: String,
     from: String,
     answers: Vec<Option<TscAnswer>>,
+    #[serde(default, deserialize_with = "deserialize_present_counts")]
+    counts: Option<TscCounts>,
+}
+
+fn deserialize_present_counts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TscCounts>, D::Error> {
+    TscCounts::deserialize(deserializer).map(Some)
 }
 
 pub const SCRIPT: &str = include_str!("tsc_sidecar.mjs");
@@ -78,6 +99,27 @@ pub const SCRIPT: &str = include_str!("tsc_sidecar.mjs");
 const TYPESCRIPT_UNAVAILABLE: i32 = 3;
 
 pub fn ask(root: &Path, tsconfig: &Path, queries: &[Query]) -> Result<TscReply, TscError> {
+    let output = exchange(root, tsconfig, queries, false)?;
+
+    parse_reply(&output, queries)
+}
+
+pub fn ask_counted(
+    root: &Path,
+    tsconfig: &Path,
+    queries: &[Query],
+) -> Result<(TscReply, TscCounts), TscError> {
+    let output = exchange(root, tsconfig, queries, true)?;
+
+    parse_counted_reply(&output, queries)
+}
+
+fn exchange(
+    root: &Path,
+    tsconfig: &Path,
+    queries: &[Query],
+    counts: bool,
+) -> Result<Vec<u8>, TscError> {
     let tsconfig = std::path::absolute(tsconfig).map_err(|error| TscError::Failed {
         status: None,
         stderr: error.to_string(),
@@ -86,6 +128,7 @@ pub fn ask(root: &Path, tsconfig: &Path, queries: &[Query]) -> Result<TscReply, 
         version: PROTOCOL_VERSION,
         tsconfig: tsconfig.to_string_lossy().into_owned(),
         queries,
+        counts,
     })
     .map_err(|error| TscError::Malformed(error.to_string()))?;
     let mut child = Command::new("node")
@@ -105,13 +148,36 @@ pub fn ask(root: &Path, tsconfig: &Path, queries: &[Query]) -> Result<TscReply, 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     match output.status.code() {
-        Some(0) => parse_reply(&output.stdout, queries),
+        Some(0) => Ok(output.stdout),
         Some(TYPESCRIPT_UNAVAILABLE) => Err(TscError::TypescriptUnavailable(stderr)),
         status => Err(TscError::Failed { status, stderr }),
     }
 }
 
 pub fn parse_reply(text: &[u8], queries: &[Query]) -> Result<TscReply, TscError> {
+    let (reply, counts) = reply_of(text, queries)?;
+
+    match counts {
+        None => Ok(reply),
+        Some(_) => Err(TscError::Malformed("unrequested counts".to_string())),
+    }
+}
+
+pub fn parse_counted_reply(
+    text: &[u8],
+    queries: &[Query],
+) -> Result<(TscReply, TscCounts), TscError> {
+    let (reply, counts) = reply_of(text, queries)?;
+
+    match counts {
+        Some(counts) => Ok((reply, counts)),
+        None => Err(TscError::Malformed(
+            "requested counts are missing".to_string(),
+        )),
+    }
+}
+
+fn reply_of(text: &[u8], queries: &[Query]) -> Result<(TscReply, Option<TscCounts>), TscError> {
     let reply: Reply =
         serde_json::from_slice(text).map_err(|error| TscError::Malformed(error.to_string()))?;
 
@@ -156,9 +222,12 @@ pub fn parse_reply(text: &[u8], queries: &[Query]) -> Result<TscReply, TscError>
         }
     }
 
-    Ok(TscReply {
-        typescript: reply.typescript,
-        from: reply.from,
-        answers: reply.answers,
-    })
+    Ok((
+        TscReply {
+            typescript: reply.typescript,
+            from: reply.from,
+            answers: reply.answers,
+        },
+        reply.counts,
+    ))
 }
