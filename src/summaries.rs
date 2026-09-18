@@ -2091,18 +2091,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let (parameters, offset) = match function {
-            FunctionNode::Function(inner) => {
-                (&inner.params, usize::from(inner.this_param.is_some()))
-            }
-            FunctionNode::Arrow(inner) => (&inner.params, 0),
+        let parameters = match function {
+            FunctionNode::Function(inner) => &inner.params,
+            FunctionNode::Arrow(inner) => &inner.params,
         };
 
         for (index, parameter) in parameters.items.iter().enumerate() {
             let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
                 continue;
             };
-            let facts = match arguments.get(index + offset) {
+            let facts = match arguments.get(index) {
                 Some(argument) => self.argument_facts_of(call_file, argument),
                 None => ArgumentFacts {
                     value: self.values.at(self.source_span(file, identifier.span)),

@@ -1,7 +1,8 @@
-use olint::analysis::Analysis;
+use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::read_config;
 use olint::cost::Cost;
 use olint::public::public_functions;
+use std::path::Path;
 
 mod support;
 
@@ -46,6 +47,117 @@ fn immutable_callback_alias_uses_the_parameter_substitution() {
 
     assert_eq!(cost, Cost::parse("O(N^3)").unwrap());
     assert!(reasons.is_empty());
+}
+
+const ERASED_THIS_CALLBACKS: [(&str, &str); 2] = [
+    (
+        "function invoke(this: void, callback: () => number): number { return callback(); } export function selected(values: number[]) { return invoke(() => { let total = 0; for (const x of values) total += x; return total; }); }",
+        "O(N)",
+    ),
+    (
+        "function invoke(this: void, callback: () => number): number { return callback(); } export function selected(values: number[]) { return invoke(() => { let total = 0; for (const x of values) for (const y of values) total += x * y; return total; }); }",
+        "O(N^2)",
+    ),
+];
+
+#[test]
+fn an_erased_this_parameter_consumes_no_callback_argument() {
+    for (source, expected) in ERASED_THIS_CALLBACKS {
+        let (cost, reasons) = selected_result(source);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{source}");
+        assert!(reasons.is_empty(), "{source}: {reasons:?}");
+    }
+}
+
+#[test]
+fn an_erased_this_parameter_consumes_no_callback_argument_with_compiler_types() {
+    for (source, expected) in ERASED_THIS_CALLBACKS {
+        let files = [
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
+            ),
+            ("index.ts", source),
+        ];
+
+        run_in_project(&files, |project, root| {
+            let file = file_of(project, root, "index.ts");
+            let mut analysis = Analysis::new(
+                project,
+                Options {
+                    minimum_exponent: 2,
+                    types: TypeMode::Tsc,
+                },
+            );
+            let functions = analysis.reportable();
+            let tsconfig = root.join("tsconfig.json");
+
+            analysis
+                .gather_answers(&functions, |queries| {
+                    olint::tsc::ask(Path::new(env!("CARGO_MANIFEST_DIR")), &tsconfig, queries)
+                })
+                .expect("the compiler helper answers");
+
+            let function = function_of_name(analysis.project, file, "selected");
+            let part = support::summary_of(&mut analysis, file, "selected");
+
+            assert_eq!(
+                support::legacy_class_of(&mut analysis, file, function, &part.cost),
+                Cost::parse(expected).unwrap(),
+                "{source}"
+            );
+            assert!(
+                support::unknown_reasons(&analysis, part.unknowns).is_empty(),
+                "{source}"
+            );
+        });
+    }
+}
+
+#[test]
+fn an_omitted_callback_after_an_erased_this_parameter_stays_unknown() {
+    let (cost, reasons) = selected_result(
+        "function invoke(this: void, callback?: () => number): number { return callback ? callback() : 0; } export function selected() { return invoke(); }",
+    );
+
+    assert_eq!(cost, Cost::ONE);
+    assert!(
+        reasons.contains(&olint::unknowns::UnknownReason::Target),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn method_and_function_callbacks_bind_their_first_argument() {
+    let linear = "{ let total = 0; for (const x of values) total += x; return total; }";
+
+    for (declarations, call) in [
+        (
+            "function invoke(callback: () => number): number { return callback(); }",
+            "invoke",
+        ),
+        (
+            "const invoke = (callback: () => number): number => callback();",
+            "invoke",
+        ),
+        (
+            "const runner = { invoke(callback: () => number): number { return callback(); } };",
+            "runner.invoke",
+        ),
+        (
+            "const runner = { invoke(this: { tag: string }, callback: () => number): number { return callback(); }, tag: 'x' };",
+            "runner.invoke",
+        ),
+    ] {
+        let source = format!(
+            "{declarations} export function selected(values: number[]) {{ return {call}(() => {linear}); }}"
+        );
+
+        let (cost, _) = selected_result(&source);
+
+        assert_eq!(cost, Cost::parse("O(N)").unwrap(), "{source}");
+    }
 }
 
 #[test]

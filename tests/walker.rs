@@ -385,3 +385,14 @@ fn a_cold_drained_budget_loop_yields_to_its_linear_sibling() {
     assert_eq!(reading.total().cost, Cost::N);
     assert_eq!(labels, vec!["xs.indexOf()"]);
 }
+
+#[test]
+fn an_erased_this_parameter_keeps_the_callback_work_in_its_call() {
+    let (reading, labels) = reading_of(
+        "function invoke(this: void, callback: () => number): number {\n\treturn callback();\n}\nexport function f(values: number[]) {\n\treturn invoke(() => {\n\t\tlet total = 0;\n\t\tfor (const x of values) total += x;\n\t\treturn total;\n\t});\n}",
+        "f",
+    );
+
+    assert_eq!(reading.total().cost, Cost::parse("O(N)").unwrap());
+    assert_eq!(labels, vec!["call invoke()"]);
+}
