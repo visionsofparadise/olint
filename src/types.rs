@@ -180,8 +180,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let (declaration, closed) =
                 self.declarations
                     .callable_reference(self.project, file, reference);
+            let mut resolved = self.resolved_of_declaration(declaration, closed);
 
-            return self.resolved_of_declaration(declaration, closed);
+            if !closed {
+                for candidate in
+                    self.declarations
+                        .runtime_candidates_of(self.project, file, reference)
+                {
+                    if let Some((file, function)) = self.declarations.function_of(candidate) {
+                        let known = FunctionId {
+                            file,
+                            node: function.node_id(),
+                        };
+
+                        if !resolved.targets.known.contains(&known) {
+                            resolved.targets.known.push(known);
+                        }
+                    }
+                }
+            }
+
+            return resolved;
         }
 
         let Some(member) = member_expression_of(callee) else {

@@ -16,6 +16,7 @@ use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportImportName,
     ModuleRecord,
 };
+use oxc_syntax::scope::ScopeId;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::project::{FileId, Project, Resolved, SourceFile};
@@ -164,6 +165,7 @@ enum Target {
 
 type GlobalBindings = HashMap<(FileId, String), Option<(FileId, SymbolId)>>;
 type CallableBindings = HashMap<(FileId, NodeId), (Option<Target>, bool)>;
+type BlockFunctions = HashMap<(ScopeId, String), Vec<NodeId>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResolutionStats {
@@ -188,6 +190,7 @@ pub struct Declarations<'a> {
     symbols: RefCell<HashMap<(FileId, SymbolId), (Target, bool)>>,
     write_free: RefCell<HashMap<Binding, bool>>,
     surface_writes: RefCell<HashMap<Binding, Vec<NodeId>>>,
+    block_functions: RefCell<HashMap<FileId, BlockFunctions>>,
     assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
     resolution_epoch: Cell<usize>,
     resolution_stats: Cell<ResolutionStats>,
@@ -204,6 +207,7 @@ impl<'a> Declarations<'a> {
             symbols: RefCell::new(HashMap::new()),
             write_free: RefCell::new(HashMap::new()),
             surface_writes: RefCell::new(HashMap::new()),
+            block_functions: RefCell::new(HashMap::new()),
             assignments: RefCell::new(HashMap::new()),
             resolution_epoch: Cell::new(0),
             resolution_stats: Cell::new(ResolutionStats::default()),
@@ -270,7 +274,8 @@ impl<'a> Declarations<'a> {
                     break (None, false);
                 }
 
-                closed &= self.is_write_free(project, Binding::Symbol { file, symbol });
+                closed &= self.is_write_free(project, Binding::Symbol { file, symbol })
+                    && self.runtime_declarations_of(project, file, symbol).1;
             }
 
             path.push((key, closed));
@@ -343,6 +348,29 @@ impl<'a> Declarations<'a> {
         let target = self.target_of_symbol(project, file, symbol);
 
         declaration_of_target(project, target)
+    }
+
+    pub(crate) fn runtime_candidates_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &IdentifierReference<'a>,
+    ) -> Vec<Declaration<'a>> {
+        let Some(Binding::Symbol { file, symbol }) =
+            self.binding_of_reference(project, file, reference)
+        else {
+            return Vec::new();
+        };
+        let (candidates, determined) = self.runtime_declarations_of(project, file, symbol);
+        let selected = match determined {
+            true => candidates.last().map_or(&[][..], std::slice::from_ref),
+            false => &candidates[..],
+        };
+
+        selected
+            .iter()
+            .filter_map(|node| declaration_of_node(project, file, *node))
+            .collect()
     }
 
     pub fn binding_of_reference(
@@ -869,6 +897,99 @@ impl<'a> Declarations<'a> {
         self.write_free.borrow_mut().insert(binding, found);
 
         found
+    }
+
+    fn runtime_declarations_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        symbol: SymbolId,
+    ) -> (Vec<NodeId>, bool) {
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let scoping = semantic.scoping();
+        let scope = scoping.symbol_scope_id(symbol);
+        let mut declarations: Vec<NodeId> = scoping.symbol_declarations(symbol).collect();
+        let mut hoisted = Vec::new();
+        let mut initialized = Vec::new();
+        let mut determined = true;
+
+        declarations.sort_by_key(|node| nodes.kind(*node).span().start);
+
+        for node in declarations {
+            match nodes.kind(node) {
+                AstKind::Function(function)
+                    if function.is_declaration() && function.body.is_some() =>
+                {
+                    determined &= nodes.get_node(node).scope_id() == scope;
+
+                    hoisted.push(node);
+                }
+                AstKind::VariableDeclarator(declarator) if declarator.init.is_some() => {
+                    initialized.push(node);
+                }
+                _ => {}
+            }
+        }
+
+        if hoisted.is_empty() {
+            return (hoisted, true);
+        }
+
+        let blocks = self
+            .block_functions_of(project, file)
+            .get(&(scope, scoping.symbol_name(symbol).to_string()))
+            .cloned()
+            .unwrap_or_default();
+
+        determined &= initialized.is_empty() && blocks.is_empty();
+
+        hoisted.extend(initialized);
+        hoisted.extend(blocks);
+
+        (hoisted, determined)
+    }
+
+    fn block_functions_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+    ) -> std::cell::Ref<'_, BlockFunctions> {
+        if !self.block_functions.borrow().contains_key(&file) {
+            let semantic = &project.file(file).semantic;
+            let scoping = semantic.scoping();
+            let mut found: BlockFunctions = HashMap::new();
+
+            for symbol in scoping.symbol_ids() {
+                let node = scoping.symbol_declaration(symbol);
+                let mut scope = scoping.symbol_scope_id(symbol);
+                let flags = scoping.scope_flags(scope);
+
+                if flags.is_var()
+                    || flags.is_strict_mode()
+                    || !matches!(semantic.nodes().kind(node), AstKind::Function(function) if function.is_declaration() && function.body.is_some())
+                {
+                    continue;
+                }
+
+                while let Some(parent) = scoping.scope_parent_id(scope) {
+                    scope = parent;
+
+                    if scoping.scope_flags(scope).is_var() {
+                        break;
+                    }
+                }
+
+                found
+                    .entry((scope, scoping.symbol_name(symbol).to_string()))
+                    .or_default()
+                    .push(node);
+            }
+
+            self.block_functions.borrow_mut().insert(file, found);
+        }
+
+        std::cell::Ref::map(self.block_functions.borrow(), |files| &files[&file])
     }
 
     pub(crate) fn surface_writes_of(&self, project: &Project<'a>, binding: Binding) -> Vec<NodeId> {
@@ -1430,7 +1551,7 @@ fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<De
     match target {
         Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
             let declarations = declaration_nodes_of(project, file, symbol);
-            let node = declarations.iter().copied().find(|node| matches!(project.file(file).semantic.nodes().kind(*node), AstKind::Function(function) if function.body.is_some())).or_else(|| declarations.first().copied())?;
+            let node = declarations.iter().rev().copied().find(|node| matches!(project.file(file).semantic.nodes().kind(*node), AstKind::Function(function) if function.body.is_some() && function.is_declaration())).or_else(|| declarations.first().copied())?;
 
             declaration_of_node(project, file, node)
         }

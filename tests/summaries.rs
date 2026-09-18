@@ -42,6 +42,58 @@ fn recovered_alias_and_overload_calls_retain_known_work() {
 }
 
 #[test]
+fn duplicate_function_declarations_bind_the_runtime_winner() {
+    let cubic = "for(const a of xs) for(const b of xs) for(const c of xs) void c;";
+    let constant = "return 0;";
+    let selected = "function selected(xs){return work(xs);}";
+    let block = format!("function work(xs){{{constant}}} {{ function work(xs){{{cubic}}} }}");
+    let mut cases = vec![
+        (format!("{block} {selected}"), "O(N^3)", true),
+        (format!("\"use strict\"; {block} {selected}"), "O(1)", false),
+        (format!("{block} export {selected}"), "O(1)", false),
+    ];
+
+    for (declarations, expected, partial) in [
+        (format!("function work(xs){{{constant}}} function work(xs){{{cubic}}}"), "O(N^3)", false),
+        (format!("function work(xs){{{cubic}}} function work(xs){{{constant}}}"), "O(1)", false),
+        (format!("function work(xs){{{cubic}}} var work = function(xs){{{constant}}};"), "O(N^3)", true),
+        (format!("var work = function(xs){{{constant}}}; function work(xs){{{cubic}}}"), "O(N^3)", true),
+        (format!("function work(xs){{{constant}}} var work = function(xs){{{cubic}}};"), "O(N^3)", true),
+        (format!("function work(xs){{{cubic}}} function work(xs){{{constant}}} work = function(xs){{{constant}}};"), "O(1)", true),
+    ] {
+        cases.push((format!("{declarations} {selected}"), expected, partial));
+        cases.push((format!("{declarations} export {selected}"), expected, partial));
+    }
+
+    for (source, expected, partial) in cases {
+        let files = [
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"allowJs":true},"files":["index.js"]}"#,
+            ),
+            ("index.js", source.as_str()),
+        ];
+        let (cost, reasons) = selected_result_in(&files, "index.js");
+        let expected_reasons = match partial {
+            true => vec![olint::unknowns::UnknownReason::Target],
+            false => Vec::new(),
+        };
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{source}");
+        assert_eq!(
+            reasons.into_iter().collect::<Vec<_>>(),
+            expected_reasons,
+            "{source}"
+        );
+    }
+
+    let (cost, reasons) = selected_result(&format!("function work(xs:number[]):number; function work(xs:number[]):number; function work(xs:number[]){{{cubic} return 0;}} export function selected(xs:number[]){{return work(xs);}}"));
+
+    assert_eq!(cost, Cost::parse("O(N^3)").unwrap());
+    assert!(reasons.is_empty());
+}
+
+#[test]
 fn immutable_callback_alias_uses_the_parameter_substitution() {
     let (cost,reasons) = selected_result("function invoke(cb:()=>void){const alias=cb;alias();}\n/** @perf O(N^3) */\nfunction work(){} export function selected(){invoke(work);}");
 
@@ -201,15 +253,27 @@ fn selected_result(
     Cost,
     std::collections::BTreeSet<olint::unknowns::UnknownReason>,
 ) {
+    selected_result_in(&[("tsconfig.json", "{}"), ("index.ts", source)], "index.ts")
+}
+
+fn selected_result_in(
+    files: &[(&str, &str)],
+    relative: &str,
+) -> (
+    Cost,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+) {
     let mut result = (Cost::ONE, std::collections::BTreeSet::new());
 
-    run_with_source(source, |analysis, file| {
+    run_in_project(files, |project, root| {
+        let file = file_of(project, root, relative);
+        let mut analysis = Analysis::new(project, SYNTACTIC);
         let function = function_of_name(analysis.project, file, "selected");
-        let part = support::summary_of(analysis, file, "selected");
+        let part = support::summary_of(&mut analysis, file, "selected");
 
         result = (
-            support::legacy_class_of(analysis, file, function, &part.cost),
-            support::unknown_reasons(analysis, part.unknowns),
+            support::legacy_class_of(&mut analysis, file, function, &part.cost),
+            support::unknown_reasons(&analysis, part.unknowns),
         );
     });
 

@@ -433,3 +433,95 @@ fn package_declaration_files_resolve_callees_without_bodies() {
         assert_eq!(resolved, vec![(true, false); 3]);
     });
 }
+
+fn work_targets_of(relative: &str, source: &str) -> (Vec<usize>, bool) {
+    let files = [
+        ("tsconfig.json", r#"{"compilerOptions":{"allowJs":true}}"#),
+        (relative, source),
+    ];
+    let mut found = (Vec::new(), true);
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, relative);
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+        let bodies: Vec<_> = project
+            .file(file)
+            .semantic
+            .nodes()
+            .iter()
+            .filter(|node| match node.kind() {
+                AstKind::Function(function) => {
+                    function.body.is_some()
+                        && function.id.as_ref().is_none_or(|name| name.name != "run")
+                }
+                _ => false,
+            })
+            .map(|node| node.id())
+            .collect();
+        let targets = analysis.callee_targets_of(file, call_of(project, file, "work"));
+
+        found = (
+            targets
+                .known
+                .iter()
+                .map(|known| {
+                    bodies
+                        .iter()
+                        .position(|body| *body == known.node)
+                        .expect("known body")
+                })
+                .collect(),
+            targets.open,
+        );
+    });
+
+    found
+}
+
+#[test]
+fn duplicate_function_declarations_target_the_runtime_winner() {
+    for (relative, source, known, open) in [
+        (
+            "index.js",
+            "function work(){return 1} function work(){return 2} function run(){work();}",
+            vec![1],
+            false,
+        ),
+        (
+            "index.js",
+            "function work(){return 1} function work(){return 2} export function run(){work();}",
+            vec![1],
+            false,
+        ),
+        (
+            "index.ts",
+            "function work(): number; function work(): number { return 1; } function run(){work();}",
+            vec![0],
+            false,
+        ),
+        (
+            "index.js",
+            "function work(){return 1} var work = function(){return 2}; function run(){work();}",
+            vec![0, 1],
+            true,
+        ),
+        (
+            "index.js",
+            "function work(){return 1} function work(){return 2} work = null; function run(){work();}",
+            vec![1],
+            true,
+        ),
+        (
+            "index.js",
+            "function work(){return 1} { function work(){return 2} } function run(){work();}",
+            vec![0, 1],
+            true,
+        ),
+    ] {
+        assert_eq!(
+            work_targets_of(relative, source),
+            (known, open),
+            "{source}"
+        );
+    }
+}
