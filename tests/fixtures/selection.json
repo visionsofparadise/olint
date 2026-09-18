@@ -1210,5 +1210,131 @@
     "expected_absent": {},
     "expectation": "Existing unknown-policy exits and partial raw-report semantics remain intact.",
     "kind": "control"
+  },
+  {
+    "name": "config_misspelled_entrypoints_field",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoint": [
+          "index.ts"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {
+      "lint": [
+        "unsupported field \"entrypoint\""
+      ],
+      "report": [
+        "unsupported field \"entrypoint\""
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "0 public"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expectation": "A misspelled root field is a configuration error rather than an empty entry selection.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_unsupported_field",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "entrypoints": [
+          "index.ts"
+        ],
+        "ignores": [
+          "generated/**"
+        ]
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 2,
+      "report": 2
+    },
+    "expected_contains": {
+      "lint": [
+        "unsupported field \"ignores\""
+      ],
+      "report": [
+        "unsupported field \"ignores\""
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "1 public"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expectation": "Every root field outside max, entrypoints, ignore and unknown is a configuration error.",
+    "kind": "invalid-selection"
+  },
+  {
+    "name": "config_all_supported_fields",
+    "files": {
+      "index.ts": "export function selected() { return 1; }\n",
+      "package.json": {
+        "main": "index.ts"
+      },
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ],
+        "ignore": [],
+        "unknown": "warn"
+      }
+    },
+    "args": [],
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "1 public"
+      ],
+      "report": [
+        "selected"
+      ]
+    },
+    "expected_absent": {},
+    "expectation": "Every supported root field together remains a valid configuration.",
+    "kind": "control"
   }
 ]

@@ -332,3 +332,28 @@ fn an_invalid_ignore_glob_names_the_pattern() {
         Some(ConfigError::Ignore { pattern }) if pattern == r#""src/[""#
     ));
 }
+
+#[test]
+fn read_config_rejects_unsupported_root_fields_by_name() {
+    for (config, expected) in [
+        (
+            r#"{ "max": "O(N^2)", "entrypoint": ["src/index.ts"] }"#,
+            "entrypoint",
+        ),
+        (
+            r#"{ "entrypoints": ["src/index.ts"], "limit": "O(N)" }"#,
+            "limit",
+        ),
+    ] {
+        let error = read_error_of(&[
+            TSCONFIG,
+            ("olint.config.json", config),
+            ("src/index.ts", "export const index = 1;"),
+        ]);
+
+        assert!(
+            matches!(&error, Some(ConfigError::Field { field, .. }) if field == expected),
+            "{config}: {error:?}"
+        );
+    }
+}

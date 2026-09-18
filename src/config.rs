@@ -49,6 +49,10 @@ pub enum ConfigError {
         path: PathBuf,
         text: String,
     },
+    Field {
+        path: PathBuf,
+        field: String,
+    },
     Selection {
         path: PathBuf,
         message: String,
@@ -95,6 +99,8 @@ fn ignore_pattern_of(value: &Value) -> Result<GlobMatcher, ConfigError> {
 }
 
 pub const LIMIT_FORMS: &str = "O(...) using constants, named input sizes, N, sums, products, max, log, powers, positive ratios or factorials";
+
+pub const CONFIG_FIELDS: [&str; 4] = ["max", "entrypoints", "ignore", "unknown"];
 
 pub const ENTRYPOINT_FORMS: &str = r#"a path string or { "path": string, "max": string }"#;
 
@@ -478,6 +484,18 @@ pub fn read_config(project: &Project<'_>, explicit: Option<&Path>) -> Result<Con
         return Err(ConfigError::Root {
             path,
             text: raw.to_string(),
+        });
+    }
+
+    if let Some(field) = raw
+        .as_object()
+        .into_iter()
+        .flat_map(Map::keys)
+        .find(|field| !CONFIG_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ConfigError::Field {
+            path,
+            field: field.clone(),
         });
     }
 

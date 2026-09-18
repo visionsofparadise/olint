@@ -6,7 +6,8 @@ use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::{
-    read_config, validate_entries, ConfigError, UnknownPolicy, ENTRYPOINT_FORMS, LIMIT_FORMS,
+    read_config, validate_entries, ConfigError, UnknownPolicy, CONFIG_FIELDS, ENTRYPOINT_FORMS,
+    LIMIT_FORMS,
 };
 use olint::cost::CostComparison;
 use olint::project::{Project, ProjectError};
@@ -52,6 +53,13 @@ impl fmt::Display for Failure {
         let message = match self {
             Failure::Config(ConfigError::Root { path, text }) => {
                 format!("{} must contain an object, got {text}", path.display())
+            }
+            Failure::Config(ConfigError::Field { path, field }) => {
+                format!(
+                    "{}: unsupported field {field:?}; supported fields are {}",
+                    path.display(),
+                    CONFIG_FIELDS.join(", ")
+                )
             }
             Failure::Config(ConfigError::Selection { path, message }) => {
                 format!("{}: {message}", path.display())
