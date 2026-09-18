@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    Argument, Class, ClassElement, Expression, ImportOrExportKind, ObjectPropertyKind, PropertyKey,
+    Class, ClassElement, Expression, ImportOrExportKind, ObjectPropertyKind, PropertyKey,
     Statement, TSAccessibility, TSNamespaceDeclarationBody,
 };
 use oxc_ast::AstKind;
@@ -11,7 +11,7 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::analysis::Analysis;
 use crate::config::{validate_entries, Config, ConfigError};
-use crate::declarations::{element_name_of, Binding, Declaration, FunctionNode, SurfaceTarget};
+use crate::declarations::{element_name_of, Binding, FunctionNode, SurfaceTarget};
 use crate::directives::PerfTag;
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Resolved};
@@ -552,47 +552,13 @@ impl<'a> Walk<'_, '_, 'a> {
                 let reflective = matches!(unwrap(member.object()), Expression::Identifier(owner) if owner.name == "Object" || owner.name == "Reflect");
                 let stored = &call.arguments[usize::from(reflective).min(call.arguments.len())..];
 
-                if stored.iter().all(|argument| {
+                !stored.iter().all(|argument| {
                     argument.as_expression().is_some_and(|expression| {
                         self.analysis.is_non_callable_expression(file, expression)
                     })
-                }) {
-                    return false;
-                }
-
-                reflective
-                    || !self.analysis.has_primitive_elements(file, member.object())
-                    || !stored
-                        .iter()
-                        .all(|argument| self.is_element_argument(file, argument))
+                })
             }
             _ => true,
-        }
-    }
-
-    fn is_element_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
-        let expression = match argument {
-            Argument::SpreadElement(spread) => &spread.argument,
-            argument => match argument.as_expression() {
-                Some(expression) => expression,
-                None => return false,
-            },
-        };
-
-        match expression {
-            Expression::Identifier(reference) => !self
-                .analysis
-                .declarations
-                .of_reference(self.analysis.project, file, reference)
-                .is_some_and(|declaration| {
-                    matches!(declaration, Declaration::Class { .. })
-                        || self
-                            .analysis
-                            .declarations
-                            .function_of(declaration)
-                            .is_some()
-                }),
-            expression => self.analysis.is_non_callable_expression(file, expression),
         }
     }
 

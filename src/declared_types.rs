@@ -71,14 +71,6 @@ const NON_STRING_RESULTS: &[&str] = &[
     "localeCompare",
     "codePointAt",
 ];
-const ELEMENT_CONTAINERS: &[&str] = &[
-    "Array",
-    "ReadonlyArray",
-    "Set",
-    "ReadonlySet",
-    "Map",
-    "ReadonlyMap",
-];
 const STRING_RESULTS: &[&str] = &["join", "toString", "toLowerCase", "toUpperCase", "trim"];
 
 #[derive(Clone, Copy)]
@@ -775,19 +767,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.is_non_callable_nested_expression(file, expression, 0)
     }
 
-    pub(crate) fn has_primitive_elements(
-        &mut self,
-        file: FileId,
-        expression: &'a Expression<'a>,
-    ) -> bool {
-        match self.typing_of_expression(file, expression, 0) {
-            Some(Typing::Annotation(file, annotation)) => {
-                self.is_primitive_element_type(file, annotation, 0)
-            }
-            _ => false,
-        }
-    }
-
     fn is_non_callable_nested_expression(
         &mut self,
         file: FileId,
@@ -818,72 +797,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
             {
                 true
             }
-            expression => match self.typing_of_expression(file, expression, depth + 1) {
-                Some(Typing::Annotation(file, annotation)) => {
-                    self.is_primitive_type(file, annotation, depth + 1)
-                }
-                Some(Typing::Initializer(file, initializer)) => {
-                    self.is_non_callable_nested_expression(file, initializer, depth + 1)
-                }
-                None => false,
-            },
-        }
-    }
-
-    fn typing_of_expression(
-        &mut self,
-        file: FileId,
-        expression: &'a Expression<'a>,
-        depth: u32,
-    ) -> Option<Typing<'a>> {
-        match unwrap(expression) {
             Expression::Identifier(reference) => {
-                let declaration = self
-                    .declarations
-                    .of_reference(self.project, file, reference)?;
-                let (target, annotation, initializer) = binding_parts_of(&declaration)?;
-                let constant = declarator_of_identifier(&declaration)
-                    .is_some_and(|(_, _, constant)| constant)
+                let Some(declaration) =
+                    self.declarations
+                        .of_reference(self.project, file, reference)
+                else {
+                    return false;
+                };
+                let Some((target, annotation, initializer)) = binding_parts_of(&declaration) else {
+                    return false;
+                };
+
+                if annotation
+                    .is_some_and(|annotation| self.is_primitive_type(target, annotation, depth + 1))
+                {
+                    return true;
+                }
+
+                declarator_of_identifier(&declaration).is_some_and(|(_, _, constant)| constant)
                     && self
                         .declarations
                         .binding_of_reference(self.project, file, reference)
                         .is_some_and(|binding| {
                             self.declarations.is_write_free(self.project, binding)
-                        });
-
-                typing_of(target, annotation, initializer.filter(|_| constant))
+                        })
+                    && initializer.is_some_and(|initializer| {
+                        self.is_non_callable_nested_expression(target, initializer, depth + 1)
+                    })
             }
-            Expression::StaticMemberExpression(member) => {
-                let container = self.container_of_expression(file, &member.object, depth + 1);
-                let typing = typing_of_member(member_of_container(
-                    container,
-                    member.property.name.as_str(),
-                ))?;
-
-                match typing {
-                    Typing::Initializer(..) if !self.is_write_free_root(file, &member.object) => {
-                        None
-                    }
-                    typing => Some(typing),
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn is_write_free_root(&self, file: FileId, expression: &'a Expression<'a>) -> bool {
-        match unwrap(expression) {
-            Expression::StaticMemberExpression(member) => {
-                self.is_write_free_root(file, &member.object)
-            }
-            Expression::Identifier(reference) => self
-                .declarations
-                .binding_of_reference(self.project, file, reference)
-                .is_some_and(|binding| {
-                    self.declarations
-                        .surface_writes_of(self.project, binding)
-                        .is_empty()
-                }),
             _ => false,
         }
     }
@@ -923,45 +864,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Some(Declaration::Enum { .. }) => true,
                     _ => false,
                 }
-            }
-            _ => false,
-        }
-    }
-
-    fn is_primitive_element_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
-        if depth > MAXIMUM_DEPTH {
-            return false;
-        }
-
-        match ty {
-            TSType::TSParenthesizedType(parenthesized) => {
-                self.is_primitive_element_type(file, &parenthesized.type_annotation, depth + 1)
-            }
-            TSType::TSTypeOperatorType(operator) => {
-                self.is_primitive_element_type(file, &operator.type_annotation, depth + 1)
-            }
-            TSType::TSUnionType(union) => union
-                .types
-                .iter()
-                .all(|part| self.is_primitive_element_type(file, part, depth + 1)),
-            TSType::TSArrayType(array) => {
-                self.is_primitive_type(file, &array.element_type, depth + 1)
-            }
-            TSType::TSTupleType(tuple) => tuple.element_types.iter().all(|element| {
-                element
-                    .as_ts_type()
-                    .is_some_and(|element| self.is_primitive_type(file, element, depth + 1))
-            }),
-            TSType::TSTypeReference(reference)
-                if ELEMENT_CONTAINERS.contains(&type_name_text_of(&reference.type_name))
-                    && self.is_global_type_name(file, &reference.type_name) =>
-            {
-                reference.type_arguments.as_ref().is_some_and(|arguments| {
-                    arguments
-                        .params
-                        .iter()
-                        .all(|argument| self.is_primitive_type(file, argument, depth + 1))
-                })
             }
             _ => false,
         }
