@@ -270,7 +270,7 @@ fn direct_nested_calls_bind_lexical_captures_and_inner_formals_shadow_them() {
 #[test]
 fn opaque_actual_relations_are_partial_instead_of_invalid_or_provably_over() {
     for argument in ["n+1", "n-n", "m"] {
-        run_with_source(&format!("/** @perf O(n^2) */ function kernel(n:number) {{}}\nexport function work(n:number) {{ const m=n; kernel({argument}); }}"), |analysis, file| {
+        run_with_source(&format!("/** @perf O(n^2) */ function kernel(n:number) {{}}\nexport function work(n:number) {{ let m=n; m+=1; kernel({argument}); }}"), |analysis, file| {
             let part = summary_of(analysis, file, "work");
 
             assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
@@ -278,6 +278,13 @@ fn opaque_actual_relations_are_partial_instead_of_invalid_or_provably_over() {
             assert_eq!(part.cost.compare(&Cost::ONE), CostComparison::Within);
         });
     }
+
+    run_with_source("/** @perf O(n^2) */ function kernel(n:number) {}\nexport function work(n:number) { const m=n; kernel(m); }", |analysis, file| {
+        let part = summary_of(analysis, file, "work");
+
+        assert!(part.is_complete());
+        assert_eq!(part.cost.compare(&Cost::ONE), CostComparison::Exceeds);
+    });
 
     for argument in ["1", "2"] {
         run_with_source(&format!("/** @perf O(n^2) */ function kernel(n:number) {{}}\nexport function work(n:number) {{ kernel({argument}); }}"), |analysis, file| {
