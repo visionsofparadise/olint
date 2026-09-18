@@ -99,7 +99,7 @@ fn first_parameter(function: FunctionNode<'_>, file: FileId) -> (Binding, Source
 
 #[test]
 fn raw_and_selected_tasks_survive_three_answer_generations_without_aliasing() {
-    let source = "function target(){return 1;}\nfunction make():any{return 1;}\n/** @perf O(N^2) */\nexport function tagged(loose:any){loose.map((x:number)=>x);make().run();}\n";
+    let source = "function target(){\n/** @perf O(N^3) */\nvoid 0;}\nfunction make():any{return 1;}\n/** @perf O(N^2) */\nexport function tagged(loose:any){loose.map((x:number)=>x);make().run();}\n";
 
     support::run_with_source(source, |analysis, file| {
         let target = support::function_of_name(analysis.project, file, "target");
@@ -172,13 +172,20 @@ fn raw_and_selected_tasks_survive_three_answer_generations_without_aliasing() {
 
             let part = raw_again.total(&mut analysis.unknowns, &mut analysis.traces);
 
-            if let Some(id) = part.unknowns {
-                assert!(!analysis
-                    .unknowns
-                    .lines(analysis.project, id)
-                    .iter()
-                    .any(|line| line.contains("unknown call target")));
-            }
+            assert_eq!(
+                support::legacy_class_of(analysis, file, tagged, &part.cost),
+                Cost::parse("O(N^3)").unwrap()
+            );
+
+            let id = part.unknowns.expect("sidecar leaves dispatch open");
+            let call = support::call_of(analysis.project, file, "make().run");
+            let location = format!(":6 [{}..{}]", call.span.start, call.span.end);
+
+            assert!(analysis
+                .unknowns
+                .lines(analysis.project, id)
+                .iter()
+                .any(|line| line.contains("unknown call target") && line.contains(&location)));
 
             assert_drained(analysis);
 

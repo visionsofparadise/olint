@@ -4,13 +4,13 @@ O((xs * xs^2))      8
 O(xs^2)             4
 O(xs)               4
 O(max(xs, fast))    2
-O(1)                2
+O(1) [partial]      2
 O(max(xs, rebuild))    1
 O(max(xs, mode))    1
-O(1) [partial]      1
 O((max(xs, fast))^(2))    1
 O(max(xs, channels))    1
 O(xs) [partial]     1
+O(1)                1
 O((xs^2)^(2))       1
 
 O((xs * xs^2)) uses  src/public.ts:34

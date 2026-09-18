@@ -701,7 +701,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn function_at(&self, id: FunctionId) -> FunctionNode<'a> {
+    pub(crate) fn function_at(&self, id: FunctionId) -> FunctionNode<'a> {
         match self.kind_of_node(id.file, id.node) {
             AstKind::Function(function) => FunctionNode::Function(function),
             AstKind::ArrowFunctionExpression(function) => FunctionNode::Arrow(function),
@@ -1770,55 +1770,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let mut declaration = expression.and_then(|expression| match expression {
+        let mut callback_open = false;
+        let declaration = expression.and_then(|expression| match expression {
             Expression::Identifier(reference) => {
-                self.declarations
-                    .of_reference(self.project, file, reference)
+                let (declaration, closed) =
+                    self.declarations
+                        .callable_reference(self.project, file, reference);
+
+                callback_open = !closed;
+
+                declaration
             }
-            _ => expression
-                .as_member_expression()
-                .and_then(|member| self.member_declaration_of(file, member)),
+            _ => expression.as_member_expression().and_then(|member| {
+                callback_open = true;
+
+                self.member_declaration_of(file, member).map(|declaration| {
+                    self.declarations
+                        .executable_declaration(self.project, declaration)
+                })
+            }),
         });
 
-        let mut aliases = HashSet::new();
-
-        while let Some(Declaration::Variable {
-            file: target,
-            declarator,
-            constant: true,
-        }) = declaration
+        if let Some(binding) =
+            declaration.and_then(|declaration| self.parameter_binding_of(declaration))
         {
-            let Some(Expression::Identifier(reference)) = declarator.init.as_ref().map(unwrap)
-            else {
-                break;
-            };
-
-            if !self.charge_work(Event::CaptureEdge, 1) {
-                return ArgumentFacts {
-                    value,
-                    callback: Some(self.deferred_unknown(
-                        file,
-                        argument.span(),
-                        UnknownReason::ResourceExhaustion,
-                    )),
-                    preference: Preference::Unmarked,
-                };
-            }
-
-            if !aliases.insert((target, declarator.span)) {
-                break;
-            }
-
-            declaration = self
-                .declarations
-                .of_reference(self.project, target, reference);
-        }
-
-        if let Some(Expression::Identifier(reference)) = expression {
-            if let Some(binding) = self.binding_of_identifier(file, reference) {
-                if let Some(facts) = self.current_substitutions.get(&binding) {
-                    return facts.clone();
-                }
+            if let Some(facts) = self.current_substitutions.get(&binding) {
+                return facts.clone();
             }
         }
 
@@ -1914,7 +1891,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         file: target,
                         node: function.node_id(),
                     }],
-                    open: false,
+                    open: callback_open,
                 };
 
                 self.scheduler
@@ -1978,23 +1955,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let function = self.function_at(descriptor.function);
             let target = descriptor.function;
 
-            if self.fallback_active() {
-                let (part, cyclic) = self.fallback_invocation(target, file, span);
+            let (mut part, cyclic) = if self.fallback_active() {
+                self.fallback_invocation(target, file, span)
+            } else {
+                let descriptor = descriptor.clone();
 
-                return self.called_part_of(target.file, function, part, cyclic);
+                self.call_with_captures(
+                    target.file,
+                    function,
+                    file,
+                    arguments,
+                    span,
+                    descriptor.captured,
+                )
+            };
+
+            if facts.value.targets.open {
+                let unknown = self.unknown_invocation(file, span, arguments, UnknownReason::Target);
+
+                part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
             }
 
-            let descriptor = descriptor.clone();
-            let (part, cyclic) = self.call_with_captures(
-                descriptor.function.file,
-                function,
-                file,
-                arguments,
-                span,
-                descriptor.captured,
-            );
-
-            return self.called_part_of(descriptor.function.file, function, part, cyclic);
+            return self.called_part_of(target.file, function, part, cyclic);
         }
 
         self.apply_argument_effects(facts);

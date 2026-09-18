@@ -6,6 +6,104 @@ use oxc_ast::AstKind;
 
 mod support;
 
+fn calls_in<'a>(project: &Project<'a>, file: FileId) -> Vec<&'a oxc_ast::ast::CallExpression<'a>> {
+    project
+        .file(file)
+        .semantic
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            AstKind::CallExpression(call) => Some(call),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn import_equals_index_visits_each_symbol_once_in_deep_chains_and_cycles() {
+    for count in [128, 2048] {
+        for reverse in [false, true] {
+            for base in [
+                "N.work".to_string(),
+                format!("a{}", count - 1),
+                "missing.work".to_string(),
+            ] {
+                let source = format!("namespace N {{export function work(){{}}}} import a0={base};{} function selected(){{{}}}",(1..count).map(|i|format!("import a{i}=a{};",i-1)).collect::<String>(),(0..count).map(|i|format!("a{i}();")).collect::<String>());
+                let files = [("tsconfig.json", "{}"), ("index.ts", source.as_str())];
+
+                run_in_project(&files, |project, root| {
+                    let file = file_of(project, root, "index.ts");
+                    let mut calls = calls_in(project, file);
+                    let mut analysis = Analysis::new(project, SYNTACTIC);
+
+                    if reverse {
+                        calls.reverse();
+                    }
+
+                    for call in &calls {
+                        let target = analysis.callee_targets_of(file, call);
+
+                        assert_eq!(target.known.len(), usize::from(base == "N.work"));
+                        assert!(target.open);
+                    }
+
+                    let cold = analysis.declarations.resolution_stats();
+
+                    assert!(cold.symbol_visits <= count + 2, "{cold:?}");
+                    assert!(cold.helper_visits <= 1, "{cold:?}");
+                    assert!(cold.stack_peak <= count + 4, "{cold:?}");
+
+                    for call in calls {
+                        analysis.callee_targets_of(file, call);
+                    }
+
+                    assert_eq!(analysis.declarations.resolution_stats(), cold);
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn many_import_aliases_share_one_write_reference_scan() {
+    let count = 512;
+    let helper = format!("export function work(){{{}}}", "work();".repeat(count));
+    let source = format!(
+        "import {{{}}} from './helper'; function selected(){{{}}}",
+        (0..count)
+            .map(|i| format!("work as a{i}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        (0..count).map(|i| format!("a{i}();")).collect::<String>()
+    );
+    let files = [
+        ("tsconfig.json", "{}"),
+        ("index.ts", source.as_str()),
+        ("helper.ts", helper.as_str()),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let calls = calls_in(project, file);
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+
+        for call in &calls {
+            assert!(!analysis.callee_targets_of(file, call).open);
+        }
+
+        let cold = analysis.declarations.resolution_stats();
+
+        assert_eq!(cold.write_reference_visits, count);
+        assert!(cold.symbol_visits <= count + 1, "{cold:?}");
+
+        for call in calls {
+            analysis.callee_targets_of(file, call);
+        }
+
+        assert_eq!(analysis.declarations.resolution_stats(), cold);
+    });
+}
+
 use support::{call_of, file_of, first_node_of, run_in_project, SYNTACTIC, TYPED_PACKAGE};
 
 fn reference_of<'a>(
@@ -277,7 +375,7 @@ fn exports_carry_every_declaration_in_typescript_order() {
             declaration_of_reference(project, &declarations, index, "over")
                 .as_ref()
                 .map(shape_of),
-            Some("signature")
+            Some("function")
         );
     });
 }

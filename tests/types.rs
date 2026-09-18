@@ -8,6 +8,110 @@ use oxc_ast::ast::Expression;
 
 mod support;
 
+#[test]
+fn recovered_callable_targets_keep_dispatch_closedness_separate() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        ("helper.ts", "export function work(xs:number[]):void; export function work(xs:number[]){ for(const x of xs) void x; }"),
+        ("index.ts", "import helper = require('./helper'); import {work} from './helper'; const a=work; const alias=a; let mutable=work; const x=y; const y=x; class API {work(xs:number[]):void; work(xs:number[]){for(const x of xs) void x;}} export function root(xs:number[]){work(xs); alias(xs); mutable(xs); x(); helper.work(xs); new API().work(xs);}"),
+    ];
+
+    assert_call_targets(
+        &files,
+        &[
+            ("work", 1, false),
+            ("alias", 1, false),
+            ("mutable", 0, true),
+            ("x", 0, true),
+            ("helper.work", 1, true),
+            ("new API().work", 1, true),
+        ],
+    );
+}
+
+#[test]
+fn sidecar_signature_spans_recover_bodies_without_closing_dispatch() {
+    let source = "function work(xs:number[]):void; function work(xs:number[]){for(const x of xs) void x;} class API {work(xs:number[]):void;work(xs:number[]){for(const x of xs) void x;}} declare const loose:any; loose.first([]);loose.second([]);";
+    let files = [("tsconfig.json", "{}"), ("index.ts", source)];
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+
+        for (callee, signature) in [
+            ("loose.first", "function work(xs:number[]):void;"),
+            ("loose.second", "work(xs:number[]):void;"),
+        ] {
+            let mut analysis = Analysis::new(project, SYNTACTIC);
+            let call = call_of(project, file, callee);
+
+            analysis.set_pass(TscPass::Recording);
+            assert!(analysis.callee_targets_of(file, call).known.is_empty());
+
+            let start = if callee == "loose.second" {
+                source.rfind(signature).unwrap()
+            } else {
+                source.find(signature).unwrap()
+            };
+
+            analysis
+                .take_answers(reply_of(vec![Some(TscAnswer::Callee(CalleeAnswer {
+                    file: project.file(file).path.to_string_lossy().into_owned(),
+                    start: start as u32,
+                    end: (start + signature.len()) as u32,
+                }))]))
+                .unwrap();
+            analysis.set_pass(TscPass::Answering);
+
+            let targets = analysis.callee_targets_of(file, call);
+
+            assert_eq!(targets.known.len(), 1, "{callee}");
+            assert!(targets.open);
+            assert!(
+                matches!(project.file(file).semantic.nodes().kind(targets.known[0].node),oxc_ast::AstKind::Function(function) if function.body.is_some())
+            );
+        }
+    });
+}
+
+#[test]
+fn internal_import_equals_follows_assignments_and_qualified_names_with_cycle_guards() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        ("helper.ts", "function work(){} export = work;"),
+        ("qualified.ts", "namespace N {export function work(){}} export import alias=N.work;"),
+        ("forward.ts", "export {alias} from './qualified';"),
+        ("index.ts", "import work = require('./helper'); import {alias as forwarded} from './forward'; namespace N {export function run(){}} import alias = N.run; const equivalent=N.run; N.run=()=>{}; import first = second; import second = first; work();alias();equivalent();first();forwarded();"),
+    ];
+
+    assert_call_targets(
+        &files,
+        &[
+            ("work", 1, false),
+            ("alias", 1, true),
+            ("equivalent", 1, true),
+            ("first", 0, true),
+            ("forwarded", 1, true),
+        ],
+    );
+}
+
+fn assert_call_targets(files: &[(&str, &str)], expected: &[(&str, usize, bool)]) {
+    run_in_project(files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+
+        for (callee, count, open) in expected {
+            let target = analysis.callee_targets_of(file, call_of(project, file, callee));
+
+            assert_eq!(
+                (target.known.len(), target.open),
+                (*count, *open),
+                "{callee}"
+            );
+        }
+    });
+}
+
 use support::{call_of, file_of, member_callee_of, run_in_project, SYNTACTIC};
 
 const SOURCE: &str = "class Engine {\n\tgo() {}\n}\nexport function run() {}\nfunction make(): any {\n\treturn 1;\n}\nexport function f(loose: any, xs: number[], other: any) {\n\tloose.map((x: number) => x);\n\txs.includes(1);\n\tother.map((x: number) => x);\n\tmake().run();\n\tconst engine = new Engine();\n\tengine.go();\n\tmake().go();\n}\n";

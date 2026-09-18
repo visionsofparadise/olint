@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -155,16 +155,40 @@ impl Default for TargetSet {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
     Symbol(FileId, SymbolId),
+    OpenSymbol(FileId, SymbolId),
     Node(FileId, NodeId),
     Namespace(FileId),
     External,
 }
 
 type GlobalBindings = HashMap<(FileId, String), Option<(FileId, SymbolId)>>;
+type CallableBindings = HashMap<(FileId, NodeId), (Option<Target>, bool)>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResolutionStats {
+    pub symbol_visits: usize,
+    pub helper_visits: usize,
+    pub write_reference_visits: usize,
+    pub stack_peak: usize,
+}
+
+enum ResolutionStep<'a> {
+    Symbol(FileId, SymbolId),
+    Finish(FileId, SymbolId, usize),
+    Members(Vec<&'a str>),
+    Open,
+}
 
 pub struct Declarations<'a> {
     followed: RefCell<HashMap<(FileId, String), Option<Target>>>,
     globals: RefCell<GlobalBindings>,
+    resolving: RefCell<HashSet<(FileId, SymbolId)>>,
+    callable: RefCell<CallableBindings>,
+    symbols: RefCell<HashMap<(FileId, SymbolId), (Target, bool)>>,
+    write_free: RefCell<HashMap<Binding, bool>>,
+    assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
+    resolution_epoch: Cell<usize>,
+    resolution_stats: Cell<ResolutionStats>,
     module_records: Vec<&'a ModuleRecord<'a>>,
 }
 
@@ -173,12 +197,137 @@ impl<'a> Declarations<'a> {
         Declarations {
             followed: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashMap::new()),
+            resolving: RefCell::new(HashSet::new()),
+            callable: RefCell::new(HashMap::new()),
+            symbols: RefCell::new(HashMap::new()),
+            write_free: RefCell::new(HashMap::new()),
+            assignments: RefCell::new(HashMap::new()),
+            resolution_epoch: Cell::new(0),
+            resolution_stats: Cell::new(ResolutionStats::default()),
             module_records: project
                 .files
                 .iter()
                 .map(|file| file.module_record)
                 .collect(),
         }
+    }
+
+    pub(crate) fn callable_reference(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &'a IdentifierReference<'a>,
+    ) -> (Option<Declaration<'a>>, bool) {
+        let key_of = |file, reference: &IdentifierReference<'a>| {
+            self.symbol_of_reference(project, file, reference)
+                .map(|(file, symbol)| {
+                    (
+                        file,
+                        project
+                            .file(file)
+                            .semantic
+                            .scoping()
+                            .symbol_declaration(symbol),
+                    )
+                })
+                .unwrap_or((file, reference.node_id()))
+        };
+        let key = key_of(file, reference);
+
+        if let Some(cached) = self.callable.borrow().get(&key) {
+            return (
+                cached
+                    .0
+                    .and_then(|target| declaration_of_target(project, target)),
+                cached.1,
+            );
+        }
+
+        let mut current = (file, reference);
+        let mut seen = HashSet::new();
+        let mut path = Vec::new();
+        let mut result = loop {
+            let (file, reference) = current;
+            let key = key_of(file, reference);
+
+            if let Some((declaration, exact)) = self.callable.borrow().get(&key) {
+                break (
+                    declaration.and_then(|target| declaration_of_target(project, target)),
+                    *exact,
+                );
+            }
+
+            let declaration = self.of_reference(project, file, reference);
+            let mut closed = true;
+
+            if let Some(Binding::Symbol { file, symbol }) =
+                self.binding_of_reference(project, file, reference)
+            {
+                if !seen.insert((file, symbol)) {
+                    break (None, false);
+                }
+
+                closed &= self.is_write_free(project, Binding::Symbol { file, symbol });
+            }
+
+            path.push((key, closed));
+
+            if !closed {
+                break (None, false);
+            }
+
+            if self
+                .symbol_of_reference(project, file, reference)
+                .is_some_and(|key| {
+                    self.symbols
+                        .borrow()
+                        .get(&key)
+                        .is_some_and(|(_, open)| *open)
+                })
+            {
+                if let Some((_, closed)) = path.last_mut() {
+                    *closed = false;
+                }
+            }
+
+            match declaration {
+                Some(Declaration::Variable {
+                    file,
+                    declarator,
+                    constant: true,
+                }) => match declarator.init.as_ref().map(crate::syntax::unwrap) {
+                    Some(Expression::Identifier(reference)) => current = (file, reference),
+                    Some(expression)
+                        if crate::syntax::member_expression_of(expression).is_some() =>
+                    {
+                        let member = crate::syntax::member_expression_of(expression).unwrap();
+
+                        break (
+                            self.member_of_receiver(project, file, member).or_else(|| {
+                                self.namespace_target_of(project, file, expression)
+                                    .and_then(|target| declaration_of_target(project, target))
+                            }),
+                            false,
+                        );
+                    }
+                    _ => break (declaration, true),
+                },
+                Some(Declaration::Variable {
+                    constant: false, ..
+                }) => break (None, false),
+                _ => break (declaration, true),
+            }
+        };
+
+        for (key, closed) in path.into_iter().rev() {
+            result.1 &= closed;
+
+            self.callable
+                .borrow_mut()
+                .insert(key, (result.0.map(target_of_declaration), result.1));
+        }
+
+        result
     }
 
     pub fn of_reference(
@@ -202,7 +351,9 @@ impl<'a> Declarations<'a> {
         let (file, symbol) = self.symbol_of_reference(project, file, reference)?;
 
         match self.target_of_symbol(project, file, symbol) {
-            Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
+            Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
+                Some(Binding::Symbol { file, symbol })
+            }
             _ => None,
         }
     }
@@ -217,7 +368,9 @@ impl<'a> Declarations<'a> {
         let owner = self.namespace_target_of(project, file, object)?;
 
         match self.member_target_of(project, owner, name)? {
-            Target::Symbol(file, symbol) => Some(Binding::Symbol { file, symbol }),
+            Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
+                Some(Binding::Symbol { file, symbol })
+            }
             _ => None,
         }
     }
@@ -249,7 +402,7 @@ impl<'a> Declarations<'a> {
     fn member_target_of(&self, project: &Project<'a>, owner: Target, name: &str) -> Option<Target> {
         match owner {
             Target::Namespace(namespace) => self.followed_export_of(project, namespace, name),
-            Target::Symbol(file, symbol) => {
+            Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
                 let semantic = &project.file(file).semantic;
                 let scoping = semantic.scoping();
 
@@ -528,7 +681,7 @@ impl<'a> Declarations<'a> {
 
     fn surface_targets(&self, project: &Project<'a>, target: Option<Target>) -> Vec<SurfaceTarget> {
         match target {
-            Some(Target::Symbol(file, symbol)) => {
+            Some(Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol)) => {
                 let nodes = declaration_nodes_of(project, file, symbol);
                 let implemented = nodes.iter().any(|node| matches!(project.file(file).semantic.nodes().kind(*node), AstKind::Function(function) if function.body.is_some()));
 
@@ -540,7 +693,31 @@ impl<'a> Declarations<'a> {
         }
     }
 
-    pub fn function_of(&self, declaration: Declaration<'a>) -> Option<(FileId, FunctionNode<'a>)> {
+    pub(crate) fn executable_declaration(
+        &self,
+        project: &Project<'a>,
+        declaration: Declaration<'a>,
+    ) -> Declaration<'a> {
+        if let Declaration::Function {
+            file,
+            function: FunctionNode::Function(function),
+        } = declaration
+        {
+            if function.body.is_none() {
+                if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                    return declaration_of_target(project, Target::Symbol(file, symbol))
+                        .unwrap_or(declaration);
+                }
+            }
+        }
+
+        declaration
+    }
+
+    pub fn function_of<'d>(
+        &self,
+        declaration: Declaration<'d>,
+    ) -> Option<(FileId, FunctionNode<'d>)> {
         match declaration {
             Declaration::Function { file, function } => match function {
                 FunctionNode::Function(inner) if inner.body.is_none() => None,
@@ -549,9 +726,28 @@ impl<'a> Declarations<'a> {
             Declaration::Variable {
                 file, declarator, ..
             } => function_of_initializer(declarator.init.as_ref()).map(|function| (file, function)),
-            Declaration::Member { file, element, .. } => match element {
+            Declaration::Member {
+                file,
+                class,
+                element,
+            } => match element {
                 ClassElement::MethodDefinition(method) if method.value.body.is_some() => {
                     Some((file, FunctionNode::Function(&method.value)))
+                }
+                ClassElement::MethodDefinition(signature) if signature.value.body.is_none() => {
+                    let name = signature.key.static_name()?;
+
+                    class.body.body.iter().find_map(|element| match element {
+                        ClassElement::MethodDefinition(method)
+                            if method.value.body.is_some()
+                                && method.r#static == signature.r#static
+                                && method.kind == signature.kind
+                                && method.key.static_name().as_deref() == Some(name.as_ref()) =>
+                        {
+                            Some((file, FunctionNode::Function(&method.value)))
+                        }
+                        _ => None,
+                    })
                 }
                 ClassElement::PropertyDefinition(property) => {
                     function_of_initializer(property.value.as_ref())
@@ -643,7 +839,254 @@ impl<'a> Declarations<'a> {
         found
     }
 
+    pub fn resolution_stats(&self) -> ResolutionStats {
+        self.resolution_stats.get()
+    }
+
+    fn is_write_free(&self, project: &Project<'a>, binding: Binding) -> bool {
+        if let Some(found) = self.write_free.borrow().get(&binding) {
+            return *found;
+        }
+
+        let Binding::Symbol { file, symbol } = binding;
+        let mut stats = self.resolution_stats.get();
+        let mut found = true;
+
+        for reference in project
+            .file(file)
+            .semantic
+            .scoping()
+            .get_resolved_references(symbol)
+        {
+            stats.write_reference_visits = stats.write_reference_visits.saturating_add(1);
+            found &= !reference.is_write();
+        }
+
+        self.resolution_stats.set(stats);
+        self.write_free.borrow_mut().insert(binding, found);
+
+        found
+    }
+
     fn target_of_symbol(&self, project: &Project<'a>, file: FileId, symbol: SymbolId) -> Target {
+        let mut pending = vec![ResolutionStep::Symbol(file, symbol)];
+        let mut owned = HashSet::new();
+        let mut target = Target::External;
+        let mut open = false;
+
+        while let Some(step) = pending.pop() {
+            let mut stats = self.resolution_stats.get();
+
+            stats.stack_peak = stats.stack_peak.max(pending.len() + 1);
+
+            self.resolution_stats.set(stats);
+
+            match step {
+                ResolutionStep::Symbol(file, symbol) => {
+                    if let Some(cached) = self.symbols.borrow().get(&(file, symbol)) {
+                        (target, open) = *cached;
+
+                        continue;
+                    }
+
+                    if !self.resolving.borrow_mut().insert((file, symbol)) {
+                        if !owned.contains(&(file, symbol)) {
+                            self.resolution_epoch
+                                .set(self.resolution_epoch.get().saturating_add(1));
+                        }
+
+                        target = Target::External;
+                        open = true;
+
+                        continue;
+                    }
+
+                    owned.insert((file, symbol));
+
+                    stats.symbol_visits = stats.symbol_visits.saturating_add(1);
+
+                    self.resolution_stats.set(stats);
+                    pending.push(ResolutionStep::Finish(
+                        file,
+                        symbol,
+                        self.resolution_epoch.get(),
+                    ));
+
+                    let semantic = &project.file(file).semantic;
+                    let node = semantic.scoping().symbol_declaration(symbol);
+
+                    if let AstKind::TSImportEqualsDeclaration(import) = semantic.nodes().kind(node)
+                    {
+                        let (base, names) =
+                            self.import_equals_input(project, file, &import.module_reference);
+
+                        if !names.is_empty() {
+                            pending.push(ResolutionStep::Members(names));
+                        }
+
+                        match base {
+                            Target::Symbol(file, symbol) => {
+                                pending.push(ResolutionStep::Symbol(file, symbol))
+                            }
+                            other => {
+                                target = other;
+                                open = false;
+                            }
+                        }
+                    } else {
+                        target = self.target_of_symbol_inner(project, file, symbol);
+                        open = matches!(target, Target::OpenSymbol(..));
+                    }
+                }
+                ResolutionStep::Members(mut names) => {
+                    let name = names.pop().expect("nonempty qualified name");
+
+                    stats.helper_visits = stats.helper_visits.saturating_add(1);
+
+                    self.resolution_stats.set(stats);
+
+                    target = self
+                        .member_target_of(project, target, name)
+                        .unwrap_or(Target::External);
+
+                    if !names.is_empty() {
+                        pending.push(ResolutionStep::Members(names));
+                    }
+
+                    if let Target::Symbol(file, symbol) = target {
+                        pending.push(ResolutionStep::Open);
+                        pending.push(ResolutionStep::Symbol(file, symbol));
+                    } else {
+                        open = true;
+                    }
+                }
+                ResolutionStep::Open => open = true,
+                ResolutionStep::Finish(file, symbol, epoch) => {
+                    self.resolving.borrow_mut().remove(&(file, symbol));
+                    owned.remove(&(file, symbol));
+
+                    if open {
+                        if let Target::Symbol(file, symbol) = target {
+                            target = Target::OpenSymbol(file, symbol);
+                        }
+                    }
+
+                    if epoch == self.resolution_epoch.get() || target != Target::External {
+                        self.symbols
+                            .borrow_mut()
+                            .insert((file, symbol), (target, open));
+                    }
+                }
+            }
+        }
+
+        target
+    }
+
+    fn import_equals_input(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &'a TSModuleReference<'a>,
+    ) -> (Target, Vec<&'a str>) {
+        let mut names = Vec::new();
+        let reference = match reference {
+            TSModuleReference::IdentifierReference(reference) => reference.as_ref(),
+            TSModuleReference::QualifiedName(name) => {
+                names.push(name.right.name.as_str());
+
+                let mut left = &name.left;
+
+                while let TSTypeName::QualifiedName(name) = left {
+                    names.push(name.right.name.as_str());
+
+                    left = &name.left;
+                }
+
+                let TSTypeName::IdentifierReference(reference) = left else {
+                    return (Target::External, names);
+                };
+
+                reference.as_ref()
+            }
+            TSModuleReference::ExternalModuleReference(external) => {
+                let Resolved::File(file) =
+                    project.resolve(file, external.expression.value.as_str())
+                else {
+                    return (Target::External, names);
+                };
+
+                return self.assignment_input(project, file);
+            }
+        };
+
+        (
+            self.symbol_of_reference(project, file, reference)
+                .map(|(file, symbol)| Target::Symbol(file, symbol))
+                .unwrap_or(Target::External),
+            names,
+        )
+    }
+
+    fn assignment_input(&self, project: &Project<'a>, file: FileId) -> (Target, Vec<&'a str>) {
+        let cached = self.assignments.borrow().get(&file).copied();
+        let assignment = cached.unwrap_or_else(|| {
+            let mut stats = self.resolution_stats.get();
+            let found = project
+                .file(file)
+                .program
+                .body
+                .iter()
+                .find_map(|statement| {
+                    stats.helper_visits = stats.helper_visits.saturating_add(1);
+
+                    match statement {
+                        Statement::TSExportAssignment(assignment) => Some(assignment.node_id()),
+                        _ => None,
+                    }
+                });
+
+            self.resolution_stats.set(stats);
+            self.assignments.borrow_mut().insert(file, found);
+
+            found
+        });
+        let Some(assignment) = assignment else {
+            return (Target::Namespace(file), Vec::new());
+        };
+        let AstKind::TSExportAssignment(assignment) =
+            project.file(file).semantic.nodes().kind(assignment)
+        else {
+            unreachable!()
+        };
+        let mut expression = crate::syntax::unwrap(&assignment.expression);
+        let mut names = Vec::new();
+
+        while let Expression::StaticMemberExpression(member) = expression {
+            names.push(member.property.name.as_str());
+
+            expression = crate::syntax::unwrap(&member.object);
+        }
+
+        let target = match expression {
+            Expression::Identifier(reference) => self
+                .symbol_of_reference(project, file, reference)
+                .map(|(file, symbol)| Target::Symbol(file, symbol))
+                .unwrap_or(Target::External),
+            Expression::FunctionExpression(function) => Target::Node(file, function.node_id()),
+            Expression::ArrowFunctionExpression(function) => Target::Node(file, function.node_id()),
+            _ => Target::External,
+        };
+
+        (target, names)
+    }
+
+    fn target_of_symbol_inner(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        symbol: SymbolId,
+    ) -> Target {
         let semantic = &project.file(file).semantic;
         let node = semantic.scoping().symbol_declaration(symbol);
         let nodes = semantic.nodes();
@@ -651,7 +1094,6 @@ impl<'a> Declarations<'a> {
             AstKind::ImportSpecifier(specifier) => Some(specifier.imported.name().as_str()),
             AstKind::ImportDefaultSpecifier(_) => Some("default"),
             AstKind::ImportNamespaceSpecifier(_) => None,
-            AstKind::TSImportEqualsDeclaration(_) => return Target::External,
             _ => return Target::Symbol(file, symbol),
         };
         let source = nodes
@@ -686,9 +1128,14 @@ impl<'a> Declarations<'a> {
         }
 
         let mut visited = HashSet::new();
+        let epoch = self.resolution_epoch.get();
         let target = self.export_target_of(project, file, name, &mut visited);
 
-        self.followed.borrow_mut().insert(key, target);
+        if epoch == self.resolution_epoch.get()
+            || target.is_some_and(|target| target != Target::External)
+        {
+            self.followed.borrow_mut().insert(key, target);
+        }
 
         target
     }
@@ -850,10 +1297,39 @@ fn star_targets_of(
         .collect()
 }
 
+fn target_of_declaration(declaration: Declaration<'_>) -> Target {
+    match declaration {
+        Declaration::Function { file, function } => Target::Node(file, function.node_id()),
+        Declaration::Variable {
+            file, declarator, ..
+        } => Target::Node(file, declarator.node_id()),
+        Declaration::Parameter {
+            file, parameter, ..
+        } => Target::Node(
+            file,
+            match parameter {
+                ParameterNode::Formal(parameter) => parameter.node_id(),
+                ParameterNode::Rest(parameter) => parameter.node_id(),
+            },
+        ),
+        Declaration::Class { file, class } => Target::Node(file, class.node_id()),
+        Declaration::Member { file, element, .. } => Target::Node(file, element.node_id()),
+        Declaration::Property { file, property } => Target::Node(file, property.node_id()),
+        Declaration::Enum { file, declaration } => Target::Node(file, declaration.node_id()),
+        Declaration::EnumMember { file, member } => Target::Node(file, member.node_id()),
+        Declaration::Interface { file, declaration } => Target::Node(file, declaration.node_id()),
+        Declaration::TypeAlias { file, declaration } => Target::Node(file, declaration.node_id()),
+        Declaration::TypeParameter { file, parameter } => Target::Node(file, parameter.node_id()),
+        Declaration::Namespace { file } => Target::Namespace(file),
+        Declaration::External => Target::External,
+    }
+}
+
 fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<Declaration<'a>> {
     match target {
-        Target::Symbol(file, symbol) => {
-            let node = *declaration_nodes_of(project, file, symbol).first()?;
+        Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
+            let declarations = declaration_nodes_of(project, file, symbol);
+            let node = declarations.iter().copied().find(|node| matches!(project.file(file).semantic.nodes().kind(*node), AstKind::Function(function) if function.body.is_some())).or_else(|| declarations.first().copied())?;
 
             declaration_of_node(project, file, node)
         }
@@ -865,10 +1341,12 @@ fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<De
 
 fn declarations_of_target<'a>(project: &Project<'a>, target: Target) -> Vec<Declaration<'a>> {
     match target {
-        Target::Symbol(file, symbol) => declaration_nodes_of(project, file, symbol)
-            .into_iter()
-            .filter_map(|node| declaration_of_node(project, file, node))
-            .collect(),
+        Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
+            declaration_nodes_of(project, file, symbol)
+                .into_iter()
+                .filter_map(|node| declaration_of_node(project, file, node))
+                .collect()
+        }
         other => declaration_of_target(project, other).into_iter().collect(),
     }
 }

@@ -3,7 +3,7 @@ use crate::analysis::Analysis;
 use crate::declarations::Binding;
 use crate::declarations::Declaration;
 use crate::project::FileId;
-use crate::syntax::{identifier_of, Root};
+use crate::syntax::Root;
 use crate::values::ValueId;
 use oxc_ast::AstKind;
 
@@ -112,25 +112,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     self.record_write_effects(file, kind);
                 }
                 AstKind::CallExpression(call) => {
-                    let declaration = self.callee_declaration_of(file, call);
+                    let (declaration, closed) = self.resolved_callee_of(file, call);
 
                     if let Some(Declaration::Parameter { .. }) = declaration {
-                        let facts = identifier_of(&call.callee)
-                            .and_then(|reference| self.binding_of_identifier(file, reference))
+                        let facts = self
+                            .parameter_binding_of(declaration.unwrap())
                             .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
                         match facts {
                             Some(facts) => {
                                 self.invoke_argument(&facts, file, call.span, &call.arguments);
+
+                                self.current_effects.unknown_global |= !closed;
                             }
                             None => return true,
                         }
-                    } else if let Some((target, function)) = declaration
-                        .and_then(|declaration| self.declarations.function_of(declaration))
-                    {
-                        self.call_user(target, function, file, &call.arguments, call.span);
                     } else {
-                        self.current_effects.unknown_global = true;
+                        let targets = self.targets_of_declaration(declaration, closed);
+
+                        for target in targets.known {
+                            let function = self.function_at(target);
+
+                            self.call_user(target.file, function, file, &call.arguments, call.span);
+                        }
+
+                        self.current_effects.unknown_global |= targets.open;
                     }
                 }
                 AstKind::NewExpression(_) => self.current_effects.unknown_global = true,

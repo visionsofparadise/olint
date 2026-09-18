@@ -5,7 +5,9 @@ use oxc_ast::AstKind;
 use oxc_span::{GetSpan, Span};
 
 use crate::analysis::Analysis;
-use crate::declarations::{declaration_of_node, Declaration};
+use crate::declarations::{
+    declaration_of_node, Binding, Declaration, FunctionId, ParameterNode, TargetSet,
+};
 use crate::declared_types::{DeclaredType, Kind};
 use crate::project::FileId;
 use crate::syntax::{member_expression_of, unwrap};
@@ -66,6 +68,27 @@ enum Lookup<T> {
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn parameter_binding_of(&self, declaration: Declaration<'a>) -> Option<Binding> {
+        let Declaration::Parameter {
+            file, parameter, ..
+        } = declaration
+        else {
+            return None;
+        };
+        let pattern = match parameter {
+            ParameterNode::Formal(parameter) => &parameter.pattern,
+            ParameterNode::Rest(parameter) => &parameter.rest.argument,
+        };
+        let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) = pattern else {
+            return None;
+        };
+
+        Some(Binding::Symbol {
+            file,
+            symbol: identifier.symbol_id.get()?,
+        })
+    }
+
     pub fn kind_of(&mut self, file: FileId, e: &'a Expression<'a>, method: &str) -> Kind {
         let mut kind = self.declared_type_of_expression(file, e).kind;
 
@@ -139,28 +162,70 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         call: &'a CallExpression<'a>,
     ) -> Option<Declaration<'a>> {
+        self.resolved_callee_of(file, call).0
+    }
+
+    pub fn callee_targets_of(&mut self, file: FileId, call: &'a CallExpression<'a>) -> TargetSet {
+        let (declaration, closed) = self.resolved_callee_of(file, call);
+
+        self.targets_of_declaration(declaration, closed)
+    }
+
+    pub(crate) fn targets_of_declaration(
+        &self,
+        declaration: Option<Declaration<'a>>,
+        closed: bool,
+    ) -> TargetSet {
+        let known = declaration
+            .and_then(|declaration| self.declarations.function_of(declaration))
+            .map(|(file, function)| FunctionId {
+                file,
+                node: function.node_id(),
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        TargetSet {
+            open: !closed || known.is_empty(),
+            known,
+        }
+    }
+
+    pub(crate) fn resolved_callee_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> (Option<Declaration<'a>>, bool) {
         let callee = unwrap(&call.callee);
 
         if let Expression::Identifier(reference) = callee {
             return self
                 .declarations
-                .of_reference(self.project, file, reference);
+                .callable_reference(self.project, file, reference);
         }
 
-        let member = member_expression_of(callee)?;
+        let Some(member) = member_expression_of(callee) else {
+            return (None, false);
+        };
 
         if let Some(declaration) = self
             .declarations
             .member_of_receiver(self.project, file, member)
         {
-            return Some(declaration);
+            return (
+                Some(
+                    self.declarations
+                        .executable_declaration(self.project, declaration),
+                ),
+                false,
+            );
         }
 
         let MemberExpression::StaticMemberExpression(access) = member else {
-            return None;
+            return (None, false);
         };
 
-        self.callee_answer_of(file, access.span)
+        (self.callee_answer_of(file, access.span), false)
     }
 
     pub(crate) fn callee_answer_of(&mut self, file: FileId, span: Span) -> Option<Declaration<'a>> {
@@ -287,6 +352,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         best.and_then(|(_, node)| declaration_of_node(self.project, target, node))
+            .map(|declaration| {
+                self.declarations
+                    .executable_declaration(self.project, declaration)
+            })
     }
 }
 

@@ -19,4 +19,4 @@ O((xs * xs^2)) > O(N^2)  cubic  src/public.ts:1  via src/index.ts
             in loop for-of                                   src/public.ts:3  x N
 
 3 over limit
-1 partial results
+2 partial results

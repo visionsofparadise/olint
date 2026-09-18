@@ -5,6 +5,105 @@ use olint::public::public_functions;
 
 mod support;
 
+#[test]
+fn recovered_alias_and_overload_calls_retain_known_work() {
+    let cubic = "for(const a of xs) for(const b of xs) for(const c of xs) void c;";
+
+    for (declarations, call, partial) in [
+        (
+            format!("function work(xs:number[]):void; function work(xs:number[]){{{cubic}}}"),
+            "work(xs)",
+            false,
+        ),
+        (
+            format!("function work(xs:number[]){{{cubic}}} const a=work; const alias=a;"),
+            "alias(xs)",
+            false,
+        ),
+        (
+            format!("class API {{work(xs:number[]):void; work(xs:number[]){{{cubic}}}}}"),
+            "new API().work(xs)",
+            true,
+        ),
+        (
+            format!("class API {{/** @perf hot */\nwork(xs:number[]){{{cubic}}}}}"),
+            "new API().work(xs)",
+            true,
+        ),
+    ] {
+        let source = format!("{declarations} export function selected(xs:number[]){{{call};}}");
+
+        let (cost, reasons) = selected_result(&source);
+
+        assert_eq!(cost, Cost::parse("O(N^3)").unwrap(), "{call}");
+        assert_eq!(!reasons.is_empty(), partial, "{call}");
+    }
+}
+
+#[test]
+fn immutable_callback_alias_uses_the_parameter_substitution() {
+    let (cost,reasons) = selected_result("function invoke(cb:()=>void){const alias=cb;alias();}\n/** @perf O(N^3) */\nfunction work(){} export function selected(){invoke(work);}");
+
+    assert_eq!(cost, Cost::parse("O(N^3)").unwrap());
+    assert!(reasons.is_empty());
+}
+
+#[test]
+fn hot_open_dispatch_retains_its_call_owned_uncertainty() {
+    let source = "class API {\n/** @perf hot */\nwork(){}} export function selected(xs:number[]){for(const a of xs)for(const b of xs)for(const c of xs)void c; new API().work();}";
+
+    let (cost, reasons) = selected_result(source);
+
+    assert_eq!(cost, Cost::ONE);
+    assert!(reasons.contains(&olint::unknowns::UnknownReason::Target));
+}
+
+#[test]
+fn recovered_call_effects_fence_dependent_loop_proofs() {
+    for declaration in [
+        "function mutate(){xs.length=0;} const alias=mutate;",
+        "function mutate():void;function mutate(){xs.length=0;} const alias=mutate;",
+    ] {
+        let source = format!("let xs:number[]=[]; {declaration} export function selected(){{for(const x of xs){{alias();}}}}");
+
+        let (_, reasons) = selected_result(&source);
+
+        assert!(reasons.contains(&olint::unknowns::UnknownReason::Bound));
+    }
+}
+
+#[test]
+fn written_callback_alias_retains_open_cost_and_effects() {
+    let source = "declare const opaque:()=>void; function invoke(cb:()=>void){cb=opaque;const alias=cb;alias();}\n/** @perf O(N^3) */\nfunction supplied(){} export function selected(xs:number[]){for(const x of xs){invoke(supplied);}}";
+
+    let (cost, reasons) = selected_result(source);
+
+    assert!(reasons.contains(&olint::unknowns::UnknownReason::Target));
+    assert!(reasons.contains(&olint::unknowns::UnknownReason::Bound));
+    assert_eq!(cost, Cost::ONE);
+}
+
+fn selected_result(
+    source: &str,
+) -> (
+    Cost,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+) {
+    let mut result = (Cost::ONE, std::collections::BTreeSet::new());
+
+    run_with_source(source, |analysis, file| {
+        let function = function_of_name(analysis.project, file, "selected");
+        let part = support::summary_of(analysis, file, "selected");
+
+        result = (
+            support::legacy_class_of(analysis, file, function, &part.cost),
+            support::unknown_reasons(analysis, part.unknowns),
+        );
+    });
+
+    result
+}
+
 use support::{file_of, function_of_name, run_in_project, run_with_source, SYNTACTIC};
 
 fn labels_of(

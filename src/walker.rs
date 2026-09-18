@@ -76,7 +76,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Reading::of_part(self.unknown_part(file, span, reason))
     }
 
-    fn unknown_invocation(
+    pub(crate) fn unknown_invocation(
         &mut self,
         file: FileId,
         span: Span,
@@ -1026,7 +1026,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let declaration = self.callee_declaration_of(file, call);
+        let (declaration, closed) = self.resolved_callee_of(file, call);
         let site = self.site_of_node(file, call.node_id());
 
         if let (Some(Declaration::Parameter { parameter, .. }), Some(reference)) =
@@ -1039,11 +1039,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if identifier {
                 let substituted = self
-                    .binding_of_identifier(file, reference)
+                    .parameter_binding_of(declaration.unwrap())
                     .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
                 if let Some(facts) = substituted {
-                    let part = self.invoke_argument(&facts, file, call.span, &call.arguments);
+                    let mut part = self.invoke_argument(&facts, file, call.span, &call.arguments);
+
+                    if !closed {
+                        let unknown = self.unknown_invocation(
+                            file,
+                            call.span,
+                            &call.arguments,
+                            UnknownReason::Target,
+                        );
+
+                        part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
+                    }
+
                     let part = if part.cost.is_one() {
                         part
                     } else {
@@ -1084,10 +1096,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let function =
-            declaration.and_then(|declaration| self.declarations.function_of(declaration));
+        let targets = self.targets_of_declaration(declaration, closed);
 
-        if let Some((target, function)) = function {
+        for target in &targets.known {
+            let function = self.function_at(*target);
+            let target = target.file;
             let (called, cyclic) =
                 self.call_user(target, function, file, &call.arguments, call.span);
             let called = if called.cost.is_one() {
@@ -1107,9 +1120,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             };
 
-            let part = called.called(self.source_span(file, call.span), &mut self.unknowns);
+            let mut part = called.called(self.source_span(file, call.span), &mut self.unknowns);
 
-            return self.append_call(reading, target, function, part, cyclic);
+            if targets.open {
+                let unknown = self.unknown_invocation(
+                    file,
+                    call.span,
+                    &call.arguments,
+                    UnknownReason::Target,
+                );
+
+                part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
+            }
+
+            reading = self.append_call(reading, target, function, part, cyclic);
+        }
+
+        if !targets.known.is_empty() {
+            return reading;
         }
 
         self.current_effects.unknown_global = true;

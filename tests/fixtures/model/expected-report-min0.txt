@@ -4,10 +4,10 @@ public coverage [partial]
 O(1)               35
 O(1) [partial]     32
 O(xs)              14
-O(rows^2)          11
+O(rows^2)           8
+O(rows^2) [partial]    7
 O((xs * log(xs)))    5
-O(xs^2)             4
-O(rows^2) [partial]    4
+O(xs) [partial]     4
 O(o)                3
 O((xs * xs^2))      3
 O(x)                3
@@ -15,9 +15,9 @@ O(N)                3
 O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
+O(xs^2)             2
 O(max(n, xs))       2
 O(max(1, n^2))      2
-O(xs) [partial]     2
 O(prefix)           2
 O((max(o, matrix))^(2))    2
 O((log(max(matrix, target)) * max(matrix, target)))    1
@@ -34,7 +34,7 @@ O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
 O(obj)              1
 O(N^2)              1
-O((max(xs, other))^(2))    1
+O(max(xs, other)) [partial]    1
 O(max(xs, needle))    1
 O(max(s, cb)) [partial]    1
 O(max(m, cb)) [partial]    1
@@ -124,11 +124,6 @@ O((max(o, matrix))^(2)) unionOfClosed  src/types.ts:18
     in loop for-of                                           src/types.ts:20  x N
         in loop for-of                                       src/types.ts:20  x N
 
-O((max(xs, other))^(2)) AccessorHolder.walk  src/classes.ts:160
-    in loop for-of                                           src/classes.ts:161  x N
-        calls AccessorHolder.hidden()                      src/classes.ts:161  = O(max(xs, other))
-        in loop for-of                                       src/classes.ts:148  x N
-
 O(rows^2)      WithStaticMethod.compute  src/classes.ts:54
     in loop for-of                                           src/classes.ts:56  x N
         in loop for-of                                       src/classes.ts:56  x N
@@ -139,7 +134,7 @@ O(rows^2)      callsHashPrivateMethod  src/classes.ts:37 [partial]
     in loop for-of                                           src/classes.ts:30  x N
         in loop for-of                                       src/classes.ts:30  x N
 
-O(rows^2)      WithHashPrivateMethod.run  src/classes.ts:33
+O(rows^2)      WithHashPrivateMethod.run  src/classes.ts:33 [partial]
     calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows^2)
     in loop for-of                                           src/classes.ts:30  x N
         in loop for-of                                       src/classes.ts:30  x N
@@ -154,7 +149,7 @@ O(rows^2)      callsPrivateMethod  src/classes.ts:23 [partial]
     in loop for-of                                           src/classes.ts:16  x N
         in loop for-of                                       src/classes.ts:16  x N
 
-O(rows^2)      WithPrivateMethod.run  src/classes.ts:19
+O(rows^2)      WithPrivateMethod.run  src/classes.ts:19 [partial]
     calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows^2)
     in loop for-of                                           src/classes.ts:16  x N
         in loop for-of                                       src/classes.ts:16  x N
@@ -192,19 +187,9 @@ O(items^2)     structuredCloneCall  src/methods.ts:51
     does items.map()                                      src/methods.ts:52  x N
         does structuredClone()                            src/methods.ts:52  x N
 
-O(xs^2)        AccessorHolder.run  src/classes.ts:157
-    in loop for-of                                           src/classes.ts:158  x N
-        calls AccessorHolder.sweep()                       src/classes.ts:158  = O(xs)
-        in loop for-of                                       src/classes.ts:142  x N
-
 O(matrix^2)    labeledLoop  src/bounds.ts:78
     in loop for-of                                           src/bounds.ts:80  x N
         in loop for-of                                       src/bounds.ts:81  x N
-
-O(xs^2)        AccessorHolder.build  src/classes.ts:144
-    in loop for-of                                           src/classes.ts:145  x N
-        calls AccessorHolder.helper()                      src/classes.ts:145  = O(xs)
-        in loop for-of                                       src/classes.ts:151  x N
 
 O(rows^2)      usesClassExpression  src/classes.ts:94 [partial]
     calls <class>.run()                                    src/classes.ts:95  = O(rows^2)
@@ -224,7 +209,7 @@ O(rows^2)      WithArrowProperty.handler  src/classes.ts:65
     in loop for-of                                           src/classes.ts:67  x N
         in loop for-of                                       src/classes.ts:67  x N
 
-O(rows^2)      callsStaticMethod  src/classes.ts:60
+O(rows^2)      callsStaticMethod  src/classes.ts:60 [partial]
     calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows^2)
     in loop for-of                                           src/classes.ts:56  x N
         in loop for-of                                       src/classes.ts:56  x N
@@ -270,6 +255,10 @@ O(max(s, cb))  setLinearCall  src/methods.ts:9 [partial]
 
 O(max(xs, needle)) arrayLinearCall  src/methods.ts:1
     does xs.includes()                                    src/methods.ts:2  x N
+
+O(max(xs, other)) AccessorHolder.walk  src/classes.ts:160 [partial]
+    calls AccessorHolder.hidden()                          src/classes.ts:161  = O(max(xs, other))
+    in loop for-of                                           src/classes.ts:148  x N
 
 O(max(1, n^2)) callbackSubstituted  src/calls.ts:13
     calls runNTimes()                                      src/calls.ts:14  = O(max(1, n^2))
@@ -376,11 +365,19 @@ O(o)           objectKeysCall  src/methods.ts:33
 O(xs)          forAwaitLoop  src/bounds.ts:89
     in loop for-of                                           src/bounds.ts:91  x N
 
+O(xs)          AccessorHolder.run  src/classes.ts:157 [partial]
+    calls AccessorHolder.sweep()                           src/classes.ts:158  = O(xs)
+    in loop for-of                                           src/classes.ts:142  x N
+
 O(xs)          AccessorHolder.helper  src/classes.ts:150
     in loop for-of                                           src/classes.ts:151  x N
 
 O(xs)          AccessorHolder.hidden  src/classes.ts:147
     in loop for-of                                           src/classes.ts:148  x N
+
+O(xs)          AccessorHolder.build  src/classes.ts:144 [partial]
+    calls AccessorHolder.helper()                          src/classes.ts:145  = O(xs)
+    in loop for-of                                           src/classes.ts:151  x N
 
 O(xs)          AccessorHolder.sweep  src/classes.ts:141
     in loop for-of                                           src/classes.ts:142  x N
