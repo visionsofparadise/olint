@@ -221,6 +221,15 @@ pub static MUTATORS: &[&str] = &[
     "copyWithin",
 ];
 
+pub static REFLECTIVE_WRITES: &[&str] = &[
+    "assign",
+    "defineProperties",
+    "defineProperty",
+    "deleteProperty",
+    "set",
+    "setPrototypeOf",
+];
+
 pub fn method_matters(method: &str) -> bool {
     [
         ARRAY_LINEAR,

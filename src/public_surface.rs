@@ -7,10 +7,11 @@ use oxc_ast::ast::{
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
+use oxc_syntax::symbol::SymbolId;
 
 use crate::analysis::Analysis;
 use crate::config::{validate_entries, Config, ConfigError};
-use crate::declarations::{element_name_of, FunctionNode, SurfaceTarget};
+use crate::declarations::{element_name_of, Binding, FunctionNode, SurfaceTarget};
 use crate::directives::PerfTag;
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Resolved};
@@ -516,9 +517,43 @@ impl<'a> Walk<'_, '_, 'a> {
         values
     }
 
+    fn surface_writes(&mut self, file: FileId, symbols: Vec<SymbolId>) {
+        for symbol in symbols {
+            for write in self
+                .analysis
+                .declarations
+                .surface_writes_of(self.analysis.project, Binding::Symbol { file, symbol })
+            {
+                self.issue(self.site(file, write), UnknownReason::Target);
+            }
+        }
+    }
+
     fn visit(&mut self, file: FileId, node: NodeId) {
         let kind = self.analysis.project.file(file).semantic.nodes().kind(node);
         let site = self.site(file, node);
+        let symbols = match kind {
+            AstKind::VariableDeclarator(declaration) => declaration
+                .id
+                .get_binding_identifiers()
+                .into_iter()
+                .map(|identifier| identifier.symbol_id())
+                .collect(),
+            AstKind::Function(function) => function
+                .id
+                .iter()
+                .map(|identifier| identifier.symbol_id())
+                .collect(),
+            AstKind::Class(class) => class
+                .id
+                .iter()
+                .map(|identifier| identifier.symbol_id())
+                .collect(),
+            AstKind::TSNamespaceDeclaration(namespace) => vec![namespace.id.symbol_id()],
+            _ => Vec::new(),
+        };
+
+        self.surface_writes(file, symbols);
 
         match kind {
             AstKind::Function(function) => {

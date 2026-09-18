@@ -10,7 +10,7 @@ use oxc_ast::ast::{
     TSTypeParameter, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast::AstKind;
-use oxc_semantic::NodeId;
+use oxc_semantic::{AstNodes, NodeId};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportImportName,
@@ -19,6 +19,7 @@ use oxc_syntax::module_record::{
 use oxc_syntax::symbol::SymbolId;
 
 use crate::project::{FileId, Project, Resolved, SourceFile};
+use crate::tables::{MUTATORS, REFLECTIVE_WRITES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Binding {
@@ -186,6 +187,7 @@ pub struct Declarations<'a> {
     callable: RefCell<CallableBindings>,
     symbols: RefCell<HashMap<(FileId, SymbolId), (Target, bool)>>,
     write_free: RefCell<HashMap<Binding, bool>>,
+    surface_writes: RefCell<HashMap<Binding, Vec<NodeId>>>,
     assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
     resolution_epoch: Cell<usize>,
     resolution_stats: Cell<ResolutionStats>,
@@ -201,6 +203,7 @@ impl<'a> Declarations<'a> {
             callable: RefCell::new(HashMap::new()),
             symbols: RefCell::new(HashMap::new()),
             write_free: RefCell::new(HashMap::new()),
+            surface_writes: RefCell::new(HashMap::new()),
             assignments: RefCell::new(HashMap::new()),
             resolution_epoch: Cell::new(0),
             resolution_stats: Cell::new(ResolutionStats::default()),
@@ -868,6 +871,34 @@ impl<'a> Declarations<'a> {
         found
     }
 
+    pub(crate) fn surface_writes_of(&self, project: &Project<'a>, binding: Binding) -> Vec<NodeId> {
+        if let Some(found) = self.surface_writes.borrow().get(&binding) {
+            return found.clone();
+        }
+
+        let Binding::Symbol { file, symbol } = binding;
+        let semantic = &project.file(file).semantic;
+        let mut stats = self.resolution_stats.get();
+        let mut writes = Vec::new();
+
+        for reference in semantic.scoping().get_resolved_references(symbol) {
+            stats.write_reference_visits = stats.write_reference_visits.saturating_add(1);
+
+            if reference.is_write() {
+                writes.push(reference.node_id());
+            } else if let Some(write) = surface_write_of(semantic.nodes(), reference.node_id()) {
+                writes.push(write);
+            }
+        }
+
+        self.resolution_stats.set(stats);
+        self.surface_writes
+            .borrow_mut()
+            .insert(binding, writes.clone());
+
+        writes
+    }
+
     fn target_of_symbol(&self, project: &Project<'a>, file: FileId, symbol: SymbolId) -> Target {
         let mut pending = vec![ResolutionStep::Symbol(file, symbol)];
         let mut owned = HashSet::new();
@@ -1236,6 +1267,76 @@ impl<'a> Declarations<'a> {
         for target in star_targets_of(project, module_record, file) {
             self.collect_export_names(project, target, false, visited, seen, names);
         }
+    }
+}
+
+fn is_reflective_write(callee: &Expression<'_>) -> bool {
+    matches!(
+        crate::syntax::unwrap(callee),
+        Expression::StaticMemberExpression(member)
+            if matches!(crate::syntax::unwrap(&member.object), Expression::Identifier(owner) if owner.name == "Object" || owner.name == "Reflect")
+                && REFLECTIVE_WRITES.contains(&member.property.name.as_str())
+    )
+}
+
+fn surface_write_of(nodes: &AstNodes<'_>, reference: NodeId) -> Option<NodeId> {
+    let mut current = reference;
+    let mut member = false;
+
+    loop {
+        let span = nodes.kind(current).span();
+        let parent = nodes.parent_id(current);
+        let written = match nodes.kind(parent) {
+            AstKind::ParenthesizedExpression(_)
+            | AstKind::TSAsExpression(_)
+            | AstKind::TSSatisfiesExpression(_)
+            | AstKind::TSNonNullExpression(_)
+            | AstKind::TSTypeAssertion(_) => {
+                current = parent;
+
+                continue;
+            }
+            AstKind::StaticMemberExpression(expression) if expression.object.span() == span => {
+                if MUTATORS.contains(&expression.property.name.as_str())
+                    && matches!(nodes.parent_kind(parent), AstKind::CallExpression(call) if call.callee.span() == expression.span)
+                {
+                    return Some(nodes.parent_id(parent));
+                }
+
+                member = true;
+                current = parent;
+
+                continue;
+            }
+            AstKind::ComputedMemberExpression(expression) if expression.object.span() == span => {
+                member = true;
+                current = parent;
+
+                continue;
+            }
+            AstKind::CallExpression(call) => {
+                call.arguments
+                    .first()
+                    .is_some_and(|argument| argument.span() == span)
+                    && is_reflective_write(&call.callee)
+            }
+            AstKind::AssignmentExpression(assignment) => member && assignment.left.span() == span,
+            AstKind::UpdateExpression(_)
+            | AstKind::ArrayAssignmentTarget(_)
+            | AstKind::AssignmentTargetRest(_) => member,
+            AstKind::UnaryExpression(unary) => {
+                member && unary.operator == oxc_syntax::operator::UnaryOperator::Delete
+            }
+            AstKind::AssignmentTargetWithDefault(target) => member && target.binding.span() == span,
+            AstKind::AssignmentTargetPropertyProperty(property) => {
+                member && property.binding.span() == span
+            }
+            AstKind::ForInStatement(statement) => member && statement.left.span() == span,
+            AstKind::ForOfStatement(statement) => member && statement.left.span() == span,
+            _ => false,
+        };
+
+        return written.then_some(parent);
     }
 }
 
