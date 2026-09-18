@@ -841,19 +841,50 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let declaration = self
                     .declarations
                     .of_reference(self.project, file, reference)?;
-                let (file, annotation, initializer) = binding_parts_of(&declaration)?;
+                let (target, annotation, initializer) = binding_parts_of(&declaration)?;
+                let constant = declarator_of_identifier(&declaration)
+                    .is_some_and(|(_, _, constant)| constant)
+                    && self
+                        .declarations
+                        .binding_of_reference(self.project, file, reference)
+                        .is_some_and(|binding| {
+                            self.declarations.is_write_free(self.project, binding)
+                        });
 
-                typing_of(file, annotation, initializer)
+                typing_of(target, annotation, initializer.filter(|_| constant))
             }
             Expression::StaticMemberExpression(member) => {
                 let container = self.container_of_expression(file, &member.object, depth + 1);
-
-                typing_of_member(member_of_container(
+                let typing = typing_of_member(member_of_container(
                     container,
                     member.property.name.as_str(),
-                ))
+                ))?;
+
+                match typing {
+                    Typing::Initializer(..) if !self.is_write_free_root(file, &member.object) => {
+                        None
+                    }
+                    typing => Some(typing),
+                }
             }
             _ => None,
+        }
+    }
+
+    fn is_write_free_root(&self, file: FileId, expression: &'a Expression<'a>) -> bool {
+        match unwrap(expression) {
+            Expression::StaticMemberExpression(member) => {
+                self.is_write_free_root(file, &member.object)
+            }
+            Expression::Identifier(reference) => self
+                .declarations
+                .binding_of_reference(self.project, file, reference)
+                .is_some_and(|binding| {
+                    self.declarations
+                        .surface_writes_of(self.project, binding)
+                        .is_empty()
+                }),
+            _ => false,
         }
     }
 

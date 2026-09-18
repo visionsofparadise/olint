@@ -878,7 +878,7 @@ impl<'a> Declarations<'a> {
         self.resolution_stats.get()
     }
 
-    fn is_write_free(&self, project: &Project<'a>, binding: Binding) -> bool {
+    pub(crate) fn is_write_free(&self, project: &Project<'a>, binding: Binding) -> bool {
         if let Some(found) = self.write_free.borrow().get(&binding) {
             return *found;
         }
