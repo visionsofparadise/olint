@@ -1,17 +1,18 @@
 public coverage [partial]
 # tsconfig.json  (160 functions in 15 files)
 
-O(1)               35
-O(1) [partial]     32
+O(1)               33
+O(1) [partial]     28
 O(xs)              14
 O(rows^2)           8
 O(rows^2) [partial]    7
 O((xs * log(xs)))    5
+O(N)                5
 O(xs) [partial]     4
+O(N) [partial]      4
 O(o)                3
 O((xs * xs^2))      3
 O(x)                3
-O(N)                3
 O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2

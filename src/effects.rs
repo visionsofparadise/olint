@@ -4,6 +4,7 @@ use crate::declarations::Binding;
 use crate::declarations::Declaration;
 use crate::project::FileId;
 use crate::syntax::Root;
+use crate::types::ResolvedCallee;
 use crate::values::ValueId;
 use oxc_ast::AstKind;
 
@@ -112,7 +113,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     self.record_write_effects(file, kind);
                 }
                 AstKind::CallExpression(call) => {
-                    let (declaration, closed) = self.resolved_callee_of(file, call);
+                    let ResolvedCallee {
+                        declaration,
+                        closed,
+                        targets,
+                    } = self.resolved_callee_of(file, call);
 
                     if let Some(Declaration::Parameter { .. }) = declaration {
                         let facts = self
@@ -128,8 +133,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             None => return true,
                         }
                     } else {
-                        let targets = self.targets_of_declaration(declaration, closed);
-
                         for target in targets.known {
                             let function = self.function_at(target);
 

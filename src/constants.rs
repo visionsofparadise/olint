@@ -10,7 +10,7 @@ use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
 use crate::declarations::{Declaration, FunctionNode};
-use crate::declared_types::{declarator_of_identifier, DeclaredType};
+use crate::declared_types::declarator_of_identifier;
 use crate::project::FileId;
 use crate::syntax::{call_of, member_expression_of, unwrap, unwrap_to_cast};
 use crate::tables::{DERIVED_METHODS, OBJECT_KEYED, TYPED_ARRAYS};
@@ -195,9 +195,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         argument: &'a Argument<'a>,
     ) -> bool {
         match argument {
-            Argument::SpreadElement(spread) => {
-                self.is_tuple_site(file, DeclaredType::default(), spread.span)
-            }
+            Argument::SpreadElement(_) => false,
             _ => argument
                 .as_expression()
                 .is_some_and(|argument| self.is_constant_sized(file, argument)),
@@ -206,9 +204,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     pub(crate) fn is_closed_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
         match argument {
-            Argument::SpreadElement(spread) => {
-                self.is_closed_site(file, DeclaredType::default(), spread.span)
-            }
+            Argument::SpreadElement(_) => false,
             _ => argument
                 .as_expression()
                 .is_some_and(|argument| self.is_closed(file, argument)),
@@ -232,7 +228,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let declared = self.declared_type_of_identifier(file, reference);
 
-        self.is_tuple_site(file, declared, reference.span)
+        self.is_declared_tuple(declared)
     }
 
     pub fn returns_constant_sized(&mut self, file: FileId, function: FunctionNode<'a>) -> bool {

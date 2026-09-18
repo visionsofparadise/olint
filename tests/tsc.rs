@@ -1,10 +1,12 @@
 use std::path::Path;
 
-use olint::analysis::Analysis;
-use olint::declarations::Declaration;
+use olint::analysis::{Analysis, Options, TypeMode};
+use olint::cost::Cost;
 use olint::declared_types::Kind;
 use olint::project::Project;
-use olint::tsc::{ask, CalleeAnswer, Query, TscAnswer, TscError, TscReply, TypeAnswer};
+use olint::tsc::{
+    ask, parse_reply, CalleeAnswer, CalleeTarget, Query, TscAnswer, TscError, TscReply, TypeAnswer,
+};
 use olint::types::TscPass;
 use oxc_allocator::Allocator;
 
@@ -185,8 +187,9 @@ fn byte_order_marks_keep_answers_on_their_utf8_spans() {
     ));
     assert!(matches!(
         &reply.answers[1],
-        Some(TscAnswer::Callee(CalleeAnswer { file, start, end }))
-            if file.ends_with("src/lib.ts") && (*start, *end) == (method_start, method_end)
+        Some(TscAnswer::Callee(CalleeAnswer { targets, open: true }))
+            if matches!(targets.as_slice(), [CalleeTarget { file, start, end }]
+                if file.ends_with("src/lib.ts") && (*start, *end) == (method_start, method_end))
     ));
 
     let allocator = Allocator::default();
@@ -202,10 +205,11 @@ fn byte_order_marks_keep_answers_on_their_utf8_spans() {
         .expect("the reply answers every query");
     analysis.set_pass(TscPass::Answering);
 
-    assert!(matches!(
-        analysis.callee_declaration_of(file, parse),
-        Some(Declaration::External)
-    ));
+    assert!(analysis.callee_declaration_of(file, parse).is_none());
+
+    let targets = analysis.callee_targets_of(file, parse);
+
+    assert!(targets.known.is_empty() && targets.open);
 }
 
 #[test]
@@ -240,7 +244,7 @@ fn the_sidecar_answers_types_and_callees_in_utf8_offsets() {
         Some(TscAnswer::Type(TypeAnswer {
             kind: Kind::Array,
             tuple: false,
-            closed: false,
+            structural: false,
         }))
     );
     assert!(matches!(
@@ -249,14 +253,25 @@ fn the_sidecar_answers_types_and_callees_in_utf8_offsets() {
     ));
     assert!(matches!(
         reply.answers[2],
-        Some(TscAnswer::Type(TypeAnswer { closed: true, .. }))
+        Some(TscAnswer::Type(TypeAnswer {
+            structural: true,
+            ..
+        }))
     ));
 
-    let Some(TscAnswer::Callee(CalleeAnswer { file, start, end })) = &reply.answers[3] else {
+    let Some(TscAnswer::Callee(CalleeAnswer {
+        targets,
+        open: true,
+    })) = &reply.answers[3]
+    else {
         panic!(
             "the callee query answers a declaration: {:?}",
             reply.answers[3]
         );
+    };
+
+    let [CalleeTarget { file, start, end }] = targets.as_slice() else {
+        panic!("one implementation answers the callee: {targets:?}");
     };
 
     assert_eq!(
@@ -264,4 +279,412 @@ fn the_sidecar_answers_types_and_callees_in_utf8_offsets() {
         std::fs::canonicalize(directory.path().join("src/index.ts")).expect("source exists")
     );
     assert_eq!((*start, *end), (method_start, method_end));
+}
+
+fn legacy_classes_of(source: &str, types: TypeMode, names: &[&str]) -> Vec<Cost> {
+    results_of(source, types, names)
+        .into_iter()
+        .map(|(cost, _)| cost)
+        .collect()
+}
+
+fn results_of(source: &str, types: TypeMode, names: &[&str]) -> Vec<(Cost, bool)> {
+    let files = [
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
+        ),
+        ("index.ts", source),
+    ];
+    let mut classes = Vec::new();
+
+    support::run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let mut analysis = Analysis::new(
+            project,
+            Options {
+                minimum_exponent: 2,
+                types,
+            },
+        );
+
+        if types == TypeMode::Tsc {
+            let functions = analysis.reportable();
+            let tsconfig = root.join("tsconfig.json");
+
+            analysis
+                .gather_answers(&functions, |queries| {
+                    ask(Path::new(env!("CARGO_MANIFEST_DIR")), &tsconfig, queries)
+                })
+                .expect("the compiler helper answers");
+        }
+
+        for name in names {
+            let function = support::function_of_name(analysis.project, file, name);
+            let part = support::summary_of(&mut analysis, file, name);
+
+            let targeted = support::unknown_reasons(&analysis, part.unknowns)
+                .contains(&olint::unknowns::UnknownReason::Target);
+
+            classes.push((
+                support::legacy_class_of(&mut analysis, file, function, &part.cost),
+                targeted,
+            ));
+        }
+    });
+
+    classes
+}
+
+const DESCRIBED_SIZES: &str = "function pad(xs: number[]) {\n\tconst items: [number, ...number[]] = [0, ...xs];\n\treturn items;\n}\nexport function tuples(xs: number[]) {\n\tlet total = 0;\n\tfor (const left of pad(xs)) for (const right of xs) total += left * right;\n\treturn total;\n}\ninterface Shape {\n\twidth: number;\n}\nfunction widen(record: Record<string, number>) {\n\tconst shape = record as unknown as Shape;\n\treturn shape;\n}\nexport function members(record: Record<string, number>, xs: number[]) {\n\tlet total = 0;\n\tfor (const key in widen(record)) for (const right of xs) total += key.length * right;\n\treturn total;\n}\nexport function spreadRows(...rows: [number, number][]) {\n\treturn new Set(...rows);\n}\nexport function fresh(xs: number[]) {\n\tlet total = 0;\n\tfor (const left of [1, 2]) for (const right of xs) total += left * right;\n\treturn total;\n}\n";
+
+#[test]
+fn compiler_type_descriptions_create_no_constant_collection_sizes() {
+    let names = ["tuples", "members", "spreadRows", "fresh"];
+    let expected = ["O(N^2)", "O(N^2)", "O(N)", "O(N)"].map(|text| Cost::parse(text).unwrap());
+
+    for types in [TypeMode::Tsc, TypeMode::Syntactic] {
+        assert_eq!(
+            legacy_classes_of(DESCRIBED_SIZES, types, &names),
+            expected,
+            "{types:?}"
+        );
+    }
+}
+
+const UNION_MEMBERS: &str = "function make(flag: boolean) {\n\treturn flag\n\t\t? { kind: \"cheap\" as const, work(xs: number[]) { return xs.length; } }\n\t\t: { kind: \"costly\" as const, work(xs: number[]) { let total = 0; for (const left of xs) for (const right of xs) total += left * right; return total; } };\n}\nclass Engine {\n\trun(xs: number[]): number;\n\trun(xs: number[], scale: number): number;\n\trun(xs: number[], scale = 1) {\n\t\tlet total = 0;\n\t\tfor (const left of xs) for (const right of xs) total += left * right * scale;\n\t\treturn total;\n\t}\n}\nfunction engine() {\n\treturn new Engine();\n}\nexport function union(flag: boolean, xs: number[]) {\n\treturn make(flag).work(xs);\n}\nexport function overload(xs: number[]) {\n\treturn engine().run(xs);\n}\n";
+
+#[test]
+fn union_and_overload_candidates_contribute_their_implementation_work() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+
+    assert_eq!(
+        legacy_classes_of(UNION_MEMBERS, TypeMode::Tsc, &["union", "overload"]),
+        vec![quadratic.clone(), quadratic]
+    );
+}
+
+#[test]
+fn an_empty_batch_replies_without_loading_the_program() {
+    let directory = project_of(&[("index.ts", "export const value = 1;")]);
+    let reply = ask(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &directory.path().join("missing/tsconfig.json"),
+        &[],
+    )
+    .expect("an empty batch needs no program");
+
+    assert!(!reply.typescript.is_empty());
+    assert!(reply.answers.is_empty());
+}
+
+#[test]
+fn the_helper_rejects_other_protocol_versions() {
+    let directory = project_of(&[("tsconfig.json", "{}"), ("index.ts", "export {};")]);
+
+    for request in [
+        serde_json::json!({"tsconfig": directory.path().join("tsconfig.json"), "queries": []}),
+        serde_json::json!({"version": 1, "tsconfig": directory.path().join("tsconfig.json"), "queries": []}),
+    ] {
+        let mut child = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval", olint::tsc::SCRIPT])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("node runs the static helper");
+
+        std::io::Write::write_all(
+            &mut child.stdin.take().expect("stdin"),
+            request.to_string().as_bytes(),
+        )
+        .expect("request is written");
+
+        let output = child.wait_with_output().expect("helper exits");
+
+        assert!(!output.status.success(), "{request}");
+        assert!(output.stdout.is_empty(), "{request}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("protocol version"),
+            "{request}"
+        );
+    }
+}
+
+const CANDIDATE_LINES: [&str; 28] = [
+    "/* caf\u{e9} \u{1f600} */",
+    "class Engine {",
+    "\trun(xs: number[]): number;",
+    "\trun(xs: number[], scale: number): number;",
+    "\trun(xs: number[], scale = 1) {",
+    "\t\treturn xs.length * scale;",
+    "\t}",
+    "}",
+    "function engine() {",
+    "\treturn new Engine();",
+    "}",
+    "function make(flag: boolean) {",
+    "\treturn flag ? { kind: \"cheap\" as const, work(xs: number[]) { return 0; } } : { kind: \"costly\" as const, work(xs: number[]) { return xs.length; } };",
+    "}",
+    "interface Loose {",
+    "\twork(xs: number[]): number;",
+    "}",
+    "declare const loose: Loose;",
+    "const measure = (xs: number[]) => xs.length;",
+    "function holder() {",
+    "\treturn { work: measure };",
+    "}",
+    "export function probe(flag: boolean, xs: number[]) {",
+    "\tengine().run(xs);",
+    "\tmake(flag).work(xs);",
+    "\tloose.work(xs);",
+    "\tholder().work(xs);",
+    "}",
+];
+
+#[test]
+fn callee_answers_list_every_implementation_body_across_encodings() {
+    for (prefix, line_ending) in [("", "\n"), ("\u{feff}", "\r\n")] {
+        let source = format!("{prefix}{}{line_ending}", CANDIDATE_LINES.join(line_ending));
+        let directory = project_of(&[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
+            ),
+            ("index.ts", &source),
+        ]);
+        let tsconfig = directory.path().join("tsconfig.json");
+        let path = directory
+            .path()
+            .join("index.ts")
+            .to_string_lossy()
+            .into_owned();
+        let callees = [
+            "engine().run",
+            "make(flag).work",
+            "loose.work",
+            "holder().work",
+        ];
+        let queries = callees.map(|callee| {
+            let (pos, end) = byte_span_in(&source, callee);
+
+            Query::Callee {
+                file: path.clone(),
+                pos,
+                end,
+            }
+        });
+        let reply = reply_of(&tsconfig, &queries);
+        let implementation = format!(
+            "run(xs: number[], scale = 1) {{{line_ending}\t\treturn xs.length * scale;{line_ending}\t}}"
+        );
+        let expected: [Vec<&str>; 4] = [
+            vec![&implementation],
+            vec![
+                "work(xs: number[]) { return 0; }",
+                "work(xs: number[]) { return xs.length; }",
+            ],
+            Vec::new(),
+            vec!["(xs: number[]) => xs.length"],
+        ];
+
+        for ((answer, bodies), callee) in reply.answers.iter().zip(&expected).zip(callees) {
+            let Some(TscAnswer::Callee(CalleeAnswer { targets, open })) = answer else {
+                panic!("{callee} is answered: {answer:?}");
+            };
+            let mut spans: Vec<(u32, u32)> = targets
+                .iter()
+                .map(|target| {
+                    assert_eq!(
+                        std::fs::canonicalize(&target.file).expect("target exists"),
+                        std::fs::canonicalize(&path).expect("source exists"),
+                        "{callee}"
+                    );
+
+                    (target.start, target.end)
+                })
+                .collect();
+            let mut expected_spans: Vec<(u32, u32)> = bodies
+                .iter()
+                .map(|body| byte_span_in(&source, body))
+                .collect();
+
+            spans.sort();
+            expected_spans.sort();
+
+            assert!(*open, "{callee}");
+            assert_eq!(spans, expected_spans, "{callee} {line_ending:?}");
+        }
+
+        let allocator = Allocator::default();
+        let project = Project::load(&allocator, &tsconfig).expect("project loads");
+        let file = file_of(&project, directory.path(), "index.ts");
+        let mut analysis = Analysis::new(&project, SYNTACTIC);
+
+        analysis.set_pass(TscPass::Recording);
+
+        for callee in callees {
+            analysis.callee_targets_of(file, call_of(&project, file, callee));
+        }
+
+        let needed = analysis.needed_queries();
+
+        assert_eq!(needed.len(), callees.len());
+        analysis
+            .take_answers(reply_of(&tsconfig, &needed))
+            .expect("the reply answers every query");
+        analysis.set_pass(TscPass::Answering);
+
+        for (callee, count) in callees.into_iter().zip([1, 2, 0, 1]) {
+            let targets = analysis.callee_targets_of(file, call_of(&project, file, callee));
+
+            assert_eq!(
+                (targets.known.len(), targets.open),
+                (count, true),
+                "{callee}"
+            );
+
+            for target in targets.known {
+                assert!(matches!(
+                    project.file(target.file).semantic.nodes().kind(target.node),
+                    oxc_ast::AstKind::Function(oxc_ast::ast::Function { body: Some(_), .. })
+                        | oxc_ast::AstKind::ArrowFunctionExpression(_)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_replies_fail_clearly() {
+    let queries = [
+        Query::Type {
+            file: "index.ts".into(),
+            pos: 0,
+            end: 1,
+        },
+        Query::Callee {
+            file: "index.ts".into(),
+            pos: 2,
+            end: 3,
+        },
+    ];
+    let valid = r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[null,{"query":"callee","targets":[{"file":"index.ts","start":0,"end":4}],"open":true}]}"#;
+    let reply = parse_reply(valid.as_bytes(), &queries).expect("a version 2 reply parses");
+
+    assert_eq!(
+        reply.answers[1],
+        Some(TscAnswer::Callee(CalleeAnswer {
+            targets: vec![CalleeTarget {
+                file: "index.ts".into(),
+                start: 0,
+                end: 4,
+            }],
+            open: true,
+        }))
+    );
+
+    for (reply, reason) in [
+        (
+            r#"{"typescript":"5.9.3","from":"typescript.js","answers":[null,null]}"#,
+            "version",
+        ),
+        (
+            r#"{"version":1,"typescript":"5.9.3","from":"typescript.js","answers":[null,null]}"#,
+            "protocol version 1",
+        ),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[null]}"#,
+            "1 answers for 2 queries",
+        ),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[{"query":"callee","targets":[],"open":true},null]}"#,
+            "query kind",
+        ),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[null,{"query":"callee","targets":[{"file":"index.ts","start":5,"end":2}],"open":true}]}"#,
+            "inverted span",
+        ),
+        (
+            r#"{"version":2,"typescript":"5.9.3","from":"typescript.js","answers":[null,{"query":"callee","file":"index.ts","start":0,"end":4}]}"#,
+            "targets",
+        ),
+    ] {
+        match parse_reply(reply.as_bytes(), &queries) {
+            Err(TscError::Malformed(message)) => assert!(message.contains(reason), "{message}"),
+            other => panic!("{reply} is malformed: {other:?}"),
+        }
+    }
+}
+
+const MEMBER_CONSTRUCTORS: &str = "class Base {
+	constructor(xs: number[]) {
+		for (const x of xs) void x;
+	}
+}
+class Cubic extends Base {
+	constructor(xs: number[]) {
+		super(xs);
+		for (const a of xs) for (const b of xs) for (const c of xs) void c;
+	}
+}
+const table = { Base };
+const named = { Base: Base };
+export function viaShorthand(xs: number[]) {
+	return new table.Base(xs);
+}
+export function viaProperty(xs: number[]) {
+	return new named.Base(xs);
+}
+export function direct(xs: number[]) {
+	return new Base(xs);
+}
+export function swap() {
+	table.Base = Cubic;
+	named.Base = Cubic;
+}
+";
+
+#[test]
+fn compiler_member_constructors_keep_known_work_and_the_open_remainder() {
+    let linear = Cost::parse("O(N)").unwrap();
+
+    assert_eq!(
+        results_of(
+            MEMBER_CONSTRUCTORS,
+            TypeMode::Tsc,
+            &["viaShorthand", "viaProperty", "direct"]
+        ),
+        vec![
+            (linear.clone(), true),
+            (linear.clone(), true),
+            (linear, false)
+        ]
+    );
+}
+
+const MEMBER_CALLBACKS: &str = "function each(x: number, xs: number[]) {
+	for (const y of xs) void (x + y);
+}
+function cheap(x: number) {
+	return x;
+}
+const helpers = { each };
+export function viaCallback(xs: number[]) {
+	xs.forEach((x) => helpers.each(x, xs));
+	return xs.map(helpers.each);
+}
+export function swap() {
+	helpers.each = cheap;
+}
+";
+
+#[test]
+fn compiler_member_callbacks_keep_the_open_remainder() {
+    let [(_, targeted)] = results_of(MEMBER_CALLBACKS, TypeMode::Tsc, &["viaCallback"])[..] else {
+        panic!("one result");
+    };
+
+    assert!(targeted);
 }

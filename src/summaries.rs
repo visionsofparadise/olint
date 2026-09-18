@@ -1784,10 +1784,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => expression.as_member_expression().and_then(|member| {
                 callback_open = true;
 
-                self.member_declaration_of(file, member).map(|declaration| {
-                    self.declarations
-                        .executable_declaration(self.project, declaration)
-                })
+                self.resolved_member_of(file, member)
+                    .declaration
+                    .map(|declaration| {
+                        self.declarations
+                            .executable_declaration(self.project, declaration)
+                    })
             }),
         });
 

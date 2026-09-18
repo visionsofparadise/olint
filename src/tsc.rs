@@ -17,14 +17,20 @@ pub enum Query {
 pub struct TypeAnswer {
     pub kind: Kind,
     pub tuple: bool,
-    pub closed: bool,
+    pub structural: bool,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CalleeTarget {
+    pub file: String,
+    pub start: u32,
+    pub end: u32,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CalleeAnswer {
-    pub file: String,
-    pub start: u32,
-    pub end: u32,
+    pub targets: Vec<CalleeTarget>,
+    pub open: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -34,7 +40,7 @@ pub enum TscAnswer {
     Callee(CalleeAnswer),
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug)]
 pub struct TscReply {
     pub typescript: String,
     pub from: String,
@@ -49,10 +55,22 @@ pub enum TscError {
     Malformed(String),
 }
 
+pub const PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Serialize)]
 struct Request<'q> {
+    version: u32,
     tsconfig: String,
     queries: &'q [Query],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reply {
+    version: u32,
+    typescript: String,
+    from: String,
+    answers: Vec<Option<TscAnswer>>,
 }
 
 pub const SCRIPT: &str = include_str!("tsc_sidecar.mjs");
@@ -65,6 +83,7 @@ pub fn ask(root: &Path, tsconfig: &Path, queries: &[Query]) -> Result<TscReply, 
         stderr: error.to_string(),
     })?;
     let request = serde_json::to_vec(&Request {
+        version: PROTOCOL_VERSION,
         tsconfig: tsconfig.to_string_lossy().into_owned(),
         queries,
     })
@@ -86,9 +105,60 @@ pub fn ask(root: &Path, tsconfig: &Path, queries: &[Query]) -> Result<TscReply, 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     match output.status.code() {
-        Some(0) => serde_json::from_slice(&output.stdout)
-            .map_err(|error| TscError::Malformed(error.to_string())),
+        Some(0) => parse_reply(&output.stdout, queries),
         Some(TYPESCRIPT_UNAVAILABLE) => Err(TscError::TypescriptUnavailable(stderr)),
         status => Err(TscError::Failed { status, stderr }),
     }
+}
+
+pub fn parse_reply(text: &[u8], queries: &[Query]) -> Result<TscReply, TscError> {
+    let reply: Reply =
+        serde_json::from_slice(text).map_err(|error| TscError::Malformed(error.to_string()))?;
+
+    if reply.version != PROTOCOL_VERSION {
+        return Err(TscError::Malformed(format!(
+            "protocol version {} where {PROTOCOL_VERSION} was requested",
+            reply.version
+        )));
+    }
+
+    if reply.answers.len() != queries.len() {
+        return Err(TscError::Malformed(format!(
+            "{} answers for {} queries",
+            reply.answers.len(),
+            queries.len()
+        )));
+    }
+
+    for (index, (query, answer)) in queries.iter().zip(&reply.answers).enumerate() {
+        match (query, answer) {
+            (_, None)
+            | (Query::Type { .. }, Some(TscAnswer::Type(_)))
+            | (Query::Callee { .. }, Some(TscAnswer::Callee(_))) => {}
+            _ => {
+                return Err(TscError::Malformed(format!(
+                    "answer {index} does not answer its query kind"
+                )))
+            }
+        }
+
+        if let Some(TscAnswer::Callee(answer)) = answer {
+            if let Some(target) = answer
+                .targets
+                .iter()
+                .find(|target| target.start > target.end)
+            {
+                return Err(TscError::Malformed(format!(
+                    "answer {index} targets an inverted span {}..{} in {}",
+                    target.start, target.end, target.file
+                )));
+            }
+        }
+    }
+
+    Ok(TscReply {
+        typescript: reply.typescript,
+        from: reply.from,
+        answers: reply.answers,
+    })
 }

@@ -6,13 +6,13 @@ use oxc_span::{GetSpan, Span};
 
 use crate::analysis::Analysis;
 use crate::declarations::{
-    declaration_of_node, Binding, Declaration, FunctionId, ParameterNode, TargetSet,
+    declaration_of_node, Binding, Declaration, FunctionId, FunctionNode, ParameterNode, TargetSet,
 };
 use crate::declared_types::{DeclaredType, Kind};
 use crate::project::FileId;
 use crate::syntax::{member_expression_of, unwrap};
 use crate::tables::method_matters;
-use crate::tsc::{CalleeAnswer, Query, TscAnswer, TscError, TscReply, TypeAnswer};
+use crate::tsc::{CalleeAnswer, CalleeTarget, Query, TscAnswer, TscError, TscReply, TypeAnswer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TscPass {
@@ -67,6 +67,12 @@ enum Lookup<T> {
     Unanswered,
 }
 
+pub(crate) struct ResolvedCallee<'a> {
+    pub(crate) declaration: Option<Declaration<'a>>,
+    pub(crate) closed: bool,
+    pub(crate) targets: TargetSet,
+}
+
 impl<'p, 'a> Analysis<'p, 'a> {
     pub(crate) fn parameter_binding_of(&self, declaration: Declaration<'a>) -> Option<Binding> {
         let Declaration::Parameter {
@@ -106,55 +112,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
     pub fn is_tuple(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
         let declared = self.declared_type_of_expression(file, e);
 
-        self.is_tuple_site(file, declared, unwrap(e).span())
+        self.is_declared_tuple(declared)
     }
 
-    pub(crate) fn is_tuple_site(
-        &mut self,
-        file: FileId,
-        declared: DeclaredType,
-        span: Span,
-    ) -> bool {
-        let mut tuple = declared.tuple;
-
-        if !tuple {
-            tuple = self
-                .type_answer_of(file, span)
-                .is_some_and(|answer| answer.tuple);
-        }
-
-        if tuple {
+    pub(crate) fn is_declared_tuple(&mut self, declared: DeclaredType) -> bool {
+        if declared.tuple {
             self.stats.count("types: tuple");
         }
 
-        tuple
+        declared.tuple
     }
 
     pub fn is_closed(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
         let declared = self.declared_type_of_expression(file, e);
 
-        self.is_closed_site(file, declared, unwrap(e).span())
-    }
-
-    pub(crate) fn is_closed_site(
-        &mut self,
-        file: FileId,
-        declared: DeclaredType,
-        span: Span,
-    ) -> bool {
-        let mut closed = declared.closed;
-
-        if !closed {
-            closed = self
-                .type_answer_of(file, span)
-                .is_some_and(|answer| answer.closed);
-        }
-
-        if closed {
+        if declared.closed {
             self.stats.count("types: closed object");
         }
 
-        closed
+        declared.closed
     }
 
     pub fn callee_declaration_of(
@@ -162,20 +138,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         call: &'a CallExpression<'a>,
     ) -> Option<Declaration<'a>> {
-        self.resolved_callee_of(file, call).0
+        self.resolved_callee_of(file, call).declaration
     }
 
     pub fn callee_targets_of(&mut self, file: FileId, call: &'a CallExpression<'a>) -> TargetSet {
-        let (declaration, closed) = self.resolved_callee_of(file, call);
-
-        self.targets_of_declaration(declaration, closed)
+        self.resolved_callee_of(file, call).targets
     }
 
-    pub(crate) fn targets_of_declaration(
+    pub(crate) fn resolved_of_declaration(
         &self,
         declaration: Option<Declaration<'a>>,
         closed: bool,
-    ) -> TargetSet {
+    ) -> ResolvedCallee<'a> {
         let known = declaration
             .and_then(|declaration| self.declarations.function_of(declaration))
             .map(|(file, function)| FunctionId {
@@ -185,9 +159,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .into_iter()
             .collect::<Vec<_>>();
 
-        TargetSet {
-            open: !closed || known.is_empty(),
-            known,
+        ResolvedCallee {
+            declaration,
+            closed,
+            targets: TargetSet {
+                open: !closed || known.is_empty(),
+                known,
+            },
         }
     }
 
@@ -195,40 +173,68 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         call: &'a CallExpression<'a>,
-    ) -> (Option<Declaration<'a>>, bool) {
+    ) -> ResolvedCallee<'a> {
         let callee = unwrap(&call.callee);
 
         if let Expression::Identifier(reference) = callee {
-            return self
-                .declarations
-                .callable_reference(self.project, file, reference);
+            let (declaration, closed) =
+                self.declarations
+                    .callable_reference(self.project, file, reference);
+
+            return self.resolved_of_declaration(declaration, closed);
         }
 
         let Some(member) = member_expression_of(callee) else {
-            return (None, false);
+            return self.resolved_of_declaration(None, false);
         };
 
         if let Some(declaration) = self
             .declarations
             .member_of_receiver(self.project, file, member)
         {
-            return (
-                Some(
-                    self.declarations
-                        .executable_declaration(self.project, declaration),
-                ),
-                false,
-            );
+            let declaration = self
+                .declarations
+                .executable_declaration(self.project, declaration);
+
+            return self.resolved_of_declaration(Some(declaration), false);
         }
 
         let MemberExpression::StaticMemberExpression(access) = member else {
-            return (None, false);
+            return self.resolved_of_declaration(None, false);
         };
 
-        (self.callee_answer_of(file, access.span), false)
+        match self.callee_candidates_of(file, access.span) {
+            Some(answer) => self.resolved_of_callee_answer(&answer),
+            None => self.resolved_of_declaration(None, false),
+        }
     }
 
-    pub(crate) fn callee_answer_of(&mut self, file: FileId, span: Span) -> Option<Declaration<'a>> {
+    pub(crate) fn resolved_member_of(
+        &mut self,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+    ) -> ResolvedCallee<'a> {
+        if let Some(declaration) = self
+            .declarations
+            .member_of_receiver(self.project, file, member)
+        {
+            return self.resolved_of_declaration(Some(declaration), true);
+        }
+
+        let answer = match member {
+            MemberExpression::StaticMemberExpression(access) => {
+                self.callee_candidates_of(file, access.span)
+            }
+            _ => None,
+        };
+
+        match answer {
+            Some(answer) => self.resolved_of_callee_answer(&answer),
+            None => self.resolved_of_declaration(None, false),
+        }
+    }
+
+    fn callee_candidates_of(&mut self, file: FileId, span: Span) -> Option<CalleeAnswer> {
         let query = Query::Callee {
             file: self.query_path_of(file),
             pos: span.start,
@@ -236,9 +242,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         match self.answer_of_site(site_key_of(file, span, QueryKind::Callee), query) {
-            Lookup::Answered(Some(TscAnswer::Callee(answer))) => {
-                self.declaration_of_callee_answer(&answer)
-            }
+            Lookup::Answered(Some(TscAnswer::Callee(answer))) => Some(answer),
             _ => None,
         }
     }
@@ -258,6 +262,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 reply.answers.len(),
                 self.needed.len()
             )));
+        }
+
+        for answer in reply.answers.iter().flatten() {
+            if let TscAnswer::Callee(answer) = answer {
+                for target in &answer.targets {
+                    self.validate_callee_target(target)?;
+                }
+            }
         }
 
         let keys: Vec<SiteKey> = self.needed.keys().copied().collect();
@@ -318,10 +330,62 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.project.file(file).path.to_string_lossy().into_owned()
     }
 
-    fn declaration_of_callee_answer(&self, answer: &CalleeAnswer) -> Option<Declaration<'a>> {
-        let Some(target) = self.project.file_by_path(Path::new(&answer.file)) else {
-            return Some(Declaration::External);
+    fn validate_callee_target(&self, target: &CalleeTarget) -> Result<(), TscError> {
+        let Some(file) = self.project.file_by_path(Path::new(&target.file)) else {
+            return Ok(());
         };
+        let text = self.project.file(file).text;
+        let (start, end) = (target.start as usize, target.end as usize);
+
+        if start <= end
+            && end <= text.len()
+            && text.is_char_boundary(start)
+            && text.is_char_boundary(end)
+        {
+            return Ok(());
+        }
+
+        Err(TscError::Malformed(format!(
+            "callee target {start}..{end} lies outside the UTF-8 text of {}",
+            target.file
+        )))
+    }
+
+    fn resolved_of_callee_answer(&self, answer: &CalleeAnswer) -> ResolvedCallee<'a> {
+        let mut declarations = Vec::new();
+        let mut known = Vec::new();
+        let mut open = answer.open;
+
+        for target in &answer.targets {
+            match self.executable_of_callee_target(target) {
+                Some((declaration, function)) => {
+                    if !known.contains(&function) {
+                        known.push(function);
+                        declarations.push(declaration);
+                    }
+                }
+                None => open = true,
+            }
+        }
+
+        ResolvedCallee {
+            declaration: match declarations.as_slice() {
+                [declaration] => Some(*declaration),
+                _ => None,
+            },
+            closed: !open && !known.is_empty(),
+            targets: TargetSet {
+                open: open || known.is_empty(),
+                known,
+            },
+        }
+    }
+
+    fn executable_of_callee_target(
+        &self,
+        answer: &CalleeTarget,
+    ) -> Option<(Declaration<'a>, FunctionId)> {
+        let target = self.project.file_by_path(Path::new(&answer.file))?;
         let nodes = self.project.file(target).semantic.nodes();
         let mut best: Option<(Span, oxc_semantic::NodeId)> = None;
 
@@ -351,11 +415,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        best.and_then(|(_, node)| declaration_of_node(self.project, target, node))
-            .map(|declaration| {
-                self.declarations
-                    .executable_declaration(self.project, declaration)
-            })
+        let (_, node) = best?;
+
+        if let AstKind::ArrowFunctionExpression(arrow) = nodes.kind(node) {
+            return Some((
+                Declaration::Function {
+                    file: target,
+                    function: FunctionNode::Arrow(arrow),
+                },
+                FunctionId { file: target, node },
+            ));
+        }
+
+        let declaration = self.declarations.executable_declaration(
+            self.project,
+            declaration_of_node(self.project, target, node)?,
+        );
+        let (file, function) = self.declarations.function_of(declaration)?;
+
+        Some((
+            declaration,
+            FunctionId {
+                file,
+                node: function.node_id(),
+            },
+        ))
     }
 }
 

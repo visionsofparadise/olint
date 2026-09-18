@@ -2,7 +2,14 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import fs from "node:fs";
 
+const PROTOCOL_VERSION = 2;
+const MAXIMUM_CANDIDATE_SYMBOLS = 1024;
+
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
+if (input.version !== PROTOCOL_VERSION) {
+	process.stderr.write(`protocol version ${JSON.stringify(input.version)} where ${PROTOCOL_VERSION} is supported`);
+	process.exit(2);
+}
 const tsconfig = path.resolve(input.tsconfig);
 const projectDir = path.dirname(tsconfig);
 
@@ -21,36 +28,39 @@ if (!tsPath) {
 }
 const ts = (await import("file://" + tsPath)).default;
 
-const programs = [];
-const pending = [tsconfig];
-const visited = new Set();
-while (pending.length) {
-	const config = fs.realpathSync(pending.pop());
-	const key = ts.sys.useCaseSensitiveFileNames ? config : config.toLowerCase();
-	if (visited.has(key)) continue;
-	if (visited.size >= 1024) throw new Error("project reference graph exceeds 1024 configurations");
-	visited.add(key);
-	const parsed = ts.getParsedCommandLineOfConfigFile(
-		config,
-		{},
-		{
-			...ts.sys,
-			onUnRecoverableConfigFileDiagnostic: (d) => {
-				throw new Error(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+const programsOf = () => {
+	const programs = [];
+	const pending = [tsconfig];
+	const visited = new Set();
+	while (pending.length) {
+		const config = fs.realpathSync(pending.pop());
+		const key = ts.sys.useCaseSensitiveFileNames ? config : config.toLowerCase();
+		if (visited.has(key)) continue;
+		if (visited.size >= 1024) throw new Error("project reference graph exceeds 1024 configurations");
+		visited.add(key);
+		const parsed = ts.getParsedCommandLineOfConfigFile(
+			config,
+			{},
+			{
+				...ts.sys,
+				onUnRecoverableConfigFileDiagnostic: (d) => {
+					throw new Error(ts.flattenDiagnosticMessageText(d.messageText, "\n"));
+				},
 			},
-		},
-	);
-	programs.push(
-		ts.createProgram({
-			rootNames: parsed.fileNames,
-			options: parsed.options,
-			projectReferences: parsed.projectReferences,
-		}),
-	);
-	for (const reference of [...(parsed.projectReferences ?? [])].reverse()) {
-		pending.push(ts.resolveProjectReferencePath(reference));
+		);
+		programs.push(
+			ts.createProgram({
+				rootNames: parsed.fileNames,
+				options: parsed.options,
+				projectReferences: parsed.projectReferences,
+			}),
+		);
+		for (const reference of [...(parsed.projectReferences ?? [])].reverse()) {
+			pending.push(ts.resolveProjectReferencePath(reference));
+		}
 	}
-}
+	return programs;
+};
 
 const TYPED_ARRAYS = new Set([
 	"Int8Array",
@@ -85,12 +95,12 @@ const kindOfType = (checker, t) => {
 	return "other";
 };
 const isTuple = (checker, t) => !!checker.isTupleType?.(t);
-const isClosedObject = (checker, t) => {
+const isStructuralObject = (checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) return false;
-	if (t.isUnion() || t.isIntersection()) return t.types.every((type) => isClosedObject(checker, type));
+	if (t.isUnion() || t.isIntersection()) return t.types.every((type) => isStructuralObject(checker, type));
 	if (t.isTypeParameter()) {
 		const base = t.getConstraint();
-		return base ? isClosedObject(checker, base) : false;
+		return base ? isStructuralObject(checker, base) : false;
 	}
 	if (!(t.flags & ts.TypeFlags.Object)) return false;
 	if (kindOfType(checker, t) !== "other") return false;
@@ -160,11 +170,84 @@ const offsetsOf = (sf) => {
 	return entry;
 };
 
-const symbolOf = (checker, node) => {
-	let symbol = checker.getSymbolAtLocation(node);
-	if (!symbol) return undefined;
-	if (symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
-	return symbol;
+const aliasedOf = (checker, symbol) =>
+	symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+
+const isExecutable = (node) =>
+	!!node.body &&
+	(ts.isFunctionDeclaration(node) ||
+		ts.isMethodDeclaration(node) ||
+		ts.isConstructorDeclaration(node) ||
+		ts.isFunctionExpression(node) ||
+		ts.isArrowFunction(node));
+
+const implementationsOf = (checker, declaration) => {
+	if (declaration.body) return [declaration];
+	const own = declaration.name && checker.getSymbolAtLocation(declaration.name);
+	return (own?.declarations ?? []).filter((other) => other.kind === declaration.kind && isExecutable(other));
+};
+
+const candidatesOf = (checker, symbols) => {
+	const targets = new Set();
+	const seen = new Set();
+	const pending = [...symbols];
+	const follow = (symbol) => symbol && pending.push(symbol);
+	while (pending.length && seen.size < MAXIMUM_CANDIDATE_SYMBOLS) {
+		const symbol = aliasedOf(checker, pending.pop());
+		if (seen.has(symbol)) continue;
+		seen.add(symbol);
+		for (const declaration of symbol.declarations ?? []) {
+			if (ts.isClassLike(declaration)) {
+				for (const member of declaration.members)
+					if (isExecutable(member) && ts.isConstructorDeclaration(member)) targets.add(member);
+			} else if (
+				ts.isFunctionDeclaration(declaration) ||
+				ts.isMethodDeclaration(declaration) ||
+				ts.isFunctionExpression(declaration) ||
+				ts.isArrowFunction(declaration)
+			) {
+				for (const implementation of implementationsOf(checker, declaration)) targets.add(implementation);
+			} else if (ts.isShorthandPropertyAssignment(declaration)) {
+				follow(checker.getShorthandAssignmentValueSymbol(declaration));
+			} else if (
+				ts.isVariableDeclaration(declaration) ||
+				ts.isPropertyAssignment(declaration) ||
+				ts.isPropertyDeclaration(declaration)
+			) {
+				const value = unwrapNode(declaration.initializer);
+				if (value && (ts.isFunctionExpression(value) || ts.isArrowFunction(value))) targets.add(value);
+				else if (value && ts.isIdentifier(value)) follow(checker.getSymbolAtLocation(value));
+				else if (value && ts.isPropertyAccessExpression(value)) follow(checker.getSymbolAtLocation(value.name));
+			}
+		}
+	}
+	return [...targets];
+};
+
+const signatureSymbolsOf = (checker, callee) => {
+	let call = callee;
+	while (call.parent && unwrapNode(call.parent) === callee) call = call.parent;
+	call = call.parent;
+	if (!call || !ts.isCallOrNewExpression(call) || unwrapNode(call.expression) !== callee) return [];
+	const declaration = checker.getResolvedSignature(call)?.declaration;
+	const own = declaration && declaration.name && checker.getSymbolAtLocation(declaration.name);
+	return own ? [own] : [];
+};
+
+const calleeAnswerOf = (checker, node) => {
+	const symbol = checker.getSymbolAtLocation(node.name);
+	const spans = new Map();
+	for (const target of candidatesOf(checker, symbol ? [symbol] : signatureSymbolsOf(checker, node))) {
+		const file = target.getSourceFile();
+		const offset = offsetsOf(file);
+		const span = {
+			file: file.fileName,
+			start: offset.toUtf8(target.getStart(file)),
+			end: offset.toUtf8(target.getEnd()),
+		};
+		spans.set(`${span.file}\u0000${span.start}\u0000${span.end}`, span);
+	}
+	return { query: "callee", targets: [...spans.values()], open: true };
 };
 
 const answerOf = (program, q) => {
@@ -178,16 +261,7 @@ const answerOf = (program, q) => {
 	if (q.query === "callee") {
 		const node = unwrapNode(n);
 		if (!node || !ts.isPropertyAccessExpression(node)) return null;
-		const declaration = symbolOf(checker, node.name)?.declarations?.[0];
-		if (!declaration) return null;
-		const declarationFile = declaration.getSourceFile();
-		const declarationOffset = offsetsOf(declarationFile);
-		return {
-			query: "callee",
-			file: declarationFile.fileName,
-			start: declarationOffset.toUtf8(declaration.getStart(declarationFile)),
-			end: declarationOffset.toUtf8(declaration.getEnd()),
-		};
+		return calleeAnswerOf(checker, node);
 	}
 	const t = checker.getTypeAtLocation(unwrapNode(n) ?? n);
 	return {
@@ -195,14 +269,24 @@ const answerOf = (program, q) => {
 		kind: kindOfType(checker, t),
 		tuple:
 			isTuple(checker, t) || (t.isUnion() && t.types.length > 0 && t.types.every((type) => isTuple(checker, type))),
-		closed: isClosedObject(checker, t),
+		structural: isStructuralObject(checker, t),
 	};
 };
-const answers = input.queries.map((query) => {
-	const applicable = programs.filter((program) => program.getSourceFile(path.resolve(query.file)));
-	if (!applicable.length) return null;
-	const answers = applicable.map((program) => answerOf(program, query));
-	const first = JSON.stringify(answers[0]);
-	return answers.every((answer) => JSON.stringify(answer) === first) ? answers[0] : null;
-});
-process.stdout.write(JSON.stringify({ typescript: ts.version, from: tsPath, answers }));
+const answersOf = (queries) => {
+	const programs = programsOf();
+	return queries.map((query) => {
+		const applicable = programs.filter((program) => program.getSourceFile(path.resolve(query.file)));
+		if (!applicable.length) return null;
+		const answers = applicable.map((program) => answerOf(program, query));
+		const first = JSON.stringify(answers[0]);
+		return answers.every((answer) => JSON.stringify(answer) === first) ? answers[0] : null;
+	});
+};
+process.stdout.write(
+	JSON.stringify({
+		version: PROTOCOL_VERSION,
+		typescript: ts.version,
+		from: tsPath,
+		answers: input.queries.length ? answersOf(input.queries) : [],
+	}),
+);

@@ -5,7 +5,7 @@ use olint::declared_types::Kind;
 use olint::effects::Effects;
 use olint::project::FileId;
 use olint::summaries::{Substitutions, SummaryId, SummaryRecord};
-use olint::tsc::{CalleeAnswer, Query, TscAnswer, TscReply, TypeAnswer};
+use olint::tsc::{CalleeAnswer, CalleeTarget, Query, TscAnswer, TscReply, TypeAnswer};
 use olint::types::TscPass;
 use olint::unknowns::SourceSpan;
 use olint::values::{ArgumentFacts, ValueId};
@@ -36,14 +36,17 @@ fn target_answer(analysis: &Analysis<'_, '_>, file: FileId, target: FunctionNode
     };
 
     TscAnswer::Callee(CalleeAnswer {
-        file: analysis
-            .project
-            .file(file)
-            .path
-            .to_string_lossy()
-            .replace('\\', "/"),
-        start: span.start,
-        end: span.end,
+        targets: vec![CalleeTarget {
+            file: analysis
+                .project
+                .file(file)
+                .path
+                .to_string_lossy()
+                .replace('\\', "/"),
+            start: span.start,
+            end: span.end,
+        }],
+        open: true,
     })
 }
 
@@ -139,7 +142,7 @@ fn raw_and_selected_tasks_survive_three_answer_generations_without_aliasing() {
                     Some(TscAnswer::Type(TypeAnswer {
                         kind: Kind::Array,
                         tuple: false,
-                        closed: false,
+                        structural: false,
                     }))
                 }
                 Query::Callee { .. } if query_source(source, query) == "make().run" => {

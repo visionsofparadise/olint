@@ -10,8 +10,10 @@ use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
 use crate::cost::{Cost, Part, Preference, Reading};
-use crate::declarations::{function_of_initializer, Declaration, FunctionNode, ParameterNode};
-use crate::declared_types::{DeclaredType, Kind};
+use crate::declarations::{
+    function_of_initializer, Declaration, FunctionNode, ParameterNode, TargetSet,
+};
+use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::project::{FileId, Site};
 use crate::syntax::{
@@ -22,6 +24,7 @@ use crate::tables::{
     ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, GLOBAL_FUNCTIONS_LINEAR, GLOBAL_LINEAR,
     LINEAR_CONSTRUCTORS, MAP_LINEAR, OBJECT_KEYED, REGEXP_LINEAR, SET_LINEAR, STRING_LINEAR,
 };
+use crate::types::ResolvedCallee;
 use crate::unknowns::{SourceSpan, UnknownReason};
 
 fn is_type_kind(ty: AstType) -> bool {
@@ -826,7 +829,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             inner = inner.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let target_span = rest.target.span();
         let constant = match &rest.target {
             AssignmentTarget::AssignmentTargetIdentifier(reference) => {
                 if matches!(
@@ -842,7 +844,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 self.is_constant_sized_reference(file, reference)
             }
-            _ => self.is_tuple_site(file, DeclaredType::default(), target_span),
+            _ => false,
         };
 
         if constant {
@@ -869,24 +871,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    pub(crate) fn member_declaration_of(
+    fn with_open_remainder(
         &mut self,
+        mut part: Part,
+        targets: &TargetSet,
         file: FileId,
-        member: &'a MemberExpression<'a>,
-    ) -> Option<Declaration<'a>> {
-        if let Some(declaration) = self
-            .declarations
-            .member_of_receiver(self.project, file, member)
-        {
-            return Some(declaration);
+        span: Span,
+        arguments: &[Argument<'a>],
+    ) -> Part {
+        if targets.open {
+            let unknown = self.unknown_invocation(file, span, arguments, UnknownReason::Target);
+
+            part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
         }
 
-        match member {
-            MemberExpression::StaticMemberExpression(access) => {
-                self.callee_answer_of(file, access.span)
-            }
-            _ => None,
-        }
+        part
     }
 
     fn cost_of_new(&mut self, file: FileId, new: &'a NewExpression<'a>) -> Reading {
@@ -898,20 +897,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let declaration = match &new.callee {
+        let targets = match &new.callee {
             Expression::Identifier(reference) => {
-                self.declarations
-                    .of_reference(self.project, file, reference)
+                let declaration = self
+                    .declarations
+                    .of_reference(self.project, file, reference);
+
+                self.resolved_of_declaration(declaration, true).targets
             }
             callee => match callee.as_member_expression() {
-                Some(member) => self.member_declaration_of(file, member),
-                None => None,
+                Some(member) => self.resolved_member_of(file, member).targets,
+                None => TargetSet::default(),
             },
         };
-        let function =
-            declaration.and_then(|declaration| self.declarations.function_of(declaration));
 
-        if let Some((target, function)) = function {
+        for known in &targets.known {
+            let function = self.function_at(*known);
+            let target = known.file;
             let (callee, cyclic) = self.call_user(target, function, file, &new.arguments, new.span);
             let callee = if callee.cost.is_one() {
                 callee
@@ -934,8 +936,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             };
             let part = callee.called(self.source_span(file, new.span), &mut self.unknowns);
+            let part = self.with_open_remainder(part, &targets, file, new.span, &new.arguments);
 
-            return self.append_call(reading, target, function, part, cyclic);
+            reading = self.append_call(reading, target, function, part, cyclic);
+        }
+
+        if !targets.known.is_empty() {
+            return reading;
         }
 
         self.current_effects.unknown_global = true;
@@ -1026,7 +1033,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let (declaration, closed) = self.resolved_callee_of(file, call);
+        let ResolvedCallee {
+            declaration,
+            closed,
+            targets,
+        } = self.resolved_callee_of(file, call);
         let site = self.site_of_node(file, call.node_id());
 
         if let (Some(Declaration::Parameter { parameter, .. }), Some(reference)) =
@@ -1096,8 +1107,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let targets = self.targets_of_declaration(declaration, closed);
-
         for target in &targets.known {
             let function = self.function_at(*target);
             let target = target.file;
@@ -1120,18 +1129,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             };
 
-            let mut part = called.called(self.source_span(file, call.span), &mut self.unknowns);
-
-            if targets.open {
-                let unknown = self.unknown_invocation(
-                    file,
-                    call.span,
-                    &call.arguments,
-                    UnknownReason::Target,
-                );
-
-                part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
-            }
+            let part = called.called(self.source_span(file, call.span), &mut self.unknowns);
+            let part = self.with_open_remainder(part, &targets, file, call.span, &call.arguments);
 
             reading = self.append_call(reading, target, function, part, cyclic);
         }

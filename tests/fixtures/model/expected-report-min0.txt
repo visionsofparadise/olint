@@ -1,17 +1,18 @@
 public coverage [partial]
 # tsconfig.json  (160 functions in 15 files)
 
-O(1)               35
-O(1) [partial]     32
+O(1)               33
+O(1) [partial]     28
 O(xs)              14
 O(rows^2)           8
 O(rows^2) [partial]    7
 O((xs * log(xs)))    5
+O(N)                5
 O(xs) [partial]     4
+O(N) [partial]      4
 O(o)                3
 O((xs * xs^2))      3
 O(x)                3
-O(N)                3
 O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
@@ -332,8 +333,32 @@ O(N)           sumRest  src/calls.ts:17
 O(N)           MergedHolder.run  src/classes.ts:105
     does mergedItems.indexOf()                            src/classes.ts:106  x N
 
+O(N)           MergedHolder.self  src/classes.ts:108 [partial]
+    calls MergedHolder.run()                               src/classes.ts:109  = O(N)
+    does mergedItems.indexOf()                            src/classes.ts:106  x N
+
+O(N)           useMergedHolder  src/classes.ts:113 [partial]
+    calls MergedHolder.self()                              src/classes.ts:114  = O(N)
+    calls MergedHolder.run()                               src/classes.ts:109  = O(N)
+    does mergedItems.indexOf()                            src/classes.ts:106  x N
+
 O(N)           QuotedHolder.run  src/classes.ts:128
     does mergedItems.indexOf()                            src/classes.ts:129  x N
+
+O(N)           QuotedHolder.self  src/classes.ts:131 [partial]
+    calls QuotedHolder.run()                               src/classes.ts:132  = O(N)
+    does mergedItems.indexOf()                            src/classes.ts:129  x N
+
+O(N)           useQuotedHolder  src/classes.ts:136 [partial]
+    calls QuotedHolder.self()                              src/classes.ts:137  = O(N)
+    calls QuotedHolder.run()                               src/classes.ts:132  = O(N)
+    does mergedItems.indexOf()                            src/classes.ts:129  x N
+
+O(N)           spreadRestTupleSet  src/methods.ts:86
+    calls Set(...rows)                                     src/methods.ts:87  = O(N)
+
+O(N)           spreadRestKeys  src/methods.ts:90
+    does Object.keys(...rows)                             src/methods.ts:91  x N
 
 O(o)           forInIndexSig  src/types.ts:6
     in loop for-in                                           src/types.ts:8  x N
@@ -439,15 +464,7 @@ O(1)           WithGetter.constructor  src/classes.ts:42
 
 O(1)           readsGetter  src/classes.ts:49
 
-O(1)           MergedHolder.self  src/classes.ts:108 [partial]
-
-O(1)           useMergedHolder  src/classes.ts:113 [partial]
-
 O(1)           ComputedKeys.[ Symbol.iterator ]  src/classes.ts:118 [partial]
-
-O(1)           QuotedHolder.self  src/classes.ts:131 [partial]
-
-O(1)           useQuotedHolder  src/classes.ts:136 [partial]
 
 O(1)           arrayLiteralSpread  src/constants.ts:1
 
@@ -476,10 +493,6 @@ O(1)           newMapConstant  src/methods.ts:65
 O(1)           makeCallbackSet  src/methods.ts:72
 
 O(1)           makeDoubled  src/methods.ts:76
-
-O(1)           spreadRestTupleSet  src/methods.ts:86
-
-O(1)           spreadRestKeys  src/methods.ts:90
 
 O(1)           makeRoundEngine  src/methods.ts:108 [partial]
 
