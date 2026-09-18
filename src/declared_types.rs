@@ -6,10 +6,11 @@ use oxc_ast::ast::{
     TSTypeReference, VariableDeclarator,
 };
 use oxc_ast::AstKind;
+use oxc_span::GetSpan;
 use oxc_syntax::operator::{BinaryOperator, LogicalOperator};
 
 use crate::analysis::Analysis;
-use crate::declarations::{Declaration, FunctionNode, ParameterNode};
+use crate::declarations::{Binding, Declaration, FunctionNode, ParameterNode};
 use crate::project::FileId;
 use crate::syntax::{call_of, is_const_type, is_identifier_pattern, member_expression_of, unwrap};
 use crate::tables::{KIND_OF_NAME, STRING_LINEAR, STRING_TO_ARRAY, TYPED_ARRAYS};
@@ -811,7 +812,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 if annotation
                     .is_some_and(|annotation| self.is_primitive_type(target, annotation, depth + 1))
                 {
-                    return true;
+                    return self.is_proven_primitive_binding(&declaration, initializer, depth + 1);
                 }
 
                 declarator_of_identifier(&declaration).is_some_and(|(_, _, constant)| constant)
@@ -827,6 +828,169 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             _ => false,
         }
+    }
+
+    fn is_proven_primitive_binding(
+        &mut self,
+        declaration: &Declaration<'a>,
+        initializer: Option<&'a Expression<'a>>,
+        depth: u32,
+    ) -> bool {
+        let (file, identifier) = match *declaration {
+            Declaration::Variable {
+                file, declarator, ..
+            } => (file, declarator.id.get_binding_identifier()),
+            Declaration::Parameter {
+                file,
+                parameter: ParameterNode::Formal(parameter),
+                function,
+            } => {
+                if !self.are_call_arguments_non_callable(file, function, parameter, depth + 1) {
+                    return false;
+                }
+
+                (file, parameter.pattern.get_binding_identifier())
+            }
+            _ => return false,
+        };
+        let Some(symbol) = identifier.and_then(|identifier| identifier.symbol_id.get()) else {
+            return false;
+        };
+        let project = self.project;
+        let source = project.file(file);
+        let nodes = source.semantic.nodes();
+        let declared = source.semantic.scoping().symbol_declaration(symbol);
+        let ambient = source.program.source_type.is_typescript_definition()
+            || std::iter::once(declared)
+                .chain(nodes.ancestor_ids(declared))
+                .any(|node| match nodes.kind(node) {
+                    AstKind::VariableDeclaration(declaration) => declaration.declare,
+                    AstKind::TSNamespaceDeclaration(namespace) => namespace.declare,
+                    AstKind::TSGlobalDeclaration(_) => true,
+                    AstKind::Function(function) => function.declare,
+                    _ => false,
+                });
+
+        if ambient
+            || initializer.is_some_and(|initializer| {
+                !self.is_non_callable_nested_expression(file, initializer, depth + 1)
+            })
+        {
+            return false;
+        }
+
+        let writes: Vec<_> = source
+            .semantic
+            .scoping()
+            .get_resolved_references(symbol)
+            .filter(|reference| reference.is_write())
+            .map(|reference| reference.node_id())
+            .collect();
+
+        writes.into_iter().all(|write| {
+            let mut current = write;
+
+            loop {
+                let span = nodes.kind(current).span();
+                let parent = nodes.parent_id(current);
+
+                match nodes.kind(parent) {
+                    AstKind::ParenthesizedExpression(_)
+                    | AstKind::TSAsExpression(_)
+                    | AstKind::TSSatisfiesExpression(_)
+                    | AstKind::TSNonNullExpression(_)
+                    | AstKind::TSTypeAssertion(_) => current = parent,
+                    AstKind::UpdateExpression(_) => return true,
+                    AstKind::AssignmentExpression(assignment) if assignment.left.span() == span => {
+                        return !(assignment.operator.is_assign()
+                            || assignment.operator.is_logical())
+                            || self.is_non_callable_nested_expression(
+                                file,
+                                &assignment.right,
+                                depth + 1,
+                            );
+                    }
+                    _ => return false,
+                }
+            }
+        })
+    }
+
+    fn are_call_arguments_non_callable(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        parameter: &'a FormalParameter<'a>,
+        depth: u32,
+    ) -> bool {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let (parameters, name) = match function {
+            FunctionNode::Function(inner) => (&inner.params, inner.id.as_ref()),
+            FunctionNode::Arrow(arrow) => (
+                &arrow.params,
+                match nodes.parent_kind(arrow.node_id()) {
+                    AstKind::VariableDeclarator(declarator) => {
+                        declarator.id.get_binding_identifier()
+                    }
+                    _ => None,
+                },
+            ),
+        };
+        let Some(index) = parameters
+            .items
+            .iter()
+            .position(|item| std::ptr::eq(item, parameter))
+        else {
+            return false;
+        };
+        let Some(symbol) = name.and_then(|name| name.symbol_id.get()) else {
+            return false;
+        };
+        let binding = Binding::Symbol { file, symbol };
+        let exported = project
+            .file(file)
+            .module_record
+            .local_export_entries
+            .iter()
+            .any(|entry| {
+                entry.local_name.name().is_some_and(|local| {
+                    local.as_str() == project.file(file).semantic.scoping().symbol_name(symbol)
+                })
+            })
+            || nodes.ancestors(function.node_id()).any(|ancestor| {
+                matches!(
+                    ancestor.kind(),
+                    AstKind::ExportNamedDeclaration(_) | AstKind::ExportDefaultDeclaration(_)
+                )
+            });
+
+        if exported || !self.declarations.importers_of(project, binding).is_empty() {
+            return false;
+        }
+
+        let references = self.declarations.surface_references_of(project, binding);
+
+        references.into_iter().all(|(site, node, write)| {
+            let nodes = project.file(site).semantic.nodes();
+            let span = nodes.kind(node).span();
+            let AstKind::CallExpression(call) = nodes.parent_kind(node) else {
+                return false;
+            };
+
+            !write
+                && call.callee.span() == span
+                && call
+                    .arguments
+                    .iter()
+                    .take(index + 1)
+                    .all(|argument| !matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)))
+                && call.arguments.get(index).is_none_or(|argument| {
+                    argument.as_expression().is_some_and(|argument| {
+                        self.is_non_callable_nested_expression(site, argument, depth + 1)
+                    })
+                })
+        })
     }
 
     fn is_primitive_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {

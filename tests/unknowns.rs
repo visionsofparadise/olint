@@ -308,7 +308,7 @@ fn known_native_cost_does_not_prove_empty_effects() {
             assert!(analysis
                 .summaries_arena
                 .iter()
-                .any(|record| record.effects.unknown_global));
+                .any(|record| !record.effects.unknown_reachable.is_empty()));
 
             let part = summary_of(analysis, file, "f");
 

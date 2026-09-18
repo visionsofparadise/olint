@@ -59,6 +59,7 @@ pub struct ArgumentFacts {
 #[derive(Default)]
 pub struct Values {
     origins: HashMap<SourceSpan, ValueId>,
+    allocations: std::collections::HashSet<ValueId>,
     callbacks: HashMap<usize, ValueId>,
     next_value: u32,
     quantities: HashMap<(ValueId, SizeQuantity), u64>,
@@ -194,6 +195,22 @@ impl Values {
             targets: TargetSet::default(),
             latent: None,
         }
+    }
+
+    pub fn allocation(&mut self, origin: SourceSpan) -> ValueFacts {
+        let facts = self.at(origin);
+
+        self.allocations.insert(facts.value);
+
+        facts
+    }
+
+    pub fn is_allocation(&self, value: ValueId) -> bool {
+        self.allocations.contains(&value)
+    }
+
+    pub fn may_alias(&self, left: ValueId, right: ValueId) -> bool {
+        left == right || !(self.is_allocation(left) && self.is_allocation(right))
     }
 
     pub fn at(&mut self, origin: SourceSpan) -> ValueFacts {

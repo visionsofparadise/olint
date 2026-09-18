@@ -347,7 +347,10 @@ fn captured_callback_facts_separate_impure_work_and_reuse_pure_work() {
                 let why = reasons(analysis, selected.unknowns);
 
                 assert_eq!(selected.cost, Cost::ONE);
-                outcomes.push((selected.is_complete(), record.effects.unknown_global));
+                outcomes.push((
+                    selected.is_complete(),
+                    !record.effects.unknown_reachable.is_empty(),
+                ));
 
                 if selected.is_complete() {
                     assert_eq!(record.effects, Effects::default());

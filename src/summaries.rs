@@ -505,7 +505,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
-    fn store_summary(&mut self, key: SummaryKey, reading: Reading, effects: Effects) -> SummaryId {
+    fn store_summary(
+        &mut self,
+        key: SummaryKey,
+        reading: Reading,
+        mut effects: Effects,
+    ) -> SummaryId {
+        effects
+            .binding_writes
+            .retain(|binding| !self.is_declared_within(*binding, key.function));
+
         let span = self
             .kind_of_node(key.function.file, key.function.node)
             .span();
@@ -1924,15 +1933,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Some(self.invoke_argument(&facts, file, argument.span(), &[]))
     }
 
-    pub(crate) fn apply_argument_effects(&mut self, facts: &ArgumentFacts) {
-        let effects = facts
+    pub(crate) fn apply_argument_effects(
+        &mut self,
+        facts: &ArgumentFacts,
+        file: FileId,
+        span: oxc_span::Span,
+        arguments: &'a [Argument<'a>],
+    ) {
+        match facts
             .value
             .latent
             .and_then(|id| self.summaries_arena.get(id.0 as usize))
             .map(|record| record.effects.clone())
-            .unwrap_or_else(Effects::unknown);
-
-        self.current_effects.join(&effects);
+        {
+            Some(effects) => self.current_effects.join(&effects),
+            None => self.record_unknown_reach(file, None, arguments, span),
+        }
     }
 
     pub(crate) fn invoke_argument(
@@ -1981,7 +1997,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return self.called_part_of(target.file, function, part, cyclic);
         }
 
-        self.apply_argument_effects(facts);
+        self.apply_argument_effects(facts, file, span, arguments);
 
         facts
             .callback
@@ -2132,15 +2148,59 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.observe_invocation(&key, call_file, span);
 
-        let effects = self
+        let mut effects = self
             .summaries
             .get(&key)
             .map(|id| self.summaries_arena[id.0 as usize].effects.clone())
             .unwrap_or_else(Effects::unknown);
 
+        self.substitute_parameter_values(file, function, call_file, arguments, &mut effects);
         self.current_effects.join(&effects);
 
         (reading.total(&mut self.unknowns, &mut self.traces), cyclic)
+    }
+
+    fn substitute_parameter_values(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        call_file: FileId,
+        arguments: &'a [Argument<'a>],
+        effects: &mut Effects,
+    ) {
+        if effects.unknown_global {
+            return;
+        }
+
+        let parameters = match function {
+            FunctionNode::Function(inner) => &inner.params,
+            FunctionNode::Arrow(inner) => &inner.params,
+        };
+
+        for (parameter, argument) in parameters.items.iter().zip(arguments) {
+            let (BindingPattern::BindingIdentifier(identifier), Some(expression)) =
+                (&parameter.pattern, argument.as_expression())
+            else {
+                break;
+            };
+            let rebound = identifier.symbol_id.get().is_none_or(|symbol| {
+                !self
+                    .declarations
+                    .is_write_free(self.project, Binding::Symbol { file, symbol })
+            });
+
+            if rebound {
+                continue;
+            }
+
+            let parameter = self
+                .values
+                .at(self.source_span(file, parameter.pattern.span()))
+                .value;
+            let argument = self.storage_value_of(call_file, expression);
+
+            effects.substitute(parameter, argument);
+        }
     }
 
     fn observe_invocation(&mut self, key: &SummaryKey, file: FileId, span: oxc_span::Span) {

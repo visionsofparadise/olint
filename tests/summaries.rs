@@ -582,3 +582,81 @@ fn a_cold_call_leaves_its_argument_costs_unmarked() {
         (Cost::N, vec!["xs.indexOf()".to_string()])
     );
 }
+
+#[test]
+fn callee_member_writes_compose_through_parameter_substitution() {
+    for (argument, expected) in [("box", "O(N^2)"), ("other", "O(N)")] {
+        let source = format!("function grow(target: {{ limit: number }}, n: number) {{ target.limit += n; }} export function selected(n: number) {{ const box = {{ limit: n }}; const other = {{ limit: n }}; let i = 0, total = 0; for (let j = 0; j < n; j++) {{ while (i < box.limit) {{ i++; total++; }} grow({argument}, n); }} return total; }}");
+
+        let (cost, reasons) = selected_result(&source);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{argument}");
+        assert!(reasons.is_empty(), "{argument}: {reasons:?}");
+    }
+}
+
+#[test]
+fn published_effects_keep_reachable_writes_and_drop_activation_locals() {
+    let source = "declare function opaque(value: unknown): void;\nexport function outer(n: number) { let i = 0; const reset = () => { let local = 0; local++; i = local; }; reset(); return i + n; }\nfunction grow(target: { limit: number }) { let k = 0; k++; target.limit += k; }\nfunction leak(target: object) { opaque(target); }";
+
+    run_with_source(source, |analysis, file| {
+        let records_of = |analysis: &mut Analysis<'_, '_>, name: &str| {
+            let function = function_of_name(analysis.project, file, name);
+
+            analysis.summarize(file, function);
+
+            let records: Vec<_> = analysis
+                .summary_records_for(olint::declarations::FunctionId {
+                    file,
+                    node: function.node_id(),
+                })
+                .into_iter()
+                .cloned()
+                .collect();
+
+            assert_eq!(records.len(), 1, "{name}");
+
+            records.into_iter().next().unwrap().effects
+        };
+        let outer = records_of(analysis, "outer");
+        let reset = records_of(analysis, "reset");
+        let grow = records_of(analysis, "grow");
+        let leak = records_of(analysis, "leak");
+        let names = |analysis: &Analysis<'_, '_>, effects: &olint::effects::Effects| {
+            let mut names: Vec<_> = effects
+                .binding_writes
+                .iter()
+                .map(|binding| match binding {
+                    olint::declarations::Binding::Symbol { file, symbol } => analysis
+                        .project
+                        .file(*file)
+                        .semantic
+                        .scoping()
+                        .symbol_name(*symbol)
+                        .to_string(),
+                })
+                .collect();
+
+            names.sort();
+
+            names
+        };
+
+        assert_eq!(names(analysis, &reset), ["i"]);
+        assert!(names(analysis, &outer).is_empty());
+        assert!(names(analysis, &grow).is_empty());
+        assert_eq!(grow.member_writes.len(), 1);
+        assert!(grow.unknown_reachable.is_empty() && !grow.unknown_global);
+        assert!(!leak.unknown_reachable.is_empty());
+        assert!(leak.escapes.len() == 1 && !leak.unknown_global);
+    });
+}
+
+#[test]
+fn rebound_callee_parameters_keep_their_writes_unattributed() {
+    let source = "function grow(target: { limit: number }, spare: { limit: number }, n: number) { target = spare; target.limit += n; } export function selected(n: number) { const box = { limit: n }; const other = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n; j++) { while (i < box.limit) { i++; total++; } grow(other, box, n); } return total; }";
+
+    let (cost, _) = selected_result(source);
+
+    assert_eq!(cost, Cost::parse("O(N^2)").unwrap());
+}

@@ -2,21 +2,21 @@ public coverage [partial]
 # tsconfig.json  (160 functions in 15 files)
 
 O(1)               33
-O(1) [partial]     28
+O(1) [partial]     22
 O(xs)              14
 O(rows^2)           8
+O(xs) [partial]     7
 O(rows^2) [partial]    7
 O((xs * log(xs)))    5
 O(N)                5
-O(xs) [partial]     4
 O(N) [partial]      4
 O(o)                3
 O((xs * xs^2))      3
+O(xs^2)             3
 O(x)                3
 O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
-O(xs^2)             2
 O(max(n, xs))       2
 O(max(1, n^2))      2
 O(prefix)           2
@@ -31,6 +31,8 @@ O((max(rows, width))^(2))    1
 O(max(n, g, xs)) [partial]    1
 O((max(xs, n, next))^(2)) [partial]    1
 O((max(xs, n))^(2))    1
+O(max(xs, n)) [partial]    1
+O(max(n, cb)) [partial]    1
 O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
 O(obj)              1
@@ -171,6 +173,10 @@ O(rows^2)      CostedCtor.constructor  src/classes.ts:3
 O(xs^2)        hotLocalFunctionDeclaration  src/branches.ts:207
     in loop for-of                                           src/branches.ts:211  x N
         in loop for-of                                       src/branches.ts:211  x N
+
+O(xs^2)        boundedNonLoopStatement  src/branches.ts:81
+    in loop for-of                                           src/branches.ts:85  x N
+        in loop for-of                                       src/branches.ts:85  x N
 
 O(N^2)         WithGetter.total  src/classes.ts:43
     in loop for-of                                           src/classes.ts:45  x N

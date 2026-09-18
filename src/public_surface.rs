@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    Class, ClassElement, Expression, ImportOrExportKind, ObjectPropertyKind, PropertyKey,
-    Statement, TSAccessibility, TSNamespaceDeclarationBody,
+    Argument, AssignmentTarget, Class, ClassElement, Expression, ForStatementLeft,
+    IdentifierReference, ImportOrExportKind, ObjectPropertyKind, PropertyKey, Statement,
+    TSAccessibility, TSNamespaceDeclarationBody,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
@@ -11,11 +12,15 @@ use oxc_syntax::symbol::SymbolId;
 
 use crate::analysis::Analysis;
 use crate::config::{validate_entries, Config, ConfigError};
-use crate::declarations::{element_name_of, Binding, FunctionNode, SurfaceTarget};
+use crate::declarations::{
+    element_name_of, surface_write_of, Binding, Declaration, FunctionId, FunctionNode,
+    SurfaceTarget,
+};
 use crate::directives::PerfTag;
+use crate::effects::{value_flow_of, ValueFlow};
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Resolved};
-use crate::syntax::unwrap;
+use crate::syntax::{member_expression_of, unwrap};
 use crate::unknowns::{SourceSpan, UnknownReason};
 
 use super::{ApplicableLimit, PublicFunction};
@@ -107,6 +112,10 @@ fn hidden(accessibility: Option<TSAccessibility>, key: &PropertyKey<'_>) -> bool
         accessibility,
         Some(TSAccessibility::Private | TSAccessibility::Protected)
     ) || matches!(key, PropertyKey::PrivateIdentifier(_))
+}
+
+fn is_module_exports(name: &str) -> bool {
+    name == "module" || name == "exports"
 }
 
 fn accepts_descriptor(names: &mut HashMap<String, HashSet<u8>>, name: String, kind: u8) -> bool {
@@ -518,15 +527,317 @@ impl<'a> Walk<'_, '_, 'a> {
     }
 
     fn surface_writes(&mut self, file: FileId, symbols: Vec<SymbolId>) {
-        for symbol in symbols {
-            for write in self
+        let project = self.analysis.project;
+        let mut pending: Vec<(Binding, bool)> = symbols
+            .into_iter()
+            .map(|symbol| {
+                let binding = Binding::Symbol { file, symbol };
+
+                (binding, self.may_escape(binding))
+            })
+            .collect();
+        let roots: HashSet<Binding> = pending.iter().map(|(binding, _)| *binding).collect();
+        let mut scanned = HashSet::new();
+
+        while let Some((binding, escaping)) = pending.pop() {
+            if !scanned.insert(binding) {
+                continue;
+            }
+
+            let writes = self
                 .analysis
                 .declarations
-                .surface_writes_of(self.analysis.project, Binding::Symbol { file, symbol })
-            {
-                if self.may_install_callable(file, write) {
-                    self.issue(self.site(file, write), UnknownReason::Target);
+                .surface_writes_of(project, binding);
+
+            for (file, write) in &writes {
+                let rebinding = matches!(
+                    project.file(*file).semantic.nodes().kind(*write),
+                    AstKind::IdentifierReference(_)
+                );
+
+                if (!rebinding || roots.contains(&binding))
+                    && self.may_install_callable(*file, *write)
+                {
+                    self.issue(self.site(*file, *write), UnknownReason::Target);
                 }
+            }
+
+            for imported in self.analysis.declarations.importers_of(project, binding) {
+                pending.push((imported, escaping));
+            }
+
+            for (file, node, write) in self
+                .analysis
+                .declarations
+                .surface_references_of(project, binding)
+            {
+                if write {
+                    continue;
+                }
+
+                match value_flow_of(project.file(file).semantic.nodes(), node) {
+                    ValueFlow::Alias(target) => {
+                        self.alias_bindings(file, target, escaping, &mut pending)
+                    }
+                    ValueFlow::Stored(assignment) if escaping => {
+                        match self.stored_binding_of(file, assignment) {
+                            Ok(Some(root)) => pending.push((root, escaping)),
+                            Ok(None) => {}
+                            Err(()) => {
+                                self.issue(self.site(file, assignment), UnknownReason::Target)
+                            }
+                        }
+                    }
+                    ValueFlow::Argument(call, index)
+                        if escaping && !writes.contains(&(file, call)) =>
+                    {
+                        self.argument_bindings(file, call, index, escaping, &mut pending)
+                    }
+                    ValueFlow::Receiver(call) if escaping && !writes.contains(&(file, call)) => {
+                        self.receiver_writes(file, call, &mut HashSet::new())
+                    }
+                    ValueFlow::Escaped(site) if escaping => {
+                        self.issue(self.site(file, site), UnknownReason::Target)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn receiver_writes(&mut self, file: FileId, call: NodeId, visited: &mut HashSet<FunctionId>) {
+        let project = self.analysis.project;
+        let AstKind::CallExpression(expression) = project.file(file).semantic.nodes().kind(call)
+        else {
+            return self.issue(self.site(file, call), UnknownReason::Target);
+        };
+        let targets = self.analysis.resolved_callee_of(file, expression).targets;
+
+        if targets.open || targets.known.is_empty() {
+            let inert = expression.arguments.iter().all(|argument| {
+                argument.as_expression().is_some_and(|argument| {
+                    self.analysis.is_non_callable_expression(file, argument)
+                })
+            });
+
+            if !inert {
+                self.issue(self.site(file, call), UnknownReason::Target);
+            }
+        }
+
+        for target in targets.known {
+            if !visited.insert(target) {
+                continue;
+            }
+
+            let nodes = project.file(target.file).semantic.nodes();
+            let span = nodes.kind(target.node).span();
+            let receivers: Vec<NodeId> = nodes
+                .iter()
+                .filter(|node| {
+                    matches!(node.kind(), AstKind::ThisExpression(_))
+                        && span.contains_inclusive(node.kind().span())
+                        && nodes
+                            .ancestors(node.id())
+                            .find(|ancestor| matches!(ancestor.kind(), AstKind::Function(_)))
+                            .is_some_and(|owner| owner.id() == target.node)
+                })
+                .map(|node| node.id())
+                .collect();
+
+            for receiver in receivers {
+                match value_flow_of(nodes, receiver) {
+                    ValueFlow::Read => {}
+                    ValueFlow::Member => {
+                        if let Some(write) = surface_write_of(nodes, receiver) {
+                            if self.may_install_callable(target.file, write) {
+                                self.issue(self.site(target.file, write), UnknownReason::Target);
+                            }
+                        }
+                    }
+                    ValueFlow::Receiver(inner) => self.receiver_writes(target.file, inner, visited),
+                    ValueFlow::Alias(site)
+                    | ValueFlow::Stored(site)
+                    | ValueFlow::Argument(site, _)
+                    | ValueFlow::Escaped(site) => {
+                        self.issue(self.site(target.file, site), UnknownReason::Target)
+                    }
+                }
+            }
+        }
+    }
+
+    fn may_escape(&self, binding: Binding) -> bool {
+        match self
+            .analysis
+            .declarations
+            .of_binding(self.analysis.project, binding)
+        {
+            Some(Declaration::Function { .. }) => false,
+            Some(Declaration::Variable { declarator, .. }) => !matches!(
+                declarator.init.as_ref().map(unwrap),
+                Some(Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_))
+            ),
+            _ => true,
+        }
+    }
+
+    fn alias_bindings(
+        &mut self,
+        file: FileId,
+        target: NodeId,
+        escaping: bool,
+        pending: &mut Vec<(Binding, bool)>,
+    ) {
+        let project = self.analysis.project;
+        let kind = project.file(file).semantic.nodes().kind(target);
+        let assigned = match kind {
+            AstKind::AssignmentExpression(assignment) => Some(&assignment.left),
+            AstKind::AssignmentTargetWithDefault(default) => Some(&default.binding),
+            _ => None,
+        };
+
+        if let Some(left) = assigned {
+            return match left {
+                AssignmentTarget::AssignmentTargetIdentifier(reference) => {
+                    self.alias_reference(file, target, reference, escaping, pending)
+                }
+                _ => self.issue(self.site(file, target), UnknownReason::Target),
+            };
+        }
+
+        let identifiers = match kind {
+            AstKind::VariableDeclarator(declarator) => declarator.id.get_binding_identifiers(),
+            AstKind::ForOfStatement(statement) => match &statement.left {
+                ForStatementLeft::VariableDeclaration(declaration) => declaration
+                    .declarations
+                    .iter()
+                    .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                    .collect(),
+                ForStatementLeft::AssignmentTargetIdentifier(reference) => {
+                    return self.alias_reference(file, target, reference, escaping, pending)
+                }
+                _ => return self.issue(self.site(file, target), UnknownReason::Target),
+            },
+            AstKind::AssignmentTargetPropertyIdentifier(property) => {
+                return self.alias_reference(file, target, &property.binding, escaping, pending)
+            }
+            _ => return self.issue(self.site(file, target), UnknownReason::Target),
+        };
+
+        for identifier in identifiers {
+            pending.push((
+                Binding::Symbol {
+                    file,
+                    symbol: identifier.symbol_id(),
+                },
+                escaping,
+            ));
+        }
+    }
+
+    fn alias_reference(
+        &mut self,
+        file: FileId,
+        target: NodeId,
+        reference: &IdentifierReference<'a>,
+        escaping: bool,
+        pending: &mut Vec<(Binding, bool)>,
+    ) {
+        match self.analysis.declarations.binding_of_reference(
+            self.analysis.project,
+            file,
+            reference,
+        ) {
+            Some(binding) => pending.push((binding, escaping)),
+            None => self.issue(self.site(file, target), UnknownReason::Target),
+        }
+    }
+
+    fn stored_binding_of(&self, file: FileId, assignment: NodeId) -> Result<Option<Binding>, ()> {
+        let project = self.analysis.project;
+        let AstKind::AssignmentExpression(assignment) =
+            project.file(file).semantic.nodes().kind(assignment)
+        else {
+            return Err(());
+        };
+        let mut object = assignment.left.as_member_expression().ok_or(())?.object();
+
+        loop {
+            match unwrap(object) {
+                Expression::Identifier(reference) => {
+                    return match self
+                        .analysis
+                        .declarations
+                        .binding_of_reference(project, file, reference)
+                    {
+                        Some(binding) => Ok(Some(binding)),
+                        None if is_module_exports(reference.name.as_str()) => Ok(None),
+                        None => Err(()),
+                    }
+                }
+                other => object = member_expression_of(other).ok_or(())?.object(),
+            }
+        }
+    }
+
+    fn argument_bindings(
+        &mut self,
+        file: FileId,
+        call: NodeId,
+        index: usize,
+        escaping: bool,
+        pending: &mut Vec<(Binding, bool)>,
+    ) {
+        let (targets, arguments) =
+            match self.analysis.project.file(file).semantic.nodes().kind(call) {
+                AstKind::CallExpression(expression) => (
+                    self.analysis.resolved_callee_of(file, expression).targets,
+                    &expression.arguments,
+                ),
+                AstKind::NewExpression(expression) => (
+                    self.analysis.constructor_targets_of(file, expression),
+                    &expression.arguments,
+                ),
+                _ => return,
+            };
+        let spread = arguments[..=index]
+            .iter()
+            .any(|argument| matches!(argument, Argument::SpreadElement(_)));
+
+        if spread
+            || targets.open
+            || targets.known.is_empty()
+            || targets
+                .known
+                .iter()
+                .any(|target| self.analysis.dynamic_scope_of(target.file, target.node).1)
+        {
+            return self.issue(self.site(file, call), UnknownReason::Target);
+        }
+
+        for target in targets.known {
+            let parameters = match self.analysis.function_at(target) {
+                FunctionNode::Function(function) => &function.params,
+                FunctionNode::Arrow(arrow) => &arrow.params,
+            };
+            let identifiers = match parameters.items.get(index) {
+                Some(parameter) => parameter.pattern.get_binding_identifiers(),
+                None => parameters
+                    .rest
+                    .iter()
+                    .flat_map(|rest| rest.rest.argument.get_binding_identifiers())
+                    .collect(),
+            };
+
+            for identifier in identifiers {
+                pending.push((
+                    Binding::Symbol {
+                        file: target.file,
+                        symbol: identifier.symbol_id(),
+                    },
+                    escaping,
+                ));
             }
         }
     }

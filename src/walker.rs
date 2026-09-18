@@ -83,20 +83,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         span: Span,
-        arguments: &[Argument<'a>],
+        arguments: &'a [Argument<'a>],
         reason: UnknownReason,
     ) -> Reading {
-        for argument in arguments {
-            let origin = self.source_span(file, argument.span());
-            let value = self.values.at(origin).value;
+        self.record_unknown_reach(file, None, arguments, span);
 
-            if !self.current_effects.unknown_reachable.contains(&value) {
-                self.current_effects.unknown_reachable.push(value);
-                self.current_effects.escapes.push(value);
-            }
-        }
-
-        self.unknown_reading(file, span, reason)
+        Reading::of_part(self.unknown_part(file, span, reason))
     }
 
     pub fn cost_of_statement(&mut self, file: FileId, s: &'a Statement<'a>) -> Reading {
@@ -582,10 +574,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             sibling = sibling.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let opaque_effects = self.opaque_effects_in(file, Root::Statement(body));
+        let invalidation = self.loop_invalidation_of(file, kind);
         let assumed_bound = self.perf_tags(file, kind).contains(&PerfTag::Bounded);
-        let saved_budget = opaque_effects.then(|| self.budget_context.take());
-        let saved_shares = opaque_effects.then(|| std::mem::take(&mut self.share_bindings));
+        let saved_budget = invalidation.budget.then(|| self.budget_context.take());
+        let saved_shares = invalidation
+            .budget
+            .then(|| std::mem::take(&mut self.share_bindings));
         let bound = self.bound_of(file, kind);
         let spend = if bound.factor.is_one() {
             None
@@ -623,7 +617,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             None => body_raw,
         };
 
-        if opaque_effects && !assumed_bound {
+        if invalidation.bound && !assumed_bound {
             let origin = self.source_span(file, kind.span());
             let mut unknown = Some(self.unknowns.origin(origin, UnknownReason::Bound));
 
@@ -877,7 +871,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         targets: &TargetSet,
         file: FileId,
         span: Span,
-        arguments: &[Argument<'a>],
+        arguments: &'a [Argument<'a>],
     ) -> Part {
         if targets.open {
             let unknown = self.unknown_invocation(file, span, arguments, UnknownReason::Target);
@@ -897,19 +891,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let targets = match &new.callee {
-            Expression::Identifier(reference) => {
-                let declaration = self
-                    .declarations
-                    .of_reference(self.project, file, reference);
-
-                self.resolved_of_declaration(declaration, true).targets
-            }
-            callee => match callee.as_member_expression() {
-                Some(member) => self.resolved_member_of(file, member).targets,
-                None => TargetSet::default(),
-            },
-        };
+        let targets = self.constructor_targets_of(file, new);
 
         for known in &targets.known {
             let function = self.function_at(*known);
@@ -945,7 +927,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return reading;
         }
 
-        self.current_effects.unknown_global = true;
+        self.record_unknown_reach(file, Some(&new.callee), &new.arguments, new.span);
 
         let constructor = match &new.callee {
             Expression::Identifier(reference) => reference.name.as_str(),
@@ -992,6 +974,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.unknown_invocation(file, new.span, &new.arguments, UnknownReason::Target);
 
         reading.merge(unknown, &mut self.unknowns, &mut self.traces)
+    }
+
+    pub(crate) fn constructor_targets_of(
+        &mut self,
+        file: FileId,
+        new: &'a NewExpression<'a>,
+    ) -> TargetSet {
+        match &new.callee {
+            Expression::Identifier(reference) => {
+                let declaration = self
+                    .declarations
+                    .of_reference(self.project, file, reference);
+
+                self.resolved_of_declaration(declaration, true).targets
+            }
+            callee => match callee.as_member_expression() {
+                Some(member) => self.resolved_member_of(file, member).targets,
+                None => TargetSet::default(),
+            },
+        }
     }
 
     fn is_share_sized_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
@@ -1139,7 +1141,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return reading;
         }
 
-        self.current_effects.unknown_global = true;
+        self.record_unknown_reach(file, Some(&call.callee), &call.arguments, call.span);
 
         if let Some(member) = member {
             return self.cost_of_method_call(file, call, member, reading, site);

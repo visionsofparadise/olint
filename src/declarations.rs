@@ -167,6 +167,13 @@ type GlobalBindings = HashMap<(FileId, String), Option<(FileId, SymbolId)>>;
 type CallableBindings = HashMap<(FileId, NodeId), (Option<Target>, bool)>;
 type BlockFunctions = HashMap<(ScopeId, String), Vec<NodeId>>;
 type DeclarationSpans = Vec<(u32, u32, NodeId)>;
+type SurfaceReference = (FileId, NodeId, bool);
+
+#[derive(Default)]
+struct Importers {
+    bindings: HashMap<Binding, Vec<Binding>>,
+    namespaces: HashMap<FileId, Vec<Binding>>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResolutionStats {
@@ -191,7 +198,9 @@ pub struct Declarations<'a> {
     callable: RefCell<CallableBindings>,
     symbols: RefCell<HashMap<(FileId, SymbolId), (Target, bool)>>,
     write_free: RefCell<HashMap<Binding, bool>>,
-    surface_writes: RefCell<HashMap<Binding, Vec<NodeId>>>,
+    surface_writes: RefCell<HashMap<Binding, Vec<(FileId, NodeId)>>>,
+    surface_references: RefCell<HashMap<Binding, Vec<SurfaceReference>>>,
+    importers: RefCell<Option<Importers>>,
     block_functions: RefCell<HashMap<FileId, BlockFunctions>>,
     declaration_spans: RefCell<HashMap<FileId, DeclarationSpans>>,
     assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
@@ -210,6 +219,8 @@ impl<'a> Declarations<'a> {
             symbols: RefCell::new(HashMap::new()),
             write_free: RefCell::new(HashMap::new()),
             surface_writes: RefCell::new(HashMap::new()),
+            surface_references: RefCell::new(HashMap::new()),
+            importers: RefCell::new(None),
             block_functions: RefCell::new(HashMap::new()),
             declaration_spans: RefCell::new(HashMap::new()),
             assignments: RefCell::new(HashMap::new()),
@@ -1036,32 +1047,144 @@ impl<'a> Declarations<'a> {
             .map(|(_, _, node)| *node)
     }
 
-    pub(crate) fn surface_writes_of(&self, project: &Project<'a>, binding: Binding) -> Vec<NodeId> {
+    pub(crate) fn surface_writes_of(
+        &self,
+        project: &Project<'a>,
+        binding: Binding,
+    ) -> Vec<(FileId, NodeId)> {
         if let Some(found) = self.surface_writes.borrow().get(&binding) {
             return found.clone();
         }
 
-        let Binding::Symbol { file, symbol } = binding;
-        let semantic = &project.file(file).semantic;
-        let mut stats = self.resolution_stats.get();
         let mut writes = Vec::new();
 
-        for reference in semantic.scoping().get_resolved_references(symbol) {
-            stats.write_reference_visits = stats.write_reference_visits.saturating_add(1);
-
-            if reference.is_write() {
-                writes.push(reference.node_id());
-            } else if let Some(write) = surface_write_of(semantic.nodes(), reference.node_id()) {
-                writes.push(write);
+        for (file, node, write) in self.surface_references_of(project, binding) {
+            if write {
+                writes.push((file, node));
+            } else if let Some(written) =
+                surface_write_of(project.file(file).semantic.nodes(), node)
+            {
+                writes.push((file, written));
             }
         }
 
-        self.resolution_stats.set(stats);
         self.surface_writes
             .borrow_mut()
             .insert(binding, writes.clone());
 
         writes
+    }
+
+    pub(crate) fn surface_references_of(
+        &self,
+        project: &Project<'a>,
+        binding: Binding,
+    ) -> Vec<SurfaceReference> {
+        if let Some(found) = self.surface_references.borrow().get(&binding) {
+            return found.clone();
+        }
+
+        let Binding::Symbol { file, symbol } = binding;
+        let scoping = project.file(file).semantic.scoping();
+        let mut stats = self.resolution_stats.get();
+        let mut found: Vec<_> = scoping
+            .get_resolved_references(symbol)
+            .filter(|reference| reference.is_value())
+            .map(|reference| (file, reference.node_id(), reference.is_write()))
+            .collect();
+        let name = scoping.symbol_name(symbol);
+
+        stats.write_reference_visits = stats.write_reference_visits.saturating_add(found.len());
+
+        for source in &project.files {
+            let scoping = source.semantic.scoping();
+            let Some(references) = scoping.root_unresolved_references().get(name) else {
+                continue;
+            };
+
+            for id in references.iter() {
+                let reference = scoping.get_reference(*id);
+                let node = reference.node_id();
+
+                stats.write_reference_visits = stats.write_reference_visits.saturating_add(1);
+
+                if !reference.is_value() {
+                    continue;
+                }
+
+                if let AstKind::IdentifierReference(identifier) = source.semantic.nodes().kind(node)
+                {
+                    if self.symbol_of_reference(project, source.id, identifier)
+                        == Some((file, symbol))
+                    {
+                        found.push((source.id, node, reference.is_write()));
+                    }
+                }
+            }
+        }
+
+        self.resolution_stats.set(stats);
+        self.surface_references
+            .borrow_mut()
+            .insert(binding, found.clone());
+
+        found
+    }
+
+    pub(crate) fn importers_of(&self, project: &Project<'a>, binding: Binding) -> Vec<Binding> {
+        if self.importers.borrow().is_none() {
+            let mut importers = Importers::default();
+
+            for source in &project.files {
+                for entry in &source.module_record.import_entries {
+                    if entry.is_type {
+                        continue;
+                    }
+
+                    let Some(local) = source
+                        .semantic
+                        .scoping()
+                        .get_root_binding(entry.local_name.name.as_str().into())
+                    else {
+                        continue;
+                    };
+                    let imported = Binding::Symbol {
+                        file: source.id,
+                        symbol: local,
+                    };
+
+                    match self.target_of_symbol(project, source.id, local) {
+                        Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => {
+                            importers
+                                .bindings
+                                .entry(Binding::Symbol { file, symbol })
+                                .or_default()
+                                .push(imported)
+                        }
+                        Target::Namespace(file) => {
+                            importers.namespaces.entry(file).or_default().push(imported)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            *self.importers.borrow_mut() = Some(importers);
+        }
+
+        let importers = self.importers.borrow();
+        let importers = importers.as_ref().expect("importers are indexed");
+        let Binding::Symbol { file, .. } = binding;
+
+        importers
+            .bindings
+            .get(&binding)
+            .into_iter()
+            .chain(importers.namespaces.get(&file))
+            .flatten()
+            .copied()
+            .filter(|imported| *imported != binding)
+            .collect()
     }
 
     fn target_of_symbol(&self, project: &Project<'a>, file: FileId, symbol: SymbolId) -> Target {
@@ -1465,7 +1588,7 @@ fn is_reflective_write(callee: &Expression<'_>) -> bool {
     )
 }
 
-fn surface_write_of(nodes: &AstNodes<'_>, reference: NodeId) -> Option<NodeId> {
+pub(crate) fn surface_write_of(nodes: &AstNodes<'_>, reference: NodeId) -> Option<NodeId> {
     let mut current = reference;
     let mut member = false;
 

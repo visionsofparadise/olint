@@ -5,9 +5,9 @@ use oxc_semantic::NodeId;
 
 use crate::budgets::BudgetContext;
 use crate::cost::Part;
-use crate::declarations::{Binding, Declarations};
+use crate::declarations::{Binding, Declarations, FunctionId};
 use crate::directives::PerfTag;
-use crate::effects::Effects;
+use crate::effects::{Effects, Storage};
 use crate::project::{FileId, Project};
 use crate::summaries::{Scheduler, Substitutions, SummaryId, SummaryKey, SummaryRecord};
 use crate::tsc::{Query, TscAnswer};
@@ -78,6 +78,10 @@ pub struct Analysis<'p, 'a> {
     pub(crate) pending_scoped: HashMap<(FileId, NodeId), Part>,
     pub(crate) bound_seen: HashSet<(FileId, NodeId)>,
     pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
+    pub(crate) isolated_bindings: HashMap<(Binding, NodeId), bool>,
+    pub(crate) budget_storage: HashMap<FunctionId, Storage>,
+    pub(crate) dynamic_scopes: HashMap<(FileId, NodeId), (bool, bool)>,
+    pub(crate) unclassified_writes: HashMap<(Binding, Option<NodeId>), bool>,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -108,6 +112,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             pending_scoped: HashMap::new(),
             bound_seen: HashSet::new(),
             children: HashMap::new(),
+            isolated_bindings: HashMap::new(),
+            budget_storage: HashMap::new(),
+            dynamic_scopes: HashMap::new(),
+            unclassified_writes: HashMap::new(),
         }
     }
 }
