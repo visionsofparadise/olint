@@ -166,6 +166,7 @@ enum Target {
 type GlobalBindings = HashMap<(FileId, String), Option<(FileId, SymbolId)>>;
 type CallableBindings = HashMap<(FileId, NodeId), (Option<Target>, bool)>;
 type BlockFunctions = HashMap<(ScopeId, String), Vec<NodeId>>;
+type DeclarationSpans = Vec<(u32, u32, NodeId)>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResolutionStats {
@@ -173,6 +174,7 @@ pub struct ResolutionStats {
     pub helper_visits: usize,
     pub write_reference_visits: usize,
     pub stack_peak: usize,
+    pub span_index_visits: usize,
 }
 
 enum ResolutionStep<'a> {
@@ -191,6 +193,7 @@ pub struct Declarations<'a> {
     write_free: RefCell<HashMap<Binding, bool>>,
     surface_writes: RefCell<HashMap<Binding, Vec<NodeId>>>,
     block_functions: RefCell<HashMap<FileId, BlockFunctions>>,
+    declaration_spans: RefCell<HashMap<FileId, DeclarationSpans>>,
     assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
     resolution_epoch: Cell<usize>,
     resolution_stats: Cell<ResolutionStats>,
@@ -208,6 +211,7 @@ impl<'a> Declarations<'a> {
             write_free: RefCell::new(HashMap::new()),
             surface_writes: RefCell::new(HashMap::new()),
             block_functions: RefCell::new(HashMap::new()),
+            declaration_spans: RefCell::new(HashMap::new()),
             assignments: RefCell::new(HashMap::new()),
             resolution_epoch: Cell::new(0),
             resolution_stats: Cell::new(ResolutionStats::default()),
@@ -992,6 +996,46 @@ impl<'a> Declarations<'a> {
         std::cell::Ref::map(self.block_functions.borrow(), |files| &files[&file])
     }
 
+    pub fn declaration_within(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        start: u32,
+        end: u32,
+    ) -> Option<NodeId> {
+        if !self.declaration_spans.borrow().contains_key(&file) {
+            let mut stats = self.resolution_stats.get();
+            let mut spans = Vec::new();
+
+            for node in project.file(file).semantic.nodes().iter() {
+                stats.span_index_visits = stats.span_index_visits.saturating_add(1);
+
+                let kind = node.kind();
+
+                if is_declaration_kind(&kind) {
+                    let span = kind.span();
+
+                    spans.push((span.start, span.end, node.id()));
+                }
+            }
+
+            spans.sort_by_key(|(start, end, node)| (*start, std::cmp::Reverse(*end), *node));
+
+            self.resolution_stats.set(stats);
+            self.declaration_spans.borrow_mut().insert(file, spans);
+        }
+
+        let files = self.declaration_spans.borrow();
+        let spans = &files[&file];
+        let first = spans.partition_point(|(candidate, _, _)| *candidate < start);
+
+        spans[first..]
+            .iter()
+            .take_while(|(candidate, _, _)| *candidate <= end)
+            .find(|(_, candidate, _)| *candidate <= end)
+            .map(|(_, _, node)| *node)
+    }
+
     pub(crate) fn surface_writes_of(&self, project: &Project<'a>, binding: Binding) -> Vec<NodeId> {
         if let Some(found) = self.surface_writes.borrow().get(&binding) {
             return found.clone();
@@ -1389,6 +1433,27 @@ impl<'a> Declarations<'a> {
             self.collect_export_names(project, target, false, visited, seen, names);
         }
     }
+}
+
+pub fn is_declaration_kind(kind: &AstKind<'_>) -> bool {
+    matches!(
+        kind,
+        AstKind::Function(_)
+            | AstKind::ArrowFunctionExpression(_)
+            | AstKind::VariableDeclarator(_)
+            | AstKind::FormalParameter(_)
+            | AstKind::FormalParameterRest(_)
+            | AstKind::Class(_)
+            | AstKind::MethodDefinition(_)
+            | AstKind::PropertyDefinition(_)
+            | AstKind::AccessorProperty(_)
+            | AstKind::ObjectProperty(_)
+            | AstKind::TSEnumDeclaration(_)
+            | AstKind::TSEnumMember(_)
+            | AstKind::TSInterfaceDeclaration(_)
+            | AstKind::TSTypeAliasDeclaration(_)
+            | AstKind::TSTypeParameter(_)
+    )
 }
 
 fn is_reflective_write(callee: &Expression<'_>) -> bool {

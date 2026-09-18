@@ -41,27 +41,6 @@ fn kind_label_of(kind: Kind) -> &'static str {
     }
 }
 
-fn is_declaration_kind(kind: &AstKind<'_>) -> bool {
-    matches!(
-        kind,
-        AstKind::Function(_)
-            | AstKind::ArrowFunctionExpression(_)
-            | AstKind::VariableDeclarator(_)
-            | AstKind::FormalParameter(_)
-            | AstKind::FormalParameterRest(_)
-            | AstKind::Class(_)
-            | AstKind::MethodDefinition(_)
-            | AstKind::PropertyDefinition(_)
-            | AstKind::AccessorProperty(_)
-            | AstKind::ObjectProperty(_)
-            | AstKind::TSEnumDeclaration(_)
-            | AstKind::TSEnumMember(_)
-            | AstKind::TSInterfaceDeclaration(_)
-            | AstKind::TSTypeAliasDeclaration(_)
-            | AstKind::TSTypeParameter(_)
-    )
-}
-
 enum Lookup<T> {
     Answered(Option<T>),
     Unanswered,
@@ -406,35 +385,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Option<(Declaration<'a>, FunctionId)> {
         let target = self.project.file_by_path(Path::new(&answer.file))?;
         let nodes = self.project.file(target).semantic.nodes();
-        let mut best: Option<(Span, oxc_semantic::NodeId)> = None;
-
-        for node in nodes.iter() {
-            let kind = node.kind();
-
-            if !is_declaration_kind(&kind) {
-                continue;
-            }
-
-            let span = kind.span();
-
-            if span.start < answer.start || span.end > answer.end {
-                continue;
-            }
-
-            let better = match best {
-                None => true,
-                Some((current, _)) => {
-                    span.start < current.start
-                        || (span.start == current.start && span.size() > current.size())
-                }
-            };
-
-            if better {
-                best = Some((span, node.id()));
-            }
-        }
-
-        let (_, node) = best?;
+        let node =
+            self.declarations
+                .declaration_within(self.project, target, answer.start, answer.end)?;
 
         if let AstKind::ArrowFunctionExpression(arrow) = nodes.kind(node) {
             return Some((

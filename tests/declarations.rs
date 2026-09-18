@@ -525,3 +525,102 @@ fn duplicate_function_declarations_target_the_runtime_winner() {
         );
     }
 }
+
+fn reference_declaration_within(
+    project: &Project<'_>,
+    file: FileId,
+    start: u32,
+    end: u32,
+) -> Option<oxc_semantic::NodeId> {
+    let mut best: Option<(oxc_span::Span, oxc_semantic::NodeId)> = None;
+
+    for node in project.file(file).semantic.nodes().iter() {
+        let kind = node.kind();
+
+        if !olint::declarations::is_declaration_kind(&kind) {
+            continue;
+        }
+
+        let span = oxc_span::GetSpan::span(&kind);
+
+        if span.start < start || span.end > end {
+            continue;
+        }
+
+        let better = match best {
+            None => true,
+            Some((current, _)) => {
+                span.start < current.start
+                    || (span.start == current.start && span.size() > current.size())
+            }
+        };
+
+        if better {
+            best = Some((span, node.id()));
+        }
+    }
+
+    best.map(|(_, node)| node)
+}
+
+fn assert_span_index_matches_reference(project: &Project<'_>) -> usize {
+    let declarations = Declarations::new(project);
+    let mut compared = 0;
+
+    for source in &project.files {
+        let length = source.text.len() as u32;
+        let spans: Vec<_> = source
+            .semantic
+            .nodes()
+            .iter()
+            .map(|node| oxc_span::GetSpan::span(&node.kind()))
+            .collect();
+
+        for span in spans {
+            for (start, end) in [
+                (span.start, span.end),
+                (span.start.saturating_sub(1), (span.end + 1).min(length)),
+                ((span.start + 1).min(span.end), span.end),
+                (span.start, span.start),
+                (0, length),
+            ] {
+                assert_eq!(
+                    declarations.declaration_within(project, source.id, start, end),
+                    reference_declaration_within(project, source.id, start, end),
+                    "{} {start}..{end}",
+                    source.relative
+                );
+
+                compared += 1;
+            }
+        }
+    }
+
+    compared
+}
+
+#[test]
+fn declaration_span_index_matches_the_reference_scan() {
+    for fixture in ["model", "tags"] {
+        let allocator = oxc_allocator::Allocator::default();
+        let project = Project::load(
+            &allocator,
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(fixture)
+                .join("tsconfig.json"),
+        )
+        .expect("fixture loads");
+
+        assert!(assert_span_index_matches_reference(&project) > 1000);
+    }
+
+    let text = "\u{feff}// é ☃ 𝒳\r\nexport const café = (xs: number[]) => xs.length;\r\nexport class Überall<T> {\r\n\t#hidden = 1;\r\n\tstatic ok(): void {}\r\n\tget ünïcode() { return \"𝒳\"; }\r\n}\r\nfunction ƒ(a: string, ...rest: string[]): void; function ƒ(a: string) { const { b = \"é\" } = { b: a }; return b; }\r\nenum Ω { A = 1, B }\r\ninterface Ψ { x: number }\r\ntype Φ = Ψ;\r\nexport default { key: () => \"☃\", [\"𝒳\"]: 1 };\r\n";
+
+    run_in_project(
+        &[("tsconfig.json", "{}"), ("index.ts", text)],
+        |project, _| {
+            assert!(assert_span_index_matches_reference(project) > 100);
+        },
+    );
+}

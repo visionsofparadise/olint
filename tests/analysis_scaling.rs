@@ -1049,3 +1049,118 @@ fn an_empty_compiler_batch_builds_no_index_or_checker() {
     assert!(answers.is_empty());
     assert_eq!(counts, olint::tsc::TscCounts::default());
 }
+
+fn callee_span_visits_of(count: usize, targets: usize, rounds: usize) -> (usize, usize) {
+    let mut source: String = (0..count)
+        .map(|index| format!("export function f{index}(xs: number[]) {{ return xs.length; }}\n"))
+        .collect();
+    let spans: Vec<(u32, u32)> = source
+        .lines()
+        .scan(0, |offset, line| {
+            let start = *offset;
+
+            *offset += line.len() + 1;
+
+            Some((start as u32, (start + line.len()) as u32))
+        })
+        .collect();
+
+    source.push_str(&format!(
+        "export function run(o: any) {{ {} }}\n",
+        (0..count)
+            .map(|index| format!("o.f{index}([]);"))
+            .collect::<String>()
+    ));
+
+    let files = [("tsconfig.json", "{}"), ("index.ts", source.as_str())];
+    let mut found = (0, 0);
+
+    support::run_in_project(&files, |project, root| {
+        let file = support::file_of(project, root, "index.ts");
+        let calls: Vec<_> = project
+            .file(file)
+            .semantic
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                oxc_ast::AstKind::CallExpression(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        let mut analysis = Analysis::new(project, support::SYNTACTIC);
+
+        analysis.set_pass(olint::types::TscPass::Recording);
+
+        for call in &calls {
+            analysis.callee_targets_of(file, call);
+        }
+
+        let answers = analysis
+            .needed_queries()
+            .into_iter()
+            .map(|query| {
+                let olint::tsc::Query::Callee { file, pos, end } = query else {
+                    panic!("only callee sites are open");
+                };
+                let name = &source[pos as usize..end as usize];
+                let index: usize = name["o.f".len()..].parse().expect("callee index");
+
+                Some(olint::tsc::TscAnswer::Callee(olint::tsc::CalleeAnswer {
+                    targets: (0..targets)
+                        .map(|offset| {
+                            let (start, end) = spans[(index + offset) % count];
+
+                            olint::tsc::CalleeTarget {
+                                file: file.clone(),
+                                start,
+                                end,
+                            }
+                        })
+                        .collect(),
+                    open: false,
+                }))
+            })
+            .collect();
+
+        analysis
+            .take_answers(olint::tsc::TscReply {
+                typescript: "5.9.3".to_string(),
+                from: "typescript.js".to_string(),
+                answers,
+            })
+            .expect("answers align");
+        analysis.set_pass(olint::types::TscPass::Answering);
+
+        for _ in 0..rounds {
+            for call in &calls {
+                let resolved = analysis.callee_targets_of(file, call);
+
+                assert_eq!(resolved.known.len(), targets.min(count));
+                assert!(!resolved.open);
+            }
+        }
+
+        found = (
+            analysis.declarations.resolution_stats().span_index_visits,
+            project.file(file).semantic.nodes().len(),
+        );
+    });
+
+    found
+}
+
+#[test]
+fn callee_target_spans_index_each_file_once() {
+    let (visits, nodes) = callee_span_visits_of(64, 1, 1);
+
+    assert_eq!(visits, nodes);
+
+    for (targets, rounds) in [(2, 1), (1, 3), (4, 2)] {
+        assert_eq!(callee_span_visits_of(64, targets, rounds), (nodes, nodes));
+    }
+
+    let (doubled, doubled_nodes) = callee_span_visits_of(128, 2, 2);
+
+    assert_eq!(doubled, doubled_nodes);
+    assert!(doubled <= 2 * nodes + 1, "{doubled} {nodes}");
+}
