@@ -71,6 +71,14 @@ const NON_STRING_RESULTS: &[&str] = &[
     "localeCompare",
     "codePointAt",
 ];
+const ELEMENT_CONTAINERS: &[&str] = &[
+    "Array",
+    "ReadonlyArray",
+    "Set",
+    "ReadonlySet",
+    "Map",
+    "ReadonlyMap",
+];
 const STRING_RESULTS: &[&str] = &["join", "toString", "toLowerCase", "toUpperCase", "trim"];
 
 #[derive(Clone, Copy)]
@@ -756,37 +764,176 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn declared_type_of_member(&mut self, member: Option<Member<'a>>, depth: u32) -> DeclaredType {
-        let typing = match member {
-            Some(Member::Property(file, property))
-                if property.kind == PropertyKind::Init && !property.method =>
+        self.declared_type_of_typing(typing_of_member(member), depth)
+    }
+
+    pub(crate) fn is_non_callable_expression(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        self.is_non_callable_nested_expression(file, expression, 0)
+    }
+
+    pub(crate) fn has_primitive_elements(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        match self.typing_of_expression(file, expression, 0) {
+            Some(Typing::Annotation(file, annotation)) => {
+                self.is_primitive_element_type(file, annotation, 0)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_non_callable_nested_expression(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match unwrap(expression) {
+            Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::TemplateLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::UnaryExpression(_)
+            | Expression::BinaryExpression(_)
+            | Expression::UpdateExpression(_) => true,
+            Expression::Identifier(reference)
+                if reference.name == "undefined"
+                    && self
+                        .declarations
+                        .of_reference(self.project, file, reference)
+                        .is_none() =>
             {
-                Some(Typing::Initializer(file, &property.value))
+                true
             }
-            Some(Member::Property(file, property)) if property.kind == PropertyKind::Get => {
-                return_type_of_function_expression(&property.value)
-                    .map(|annotation| Typing::Annotation(file, annotation))
-            }
-            Some(Member::Signature(file, TSSignature::TSPropertySignature(signature))) => {
-                annotation_of(&signature.type_annotation)
-                    .map(|annotation| Typing::Annotation(file, annotation))
-            }
-            Some(Member::Signature(file, TSSignature::TSMethodSignature(method)))
-                if method.kind == TSMethodSignatureKind::Get =>
-            {
-                annotation_of(&method.return_type)
-                    .map(|annotation| Typing::Annotation(file, annotation))
-            }
-            Some(Member::Field(file, annotation, initializer)) => {
+            expression => match self.typing_of_expression(file, expression, depth + 1) {
+                Some(Typing::Annotation(file, annotation)) => {
+                    self.is_primitive_type(file, annotation, depth + 1)
+                }
+                Some(Typing::Initializer(file, initializer)) => {
+                    self.is_non_callable_nested_expression(file, initializer, depth + 1)
+                }
+                None => false,
+            },
+        }
+    }
+
+    fn typing_of_expression(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> Option<Typing<'a>> {
+        match unwrap(expression) {
+            Expression::Identifier(reference) => {
+                let declaration = self
+                    .declarations
+                    .of_reference(self.project, file, reference)?;
+                let (file, annotation, initializer) = binding_parts_of(&declaration)?;
+
                 typing_of(file, annotation, initializer)
             }
-            Some(Member::Method(file, method)) if method.kind == MethodDefinitionKind::Get => {
-                annotation_of(&method.value.return_type)
-                    .map(|annotation| Typing::Annotation(file, annotation))
+            Expression::StaticMemberExpression(member) => {
+                let container = self.container_of_expression(file, &member.object, depth + 1);
+
+                typing_of_member(member_of_container(
+                    container,
+                    member.property.name.as_str(),
+                ))
             }
             _ => None,
-        };
+        }
+    }
 
-        self.declared_type_of_typing(typing, depth)
+    fn is_primitive_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match ty {
+            TSType::TSStringKeyword(_)
+            | TSType::TSNumberKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSBigIntKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+            | TSType::TSNullKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSVoidKeyword(_)
+            | TSType::TSNeverKeyword(_)
+            | TSType::TSLiteralType(_)
+            | TSType::TSTemplateLiteralType(_) => true,
+            TSType::TSParenthesizedType(parenthesized) => {
+                self.is_primitive_type(file, &parenthesized.type_annotation, depth + 1)
+            }
+            TSType::TSUnionType(union) => union
+                .types
+                .iter()
+                .all(|part| self.is_primitive_type(file, part, depth + 1)),
+            TSType::TSTypeReference(reference) if reference.type_arguments.is_none() => {
+                match self.declaration_of_type_name(file, &reference.type_name) {
+                    Some(Declaration::TypeAlias {
+                        file: target,
+                        declaration,
+                    }) if declaration.type_parameters.is_none() => {
+                        self.is_primitive_type(target, &declaration.type_annotation, depth + 1)
+                    }
+                    Some(Declaration::Enum { .. }) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn is_primitive_element_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match ty {
+            TSType::TSParenthesizedType(parenthesized) => {
+                self.is_primitive_element_type(file, &parenthesized.type_annotation, depth + 1)
+            }
+            TSType::TSTypeOperatorType(operator) => {
+                self.is_primitive_element_type(file, &operator.type_annotation, depth + 1)
+            }
+            TSType::TSUnionType(union) => union
+                .types
+                .iter()
+                .all(|part| self.is_primitive_element_type(file, part, depth + 1)),
+            TSType::TSArrayType(array) => {
+                self.is_primitive_type(file, &array.element_type, depth + 1)
+            }
+            TSType::TSTupleType(tuple) => tuple.element_types.iter().all(|element| {
+                element
+                    .as_ts_type()
+                    .is_some_and(|element| self.is_primitive_type(file, element, depth + 1))
+            }),
+            TSType::TSTypeReference(reference)
+                if ELEMENT_CONTAINERS.contains(&type_name_text_of(&reference.type_name))
+                    && self.is_global_type_name(file, &reference.type_name) =>
+            {
+                reference.type_arguments.as_ref().is_some_and(|arguments| {
+                    arguments
+                        .params
+                        .iter()
+                        .all(|argument| self.is_primitive_type(file, argument, depth + 1))
+                })
+            }
+            _ => false,
+        }
     }
 
     fn return_type_of_member(&mut self, member: Option<Member<'a>>, depth: u32) -> DeclaredType {
@@ -1099,6 +1246,38 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
             _ => DeclaredType::default(),
         }
+    }
+}
+
+fn typing_of_member(member: Option<Member<'_>>) -> Option<Typing<'_>> {
+    match member {
+        Some(Member::Property(file, property))
+            if property.kind == PropertyKind::Init && !property.method =>
+        {
+            Some(Typing::Initializer(file, &property.value))
+        }
+        Some(Member::Property(file, property)) if property.kind == PropertyKind::Get => {
+            return_type_of_function_expression(&property.value)
+                .map(|annotation| Typing::Annotation(file, annotation))
+        }
+        Some(Member::Signature(file, TSSignature::TSPropertySignature(signature))) => {
+            annotation_of(&signature.type_annotation)
+                .map(|annotation| Typing::Annotation(file, annotation))
+        }
+        Some(Member::Signature(file, TSSignature::TSMethodSignature(method)))
+            if method.kind == TSMethodSignatureKind::Get =>
+        {
+            annotation_of(&method.return_type)
+                .map(|annotation| Typing::Annotation(file, annotation))
+        }
+        Some(Member::Field(file, annotation, initializer)) => {
+            typing_of(file, annotation, initializer)
+        }
+        Some(Member::Method(file, method)) if method.kind == MethodDefinitionKind::Get => {
+            annotation_of(&method.value.return_type)
+                .map(|annotation| Typing::Annotation(file, annotation))
+        }
+        _ => None,
     }
 }
 

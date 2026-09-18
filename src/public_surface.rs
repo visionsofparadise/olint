@@ -524,8 +524,43 @@ impl<'a> Walk<'_, '_, 'a> {
                 .declarations
                 .surface_writes_of(self.analysis.project, Binding::Symbol { file, symbol })
             {
-                self.issue(self.site(file, write), UnknownReason::Target);
+                if self.may_install_callable(file, write) {
+                    self.issue(self.site(file, write), UnknownReason::Target);
+                }
             }
+        }
+    }
+
+    fn may_install_callable(&mut self, file: FileId, write: NodeId) -> bool {
+        let project = self.analysis.project;
+        let nodes = project.file(file).semantic.nodes();
+        let node = match nodes.kind(write) {
+            AstKind::IdentifierReference(_) => nodes.parent_id(write),
+            _ => write,
+        };
+
+        match nodes.kind(node) {
+            AstKind::UpdateExpression(_) | AstKind::UnaryExpression(_) => false,
+            AstKind::AssignmentExpression(assignment) if assignment.operator.is_assign() => !self
+                .analysis
+                .is_non_callable_expression(file, &assignment.right),
+            AstKind::AssignmentExpression(assignment) => assignment.operator.is_logical(),
+            AstKind::CallExpression(call) => {
+                let Some(member) = call.callee.as_member_expression() else {
+                    return true;
+                };
+                let reflective = matches!(unwrap(member.object()), Expression::Identifier(owner) if owner.name == "Object" || owner.name == "Reflect");
+                let mut stored = call.arguments.iter().skip(usize::from(reflective));
+                let proved = stored.all(|argument| {
+                    argument.as_expression().is_some_and(|expression| {
+                        self.analysis.is_non_callable_expression(file, expression)
+                    })
+                });
+
+                !proved
+                    && (reflective || !self.analysis.has_primitive_elements(file, member.object()))
+            }
+            _ => true,
         }
     }
 

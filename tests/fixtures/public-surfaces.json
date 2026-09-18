@@ -668,5 +668,409 @@
         "partial"
       ]
     }
+  },
+  {
+    "name": "surface_exported_counter_update_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ],
+        "unknown": "error"
+      },
+      "index.ts": "export let counter = 0;\nexport function inc() { counter++; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]",
+        "error:"
+      ],
+      "report": [
+        "public coverage [partial]",
+        "error:"
+      ]
+    }
+  },
+  {
+    "name": "surface_static_counter_update_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport class K { static count = 0; static inc() { K.count++; } }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_object_counter_update_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const state = { count: 0 }; export function inc() { state.count++; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_boolean_member_assignment_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const config = { debug: false }; export function setDebug(v: boolean) { config.debug = v; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_number_array_push_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const items: number[] = []; export function add(x: number) { items.push(x); }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_string_displayname_assignment_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport function fn() {} fn.displayName = \"fn\";\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_primitive_compound_and_delete_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const totals: { n?: number; s: string } = { n: 0, s: \"\" }; export function add(v: number) { totals.n! += v; totals.s += `${v}`; totals.n = -v; totals.s = typeof v; delete totals.n; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_primitive_element_push_complete",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const labels: ReadonlyArray<string> | string[] = []; export function add(...more: string[]) { (labels as string[]).push(...more); }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "2 public functions"
+      ],
+      "report": []
+    },
+    "expected_absent": {
+      "lint": [
+        "public coverage [partial]"
+      ],
+      "report": [
+        "public coverage [partial]"
+      ]
+    }
+  },
+  {
+    "name": "surface_primitive_map_set_adds_no_partial_site",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const cache = new Map<string, number>(); export function put(k: string) { cache.set(k, 1); }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "public coverage [partial]",
+        "unknown call target at index.ts:2 [123..148]"
+      ],
+      "report": [
+        "public coverage [partial]",
+        "unknown call target at index.ts:2 [123..148]"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "unknown call target at index.ts:2 [183..198]"
+      ],
+      "report": [
+        "unknown call target at index.ts:2 [183..198]"
+      ]
+    }
+  },
+  {
+    "name": "surface_member_nullish_assignment_partial",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const o: { e?: (xs: number[]) => void } = {}; export function install() { o.e ??= cube; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "public coverage [partial]",
+        "2 public functions",
+        "index.ts:2 [183..195]"
+      ],
+      "report": [
+        "public coverage [partial]",
+        "index.ts:2 [183..195]"
+      ]
+    },
+    "expected_absent": {
+      "lint": [],
+      "report": []
+    }
+  },
+  {
+    "name": "surface_binding_logical_or_assignment_partial",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport let f: ((xs: number[]) => void) | undefined; export function install() { f ||= cube; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "public coverage [partial]",
+        "2 public functions",
+        "index.ts:2 [182..183]"
+      ],
+      "report": [
+        "public coverage [partial]",
+        "index.ts:2 [182..183]"
+      ]
+    },
+    "expected_absent": {
+      "lint": [],
+      "report": []
+    }
+  },
+  {
+    "name": "surface_untyped_value_assignment_partial",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N^2)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) {} }\nexport const config = { debug: false }; export function set(v) { config.debug = v; }\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "public coverage [partial]",
+        "2 public functions",
+        "index.ts:2 [167..183]"
+      ],
+      "report": [
+        "public coverage [partial]",
+        "index.ts:2 [167..183]"
+      ]
+    },
+    "expected_absent": {
+      "lint": [],
+      "report": []
+    }
   }
 ]
