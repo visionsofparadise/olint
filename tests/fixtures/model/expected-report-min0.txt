@@ -1,8 +1,8 @@
 public coverage [partial]
 # tsconfig.json  (160 functions in 15 files)
 
-O(1)               31
-O(1) [partial]     22
+O(1)               32
+O(1) [partial]     21
 O(xs)              14
 O(rows^2)           8
 O(xs) [partial]     7
@@ -506,7 +506,7 @@ O(1)           makeCallbackSet  src/methods.ts:72
 
 O(1)           makeDoubled  src/methods.ts:76
 
-O(1)           makeRoundEngine  src/methods.ts:108 [partial]
+O(1)           makeRoundEngine  src/methods.ts:108
 
 O(1)           factorialLike  src/recursion.ts:1 [partial]
 

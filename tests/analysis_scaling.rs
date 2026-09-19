@@ -1607,3 +1607,182 @@ fn parameter_initialization_specializations_grow_linearly() {
         );
     }
 }
+
+fn construction_source(groups: usize) -> String {
+    let mut lines = vec![
+        "function scan(xs: number[]) { let total = 0; for (const x of xs) total += x; return total; }".to_string(),
+    ];
+
+    for group in 0..groups {
+        lines.push(format!("class A{group}_0 {{ values = [1, 2, 3]; }}"));
+
+        for depth in 1..4 {
+            lines.push(format!(
+                "class A{group}_{depth} extends A{group}_{} {{ extra = [{depth}]; }}",
+                depth - 1
+            ));
+        }
+
+        lines.push(format!(
+            "class E{group} extends A{group}_3 {{ constructor(xs: number[]) {{ super(); scan(xs); }} }}"
+        ));
+        lines.push(format!(
+            "export function f{group}(xs: number[]) {{ class L extends A{group}_3 {{ total = scan(xs); }} new A{group}_3(); new A{group}_2(); new E{group}(xs); for (const x of xs) new L(); return class {{ static seed = scan(xs); }}; }}"
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn construction_counts_of(groups: usize) -> (Vec<u64>, Cost) {
+    let mut found = None;
+
+    run_with_source(&construction_source(groups), |analysis, file| {
+        for (file, function) in analysis.reportable() {
+            analysis.summarize(file, function);
+        }
+
+        let part = summary_of(analysis, file, "f0");
+        let selected = function_of_name(analysis.project, file, "f0");
+        let stats = analysis.scheduler_stats();
+        let events = [
+            Event::TaskKey,
+            Event::InvocationSite,
+            Event::WalkerNode,
+            Event::CaptureEdge,
+        ];
+
+        assert_terminal(stats);
+        assert!(
+            part.is_complete(),
+            "{groups}: {:?}",
+            reasons(analysis, part.unknowns)
+        );
+        assert!(
+            events.iter().all(|event| !stats.work.exhausted(*event)),
+            "{groups}: {stats:?}"
+        );
+
+        found = Some((
+            events
+                .iter()
+                .map(|event| stats.work.consumed(*event))
+                .collect(),
+            support::legacy_class_of(analysis, file, selected, &part.cost),
+        ));
+    });
+
+    found.expect("construction counts")
+}
+
+#[test]
+fn class_definition_and_construction_work_grow_linearly_with_sites_and_subclasses() {
+    let base = construction_counts_of(8);
+    let single = construction_counts_of(16);
+    let double = construction_counts_of(24);
+    let growth: Vec<(u64, u64)> = base
+        .0
+        .iter()
+        .zip(&single.0)
+        .zip(&double.0)
+        .map(|((base, single), double)| (single - base, double - base))
+        .collect();
+
+    assert_eq!(single.1, Cost::parse("O(N^2)").unwrap());
+    assert!(
+        growth
+            .iter()
+            .all(|(single, double)| *single > 0 && *double == 2 * single),
+        "{base:?} {single:?} {double:?}"
+    );
+}
+
+fn wide_construction_walks_of(width: usize) -> u64 {
+    let fields: String = (0..width)
+        .map(|index| format!("f{index} = [{index}]; "))
+        .collect();
+    let sites: String = (0..width).map(|_| "new Derived(); ".to_string()).collect();
+    let source = format!(
+        "class Wide {{ {fields}}}\nclass Derived extends Wide {{}}\nexport function selected(xs: number[]) {{ class Local {{ {fields}}} {sites}for (const x of xs) {{ {} }} }}",
+        sites.replace("Derived", "Local")
+    );
+    let mut walks = 0;
+
+    run_with_source(&source, |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(part.is_complete(), "{width}");
+
+        walks = stats.work.consumed(Event::WalkerNode);
+    });
+
+    walks
+}
+
+#[test]
+fn instance_fields_walk_once_per_class_across_construction_sites() {
+    let base = wide_construction_walks_of(16);
+    let single = wide_construction_walks_of(32);
+    let double = wide_construction_walks_of(48);
+
+    assert!(single > base, "{base} {single}");
+    assert_eq!(
+        double - base,
+        2 * (single - base),
+        "{base} {single} {double}"
+    );
+}
+
+fn parameter_base_source(width: usize) -> String {
+    let mut lines: Vec<String> = (0..width)
+        .map(|index| format!("class C{index} {{ v = [{index}]; }}"))
+        .collect();
+    let sites: String = (0..width).map(|_| "new A(); ").collect();
+    let calls: String = (0..width)
+        .map(|index| format!("make(C{index}); "))
+        .collect();
+
+    lines.push(format!(
+        "function make(B: any) {{ class A extends B {{}} {sites}}}"
+    ));
+    lines.push(format!("export function run() {{ {calls}}}"));
+
+    lines.join("\n")
+}
+
+fn parameter_base_steps_of(width: usize) -> u64 {
+    let mut steps = 0;
+
+    run_with_source(&parameter_base_source(width), |analysis, file| {
+        let part = summary_of(analysis, file, "make");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(
+            part.is_complete(),
+            "{width}: {:?}",
+            reasons(analysis, part.unknowns)
+        );
+        assert!(!stats.work.exhausted(Event::DispatchStep), "{stats:?}");
+
+        steps = stats.work.consumed(Event::DispatchStep);
+    });
+
+    steps
+}
+
+#[test]
+fn parameter_superclasses_resolve_once_across_construction_sites() {
+    let base = parameter_base_steps_of(16);
+    let single = parameter_base_steps_of(32);
+    let double = parameter_base_steps_of(48);
+
+    assert!(single > base, "{base} {single}");
+    assert_eq!(
+        double - base,
+        2 * (single - base),
+        "{base} {single} {double}"
+    );
+}

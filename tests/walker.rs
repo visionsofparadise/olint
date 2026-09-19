@@ -783,7 +783,7 @@ fn callee_and_constructor_subexpressions_run_before_their_invocation() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const table = {{ run() {{ return 1; }} }}; return table[(quadratic(xs), 'run')](); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function factory() {{ quadratic(xs); return () => 1; }} return factory()(); }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function factory() {{ return () => quadratic(xs); }} return factory()(); }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function constructor() {{ quadratic(xs); return class {{}}; }} return new (constructor())(); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function constructor() {{ quadratic(xs); return class {{}}; }} return new (constructor())(); }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function constructor() {{ return class {{ constructor() {{ quadratic(xs); }} }}; }} return new (constructor())(); }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ return xs['map'](() => quadratic(xs)); }}")), "O(N^3)", false),
         (index_of(format!("{QUADRATIC}\nconst k = 'map';\nexport function selected(xs: number[]) {{ return xs[k](() => quadratic(xs)); }}")), "O(N^3)", false),
@@ -1074,4 +1074,180 @@ fn sloppy_arguments_writes_rebind_their_parameters() {
     ];
 
     assert_dispatched(&cases);
+}
+
+#[test]
+fn class_definition_work_runs_once_where_the_class_is_evaluated() {
+    let key = "function key(xs: number[]) { quadratic(xs); return 'k'; }";
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ static value = quadratic(xs); }} return Box.value; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ static {{ quadratic(xs); }} }} return Box; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\n{key}\nexport function selected(xs: number[]) {{ class Box {{ [key(xs)]() {{ return 1; }} }} return Box; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\n{key}\nexport function selected(xs: number[]) {{ class Box {{ [key(xs)] = 1; }} return Box; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nfunction base(xs: number[]) {{ quadratic(xs); return class {{}}; }}\nexport function selected(xs: number[]) {{ class Box extends base(xs) {{}} return Box; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ return class {{ static {{ quadratic(xs); }} }}; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ for (const x of xs) {{ class Box {{ static value = quadratic(xs); }} }} }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ static value = quadratic(xs); }} for (const x of xs) new Box(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ m() {{ return quadratic(xs); }} static s() {{ return quadratic(xs); }} }} return new Box(); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ value = quadratic(xs); }} return Box; }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn instance_initialization_repeats_for_every_construction() {
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ value = quadratic(xs); }} return new Box(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const Box = class {{ value = quadratic(xs); }}; return new Box(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ return new (class {{ value = quadratic(xs); }})(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ value = quadratic(xs); constructor(ys: number[]) {{}} }} return new Box(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ static seed = quadratic(xs); value = quadratic(xs); }} for (const x of xs) new Box(); }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ accessor value = quadratic(xs); }} for (const x of xs) new Box(); }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nclass Box {{ value = 1; }}\nexport function selected(xs: number[]) {{ for (const x of xs) new Box(); }}")), "O(N)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn inherited_initialization_follows_implicit_and_explicit_super_calls() {
+    let base = format!("{QUADRATIC}\nclass A {{ constructor(ys: number[]) {{ quadratic(ys); }} }}");
+    let cases = [
+        (index_of(format!("{base}\nclass B extends A {{}}\nexport function selected(xs: number[]) {{ return new B(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{base}\nclass B extends A {{}}\nclass C extends B {{}}\nexport function selected(xs: number[]) {{ return new C(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{base}\nclass B extends A {{ constructor(ys: number[]) {{ super(ys); }} }}\nexport function selected(xs: number[]) {{ return new B(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{base}\nclass B extends A {{ constructor(ys: number[]) {{ const run = () => super(ys); run(); }} }}\nexport function selected(xs: number[]) {{ return new B(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class A {{ value = quadratic(xs); }} class B extends A {{}} return new B(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class A {{ value = quadratic(xs); }} class B extends A {{}} class C extends B {{ constructor() {{ super(); }} }} return new C(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class A {{}} class B extends A {{ value = quadratic(xs); constructor() {{ super(); }} }} return new B(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class A {{ value = quadratic(xs); }} class B extends A {{ m() {{ return quadratic(xs); }} }} for (const x of xs) new B(); }}")), "O(N^3)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn rebound_superclasses_join_their_possible_bases() {
+    let classes = format!("function cube(xs: number[]) {{ {CUBIC} }}\nclass K0 {{ m(xs: number[]) {{}} }}\nclass Other {{ m(xs: number[]) {{ cube(xs); }} }}\nclass Cheap {{ constructor(xs: number[]) {{}} }}\nclass Costly {{ constructor(xs: number[]) {{ cube(xs); }} }}");
+    let cases = [
+        (index_of(format!("{classes}\nlet B: any = K0;\nB = Other;\nclass A extends B {{}}\nexport function selected(xs: number[]) {{ new A().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nlet B: any = Cheap;\nB = Costly;\nclass A extends B {{}}\nexport function selected(xs: number[]) {{ return new A(xs); }}")), "O(N^3)", false),
+        (index_of(format!("{classes}\nconst table: any = {{ B: K0 }};\ntable.B = Other;\nclass D extends table.B {{}}\nexport function selected(xs: number[]) {{ new D().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nconst table: any = {{ B: Cheap }};\ntable.B = Costly;\nclass D extends table.B {{}}\nexport function selected(xs: number[]) {{ return new D(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nexport const table: any = {{ B: Costly }};\nexport function set(t: any, k: string, v: any) {{ t[k] = v; }}\nclass D extends table.B {{}}\nexport function selected(xs: number[]) {{ return new D(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nexport function selected(xs: number[], B: any) {{ class A extends B {{}} return new A(xs); }}")), "O(1)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn instance_fields_shadow_prototype_methods_until_deleted() {
+    let cube = format!("function cube(xs: number[]) {{ {CUBIC} }}");
+    let classes = format!("{cube}\nclass K0 {{ m(xs: number[]) {{ cube(xs); }} }}\nclass K1 extends K0 {{ m(xs: number[]) {{}} }}");
+    let fields = format!("{cube}\nclass G0 {{ m(xs: number[]) {{ cube(xs); }} }}\nclass G1 extends G0 {{ m = (xs: number[]) => {{}}; }}");
+    let cases = [
+        (index_of(format!("{cube}\nclass F0 {{ m = (xs: number[]) => cube(xs); }}\nclass F1 extends F0 {{ m(xs: number[]) {{}} }}\nexport function selected(xs: number[]) {{ new F1().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{fields}\nexport function selected(xs: number[]) {{ new G1().m(xs); }}")), "O(1)", true),
+        (index_of(format!("{fields}\nexport function selected(xs: number[]) {{ const g = new G1(); delete (g as any).m; g.m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nexport function selected(xs: number[]) {{ new K1().m(xs); }}")), "O(1)", true),
+        (index_of(format!("{classes}\ndelete (K1.prototype as any).m;\nexport function selected(xs: number[]) {{ new K1().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nconst p: any = K1.prototype;\ndelete p.m;\nexport function selected(xs: number[]) {{ new K1().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nexport function drop(k: string) {{ delete (K1.prototype as any)[k]; }}\nexport function selected(xs: number[]) {{ new K1().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nReflect.deleteProperty(K1.prototype, 'm');\nexport function selected(xs: number[]) {{ new K1().m(xs); }}")), "O(N^3)", true),
+        (vec![("index.ts", "import { K1 } from './classes';\nimport './drop';\nexport function selected(xs: number[]) { new K1().m(xs); }".to_string()), ("classes.ts", format!("function cube(xs: number[]) {{ {CUBIC} }}\nexport class K0 {{ m(xs: number[]) {{ cube(xs); }} }}\nexport class K1 extends K0 {{ m(xs: number[]) {{}} }}")), ("drop.ts", "import { K1 } from './classes';\ndelete (K1.prototype as any).m;".to_string())], "O(N^3)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn self_constructing_fields_stop_as_recurrence() {
+    let sources = [
+        "class Node { child = new Node(); }\nexport function selected() { return new Node(); }",
+        "class Left { right = new Right(); }\nclass Right extends Left {}\nexport function selected() { return new Left(); }",
+    ];
+
+    for source in sources {
+        let (cost, reasons) = dispatched_result_in(
+            &[("index.ts", source)],
+            olint::analysis::TypeMode::Syntactic,
+        );
+
+        assert_eq!(cost, Cost::parse("O(1)").unwrap(), "{source}");
+        assert!(
+            reasons.contains(&olint::unknowns::UnknownReason::Recurrence),
+            "{source}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn unresolved_bases_stay_partial_beside_instance_fields() {
+    let cube = format!("function cube(xs: number[]) {{ {CUBIC} }}");
+    let cold = "class Cold {\n// @perf cold\nconstructor(ys: number[]) { quadratic(ys); }\n}";
+    let cases = [
+        (index_of(format!("{QUADRATIC}\n{cold}\nexport function selected(xs: number[], flag: boolean, B: any) {{ class A extends (flag ? Cold : B) {{ v = [1]; }} return new A(xs); }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\n{cold}\nexport function selected(xs: number[], flag: boolean, B: any) {{ class A extends (flag ? Cold : B) {{}} return new A(xs); }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], B: any) {{ class A extends B {{ v = quadratic(xs); }} return new A(xs); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], B: any) {{ class A extends B {{ v = quadratic(xs); constructor(ys: number[]) {{ super(ys); }} }} return new A(xs); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class E extends Error {{ v = quadratic(xs); }} return new E(); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class E extends Error {{ v = quadratic(xs); constructor() {{ super('x'); }} }} return new E(); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\n{cube}\nfunction withField(xs: number[], B: any) {{ class A extends B {{ v = quadratic(xs); }} return new A(xs); }}\nexport function selected(xs: number[]) {{ return withField(xs, class {{ constructor(ys: number[]) {{ cube(ys); }} }}); }}")), "O(N^3)", false),
+        (index_of(format!("{cube}\nfunction noField(xs: number[], B: any) {{ class A extends B {{}} return new A(xs); }}\nexport function selected(xs: number[]) {{ return noField(xs, class {{ constructor(ys: number[]) {{ cube(ys); }} }}); }}")), "O(N^3)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn type_only_members_leave_inherited_methods_visible() {
+    let classes = format!(
+        "function cube(xs: number[]) {{ {CUBIC} }}\nclass G0 {{ m(xs: number[]) {{ cube(xs); }} }}"
+    );
+    let cases = [
+        (index_of(format!("{classes}\nclass G1 extends G0 {{}}\nexport function selected(xs: number[]) {{ new G1().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass G1 extends G0 {{ declare m: (xs: number[]) => void; }}\nexport function selected(xs: number[]) {{ new G1().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nabstract class G1 extends G0 {{ abstract m: (xs: number[]) => void; }}\nclass G2 extends G1 {{}}\nexport function selected(xs: number[]) {{ new G2().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nabstract class G1 extends G0 {{ abstract m(xs: number[]): void; }}\nclass G2 extends G1 {{}}\nexport function selected(xs: number[]) {{ new G2().m(xs); }}")), "O(N^3)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn class_field_directives_apply_to_their_initializers() {
+    let linear = "function linear(xs: number[]) { let total = 0; for (const x of xs) total += x; return total; }";
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{\n// @perf ignore\nv = quadratic(xs);\n}} return new Box(); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{\n// @perf ignore\nstatic v = quadratic(xs);\n}} return Box; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{\n// @perf O(1)\nv = quadratic(xs);\n}} return new Box(); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{\n// @perf O(1)\nstatic v = quadratic(xs);\n}} return Box; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{linear}\nexport function selected(xs: number[]) {{ class Box {{\n// @perf cold\nv = quadratic(xs);\nw = linear(xs);\n}} return new Box(); }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\n{linear}\nexport function selected(xs: number[]) {{ class Box {{\n// @perf cold\nstatic v = quadratic(xs);\nstatic w = linear(xs);\n}} return Box; }}")), "O(N)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn parameter_decorators_are_unsupported_class_definition_syntax() {
+    let decorator = "function quadratic(zs: number[]) { return (..._: unknown[]) => { for (const a of zs) for (const b of zs) void b; }; }";
+    let sources = [
+        format!("{decorator}\nexport function selected(xs: number[]) {{ class Box {{ constructor(@quadratic(xs) v: number) {{}} }} return Box; }}"),
+        format!("{decorator}\nexport function selected(xs: number[]) {{ class Box {{ m(@quadratic(xs) v: number) {{}} }} return Box; }}"),
+    ];
+
+    for source in &sources {
+        let (_, reasons) = dispatched_result_in(
+            &[("index.ts", source.as_str())],
+            olint::analysis::TypeMode::Syntactic,
+        );
+
+        assert!(
+            reasons.contains(&olint::unknowns::UnknownReason::UnsupportedSyntax),
+            "{source}: {reasons:?}"
+        );
+    }
 }

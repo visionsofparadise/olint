@@ -738,3 +738,101 @@ fn a_default_callback_joins_the_invocation_effects() {
         "{reasons:?}"
     );
 }
+
+fn constructor_of<'a>(
+    project: &olint::project::Project<'a>,
+    file: olint::project::FileId,
+    class: &str,
+) -> olint::declarations::FunctionNode<'a> {
+    support::first_node_of(project, file, |kind| match kind {
+        oxc_ast::AstKind::Class(found) if found.id.as_ref().is_some_and(|id| id.name == class) => {
+            found.body.body.iter().find_map(|element| match element {
+                oxc_ast::ast::ClassElement::MethodDefinition(method)
+                    if method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor =>
+                {
+                    Some(olint::declarations::FunctionNode::Function(&method.value))
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
+fn complete_selected_class_of(
+    analysis: &mut Analysis<'_, '_>,
+    file: olint::project::FileId,
+) -> Cost {
+    let selected = function_of_name(analysis.project, file, "selected");
+    let part = support::summary_of(analysis, file, "selected");
+
+    assert!(part.is_complete());
+
+    support::legacy_class_of(analysis, file, selected, &part.cost)
+}
+
+fn constructor_costs_of(
+    analysis: &mut Analysis<'_, '_>,
+    file: olint::project::FileId,
+    class: &str,
+) -> Vec<Cost> {
+    let function = constructor_of(analysis.project, file, class);
+    let root = function_of_name(analysis.project, file, "selected");
+    let readings: Vec<_> = analysis
+        .summary_records_for(olint::declarations::FunctionId {
+            file,
+            node: function.node_id(),
+        })
+        .into_iter()
+        .map(|record| record.reading.clone())
+        .collect();
+
+    readings
+        .into_iter()
+        .map(|reading| {
+            let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+            assert!(part.is_complete(), "{class}");
+
+            support::legacy_class_of(analysis, file, root, &part.cost)
+        })
+        .collect()
+}
+
+#[test]
+fn constructor_summaries_initialize_fields_once_per_instance() {
+    let source = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }\nexport function selected(xs: number[]) { class Box { value = quadratic(xs); constructor() {} } new Box(); new Box(); return new Box(); }";
+
+    run_with_source(source, |analysis, file| {
+        assert_eq!(
+            complete_selected_class_of(analysis, file),
+            Cost::parse("O(N^2)").unwrap()
+        );
+        assert_eq!(
+            constructor_costs_of(analysis, file, "Box"),
+            [Cost::parse("O(N^2)").unwrap()]
+        );
+        support::assert_scheduler_terminal(analysis.scheduler_stats());
+    });
+}
+
+#[test]
+fn derived_constructor_summaries_include_base_construction_at_super() {
+    let source = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }\nclass A { constructor(ys: number[]) { quadratic(ys); } }\nclass B extends A {}\nclass C extends B { constructor(ys: number[]) { super(ys); } }\nexport function selected(xs: number[]) { return new C(xs); }";
+
+    run_with_source(source, |analysis, file| {
+        assert_eq!(
+            complete_selected_class_of(analysis, file),
+            Cost::parse("O(N^2)").unwrap()
+        );
+        assert_eq!(
+            constructor_costs_of(analysis, file, "C"),
+            [Cost::parse("O(N^2)").unwrap()]
+        );
+        assert_eq!(
+            constructor_costs_of(analysis, file, "A"),
+            [Cost::parse("O(N^2)").unwrap()]
+        );
+        support::assert_scheduler_terminal(analysis.scheduler_stats());
+    });
+}

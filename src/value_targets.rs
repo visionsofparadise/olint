@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, BindingProperty, CallExpression, Class,
@@ -53,6 +54,13 @@ pub(crate) enum MemberKey {
     Name(String),
     Symbol(Site),
     Index,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layer {
+    Own,
+    Prototype,
+    Any,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +147,9 @@ pub(crate) struct TargetIndex {
     receivers: HashMap<Site, Vec<NodeId>>,
     classes: Vec<Site>,
     lineages: HashMap<Site, Vec<Site>>,
+    open_heritages: HashSet<Site>,
+    bases: HashMap<Site, Vec<Site>>,
+    removals: HashMap<Option<MemberKey>, Vec<usize>>,
     subclasses: Option<HashMap<Site, Vec<Site>>>,
     builtin_classes: Option<Vec<(Site, BuiltinKind)>>,
     dispatches: HashMap<Site, (Vec<FunctionId>, bool, bool)>,
@@ -154,6 +165,8 @@ pub(crate) struct TargetIndex {
     rebound_functions: HashSet<Site>,
     rebound_every_function: bool,
     patterns: HashMap<(FileId, oxc_semantic::SymbolId), TargetSet>,
+    parameter_classes: HashMap<Binding, (Vec<Site>, bool)>,
+    plans: HashMap<Site, Rc<ConstructionPlan>>,
     resolving_patterns: HashSet<(FileId, oxc_semantic::SymbolId)>,
     pattern_cuts: u64,
     depth: usize,
@@ -214,6 +227,29 @@ enum KeySource<'a> {
 pub(crate) struct MemberDispatch {
     pub(crate) known: Vec<FunctionId>,
     pub(crate) replaced: bool,
+}
+
+pub(crate) struct Construction<'a> {
+    pub(crate) targets: TargetSet,
+    pub(crate) implicit: Vec<(FileId, &'a Class<'a>)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConstructionPlan {
+    pub(crate) constructors: Vec<FunctionId>,
+    pub(crate) initializers: Vec<Site>,
+    pub(crate) owners: HashSet<Site>,
+    pub(crate) open: bool,
+}
+
+impl Construction<'_> {
+    pub(crate) fn into_targets(self) -> TargetSet {
+        let mut targets = self.targets;
+
+        targets.open |= !self.implicit.is_empty();
+
+        targets
+    }
 }
 
 fn push_target(found: &mut TargetSet, target: FunctionId) {
@@ -380,6 +416,17 @@ fn placement_of_element(element: &ClassElement<'_>) -> Option<Placement> {
     })
 }
 
+fn is_type_only_element(element: &ClassElement<'_>) -> bool {
+    match element {
+        ClassElement::MethodDefinition(method) => method.value.body.is_none(),
+        ClassElement::PropertyDefinition(property) => {
+            property.declare || property.r#type.is_abstract()
+        }
+        ClassElement::AccessorProperty(property) => property.r#type.is_abstract(),
+        _ => false,
+    }
+}
+
 fn element_key_expression<'a>(element: &'a ClassElement<'a>) -> Option<&'a PropertyKey<'a>> {
     match element {
         ClassElement::MethodDefinition(method) if method.computed => Some(&method.key),
@@ -493,26 +540,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    pub(crate) fn constructed_targets_of(
+    pub(crate) fn construction_of(
         &mut self,
         file: FileId,
         expression: &'a Expression<'a>,
-    ) -> TargetSet {
-        let mut found = self.callable_targets_of(file, expression);
+    ) -> Construction<'a> {
+        self.index_targets();
 
-        self.push_class_constructors(file, expression, &mut found);
+        let (classes, open) = self.class_candidates_of(file, expression, 0);
+        let mut targets = match (classes.is_empty(), open) {
+            (false, false) => TargetSet {
+                known: Vec::new(),
+                open: false,
+            },
+            (empty, _) => {
+                let mut targets = self.callable_targets_of(file, expression);
 
-        found.open |= found.known.is_empty();
+                targets.open |= !empty;
 
-        found
+                targets
+            }
+        };
+        let implicit = self.split_class_constructors(classes, &mut targets);
+
+        targets.open |= targets.known.is_empty() && implicit.is_empty();
+
+        Construction { targets, implicit }
     }
 
-    pub(crate) fn constructed_member_targets_of(
+    pub(crate) fn member_construction_of(
         &mut self,
         file: FileId,
         (callee, member): (&'a Expression<'a>, &'a MemberExpression<'a>),
         mut found: TargetSet,
-    ) -> TargetSet {
+    ) -> Construction<'a> {
         let dispatch = self.member_dispatch_of(file, member);
         let mut constructed = TargetSet {
             known: dispatch.known,
@@ -520,7 +581,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         self.index_targets();
-        self.push_class_constructors(file, callee, &mut constructed);
+
+        let (classes, _) = self.class_candidates_of(file, callee, 0);
+        let implicit = self.split_class_constructors(classes, &mut constructed);
 
         for known in constructed.known {
             if !found.known.contains(&known) {
@@ -530,18 +593,98 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        found.open |= constructed.open || found.known.is_empty();
+        found.open |= constructed.open || (found.known.is_empty() && implicit.is_empty());
 
-        found
+        Construction {
+            targets: found,
+            implicit,
+        }
     }
 
-    fn push_class_constructors(
+    pub(crate) fn base_construction_of(
         &mut self,
         file: FileId,
-        expression: &'a Expression<'a>,
+        class: &'a Class<'a>,
+    ) -> Construction<'a> {
+        match &class.heritage {
+            Some(heritage) => self.construction_of(file, &heritage.expression),
+            None => Construction {
+                targets: TargetSet {
+                    known: Vec::new(),
+                    open: false,
+                },
+                implicit: Vec::new(),
+            },
+        }
+    }
+
+    pub(crate) fn base_plan_of(
+        &mut self,
+        file: FileId,
+        class: &'a Class<'a>,
+    ) -> Rc<ConstructionPlan> {
+        let site = (file, class.node_id());
+
+        if let Some(plan) = self.values.targets.plans.get(&site) {
+            return Rc::clone(plan);
+        }
+
+        let exhaustions = self.values.targets.exhaustions;
+        let mut plan = ConstructionPlan::default();
+        let mut visited = HashSet::from([site]);
+        let mut pending = vec![(file, class)];
+
+        while let Some((file, class)) = pending.pop() {
+            let construction = self.base_construction_of(file, class);
+
+            plan.open |= construction.targets.open;
+
+            for known in construction.targets.known {
+                if !self.charge_dispatch() {
+                    plan.open = true;
+
+                    break;
+                }
+
+                if !plan.constructors.contains(&known) {
+                    plan.constructors.push(known);
+                }
+            }
+
+            for (base_file, base) in construction.implicit {
+                if !self.charge_dispatch() {
+                    plan.open = true;
+
+                    break;
+                }
+
+                let base_site = (base_file, base.node_id());
+
+                if visited.insert(base_site) {
+                    plan.initializers.push(base_site);
+                    plan.owners.extend(self.owners_of(base_file, base_site.1));
+                    pending.push((base_file, base));
+                }
+            }
+        }
+
+        let plan = Rc::new(plan);
+
+        if exhaustions == self.values.targets.exhaustions {
+            self.values.targets.plans.insert(site, Rc::clone(&plan));
+        }
+
+        plan
+    }
+
+    fn split_class_constructors(
+        &mut self,
+        classes: Vec<ClassSite<'a>>,
         found: &mut TargetSet,
-    ) {
-        for (target, class) in self.classes_of_expression(file, expression, 0) {
+    ) -> Vec<ClassSite<'a>> {
+        let mut implicit: Vec<ClassSite<'a>> = Vec::new();
+
+        for (target, class) in classes {
             match self.declarations.function_of(Declaration::Class {
                 file: target,
                 class,
@@ -553,9 +696,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         node: function.node_id(),
                     },
                 ),
-                None => found.open = true,
+                None if !implicit.iter().any(|(known, candidate)| {
+                    *known == target && candidate.node_id() == class.node_id()
+                }) =>
+                {
+                    implicit.push((target, class))
+                }
+                None => {}
             }
         }
+
+        implicit
     }
 
     pub(crate) fn forget_dispatches(&mut self) {
@@ -563,6 +714,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.values.targets.summaries.clear();
         self.values.targets.exhausted_calls.clear();
         self.values.targets.patterns.clear();
+        self.values.targets.parameter_classes.clear();
+        self.values.targets.plans.clear();
+        self.forget_constructions();
         self.prototype_members.clear();
         self.values.forget_sizes();
     }
@@ -1114,6 +1268,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        let mut removals: HashMap<Option<MemberKey>, Vec<usize>> = HashMap::new();
+
+        for (index, write) in writes.iter().enumerate() {
+            if write.kind == WriteKind::Removed {
+                removals.entry(write.key.clone()).or_default().push(index);
+            }
+        }
+
+        self.values.targets.removals = removals;
         self.values.targets.writes = writes;
         self.values.targets.owners = owners;
         self.values.targets.buckets = buckets;
@@ -2501,24 +2664,33 @@ impl<'p, 'a> Analysis<'p, 'a> {
         key: &MemberKey,
         found: &mut MemberValues<'a>,
     ) {
-        let mut classes = Vec::new();
-        let lineage = self.lineage_of(file, class);
+        let root = (file, class);
+        let mut classes: Vec<(ClassSite<'a>, Layer)> = Vec::new();
+        let mut prototype = true;
 
-        for (position, candidate) in lineage.iter().enumerate().skip(usize::from(inherited)) {
-            if !self.elements_keyed(*candidate, key, placement).is_empty() {
-                classes.push(*candidate);
+        self.lineage_sites_of(file, class);
 
-                found.defined += 1;
+        if placement == Placement::Instance && !inherited {
+            let (owners, exposed) =
+                self.defining_classes_of(root, (key, placement, Layer::Own), false, found);
 
-                found.below.extend(
-                    lineage[..position]
-                        .iter()
-                        .map(|(file, class)| (*file, class.node_id())),
-                );
+            prototype = exposed;
 
-                break;
-            }
+            classes.extend(owners.into_iter().map(|site| (site, Layer::Own)));
         }
+
+        if prototype {
+            let layer = match placement {
+                Placement::Instance => Layer::Prototype,
+                _ => Layer::Any,
+            };
+            let (owners, _) =
+                self.defining_classes_of(root, (key, placement, layer), inherited, found);
+
+            classes.extend(owners.into_iter().map(|site| (site, layer)));
+        }
+
+        found.defined += usize::from(!classes.is_empty());
 
         if !exact {
             let subclasses = self.subclasses_of(file, class);
@@ -2528,12 +2700,142 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .iter()
                     .map(|(file, class)| (*file, class.node_id())),
             );
-            classes.extend(subclasses);
+            classes.extend(subclasses.into_iter().map(|site| (site, Layer::Any)));
         }
 
-        for candidate in classes {
-            self.push_elements(candidate, key, placement, found);
+        for (candidate, layer) in classes {
+            self.push_elements(candidate, key, placement, layer, found);
         }
+    }
+
+    fn defining_classes_of(
+        &mut self,
+        root: ClassSite<'a>,
+        (key, placement, layer): (&MemberKey, Placement, Layer),
+        inherited: bool,
+        found: &mut MemberValues<'a>,
+    ) -> (Vec<ClassSite<'a>>, bool) {
+        let mut defining = Vec::new();
+        let mut passed = Vec::new();
+        let mut visited = HashSet::new();
+        let mut exposed = false;
+        let mut pending = vec![root];
+
+        while let Some(candidate) = pending.pop() {
+            let site = (candidate.0, candidate.1.node_id());
+
+            if !visited.insert(site) {
+                continue;
+            }
+
+            let skipped = inherited && site == (root.0, root.1.node_id());
+            let continues = if !skipped
+                && !self
+                    .elements_keyed(candidate, key, placement, layer)
+                    .is_empty()
+            {
+                defining.push(candidate);
+
+                self.may_remove_member(candidate, key, placement, layer)
+            } else {
+                true
+            };
+
+            if !continues {
+                continue;
+            }
+
+            passed.push(site);
+
+            found.replaced |= self.is_open_heritage(candidate);
+
+            let bases = self.bases_of(site);
+
+            exposed |= bases.is_empty();
+
+            pending.extend(bases);
+        }
+
+        if layer != Layer::Own && !defining.is_empty() {
+            found.below.extend(passed);
+        }
+
+        (defining, exposed)
+    }
+
+    fn bases_of(&self, site: Site) -> Vec<ClassSite<'a>> {
+        let bases = self
+            .values
+            .targets
+            .bases
+            .get(&site)
+            .cloned()
+            .unwrap_or_default();
+
+        self.class_sites_of(bases)
+    }
+
+    fn is_open_heritage(&self, (file, class): ClassSite<'a>) -> bool {
+        self.values
+            .targets
+            .open_heritages
+            .contains(&(file, class.node_id()))
+    }
+
+    fn may_remove_member(
+        &mut self,
+        (file, class): ClassSite<'a>,
+        key: &MemberKey,
+        placement: Placement,
+        layer: Layer,
+    ) -> bool {
+        let site = (file, class.node_id());
+        let mut written_keys = vec![Some(key.clone()), None];
+
+        if matches!(key, MemberKey::Name(name) if is_index_name(name)) {
+            written_keys.push(Some(MemberKey::Index));
+        }
+
+        let indices: Vec<usize> = written_keys
+            .iter()
+            .filter_map(|written| self.values.targets.removals.get(written))
+            .flatten()
+            .copied()
+            .collect();
+
+        for index in indices {
+            if !self.charge_dispatch() {
+                return true;
+            }
+
+            let removed = match &self.values.targets.owners[index].0 {
+                Owner::Prototype { class } => {
+                    *class == site && placement == Placement::Instance && layer != Layer::Own
+                }
+                Owner::ClassThis {
+                    class,
+                    placement: written,
+                } => {
+                    *class == site
+                        && match placement {
+                            Placement::Instance => {
+                                layer == Layer::Own && *written != Placement::Static
+                            }
+                            _ => *written != Placement::Instance,
+                        }
+                }
+                Owner::Value {
+                    allocation, shared, ..
+                } => layer == Layer::Own || !*allocation || *shared,
+                _ => false,
+            };
+
+            if removed {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn function_values_of(
@@ -2582,11 +2884,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (file, class): ClassSite<'a>,
         key: &MemberKey,
         placement: Placement,
+        layer: Layer,
     ) -> Vec<&'a ClassElement<'a>> {
         let mut found = Vec::new();
 
         for element in &class.body.body {
-            if placement_of_element(element) == Some(placement)
+            let own = matches!(element, ClassElement::PropertyDefinition(_));
+            let layered = match layer {
+                Layer::Own => own,
+                Layer::Prototype => !own,
+                Layer::Any => true,
+            };
+
+            if layered
+                && (class.declare || !is_type_only_element(element))
+                && placement_of_element(element) == Some(placement)
                 && self.element_key_of(file, element).as_ref() == Some(key)
             {
                 found.push(element);
@@ -2601,9 +2913,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (file, class): ClassSite<'a>,
         key: &MemberKey,
         placement: Placement,
+        layer: Layer,
         found: &mut MemberValues<'a>,
     ) {
-        for element in self.elements_keyed((file, class), key, placement) {
+        for element in self.elements_keyed((file, class), key, placement, layer) {
             match element {
                 ClassElement::MethodDefinition(method) if method.value.body.is_some() => {
                     let function = FunctionId {
@@ -2640,8 +2953,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         expression: &'a Expression<'a>,
         depth: usize,
     ) -> Vec<ClassSite<'a>> {
+        self.class_candidates_of(file, expression, depth).0
+    }
+
+    fn class_candidates_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> (Vec<ClassSite<'a>>, bool) {
         if depth > MAXIMUM_ALIAS_DEPTH {
-            return Vec::new();
+            return (Vec::new(), true);
         }
 
         let expression = unwrap(expression);
@@ -2650,32 +2972,66 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .declarations
             .class_of_expression(self.project, file, expression)
         {
-            return vec![class];
+            let Expression::Identifier(reference) = expression else {
+                return (vec![class], false);
+            };
+            let rebound = self
+                .declarations
+                .binding_of_reference(self.project, file, reference)
+                .is_some_and(|binding| !self.declarations.is_write_free(self.project, binding));
+
+            if !rebound {
+                return (vec![class], false);
+            }
+
+            let (written, unresolved) = self.written_values_of(file, reference);
+            let (mut found, open) = self.class_candidates_among(written, depth);
+
+            found.insert(0, class);
+
+            return (found, open || unresolved);
         }
 
         match expression {
-            Expression::ClassExpression(class) => vec![(file, class)],
-            Expression::ConditionalExpression(conditional) => {
-                let mut found =
-                    self.classes_of_expression(file, &conditional.consequent, depth + 1);
-
-                found.extend(self.classes_of_expression(file, &conditional.alternate, depth + 1));
-
-                found
-            }
+            Expression::ClassExpression(class) => (vec![(file, class)], false),
+            Expression::ConditionalExpression(conditional) => self.class_candidates_among(
+                vec![
+                    (file, &conditional.consequent),
+                    (file, &conditional.alternate),
+                ],
+                depth,
+            ),
             Expression::Identifier(reference) => {
-                match self
+                let declaration = self
                     .declarations
-                    .of_reference(self.project, file, reference)
-                    .and_then(constant_initializer_of)
+                    .of_reference(self.project, file, reference);
+
+                if let Some((target, init)) = declaration.and_then(constant_initializer_of) {
+                    return self.class_candidates_of(target, init, depth + 1);
+                }
+
+                if let Some(Declaration::Parameter {
+                    file: target,
+                    parameter: ParameterNode::Formal(parameter),
+                    function,
+                }) = declaration
                 {
-                    Some((target, init)) => self.classes_of_expression(target, init, depth + 1),
-                    None => Vec::new(),
+                    return self.parameter_class_candidates_of(
+                        (file, reference),
+                        (target, function, parameter),
+                        depth,
+                    );
+                }
+
+                match declaration.and_then(|_| self.local_values_of(file, reference)) {
+                    Some(values) => self.class_candidates_among(values, depth),
+                    None => (Vec::new(), true),
                 }
             }
             Expression::CallExpression(call) => {
                 let targets = self.resolved_callee_of(file, call).targets;
                 let mut found = Vec::new();
+                let mut open = targets.open;
 
                 for target in targets.known {
                     let parameters = match self.kind_of_node(target.file, target.node) {
@@ -2685,9 +3041,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     };
 
                     for value in self.returned_expressions_of(target) {
-                        for (returned_file, returned) in
-                            self.classes_of_expression(target.file, value, depth + 1)
-                        {
+                        let (returned_classes, returned_open) =
+                            self.class_candidates_of(target.file, value, depth + 1);
+
+                        open |= returned_open;
+
+                        for (returned_file, returned) in returned_classes {
                             found.push((returned_file, returned));
 
                             let Some(heritage) = &returned.heritage else {
@@ -2710,45 +3069,109 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     }
                 }
 
-                found
+                (found, open)
             }
             other => {
                 let Some(member) = member_expression_of(other) else {
-                    return Vec::new();
+                    return (Vec::new(), true);
                 };
                 let Some(key) = self.member_key_of(file, member) else {
-                    return Vec::new();
+                    return (Vec::new(), true);
                 };
                 let mut receiver = Receiver::default();
 
                 if !self.enter_targets() {
                     self.leave_targets();
 
-                    return Vec::new();
+                    return (Vec::new(), true);
                 }
 
                 self.collect_receiver(file, member.object(), &mut HashSet::new(), &mut receiver);
 
-                let values = self
-                    .member_candidates_of(file, member.object(), &receiver, &key)
-                    .values;
-                let mut found = Vec::new();
-
-                for (target, value) in values {
-                    for class in self.classes_of_expression(target, value, depth + 1) {
-                        if !found.iter().any(|(file, known): &ClassSite<'a>| {
-                            *file == class.0 && known.node_id() == class.1.node_id()
-                        }) {
-                            found.push(class);
-                        }
-                    }
-                }
+                let values = self.member_candidates_of(file, member.object(), &receiver, &key);
+                let (found, open) = self.class_candidates_among(values.values, depth);
 
                 self.leave_targets();
 
-                found
+                (found, open || values.replaced)
             }
         }
+    }
+
+    fn parameter_class_candidates_of(
+        &mut self,
+        (file, reference): (FileId, &'a IdentifierReference<'a>),
+        (target, function, parameter): (FileId, FunctionNode<'a>, &'a FormalParameter<'a>),
+        depth: usize,
+    ) -> (Vec<ClassSite<'a>>, bool) {
+        let binding = self
+            .declarations
+            .binding_of_reference(self.project, file, reference)
+            .filter(|_| matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)))
+            .filter(|binding| self.is_parameter_unwritten(*binding));
+        let Some(binding) = binding else {
+            return (Vec::new(), true);
+        };
+
+        if let Some((sites, open)) = self.values.targets.parameter_classes.get(&binding) {
+            let open = *open;
+
+            return (self.class_sites_of(sites.clone()), open);
+        }
+
+        let exhaustions = self.values.targets.exhaustions;
+        let open = self
+            .call_arguments_of(target, function, parameter)
+            .is_none();
+        let sources = self.parameter_sources_of((target, function), parameter);
+        let charged = sources.iter().all(|_| self.charge_dispatch());
+
+        if !charged {
+            return (Vec::new(), true);
+        }
+
+        let (found, sources_open) = self.class_candidates_among(sources, depth);
+        let open = open || sources_open;
+
+        if depth == 0 && exhaustions == self.values.targets.exhaustions {
+            let sites = found
+                .iter()
+                .map(|(file, class)| (*file, class.node_id()))
+                .collect();
+
+            self.values
+                .targets
+                .parameter_classes
+                .insert(binding, (sites, open));
+        }
+
+        (found, open)
+    }
+
+    fn class_candidates_among(
+        &mut self,
+        values: Vec<Valued<'a>>,
+        depth: usize,
+    ) -> (Vec<ClassSite<'a>>, bool) {
+        let mut found: Vec<ClassSite<'a>> = Vec::new();
+        let mut open = false;
+
+        for (target, value) in values {
+            let (classes, value_open) = self.class_candidates_of(target, value, depth + 1);
+
+            open |= value_open;
+
+            for class in classes {
+                if !found
+                    .iter()
+                    .any(|(file, known)| *file == class.0 && known.node_id() == class.1.node_id())
+                {
+                    found.push(class);
+                }
+            }
+        }
+
+        (found, open)
     }
 
     fn lineage_sites_of(&mut self, file: FileId, class: &'a Class<'a>) -> Vec<Site> {
@@ -2763,14 +3186,45 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         while let Some((file, class)) = pending.pop() {
             if lineage.len() >= MAXIMUM_LINEAGE {
+                self.values
+                    .targets
+                    .open_heritages
+                    .insert((file, class.node_id()));
+                self.values.targets.open_heritages.extend(
+                    pending
+                        .iter()
+                        .map(|(file, class): &ClassSite<'a>| (*file, class.node_id())),
+                );
+
                 break;
             }
 
             let Some(heritage) = &class.heritage else {
                 continue;
             };
+            let (bases, open) = self.class_candidates_of(file, &heritage.expression, 0);
+            let builtin = global_name_of(
+                self.project.file(file).semantic.scoping(),
+                &heritage.expression,
+            )
+            .is_some();
 
-            for (base_file, base) in self.classes_of_expression(file, &heritage.expression, 0) {
+            if open && !builtin {
+                self.values
+                    .targets
+                    .open_heritages
+                    .insert((file, class.node_id()));
+            }
+
+            self.values.targets.bases.insert(
+                (file, class.node_id()),
+                bases
+                    .iter()
+                    .map(|(base_file, base)| (*base_file, base.node_id()))
+                    .collect(),
+            );
+
+            for (base_file, base) in bases {
                 let base_site = (base_file, base.node_id());
 
                 if !lineage.contains(&base_site) {
@@ -3704,7 +4158,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 };
                 let before = found.functions.len() + found.values.len();
 
-                self.push_elements((class_file, class), key, Placement::Instance, found);
+                self.push_elements(
+                    (class_file, class),
+                    key,
+                    Placement::Instance,
+                    Layer::Any,
+                    found,
+                );
 
                 if found.functions.len() + found.values.len() > before {
                     found.replaced = true;

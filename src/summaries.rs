@@ -20,7 +20,9 @@ use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
 use crate::unknowns::UnknownReason;
-use crate::values::{ArgumentFacts, Definedness, SizeQuantity, ValueFacts, ValueId};
+use crate::values::{
+    ArgumentFacts, ConstructionPlan, Definedness, SizeQuantity, ValueFacts, ValueId,
+};
 use crate::walker::tagged_reading_of;
 
 const MAXIMUM_PATTERN_ALIASES: usize = 8;
@@ -61,6 +63,16 @@ pub struct SummaryKey {
     pub function: FunctionId,
     pub substitutions: Vec<ArgumentKey>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ConstructionKey {
+    class: (FileId, NodeId),
+    inherited: bool,
+    root_sizes: Vec<Cost>,
+    captures: Vec<ArgumentKey>,
+}
+
+const MAXIMUM_CONSTRUCTION_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TscRounds {
@@ -175,6 +187,9 @@ pub(crate) struct Scheduler {
     callback_values: HashMap<ValueId, usize>,
     local_records: HashMap<TaskId, SummaryRecord>,
     body_sizes: HashMap<FunctionId, u64>,
+    constructions: HashMap<ConstructionKey, (Part, Effects)>,
+    initializing: HashSet<((FileId, NodeId), bool)>,
+    constructing: Vec<(FileId, NodeId)>,
 }
 
 impl Default for Scheduler {
@@ -215,6 +230,9 @@ impl Scheduler {
             callback_values: HashMap::new(),
             local_records: HashMap::new(),
             body_sizes: HashMap::new(),
+            constructions: HashMap::new(),
+            initializing: HashSet::new(),
+            constructing: Vec::new(),
         }
     }
 }
@@ -226,16 +244,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         function: FunctionNode<'a>,
         mut substitutions: Substitutions,
     ) -> Substitutions {
-        let nodes = self.project.file(file).semantic.nodes();
         let mut scopes = vec![function];
 
-        scopes.extend(nodes.ancestor_ids(function.node_id()).filter_map(|node| {
-            match nodes.kind(node) {
-                AstKind::Function(function) => Some(FunctionNode::Function(function)),
-                AstKind::ArrowFunctionExpression(function) => Some(FunctionNode::Arrow(function)),
-                _ => None,
-            }
-        }));
+        scopes.extend(self.enclosing_functions_of(file, function.node_id()));
 
         for scope in scopes {
             let parameters = match scope {
@@ -1707,7 +1718,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         if has_body {
-            let parameters = self.cost_of_parameters(file, function);
+            let mut parameters = self.cost_of_parameters(file, function);
+
+            if let Some(class) = self
+                .constructed_class_of(file, function)
+                .filter(|class| class.heritage.is_none())
+            {
+                let fields = Reading::of_part(self.instance_fields_part_of(file, class));
+
+                parameters = Some(match parameters {
+                    Some(parameters) => {
+                        parameters.merge(fields, &mut self.unknowns, &mut self.traces)
+                    }
+                    None => fields,
+                });
+            }
 
             if self.fallback_active() {
                 self.current_effects = Effects::unknown();
@@ -1739,6 +1764,214 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 UnknownReason::Target,
             )
         }
+    }
+
+    pub(crate) fn enter_construction(
+        &mut self,
+        class: (FileId, NodeId),
+    ) -> Result<(), UnknownReason> {
+        let constructing = &mut self.scheduler.constructing;
+
+        if constructing.contains(&class) {
+            return Err(UnknownReason::Recurrence);
+        }
+
+        if constructing.len() >= MAXIMUM_CONSTRUCTION_DEPTH {
+            return Err(UnknownReason::ResourceExhaustion);
+        }
+
+        constructing.push(class);
+
+        Ok(())
+    }
+
+    pub(crate) fn leave_construction(&mut self, class: (FileId, NodeId)) {
+        if let Some(position) = self
+            .scheduler
+            .constructing
+            .iter()
+            .rposition(|known| *known == class)
+        {
+            self.scheduler.constructing.remove(position);
+        }
+    }
+
+    pub(crate) fn instance_fields_part_of(
+        &mut self,
+        file: FileId,
+        class: &'a oxc_ast::ast::Class<'a>,
+    ) -> Part {
+        let site = (file, class.node_id());
+        let owners = self.owners_of(file, site.1);
+
+        self.initializers_part_of((site, false), &[site], &owners)
+    }
+
+    pub(crate) fn inherited_fields_part_of(
+        &mut self,
+        file: FileId,
+        class: &'a oxc_ast::ast::Class<'a>,
+        plan: &ConstructionPlan,
+    ) -> Part {
+        if plan.initializers.is_empty() {
+            return Part::none();
+        }
+
+        self.initializers_part_of(
+            ((file, class.node_id()), true),
+            &plan.initializers,
+            &plan.owners,
+        )
+    }
+
+    pub(crate) fn owners_of(&self, file: FileId, node: NodeId) -> HashSet<(FileId, NodeId)> {
+        self.enclosing_functions_of(file, node)
+            .iter()
+            .map(|function| (file, function.node_id()))
+            .collect()
+    }
+
+    fn initializers_part_of(
+        &mut self,
+        (site, inherited): ((FileId, NodeId), bool),
+        initializers: &[(FileId, NodeId)],
+        owners: &HashSet<(FileId, NodeId)>,
+    ) -> Part {
+        let key = self.construction_key_of((site, inherited), owners);
+
+        if let Some((part, effects)) = key
+            .as_ref()
+            .and_then(|key| self.scheduler.constructions.get(key))
+            .cloned()
+        {
+            self.current_effects.join(&effects);
+
+            return part;
+        }
+
+        let span = self.kind_of_node(site.0, site.1).span();
+
+        if !self.scheduler.initializing.insert((site, inherited)) {
+            return self.deferred_unknown(site.0, span, UnknownReason::Recurrence);
+        }
+
+        let serial = self.scheduler.pending_serial;
+        let diagnostics = (self.warnings.len(), self.errors.len());
+        let members = self.active_recurrence_members();
+        let outer = std::mem::take(&mut self.current_effects);
+        let mut part = Part::none();
+
+        for (file, node) in initializers {
+            if !self.charge_work(Event::DispatchStep, 1) {
+                let exhausted =
+                    self.deferred_unknown(site.0, span, UnknownReason::ResourceExhaustion);
+
+                part = part.max(exhausted, &mut self.unknowns, &mut self.traces);
+
+                break;
+            }
+
+            let AstKind::Class(class) = self.kind_of_node(*file, *node) else {
+                continue;
+            };
+            let fields = self
+                .cost_of_instance_fields(*file, class)
+                .total(&mut self.unknowns, &mut self.traces);
+
+            part = part.max(fields, &mut self.unknowns, &mut self.traces);
+        }
+
+        let effects = std::mem::replace(&mut self.current_effects, outer);
+
+        self.current_effects.join(&effects);
+        self.scheduler.initializing.remove(&(site, inherited));
+
+        let stable = !self.fallback_active()
+            && !self.work_exhausted()
+            && self.scheduler.component.is_empty()
+            && serial == self.scheduler.pending_serial
+            && self.pending_scoped.is_empty()
+            && self.share_bindings.is_empty()
+            && diagnostics == (self.warnings.len(), self.errors.len())
+            && members == self.active_recurrence_members();
+
+        if let (Some(key), true) = (key, stable) {
+            self.scheduler
+                .constructions
+                .insert(key, (part.clone(), effects));
+        }
+
+        part
+    }
+
+    pub(crate) fn forget_constructions(&mut self) {
+        self.scheduler.constructions.clear();
+    }
+
+    fn enclosing_functions_of(&self, file: FileId, node: NodeId) -> Vec<FunctionNode<'a>> {
+        let nodes = self.project.file(file).semantic.nodes();
+
+        nodes
+            .ancestor_ids(node)
+            .filter_map(|node| match nodes.kind(node) {
+                AstKind::Function(function) => Some(FunctionNode::Function(function)),
+                AstKind::ArrowFunctionExpression(function) => Some(FunctionNode::Arrow(function)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn active_recurrence_members(&self) -> Option<usize> {
+        self.scheduler
+            .active
+            .map(|active| self.scheduler.tasks[active.0].recurrence_members.len())
+    }
+
+    fn construction_key_of(
+        &mut self,
+        (class, inherited): ((FileId, NodeId), bool),
+        owners: &HashSet<(FileId, NodeId)>,
+    ) -> Option<ConstructionKey> {
+        let function = owners
+            .iter()
+            .min_by_key(|(file, node)| (file.0, node.index()))
+            .and_then(|(file, node)| match self.kind_of_node(*file, *node) {
+                AstKind::Function(function) => Some((*file, FunctionNode::Function(function))),
+                AstKind::ArrowFunctionExpression(function) => {
+                    Some((*file, FunctionNode::Arrow(function)))
+                }
+                _ => None,
+            });
+        let captures = match function {
+            None => Vec::new(),
+            Some((file, function)) => {
+                if !self.charge_work(Event::CaptureEdge, self.current_substitutions.len() as u64) {
+                    return None;
+                }
+
+                let captured: Substitutions = self
+                    .current_substitutions
+                    .iter()
+                    .filter(|(binding, _)| {
+                        matches!(
+                            self.declarations.of_binding(self.project, **binding),
+                            Some(Declaration::Parameter { file: declared, function: owner, .. })
+                                if owners.contains(&(declared, owner.node_id()))
+                        )
+                    })
+                    .map(|(binding, facts)| (*binding, facts.clone()))
+                    .collect();
+
+                self.key_of(file, function, &captured).ok()?.substitutions
+            }
+        };
+
+        Some(ConstructionKey {
+            class,
+            inherited,
+            root_sizes: self.root_sizes.clone().unwrap_or_default(),
+            captures,
+        })
     }
 
     fn inherited_substitutions_of(

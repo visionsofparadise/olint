@@ -1,6 +1,6 @@
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, AssignmentTargetRest, CallExpression, Expression, MemberExpression,
-    NewExpression, SpreadElement, Statement,
+    Argument, AssignmentTarget, AssignmentTargetRest, CallExpression, Class, Expression,
+    MemberExpression, MethodDefinitionKind, NewExpression, SpreadElement, Statement,
 };
 use oxc_ast::{AstKind, AstType};
 use oxc_semantic::NodeId;
@@ -15,6 +15,7 @@ use crate::declarations::{
 };
 use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
+use crate::flow::class_phases_of;
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
@@ -26,17 +27,22 @@ use crate::tables::{
 };
 use crate::types::ResolvedCallee;
 use crate::unknowns::{SourceSpan, UnknownReason};
+use crate::values::Construction;
 use crate::values::{ArgumentFacts, Definedness};
 
 fn is_type_kind(ty: AstType) -> bool {
     crate::syntax::is_type_kind(ty) || ty == AstType::TSInstantiationExpression
 }
 
-fn is_opaque_kind(kind: &AstKind<'_>) -> bool {
+fn is_deferred_kind(kind: &AstKind<'_>) -> bool {
     matches!(
         kind,
-        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::Class(_)
+        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
     ) || is_type_kind(kind.ty())
+}
+
+fn is_opaque_kind(kind: &AstKind<'_>) -> bool {
+    is_deferred_kind(kind) || matches!(kind, AstKind::Class(_))
 }
 
 fn is_function_argument(argument: &Argument<'_>) -> bool {
@@ -261,7 +267,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn cost_of_node_inner(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
-        if is_opaque_kind(&kind) {
+        if is_deferred_kind(&kind) {
             return Reading::empty();
         }
 
@@ -450,6 +456,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 reading
             }
             AstKind::BlockStatement(block) => self.cost_of_statements(file, None, &block.body),
+            AstKind::StaticBlock(block) => self.cost_of_statements(file, None, &block.body),
+            AstKind::PropertyDefinition(property) => match &property.value {
+                Some(value) => self.cost_of_expression(file, value),
+                None => Reading::empty(),
+            },
+            AstKind::AccessorProperty(accessor) => match &accessor.value {
+                Some(value) => self.cost_of_expression(file, value),
+                None => Reading::empty(),
+            },
+            AstKind::Class(class) => self.cost_of_class_definition(file, class),
             AstKind::FunctionBody(body) => self.cost_of_statements(file, None, &body.statements),
             AstKind::TSModuleBlock(block) => self.cost_of_statements(file, None, &block.body),
             AstKind::SwitchCase(case) => {
@@ -978,7 +994,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let targets = self.constructor_targets_of(file, new);
+        let construction = self.construction_targets_of(file, new);
+        let targets = &construction.targets;
+        let site = self.site_of_node(file, new.node_id());
+        let origin = self.source_span(file, new.span);
 
         for known in &targets.known {
             let function = self.function_at(*known);
@@ -993,21 +1012,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                         callee.explain(
                             format_args!("new {name}()"),
-                            self.site_of_node(file, new.node_id()),
-                            self.source_span(file, new.span),
+                            site,
+                            origin,
                             true,
                             &mut self.traces,
                             &mut self.unknowns,
                         )
                     }
-                    Err(_) => callee
-                        .explanation_failed(self.source_span(file, new.span), &mut self.unknowns),
+                    Err(_) => callee.explanation_failed(origin, &mut self.unknowns),
                 }
             };
-            let part = callee.called(self.source_span(file, new.span), &mut self.unknowns);
+            let part = callee.called(origin, &mut self.unknowns);
             let part = self.with_open_remainder(
                 part,
-                &targets,
+                targets,
                 file,
                 new.span,
                 &new.arguments,
@@ -1017,7 +1035,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = self.append_call(reading, target, function, part, cyclic);
         }
 
-        if !targets.known.is_empty() {
+        for implicit in &construction.implicit {
+            let part = self.construction_part_of((file, &new.arguments, new.span), *implicit);
+            let part = if part.cost.is_one() {
+                part
+            } else {
+                part.explain(
+                    format_args!("new {}()", short(self.text_of(file, new.callee.span()))),
+                    site,
+                    origin,
+                    true,
+                    &mut self.traces,
+                    &mut self.unknowns,
+                )
+            };
+            let part = constructed_part_of(part.called(origin, &mut self.unknowns));
+            let part = self.with_open_remainder(
+                part,
+                targets,
+                file,
+                new.span,
+                &new.arguments,
+                UnknownReason::Target,
+            );
+
+            reading = reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
+        }
+
+        if !targets.known.is_empty() || !construction.implicit.is_empty() {
             return reading;
         }
 
@@ -1075,6 +1120,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         new: &'a NewExpression<'a>,
     ) -> TargetSet {
+        self.construction_targets_of(file, new).into_targets()
+    }
+
+    pub(crate) fn construction_targets_of(
+        &mut self,
+        file: FileId,
+        new: &'a NewExpression<'a>,
+    ) -> Construction<'a> {
         match &new.callee {
             Expression::Identifier(reference) => {
                 let declaration = self
@@ -1084,19 +1137,244 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let targets = self.resolved_of_declaration(declaration, true).targets;
 
                 match targets.known.is_empty() {
-                    true => self.constructed_targets_of(file, &new.callee),
-                    false => targets,
+                    true => self.construction_of(file, &new.callee),
+                    false => Construction {
+                        targets,
+                        implicit: Vec::new(),
+                    },
                 }
             }
             callee => match member_expression_of(unwrap(callee)) {
                 Some(member) => {
                     let targets = self.resolved_member_of(file, member).targets;
 
-                    self.constructed_member_targets_of(file, (unwrap(callee), member), targets)
+                    self.member_construction_of(file, (unwrap(callee), member), targets)
                 }
-                None => self.constructed_targets_of(file, callee),
+                None => self.construction_of(file, callee),
             },
         }
+    }
+
+    fn named_call_of(
+        &mut self,
+        (target, function): (FileId, FunctionNode<'a>),
+        called: Part,
+        (site, origin): (Site, SourceSpan),
+    ) -> Part {
+        if called.cost.is_one() {
+            return called;
+        }
+
+        match self.trace_name_of(target, function) {
+            Ok(name) => called.explain(
+                format_args!("call {name}()"),
+                site,
+                origin,
+                true,
+                &mut self.traces,
+                &mut self.unknowns,
+            ),
+            Err(_) => called.explanation_failed(origin, &mut self.unknowns),
+        }
+    }
+
+    fn cost_of_class_definition(&mut self, file: FileId, class: &'a Class<'a>) -> Reading {
+        if class.declare {
+            return Reading::empty();
+        }
+
+        let phases = class_phases_of(class);
+        let reading = match phases.decorated {
+            Some(node) => {
+                let span = self.kind_of_node(file, node).span();
+
+                self.unknown_reading(file, span, UnknownReason::UnsupportedSyntax)
+            }
+            None => Reading::empty(),
+        };
+        let evaluated = phases
+            .heritage
+            .into_iter()
+            .chain(phases.keys.into_iter().map(|(_, key)| key));
+        let reading = self.merged_costs_of(file, reading, evaluated, false);
+
+        self.merged_costs_of(
+            file,
+            reading,
+            phases.statics.into_iter().map(|(element, _)| element),
+            true,
+        )
+    }
+
+    fn merged_costs_of(
+        &mut self,
+        file: FileId,
+        mut reading: Reading,
+        nodes: impl IntoIterator<Item = NodeId>,
+        siblings: bool,
+    ) -> Reading {
+        for node in nodes {
+            let kind = self.kind_of_node(file, node);
+            let cost = self.cost_of_node(file, kind);
+            let cost = match siblings {
+                true => self.sibling_of(file, kind, cost),
+                false => cost,
+            };
+
+            reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    pub(crate) fn cost_of_instance_fields(
+        &mut self,
+        file: FileId,
+        class: &'a Class<'a>,
+    ) -> Reading {
+        if class.declare {
+            return Reading::empty();
+        }
+
+        let elements = class_phases_of(class)
+            .instances
+            .into_iter()
+            .map(|(element, _)| element);
+
+        self.merged_costs_of(file, Reading::empty(), elements, true)
+    }
+
+    pub(crate) fn constructed_class_of(
+        &self,
+        file: FileId,
+        function: FunctionNode<'a>,
+    ) -> Option<&'a Class<'a>> {
+        let FunctionNode::Function(inner) = function else {
+            return None;
+        };
+        let nodes = self.project.file(file).semantic.nodes();
+        let method = nodes.parent_id(inner.node_id());
+
+        match nodes.kind(method) {
+            AstKind::MethodDefinition(definition)
+                if definition.kind == MethodDefinitionKind::Constructor => {}
+            _ => return None,
+        }
+
+        nodes
+            .ancestors(method)
+            .find_map(|ancestor| match ancestor.kind() {
+                AstKind::Class(class) => Some(class),
+                _ => None,
+            })
+    }
+
+    fn enclosing_constructed_class_of(&self, file: FileId, node: NodeId) -> Option<&'a Class<'a>> {
+        let nodes = self.project.file(file).semantic.nodes();
+
+        nodes
+            .ancestors(node)
+            .find_map(|ancestor| match ancestor.kind() {
+                AstKind::Function(function) => Some(Some(function)),
+                AstKind::Class(_) => Some(None),
+                _ => None,
+            })
+            .flatten()
+            .and_then(|function| self.constructed_class_of(file, FunctionNode::Function(function)))
+    }
+
+    fn cost_of_super_call(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        reading: Reading,
+    ) -> Reading {
+        let part = self.super_construction_part_of(file, call);
+
+        reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces)
+    }
+
+    pub(crate) fn super_construction_part_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> Part {
+        let Some(class) = self.enclosing_constructed_class_of(file, call.node_id()) else {
+            return self
+                .unknown_invocation(file, call.span, &call.arguments, UnknownReason::Target)
+                .main;
+        };
+        let site = self.site_of_node(file, call.node_id());
+        let origin = self.source_span(file, call.span);
+        let base =
+            self.base_construction_part_of((file, &call.arguments, call.span), (file, class));
+        let fields = self.instance_fields_part_of(file, class);
+        let part = base.max(fields, &mut self.unknowns, &mut self.traces);
+        let part = if part.cost.is_one() {
+            part
+        } else {
+            part.explain(
+                "super()",
+                site,
+                origin,
+                true,
+                &mut self.traces,
+                &mut self.unknowns,
+            )
+        };
+
+        constructed_part_of(part.called(origin, &mut self.unknowns))
+    }
+
+    pub(crate) fn construction_part_of(
+        &mut self,
+        (file, arguments, span): (FileId, &'a [Argument<'a>], Span),
+        (target, class): (FileId, &'a Class<'a>),
+    ) -> Part {
+        if let Err(reason) = self.enter_construction((target, class.node_id())) {
+            return self.deferred_unknown(file, span, reason);
+        }
+
+        let fields = self.instance_fields_part_of(target, class);
+        let base = self.base_construction_part_of((file, arguments, span), (target, class));
+
+        self.leave_construction((target, class.node_id()));
+
+        fields.max(base, &mut self.unknowns, &mut self.traces)
+    }
+
+    fn base_construction_part_of(
+        &mut self,
+        (file, arguments, span): (FileId, &'a [Argument<'a>], Span),
+        (target, class): (FileId, &'a Class<'a>),
+    ) -> Part {
+        if class.heritage.is_none() {
+            return Part::none();
+        }
+
+        let plan = self.base_plan_of(target, class);
+        let site = self.project.site_of(file, span);
+        let origin = self.source_span(file, span);
+        let mut part = self.inherited_fields_part_of(target, class, &plan);
+
+        for known in &plan.constructors {
+            let function = self.function_at(*known);
+            let (called, cyclic) = self.call_user(known.file, function, file, arguments, span);
+            let called = self.named_call_of((known.file, function), called, (site, origin));
+            let called = self.called_part_of(known.file, function, called, cyclic);
+
+            part = part.max(called, &mut self.unknowns, &mut self.traces);
+        }
+
+        if plan.open {
+            let unknown = self
+                .unknown_invocation(file, span, arguments, UnknownReason::Target)
+                .main;
+
+            part = part.max(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        part
     }
 
     fn is_share_sized_argument(&mut self, file: FileId, argument: &'a Argument<'a>) -> bool {
@@ -1129,6 +1407,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let callee = unwrap(&call.callee);
+
+        if let Expression::Super(_) = callee {
+            return self.cost_of_super_call(file, call, reading);
+        }
 
         if let Expression::CallExpression(inner) = callee {
             if let Some((returned, open)) = self
@@ -1232,22 +1514,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let target = target.file;
             let (called, cyclic) =
                 self.call_user(target, function, file, &call.arguments, call.span);
-            let called = if called.cost.is_one() {
-                called
-            } else {
-                match self.trace_name_of(target, function) {
-                    Ok(name) => called.explain(
-                        format_args!("call {name}()"),
-                        site,
-                        self.source_span(file, call.span),
-                        true,
-                        &mut self.traces,
-                        &mut self.unknowns,
-                    ),
-                    Err(_) => called
-                        .explanation_failed(self.source_span(file, call.span), &mut self.unknowns),
-                }
-            };
+            let called = self.named_call_of(
+                (target, function),
+                called,
+                (site, self.source_span(file, call.span)),
+            );
 
             let part = called.called(self.source_span(file, call.span), &mut self.unknowns);
             let part =
@@ -1612,6 +1883,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         );
 
         reading.merge(unknown, &mut self.unknowns, &mut self.traces)
+    }
+}
+
+fn constructed_part_of(part: Part) -> Part {
+    match part.cost.is_one() && part.unknowns.is_none() {
+        true => part.preferred(Preference::Absent),
+        false => part.preferred(Preference::Unmarked),
     }
 }
 

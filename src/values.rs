@@ -27,7 +27,7 @@ pub use primitive::{
 };
 pub(crate) use sizes::is_direct_call;
 pub use sizes::Cardinality;
-pub(crate) use targets::PrototypeMembers;
+pub(crate) use targets::{Construction, ConstructionPlan, PrototypeMembers};
 
 use crate::cost::{Cost, CostError, Domain, Part, Preference};
 use crate::declarations::TargetSet;

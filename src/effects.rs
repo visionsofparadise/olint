@@ -819,6 +819,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             match kind {
+                AstKind::CallExpression(call)
+                    if matches!(unwrap(&call.callee), Expression::Super(_)) =>
+                {
+                    self.super_construction_part_of(file, call);
+                }
                 AstKind::CallExpression(call) if self.invoke_returned_call(file, call) => {}
                 AstKind::CallExpression(call) => {
                     let ResolvedCallee {
@@ -863,7 +868,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     }
                 }
                 AstKind::NewExpression(new) => {
-                    let targets = self.constructor_targets_of(file, new);
+                    let construction = self.construction_targets_of(file, new);
+                    let targets = &construction.targets;
 
                     for target in &targets.known {
                         let function = self.function_at(*target);
@@ -871,7 +877,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         self.call_user(target.file, function, file, &new.arguments, new.span);
                     }
 
-                    if targets.known.is_empty() || targets.open {
+                    for implicit in &construction.implicit {
+                        self.construction_part_of((file, &new.arguments, new.span), *implicit);
+                    }
+
+                    if (targets.known.is_empty() && construction.implicit.is_empty())
+                        || targets.open
+                    {
                         self.record_unknown_reach(
                             file,
                             Some(&new.callee),

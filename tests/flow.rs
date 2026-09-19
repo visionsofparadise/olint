@@ -1,4 +1,4 @@
-use olint::flow::{Completion, FlowError, Region};
+use olint::flow::{class_phases_of, Completion, FlowError, Region};
 use olint::project::{DiagnosticPhase, Project, ProjectError};
 use olint::unknowns::UnknownReason;
 use oxc_allocator::Allocator;
@@ -7,7 +7,14 @@ use oxc_semantic::NodeId;
 
 mod support;
 
-use support::{file_of, project_of, run_in_project};
+use support::{file_of, first_node_of, project_of, run_in_project};
+
+fn first_function_of(project: &Project<'_>, file: olint::project::FileId) -> NodeId {
+    first_node_of(project, file, |kind| match kind {
+        AstKind::Function(function) => Some(function.node_id()),
+        _ => None,
+    })
+}
 
 #[test]
 fn project_flow_reuses_source_index_and_retains_semantic_anchors() {
@@ -133,4 +140,105 @@ fn unrecoverable_syntax_keeps_the_project_parse_error() {
     assert!(
         matches!(Project::load(&allocator, &directory.path().join("tsconfig.json")), Err(ProjectError::Parse { message, .. }) if !message.is_empty())
     );
+}
+
+#[test]
+fn class_phases_separate_accessor_initializers_and_skip_index_signatures() {
+    let source = "export function f(){ const C = class extends base() { [key: string]: unknown; static accessor shared = stat(); accessor [name()] = instance(); declare hidden: number; static { block(); } run() { method(); } }; after(); }";
+
+    run_in_project(
+        &[("tsconfig.json", "{}"), ("index.ts", source)],
+        |project, root| {
+            let file = project.file(file_of(project, root, "index.ts"));
+            let nodes = file.semantic.nodes();
+            let call = |text: &str| {
+                nodes
+                    .iter()
+                    .find(|node| {
+                        matches!(node.kind(), AstKind::CallExpression(call) if call.span.source_text(source) == text)
+                    })
+                    .unwrap()
+                    .id()
+            };
+            let function = first_function_of(project, file.id);
+            let class = nodes
+                .iter()
+                .find_map(|node| match node.kind() {
+                    AstKind::Class(class) => Some(class),
+                    _ => None,
+                })
+                .unwrap();
+            let phases = class_phases_of(class);
+            let flow = file.flow(function).unwrap();
+            let region = |text: &str| {
+                let node = call(text);
+
+                flow.points
+                    .iter()
+                    .find(|point| point.node == node)
+                    .map(|point| point.region)
+            };
+
+            assert_eq!(phases.heritage, Some(call("base()")));
+            assert_eq!(phases.keys.len(), 1);
+            assert_eq!(phases.statics.len(), 2);
+            assert_eq!(
+                phases
+                    .instances
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .collect::<Vec<_>>(),
+                vec![call("instance()")]
+            );
+            assert!(phases
+                .instances
+                .iter()
+                .all(|(element, _)| matches!(nodes.kind(*element), AstKind::AccessorProperty(_))));
+            assert_eq!(phases.decorated, None);
+
+            for text in ["base()", "name()", "stat()", "block()"] {
+                assert!(
+                    matches!(region(text), Some(Region::ClassDefinition(_))),
+                    "{text}"
+                );
+            }
+
+            assert!(matches!(
+                region("instance()"),
+                Some(Region::Construction(_))
+            ));
+            assert_eq!(region("method()"), None);
+            assert!(matches!(region("after()"), Some(Region::Invocation(_))));
+            assert_eq!(flow.construction_entries.len(), 1);
+        },
+    );
+}
+
+#[test]
+fn decorated_elements_and_parameters_report_their_decorator_as_unsupported() {
+    for (source, decorated) in [
+        (
+            "export function f(){ class C { @mark run() {} } }",
+            "@mark run",
+        ),
+        (
+            "export function f(){ class C { constructor(@mark v: number) {} } }",
+            "@mark v",
+        ),
+        (
+            "export function f(){ class C { run(@mark v: number) {} } }",
+            "@mark v",
+        ),
+    ] {
+        run_in_project(
+            &[("tsconfig.json", "{}"), ("index.ts", source)],
+            |project, root| {
+                let file = project.file(file_of(project, root, "index.ts"));
+                let failure = file.flow(first_function_of(project, file.id)).unwrap_err();
+
+                assert!(matches!(failure.error, FlowError::Unsupported(_)));
+                assert!(failure.span.source_text(source).starts_with(decorated));
+            },
+        );
+    }
 }

@@ -1133,72 +1133,39 @@ impl<'s, 'a> Builder<'s, 'a> {
             return self.atom(node, Step::Evaluate);
         }
 
+        let phases = class_phases_of(class);
+
+        if let Some(decorated) = phases.decorated {
+            return Err(FlowError::Unsupported(decorated));
+        }
+
         let saved = self.region;
         self.region = Region::ClassDefinition(node);
         let mut definition = self.atom(node, Step::Entry)?;
 
-        if !class.decorators.is_empty() {
-            return Err(FlowError::Unsupported(node));
-        }
-
-        if let Some(base) = &class.heritage {
-            let base = self.build(base.expression.node_id())?;
+        if let Some(base) = phases.heritage {
+            let base = self.build(base)?;
             let base = self.possible_throw(node, base)?;
             definition = self.append(definition, base);
         }
 
-        let mut instances = Vec::new();
-        let mut statics = Vec::new();
-
-        for element in &class.body.body {
-            use oxc_ast::ast::ClassElement;
-
-            match element {
-                ClassElement::PropertyDefinition(property) => {
-                    if !property.decorators.is_empty() {
-                        return Err(FlowError::Unsupported(element.node_id()));
-                    }
-
-                    if property.declare || property.r#type.is_abstract() {
-                        continue;
-                    }
-
-                    if property.computed {
-                        let key = self.build(property.key.node_id())?;
-                        let key = self.possible_throw(element.node_id(), key)?;
-                        definition = self.append(definition, key);
-                    }
-
-                    if let Some(value) = &property.value {
-                        if property.r#static {
-                            statics.push(value.node_id());
-                        } else {
-                            instances.push(value.node_id());
-                        }
-                    }
-                }
-                ClassElement::StaticBlock(block) => statics.push(block.node_id()),
-                ClassElement::MethodDefinition(method) => {
-                    if !method.decorators.is_empty() {
-                        return Err(FlowError::Unsupported(element.node_id()));
-                    }
-
-                    if method.value.body.is_some() && method.computed {
-                        let key = self.build(method.key.node_id())?;
-                        let key = self.possible_throw(element.node_id(), key)?;
-                        definition = self.append(definition, key);
-                    }
-                }
-                _ => return Err(FlowError::Unsupported(element.node_id())),
-            }
+        for (element, key) in phases.keys {
+            let key = self.build(key)?;
+            let key = self.possible_throw(element, key)?;
+            definition = self.append(definition, key);
         }
 
-        for value in statics {
+        for (_, value) in phases.statics {
             let value = self.build(value)?;
             definition = self.append(definition, value);
         }
 
         self.region = Region::Construction(node);
+        let instances = phases
+            .instances
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
         let construction = self.sequence(node, instances)?;
 
         self.summary
@@ -1212,6 +1179,86 @@ impl<'s, 'a> Builder<'s, 'a> {
 
         Ok(definition)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassPhases {
+    pub heritage: Option<NodeId>,
+    pub keys: Vec<(NodeId, NodeId)>,
+    pub statics: Vec<(NodeId, NodeId)>,
+    pub instances: Vec<(NodeId, NodeId)>,
+    pub decorated: Option<NodeId>,
+}
+
+pub fn class_phases_of(class: &oxc_ast::ast::Class<'_>) -> ClassPhases {
+    use oxc_ast::ast::ClassElement;
+
+    let mut phases = ClassPhases {
+        heritage: class
+            .heritage
+            .as_ref()
+            .map(|heritage| heritage.expression.node_id()),
+        decorated: (!class.decorators.is_empty()).then(|| class.node_id()),
+        ..ClassPhases::default()
+    };
+
+    for element in &class.body.body {
+        let decorated_element = |decorators: &[oxc_ast::ast::Decorator<'_>]| {
+            (!decorators.is_empty()).then(|| element.node_id())
+        };
+        let (decorated, key, value, is_static) = match element {
+            ClassElement::PropertyDefinition(property)
+                if property.declare || property.r#type.is_abstract() =>
+            {
+                continue
+            }
+            ClassElement::AccessorProperty(property) if property.r#type.is_abstract() => continue,
+            ClassElement::PropertyDefinition(property) => (
+                decorated_element(&property.decorators),
+                property.computed.then_some(&property.key),
+                property.value.as_ref().map(|value| value.node_id()),
+                property.r#static,
+            ),
+            ClassElement::AccessorProperty(accessor) => (
+                decorated_element(&accessor.decorators),
+                accessor.computed.then_some(&accessor.key),
+                accessor.value.as_ref().map(|value| value.node_id()),
+                accessor.r#static,
+            ),
+            ClassElement::MethodDefinition(method) => (
+                decorated_element(&method.decorators).or_else(|| {
+                    method
+                        .value
+                        .params
+                        .items
+                        .iter()
+                        .find(|parameter| !parameter.decorators.is_empty())
+                        .map(|parameter| parameter.node_id())
+                }),
+                (method.computed && method.value.body.is_some()).then_some(&method.key),
+                None,
+                method.r#static,
+            ),
+            ClassElement::StaticBlock(block) => (None, None, Some(block.node_id()), true),
+            ClassElement::TSIndexSignature(_) => continue,
+        };
+
+        if phases.decorated.is_none() {
+            phases.decorated = decorated;
+        }
+
+        if let Some(key) = key {
+            phases.keys.push((element.node_id(), key.node_id()));
+        }
+
+        match (value, is_static) {
+            (Some(value), true) => phases.statics.push((element.node_id(), value)),
+            (Some(value), false) => phases.instances.push((element.node_id(), value)),
+            (None, _) => {}
+        }
+    }
+
+    phases
 }
 
 #[cfg(test)]
