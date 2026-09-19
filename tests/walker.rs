@@ -420,17 +420,20 @@ fn dispatched_result_in(
     sources: &[(&str, &str)],
     types: olint::analysis::TypeMode,
 ) -> DispatchedResult {
-    let mut files = vec![(
-        "tsconfig.json",
-        r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["index.ts"]}"#,
-    )];
+    let entry = sources[0].0;
+    let options = match entry.ends_with(".ts") {
+        true => r#""strict":true,"noEmit":true"#,
+        false => r#""allowJs":true,"noEmit":true"#,
+    };
+    let tsconfig = format!(r#"{{"compilerOptions":{{{options}}},"files":["{entry}"]}}"#);
+    let mut files = vec![("tsconfig.json", tsconfig.as_str())];
 
     files.extend_from_slice(sources);
 
     let mut result = (Cost::ONE, std::collections::BTreeSet::new());
 
     support::run_in_project(&files, |project, root| {
-        let file = support::file_of(project, root, "index.ts");
+        let file = support::file_of(project, root, entry);
         let mut analysis = olint::analysis::Analysis::new(
             project,
             olint::analysis::Options {
@@ -658,7 +661,7 @@ fn statically_typed_object_owners_may_hold_any_builtin_kind() {
         (index_of(format!("{slow}\nfunction set(target: object, key: string, value: unknown) {{ (target as Record<string, unknown>)[key] = value; }}\n{call}")), "O(N)", true),
         (index_of(format!("{slow}\nfunction set<T extends object>(target: T, key: keyof T, value: unknown) {{ (target as any)[key] = value; }}\n{call}")), "O(N)", true),
         (index_of(format!("{slow}\nfunction set(target: Record<string, unknown>, key: string, value: unknown) {{ target[key] = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
-        (index_of(format!("{slow}\nfunction set(target: object, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(xs, () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
+        (index_of(format!("{slow}\nfunction set(target: object, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(xs, () => slow(xs)); return xs.includes(0); }}")), "O(N^3)", true),
         (index_of(format!("{slow}\nfunction set(target: any, key: string, value: unknown) {{ const t: object = target; (t as any)[key] = value; }}\n{call}")), "O(N)", true),
         (index_of(format!("{slow}\nfunction set(target: Set<number>, key: string, value: unknown) {{ (target as any)[key] = value; }}\nexport function selected(xs: number[]) {{ set(new Set(xs), 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", false),
     ];
@@ -671,7 +674,7 @@ fn declared_builtin_kinds_need_construction_or_call_evidence() {
     let slow = format!("function slow(xs: number[]) {{ {CUBIC} return true; }}");
     let cases = [
         (index_of(format!("{slow}\nfunction set(target: Set<number>, key: string, value: unknown) {{ (target as any)[key] = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
-        (index_of(format!("{slow}\nfunction set(target: Set<number>, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
+        (index_of(format!("{slow}\nfunction set(target: Set<number>, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, () => slow(xs)); return xs.includes(0); }}")), "O(N^3)", true),
         (index_of("function set(target: string, value: unknown) { (target as any).includes = value; }\nset(Array.prototype as any, () => true);\nexport function selected(xs: number[]) { const zs = [1, 2]; return zs.includes(0) && xs.includes(0); }".to_string()), "O(N)", true),
         (index_of(format!("{slow}\nfunction set(target: Set<number>, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(new Set(xs), () => slow(xs)); return xs.includes(0); }}")), "O(N)", false),
     ];
@@ -909,6 +912,165 @@ fn destructured_callback_arguments_keep_their_known_bodies() {
         (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ const {{ f }} = qs; return each(xs, f); }}")), "O(N^2)", true),
         (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ const f = qs.f; return each(xs, f); }}")), "O(N^2)", true),
         (index_of(format!("{helpers}\nfunction use({{ run }}: {{ run: (ys: number[]) => number }}, xs: number[]) {{ return each(xs, run); }}\nexport function selected(xs: number[]) {{ return use({{ run: quadratic }}, xs); }}")), "O(N^2)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn parameter_defaults_run_when_omitted_or_undefined() {
+    let default = format!(
+        "{QUADRATIC}\nfunction defaultParameter(xs: number[], n = quadratic(xs)) {{ return n; }}"
+    );
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], n = quadratic(xs)) {{ return n; }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return defaultParameter(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return defaultParameter(xs, undefined); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return defaultParameter(xs, void 0); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return defaultParameter(xs, 1); }}")), "O(1)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return defaultParameter(xs, null as any); }}")), "O(1)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[], m: number) {{ return defaultParameter(xs, m); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return defaultParameter(...([xs] as [number[]])); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nfunction forward(xs: number[], m?: number) {{ return defaultParameter(xs, m); }}\nexport function selected(xs: number[]) {{ return forward(xs, 2); }}")), "O(1)", false),
+        (index_of(format!("{default}\nfunction forward(xs: number[], m?: number) {{ return defaultParameter(xs, m); }}\nexport function selected(xs: number[]) {{ return forward(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nfunction forward(xs: number[], m?: number) {{ m = undefined; return defaultParameter(xs, m); }}\nexport function selected(xs: number[]) {{ return forward(xs, 2); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nconst one = 1;\nexport function selected(xs: number[]) {{ return defaultParameter(xs, one); }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn later_parameter_defaults_see_earlier_parameters() {
+    let helpers = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{ return xs; }}\ntype F = (xs: number[]) => unknown;\nfunction later(xs: number[], g: F = cube, run = () => g(xs)) {{ return run(); }}");
+    let cases = [
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return later(xs); }}")), "O(N^3)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return later(xs, undefined); }}")), "O(N^3)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return later(xs, cheap); }}")), "O(1)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return later(xs, undefined, () => 0); }}")), "O(1)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[], g: F) {{ return later(xs, g); }}")), "O(1)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn destructured_parameters_initialize_their_bindings_at_invocation() {
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nfunction use(xs: number[], {{ n = quadratic(xs) }}: {{ n?: number }} = {{}}) {{ return n; }}\nexport function selected(xs: number[]) {{ return use(xs); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nfunction use(xs: number[], [n = quadratic(xs)]: number[]) {{ return n; }}\nexport function selected(xs: number[]) {{ return use(xs, []); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], {{ [quadratic(xs)]: n }}: Record<number, number>) {{ return n; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], ...[n = quadratic(xs)]: number[]) {{ return n; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nfunction use(xs: number[], {{ n }}: {{ n: number }}) {{ return n; }}\nexport function selected(xs: number[]) {{ return use(xs, {{ n: 1 }}); }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn parameter_initialization_is_charged_once_per_invocation() {
+    for (source, expected) in [
+        (format!("{QUADRATIC}\nexport function selected(xs: number[], n = quadratic(xs)) {{ return n; }}"), vec!["call quadratic()"]),
+        (format!("{QUADRATIC}\nfunction use(xs: number[], n = quadratic(xs)) {{ return n; }}\nexport function selected(xs: number[]) {{ return use(xs); }}"), vec!["call use()"]),
+        (format!("{QUADRATIC}\nexport function selected(xs: number[], {{ n = quadratic(xs) }}: {{ n?: number }}) {{ return n; }}"), vec!["call quadratic()"]),
+    ] {
+        let (reading, labels) = reading_of(&source, "selected");
+
+        assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap(), "{source}");
+        assert_eq!(labels, expected, "{source}");
+    }
+}
+
+#[test]
+fn functions_returned_through_parameters_invoke_the_supplied_body() {
+    let helpers = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{ return xs; }}\ntype F = (xs: number[]) => unknown;\nfunction wrap(f: F) {{ return f; }}\nfunction factory(f: F, xs: number[]) {{ return () => f(xs); }}\nfunction curry(f: F) {{ return (xs: number[]) => f(xs); }}\nexport function other(xs: number[]) {{ wrap(cube)(xs); factory(cube, xs)(); curry(cube)(xs); }}");
+    let cases = [
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return wrap(cube)(xs); }}")), "O(N^3)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return wrap(cheap)(xs); }}")), "O(1)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return factory(cube, xs)(); }}")), "O(N^3)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return factory(cheap, xs)(); }}")), "O(1)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ for (const _ of xs) curry(cheap)(xs); return curry(cube)(xs); }}")), "O(N^3)", false),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ for (const _ of xs) curry(cube)(xs); }}")), "O(N^4)", false),
+        (index_of(format!("{helpers}\nfunction fallback(f: F = cube) {{ return f; }}\nexport function selected(xs: number[]) {{ return fallback()(xs); }}")), "O(N^3)", false),
+        (index_of(format!("{helpers}\nfunction pick(f: F, k: number) {{ return k > 0 ? f : ((globalThis as any).other as F); }}\nexport function selected(xs: number[]) {{ return pick(cube, 1)(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[], f: F) {{ return wrap(f)(xs); }}")), "O(1)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn replacement_writes_join_the_values_supplied_to_their_parameters() {
+    let slow = format!("function slow(xs: number[]) {{ {CUBIC} return true; }}");
+    let cases = [
+        (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(new Set<number>(), null); [Array.prototype].forEach((p) => set(p, () => slow(xs))); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nfunction set(v: unknown, t: any = Array.prototype) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(() => slow(xs)); set(null, new Set<number>()); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nfunction set([t]: any[], v: unknown) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set([Array.prototype], () => slow(xs)); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nexport function set(t: any, v: unknown) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(new Set<number>(), () => slow(xs)); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nfunction set(t: any, v: unknown = () => slow([])) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(Array.prototype); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ v = null; t.includes = v; }}\nexport function selected(xs: number[]) {{ set(Array.prototype, () => slow(xs)); const zs = [1]; return zs.includes(0) && xs.includes(0); }}")), "O(N)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn argument_definedness_follows_each_invocation_context() {
+    let default = format!(
+        "{QUADRATIC}\nfunction h(xs: number[], n: unknown = quadratic(xs)) {{ return n; }}"
+    );
+    let cases = [
+        (index_of(format!("{default}\nfunction g(xs: number[], p: number | undefined, c: boolean) {{ return h(xs, c ? p : 1); }}\nexport function selected(xs: number[]) {{ g(xs, 5, true); return g(xs, undefined, true); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nfunction g(xs: number[], p: number | undefined, c: boolean) {{ return h(xs, c ? p : 1); }}\nexport function selected(xs: number[]) {{ g(xs, undefined, true); return g(xs, 5, true); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nfunction g(xs: number[], p: number | undefined, c: boolean) {{ return h(xs, c ? p : 1); }}\nexport function selected(xs: number[]) {{ return g(xs, 5, true); }}")), "O(1)", false),
+        (index_of(format!("{default}\nfunction g(xs: number[], p: number | undefined) {{ return h(xs, (p, p)); }}\nexport function selected(xs: number[], p?: number) {{ g(xs, 5); return g(xs, p); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\ntype F = (xs: number[]) => unknown;\nfunction cheap(xs: number[]) {{ return xs; }}\nfunction inner({{ fn }}: {{ fn?: F }}, xs: number[]) {{ return h(xs, fn); }}\nexport function selected(xs: number[]) {{ inner({{ fn: cheap }}, xs); return inner({{}}, xs); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\ntype F = (xs: number[]) => unknown;\nfunction cheap(xs: number[]) {{ return xs; }}\nexport function selected(xs: number[]) {{ return h(xs, cheap); }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn conjunctions_are_undefined_only_after_a_known_truthy_left_side() {
+    let default = format!(
+        "{QUADRATIC}\nfunction h(xs: number[], n: unknown = quadratic(xs)) {{ return n; }}"
+    );
+    let cases = [
+        (index_of(format!("{default}\nexport function selected(xs: number[], k: number) {{ return h(xs, (k + 1) && undefined); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return h(xs, {{}} && undefined); }}")), "O(N^2)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[]) {{ return h(xs, 0 && undefined); }}")), "O(1)", false),
+        (index_of(format!("{default}\nexport function selected(xs: number[], k: number) {{ return h(xs, (k + 1) && 2); }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn arguments_after_a_spread_bind_open_facts() {
+    let helpers = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{ return xs; }}\ntype F = (xs: number[]) => unknown;\nfunction run(xs: number[], g: F = cube) {{ return g(xs); }}\nfunction wrap(a: unknown, f: F) {{ return f; }}");
+    let cases = [
+        (index_of(format!("{helpers}\nexport function selected(xs: number[], rest: any[]) {{ return (run as any)(...rest, cheap); }}")), "O(N)", true),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[], rest: any[]) {{ return (wrap as any)(...rest, cheap)(xs); }}")), "O(N)", true),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return run(xs, cheap); }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn sloppy_arguments_writes_rebind_their_parameters() {
+    let helpers = format!("function quadratic(xs) {{ var t = 0; for (var i = 0; i < xs.length; i++) for (var j = 0; j < xs.length; j++) t += i + j; return t; }}\nfunction cube(xs) {{ {CUBIC} }}\nfunction cheap(xs) {{ return xs; }}\nfunction h(xs, n = quadratic(xs)) {{ return n; }}");
+    let script = |name: &'static str, source: String| vec![(name, source)];
+    let cases = [
+        (script("cases.js", format!("{helpers}\nfunction alias(xs, d) {{ arguments[1] = undefined; return h(xs, d); }}\nfunction selected(xs) {{ return alias(xs, 1); }}")), "O(N^2)", false),
+        (script("cases.js", format!("{helpers}\nfunction alias(xs, d) {{ eval('d = undefined'); return h(xs, d); }}\nfunction selected(xs) {{ return alias(xs, 1); }}")), "O(N^2)", true),
+        (script("cases.js", format!("{helpers}\nfunction control(xs, d) {{ return h(xs, d); }}\nfunction selected(xs) {{ return control(xs, 1); }}")), "O(1)", false),
+        (script("cases.js", format!("{helpers}\nfunction aliasCb(xs, g) {{ arguments[1] = cube; return g(xs); }}\nfunction selected(xs) {{ return aliasCb(xs, cheap); }}")), "O(1)", true),
+        (script("cases.js", format!("{helpers}\nfunction retAlias(g) {{ arguments[0] = cube; return g; }}\nfunction selected(xs) {{ return retAlias(cheap)(xs); }}")), "O(1)", true),
+        (script("cases.cjs", format!("{helpers}\nfunction retAlias(g) {{ arguments[0] = cube; return g; }}\nfunction selected(xs) {{ return retAlias(cheap)(xs); }}\nmodule.exports = {{ selected }};")), "O(1)", true),
+        (script("cases.js", format!("{helpers}\nfunction retControl(g) {{ return g; }}\nfunction selected(xs) {{ return retControl(cube)(xs); }}")), "O(N^3)", false),
+        (script("cases.js", format!("{helpers}\nfunction set(t, v) {{ arguments[1] = null; t.includes = v; }}\nfunction selected(xs) {{ set(Array.prototype, () => cube(xs)); return xs.includes(0); }}")), "O(1)", true),
     ];
 
     assert_dispatched(&cases);

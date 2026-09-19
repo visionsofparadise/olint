@@ -1521,3 +1521,89 @@ fn destructured_parameter_targets_grow_linearly_with_callers() {
         }
     }
 }
+
+fn parameter_initialization_source(size: usize) -> String {
+    let mut lines = vec![
+        "function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; }".to_string(),
+        "type F = (xs: number[]) => unknown;".to_string(),
+        "function factory(f: F, xs: number[]) { return () => f(xs); }".to_string(),
+        "function set(t: any, v: unknown) { t.includes = v; }".to_string(),
+        "function d0(xs: number[], n = cube(xs)) { return n; }".to_string(),
+    ];
+
+    for index in 1..size {
+        lines.push(format!(
+            "function d{index}(xs: number[], n = d{}(xs)) {{ return n; }}",
+            index - 1
+        ));
+    }
+
+    let calls: Vec<String> = (0..size)
+        .map(|index| {
+            format!("d{index}(xs); d{index}(xs, undefined); d{index}(xs, {index}); factory(cube, xs)(); set(Array.prototype, () => cube(xs));")
+        })
+        .collect();
+
+    lines.push(format!(
+        "export function root(xs: number[]) {{ {} return [1].includes(0); }}",
+        calls.join(" ")
+    ));
+
+    lines.join("\n")
+}
+
+fn parameter_initialization_counts_of(size: usize) -> (Vec<u64>, usize, Cost) {
+    let mut found = None;
+
+    run_with_source(&parameter_initialization_source(size), |analysis, file| {
+        let part = summary_of(analysis, file, "root");
+        let stats = analysis.scheduler_stats();
+        let events = [
+            Event::DispatchStep,
+            Event::TaskKey,
+            Event::WalkerNode,
+            Event::CallbackDescriptor,
+        ];
+
+        assert_terminal(stats);
+        assert!(
+            events.iter().all(|event| !stats.work.exhausted(*event)),
+            "{size}: {stats:?}"
+        );
+
+        found = Some((
+            events
+                .iter()
+                .map(|event| stats.work.consumed(*event))
+                .collect(),
+            stats.tasks,
+            part.cost,
+        ));
+    });
+
+    found.expect("parameter initialization counts")
+}
+
+#[test]
+fn parameter_initialization_specializations_grow_linearly() {
+    let base = parameter_initialization_counts_of(8);
+    let single = parameter_initialization_counts_of(16);
+    let double = parameter_initialization_counts_of(24);
+
+    assert!(!single.2.is_one(), "{single:?}");
+
+    for (size, counts) in [(8, &base), (16, &single), (24, &double)] {
+        assert_eq!(counts.1, 4 * size + 4, "{size}: {counts:?}");
+    }
+
+    for (position, ((base, single), double)) in
+        base.0.iter().zip(&single.0).zip(&double.0).enumerate()
+    {
+        assert!(single > base, "{position}: {single} {base}");
+        assert_eq!(
+            double - base,
+            2 * (single - base),
+            "{position}: {base} {single} {double}"
+        );
+    }
+}

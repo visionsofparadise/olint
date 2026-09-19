@@ -660,3 +660,81 @@ fn rebound_callee_parameters_keep_their_writes_unattributed() {
 
     assert_eq!(cost, Cost::parse("O(N^2)").unwrap());
 }
+
+fn record_costs_of(
+    analysis: &mut Analysis<'_, '_>,
+    file: olint::project::FileId,
+    name: &str,
+) -> Vec<Cost> {
+    let function = function_of_name(analysis.project, file, name);
+    let root = function_of_name(analysis.project, file, "selected");
+    let id = olint::declarations::FunctionId {
+        file,
+        node: function.node_id(),
+    };
+    let mut costs: Vec<Cost> = analysis
+        .summary_records_for(id)
+        .into_iter()
+        .map(|record| record.reading.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|reading| {
+            let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+            support::legacy_class_of(analysis, file, root, &part.cost)
+        })
+        .collect();
+
+    costs.sort_by_key(|cost| cost.text());
+
+    costs
+}
+
+#[test]
+fn omitted_and_undefined_arguments_share_the_defaulted_specialization() {
+    let source = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }\nfunction defaultParameter(xs: number[], n = quadratic(xs)) { return n; }\nexport function selected(xs: number[]) { defaultParameter(xs); defaultParameter(xs, undefined); defaultParameter(xs, void 0); return defaultParameter(xs, 1); }";
+
+    run_with_source(source, |analysis, file| {
+        let part = support::summary_of(analysis, file, "selected");
+
+        assert!(part.is_complete());
+        assert_eq!(
+            record_costs_of(analysis, file, "defaultParameter"),
+            [Cost::parse("O(1)").unwrap(), Cost::parse("O(N^2)").unwrap()]
+        );
+        support::assert_scheduler_terminal(analysis.scheduler_stats());
+    });
+}
+
+#[test]
+fn returned_closures_specialize_on_their_factory_arguments() {
+    let source = "function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; }\nfunction cheap(xs: number[]) { return xs; }\nfunction factory(f: (xs: number[]) => unknown, xs: number[]) { return function run() { return f(xs); }; }\nexport function selected(xs: number[]) { factory(cheap, xs)(); return factory(cube, xs)(); }";
+
+    run_with_source(source, |analysis, file| {
+        let selected = function_of_name(analysis.project, file, "selected");
+        let part = support::summary_of(analysis, file, "selected");
+
+        assert!(part.is_complete());
+        assert_eq!(
+            support::legacy_class_of(analysis, file, selected, &part.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+        assert_eq!(
+            record_costs_of(analysis, file, "run"),
+            [Cost::parse("O(1)").unwrap(), Cost::parse("O(N^3)").unwrap()]
+        );
+        support::assert_scheduler_terminal(analysis.scheduler_stats());
+    });
+}
+
+#[test]
+fn a_default_callback_joins_the_invocation_effects() {
+    let source = "let counter = 0;\nfunction bump() { counter++; }\nfunction run(f: () => void = bump) { f(); }\nexport function selected(xs: number[]) { counter = 0; run(); for (let i = 0; i < counter; i++) void xs; }";
+
+    let (_, reasons) = selected_result(source);
+
+    assert!(
+        !reasons.contains(&olint::unknowns::UnknownReason::Target),
+        "{reasons:?}"
+    );
+}

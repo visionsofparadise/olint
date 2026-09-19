@@ -55,3 +55,118 @@ fn retained_lazy_callbacks_cannot_alias_a_new_generation() {
         .is_complete());
     assert_eq!(analysis.invoke_argument(&old, file, call.span, &[]), stale);
 }
+
+#[test]
+fn a_failed_invocation_observation_keeps_observed_work_and_marks_exhaustion() {
+    let directory = tempfile::tempdir().unwrap();
+
+    std::fs::write(directory.path().join("tsconfig.json"), "{}").unwrap();
+    std::fs::write(
+        directory.path().join("index.ts"),
+        "function quadratic(xs:number[]){for(const a of xs)for(const b of xs)void b} function run(f:(xs:number[])=>void,xs:number[]){f(xs)} export function root(xs:number[]){run(quadratic,xs)}",
+    )
+    .unwrap();
+
+    let allocator = Allocator::default();
+    let project = Project::load(&allocator, &directory.path().join("tsconfig.json")).unwrap();
+    let file = project
+        .file_by_path(&directory.path().join("index.ts"))
+        .unwrap();
+    let nodes = project.file(file).semantic.nodes();
+    let function_named = |name: &str| {
+        nodes
+            .iter()
+            .find_map(|node| match node.kind() {
+                AstKind::Function(function)
+                    if function.id.as_ref().is_some_and(|id| id.name == name) =>
+                {
+                    Some(FunctionNode::Function(function))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    let call = nodes
+        .iter()
+        .find_map(|node| match node.kind() {
+            AstKind::CallExpression(call)
+                if matches!(&call.callee, Expression::Identifier(callee) if callee.name == "run") =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let (root, run) = (function_named("root"), function_named("run"));
+    let mut analysis = Analysis::new(
+        &project,
+        Options {
+            minimum_exponent: 2,
+            types: crate::analysis::TypeMode::Syntactic,
+        },
+    );
+
+    analysis.summarize(file, root);
+    analysis.summarize(file, run);
+
+    let task_of = |analysis: &Analysis<'_, '_>, function: FunctionNode<'_>, substituted: bool| {
+        analysis
+            .scheduler
+            .tasks
+            .iter()
+            .position(|task| {
+                task.key.function.node == function.node_id()
+                    && task.key.substitutions.iter().any(|argument| {
+                        analysis
+                            .scheduler
+                            .callback_values
+                            .contains_key(&argument.value.value)
+                    }) == substituted
+            })
+            .map(TaskId)
+            .unwrap()
+    };
+    let parent = task_of(&analysis, root, false);
+    let generic = task_of(&analysis, run, false);
+    let target = FunctionId {
+        file,
+        node: run.node_id(),
+    };
+    let generic_key = analysis.scheduler.tasks[generic.0].key.clone();
+
+    analysis.scheduler.work =
+        WorkBudget::new(Limits::uniform(1_000_000).with(Event::InvocationObservation, 0));
+    analysis.scheduler.active = Some(parent);
+
+    analysis.observe_invocation(&generic_key, file, call.span);
+
+    let (observed, incomplete) = analysis.scheduler.tasks[parent.0]
+        .invocations
+        .get(&(analysis.source_span(file, call.span), target))
+        .cloned()
+        .unwrap();
+
+    assert_eq!(observed.len(), 1);
+    assert!(incomplete);
+
+    let (part, _) = analysis.fallback_invocation(target, file, call.span);
+    let mut reasons = Vec::new();
+    let mut pending: Vec<_> = part.unknowns.into_iter().collect();
+
+    while let Some(id) = pending.pop() {
+        match analysis.unknowns.node(id) {
+            crate::unknowns::UnknownNode::Origin(unknown) => reasons.push(unknown.reason),
+            crate::unknowns::UnknownNode::Call { child, .. }
+            | crate::unknowns::UnknownNode::Scale { child, .. } => pending.push(*child),
+            crate::unknowns::UnknownNode::Join { children } => pending.extend(children),
+        }
+    }
+
+    assert!(!part.cost.is_one(), "{part:?}");
+    assert!(
+        reasons.contains(&UnknownReason::ResourceExhaustion),
+        "{reasons:?}"
+    );
+
+    analysis.scheduler.active = None;
+}

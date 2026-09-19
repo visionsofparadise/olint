@@ -26,6 +26,7 @@ use crate::tables::{
 };
 use crate::types::ResolvedCallee;
 use crate::unknowns::{SourceSpan, UnknownReason};
+use crate::values::{ArgumentFacts, Definedness};
 
 fn is_type_kind(ty: AstType) -> bool {
     crate::syntax::is_type_kind(ty) || ty == AstType::TSInstantiationExpression
@@ -112,6 +113,65 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             Some(Root::Expression(expression)) => self.cost_of_expression(file, expression),
             _ => Reading::empty(),
+        }
+    }
+
+    pub(crate) fn cost_of_parameters(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+    ) -> Option<Reading> {
+        let parameters = match function {
+            FunctionNode::Function(inner) => &inner.params,
+            FunctionNode::Arrow(inner) => &inner.params,
+        };
+        let mut reading: Option<Reading> = None;
+
+        for parameter in &parameters.items {
+            if let Some(initializer) = &parameter.initializer {
+                let definedness = self.parameter_definedness_of(file, parameter);
+
+                if definedness != Definedness::Defined {
+                    let kind = self.kind_of_node(file, initializer.node_id());
+                    let cost = self.cost_of_node(file, kind);
+                    let cost = self.sibling_of(file, kind, cost);
+
+                    reading = Some(self.merge_parameter(reading, cost));
+                }
+
+                if definedness == Definedness::Undefined {
+                    self.bind_parameter_default(file, parameter);
+                }
+            }
+
+            if !is_identifier_pattern(&parameter.pattern) {
+                let kind = self.kind_of_node(file, parameter.pattern.node_id());
+                let cost = self.cost_of_node(file, kind);
+                let cost = self.sibling_of(file, kind, cost);
+
+                reading = Some(self.merge_parameter(reading, cost));
+            }
+        }
+
+        if let Some(rest) = parameters
+            .rest
+            .as_ref()
+            .filter(|rest| !is_identifier_pattern(&rest.rest.argument))
+        {
+            let kind = self.kind_of_node(file, rest.rest.argument.node_id());
+            let cost = self.cost_of_node(file, kind);
+            let cost = self.sibling_of(file, kind, cost);
+
+            reading = Some(self.merge_parameter(reading, cost));
+        }
+
+        reading
+    }
+
+    fn merge_parameter(&mut self, reading: Option<Reading>, cost: Reading) -> Reading {
+        match reading {
+            Some(reading) => reading.merge(cost, &mut self.unknowns, &mut self.traces),
+            None => cost,
         }
     }
 
@@ -1069,6 +1129,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let callee = unwrap(&call.callee);
+
+        if let Expression::CallExpression(inner) = callee {
+            if let Some((returned, open)) = self
+                .returned_facts_of(file, inner)
+                .filter(|(returned, open)| *open || !returned.is_empty())
+            {
+                return self.cost_of_returned_call(file, call, (returned, open), reading);
+            }
+        }
+
         let member = member_expression_of(callee).filter(|member| {
             !matches!(member, MemberExpression::ComputedMemberExpression(_))
                 || self.static_member_name_of(file, member).is_some()
@@ -1096,6 +1166,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let substituted = if identifier {
                 self.parameter_binding_of(declaration.unwrap())
+                    .filter(|binding| self.is_parameter_unwritten(*binding))
                     .and_then(|binding| self.current_substitutions.get(&binding).cloned())
             } else {
                 self.pattern_argument_facts_of(file, reference, closed)
@@ -1213,6 +1284,51 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.intrinsic_reading_of(file, call, member, reading, site)
+    }
+
+    fn cost_of_returned_call(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        (returned, open): (Vec<ArgumentFacts>, bool),
+        mut reading: Reading,
+    ) -> Reading {
+        let site = self.site_of_node(file, call.node_id());
+        let origin = self.source_span(file, call.span);
+
+        for facts in returned {
+            let part = self.invoke_argument(&facts, file, call.span, &call.arguments);
+            let named = facts
+                .value
+                .targets
+                .known
+                .first()
+                .map(|known| self.trace_name_of(known.file, self.function_at(*known)));
+            let part = match named {
+                _ if part.cost.is_one() => part,
+                Some(Ok(name)) => part.explain(
+                    format_args!("call {name}()"),
+                    site,
+                    origin,
+                    true,
+                    &mut self.traces,
+                    &mut self.unknowns,
+                ),
+                _ => part.explanation_failed(origin, &mut self.unknowns),
+            };
+            let part = part.called(origin, &mut self.unknowns);
+
+            reading = reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
+        }
+
+        if open {
+            let unknown =
+                self.unknown_invocation(file, call.span, &call.arguments, UnknownReason::Target);
+
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
     }
 
     fn has_intrinsic_model(

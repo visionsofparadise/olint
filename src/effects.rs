@@ -1,7 +1,7 @@
 use oxc_ast::ast::{
     Argument, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
-    ClassElement, Expression, ForStatementLeft, MemberExpression, MethodDefinitionKind,
-    NewExpression, SimpleAssignmentTarget, Statement,
+    CallExpression, ClassElement, Expression, ForStatementLeft, MemberExpression,
+    MethodDefinitionKind, NewExpression, SimpleAssignmentTarget, Statement,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, NodeId};
@@ -819,6 +819,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             match kind {
+                AstKind::CallExpression(call) if self.invoke_returned_call(file, call) => {}
                 AstKind::CallExpression(call) => {
                     let ResolvedCallee {
                         declaration,
@@ -829,6 +830,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     if let Some(Declaration::Parameter { .. }) = declaration {
                         let facts = self
                             .parameter_binding_of(declaration.unwrap())
+                            .filter(|binding| self.is_parameter_unwritten(*binding))
                             .and_then(|binding| self.current_substitutions.get(&binding).cloned());
 
                         if let Some(facts) = &facts {
@@ -885,6 +887,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return;
             }
         }
+    }
+
+    fn invoke_returned_call(&mut self, file: FileId, call: &'a CallExpression<'a>) -> bool {
+        let Expression::CallExpression(inner) = unwrap(&call.callee) else {
+            return false;
+        };
+        let Some((returned, open)) = self
+            .returned_facts_of(file, inner)
+            .filter(|(returned, open)| *open || !returned.is_empty())
+        else {
+            return false;
+        };
+
+        for facts in &returned {
+            self.invoke_argument(facts, file, call.span, &call.arguments);
+        }
+
+        if open {
+            self.record_unknown_reach(file, Some(&call.callee), &call.arguments, call.span);
+        }
+
+        true
     }
 
     fn invalidation_of(

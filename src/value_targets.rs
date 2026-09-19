@@ -1469,6 +1469,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     PatternSources::Parameter(function, parameter),
                     found,
                 ),
+            Declaration::Parameter {
+                file: target,
+                parameter: ParameterNode::Formal(parameter),
+                function,
+            } => self.collect_parameter_targets(
+                (file, reference),
+                (target, function, parameter),
+                found,
+            ),
             _ => found.open = true,
         }
 
@@ -1504,7 +1513,94 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return;
         }
 
-        if let Some(cached) = self.values.targets.patterns.get(&(declared, symbol)) {
+        self.collect_binding_targets((declared, symbol), found, |analysis| {
+            let sources = match sources {
+                PatternSources::Initializer(init) => vec![(target, init)],
+                PatternSources::Parameter(function, parameter) => {
+                    analysis.parameter_sources_of((target, function), parameter)
+                }
+            };
+            let mut resolved = TargetSet {
+                known: Vec::new(),
+                open: true,
+            };
+
+            analysis.resolve_pattern(
+                (target, pattern),
+                symbol,
+                sources,
+                &mut HashSet::new(),
+                &mut resolved,
+            );
+
+            resolved
+        });
+    }
+
+    fn collect_parameter_targets(
+        &mut self,
+        (file, reference): (FileId, &'a IdentifierReference<'a>),
+        (target, function, parameter): (FileId, FunctionNode<'a>, &'a FormalParameter<'a>),
+        found: &mut TargetSet,
+    ) {
+        let binding = self
+            .declarations
+            .binding_of_reference(self.project, file, reference)
+            .filter(|binding| self.is_parameter_unwritten(*binding));
+        let Some(Binding::Symbol {
+            file: declared,
+            symbol,
+        }) = binding
+        else {
+            found.open = true;
+
+            return;
+        };
+
+        self.collect_binding_targets((declared, symbol), found, |analysis| {
+            let mut resolved = TargetSet {
+                known: Vec::new(),
+                open: analysis
+                    .call_arguments_of(target, function, parameter)
+                    .is_none(),
+            };
+            let mut visited = HashSet::new();
+
+            for (source, value) in analysis.parameter_sources_of((target, function), parameter) {
+                analysis.collect_callable_targets(source, value, &mut visited, &mut resolved);
+            }
+
+            resolved
+        });
+    }
+
+    fn parameter_sources_of(
+        &mut self,
+        (target, function): (FileId, FunctionNode<'a>),
+        parameter: &'a FormalParameter<'a>,
+    ) -> Vec<Valued<'a>> {
+        parameter
+            .initializer
+            .iter()
+            .map(|initializer| (target, &**initializer))
+            .chain(
+                self.local_call_arguments_of((target, function), parameter)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect()
+    }
+
+    fn collect_binding_targets(
+        &mut self,
+        binding: (FileId, oxc_semantic::SymbolId),
+        found: &mut TargetSet,
+        resolve: impl FnOnce(&mut Self) -> TargetSet,
+    ) {
+        if let Some(cached) = self.values.targets.patterns.get(&binding) {
+            found.open |= cached.open;
+
             for known in cached.known.clone() {
                 push_target(found, known);
             }
@@ -1512,49 +1608,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return;
         }
 
-        if !self
-            .values
-            .targets
-            .resolving_patterns
-            .insert((declared, symbol))
-        {
+        if !self.values.targets.resolving_patterns.insert(binding) {
             self.values.targets.pattern_cuts += 1;
+            found.open = true;
 
             return;
         }
 
         let cuts = self.values.targets.pattern_cuts;
         let exhaustions = self.values.targets.exhaustions;
-        let sources = match sources {
-            PatternSources::Initializer(init) => vec![(target, init)],
-            PatternSources::Parameter(function, parameter) => parameter
-                .initializer
-                .iter()
-                .map(|initializer| (target, &**initializer))
-                .chain(
-                    self.local_call_arguments_of((target, function), parameter)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .flatten(),
-                )
-                .collect(),
-        };
-        let mut resolved = TargetSet {
-            known: Vec::new(),
-            open: true,
-        };
+        let resolved = resolve(self);
 
-        self.resolve_pattern(
-            (target, pattern),
-            symbol,
-            sources,
-            &mut HashSet::new(),
-            &mut resolved,
-        );
-        self.values
-            .targets
-            .resolving_patterns
-            .remove(&(declared, symbol));
+        self.values.targets.resolving_patterns.remove(&binding);
 
         if self.values.targets.pattern_cuts == cuts
             && self.values.targets.exhaustions == exhaustions
@@ -1563,8 +1628,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.values
                 .targets
                 .patterns
-                .insert((declared, symbol), resolved.clone());
+                .insert(binding, resolved.clone());
         }
+
+        found.open |= resolved.open;
 
         for known in resolved.known {
             push_target(found, known);

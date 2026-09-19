@@ -307,6 +307,7 @@ fn equivalent_latent_effect_sets_share_keys_but_different_effects_do_not() {
                     value: actual,
                     callback: Some(Part::unmarked(Cost::ONE, None)),
                     preference: Preference::Unmarked,
+                    definedness: olint::values::Definedness::Unknown,
                 };
 
                 analysis.summarize_with(
@@ -352,6 +353,7 @@ fn published_callback_facts_and_unknown_handles_remain_valid_after_reset() {
             value,
             callback: Some(part),
             preference: Preference::Unmarked,
+            definedness: olint::values::Definedness::Unknown,
         };
         let (binding, _) = first_parameter(invoke, file);
 

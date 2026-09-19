@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use oxc_ast::ast::{Argument, BindingPattern, Expression, MethodDefinitionKind, PropertyKind};
+use oxc_ast::ast::{
+    Argument, BindingPattern, CallExpression, Expression, FormalParameter, MethodDefinitionKind,
+    PropertyKind,
+};
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
@@ -17,7 +20,7 @@ use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
 use crate::unknowns::UnknownReason;
-use crate::values::{ArgumentFacts, SizeQuantity, ValueFacts, ValueId};
+use crate::values::{ArgumentFacts, Definedness, SizeQuantity, ValueFacts, ValueId};
 use crate::walker::tagged_reading_of;
 
 const MAXIMUM_PATTERN_ALIASES: usize = 8;
@@ -46,6 +49,7 @@ pub struct ArgumentKey {
     pub cost_error: Option<CostError>,
     pub unknowns: crate::unknowns::SemanticKeyId,
     pub preference: Preference,
+    pub definedness: Definedness,
     pub latent_effects: Option<Effects>,
 }
 
@@ -96,7 +100,7 @@ struct SummaryTask {
     pending_children: usize,
     recurrence_members: Arc<HashSet<FunctionId>>,
     stable_loops: HashMap<(FileId, NodeId), (Reading, Effects)>,
-    invocations: HashMap<(crate::unknowns::SourceSpan, FunctionId), TaskId>,
+    invocations: HashMap<(crate::unknowns::SourceSpan, FunctionId), (Vec<TaskId>, bool)>,
     waiters: HashSet<TaskId>,
     credit: Option<FallbackCredit>,
     fallback: bool,
@@ -283,6 +287,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             value,
                             callback: None,
                             preference: Preference::Absent,
+                            definedness: Definedness::Unknown,
                         });
                     }
                 }
@@ -486,6 +491,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         },
                     )?,
                     preference: facts.preference,
+                    definedness: facts.definedness,
                     latent_effects,
                 })
             })
@@ -1701,6 +1707,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         if has_body {
+            let parameters = self.cost_of_parameters(file, function);
+
             if self.fallback_active() {
                 self.current_effects = Effects::unknown();
             } else {
@@ -1711,7 +1719,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             }
 
-            self.cost_of_function_body(file, function)
+            let body = self.cost_of_function_body(file, function);
+
+            match parameters {
+                Some(parameters) => {
+                    let phases = body.phases;
+                    let mut reading = parameters.merge(body, &mut self.unknowns, &mut self.traces);
+
+                    reading.phases = phases;
+
+                    reading
+                }
+                None => body,
+            }
         } else {
             self.unknown_reading(
                 file,
@@ -1726,10 +1746,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         target: FileId,
         function: FunctionNode<'a>,
     ) -> Option<Substitutions> {
-        if !self.charge_work(
-            Event::BudgetPrepassNode,
-            self.current_substitutions.len() as u64,
-        ) {
+        let source = std::mem::take(&mut self.current_substitutions);
+        let captured = self.captured_substitutions_of(&source, target, function);
+
+        self.current_substitutions = source;
+
+        captured
+    }
+
+    fn captured_substitutions_of(
+        &mut self,
+        source: &Substitutions,
+        target: FileId,
+        function: FunctionNode<'a>,
+    ) -> Option<Substitutions> {
+        if !self.charge_work(Event::BudgetPrepassNode, source.len() as u64) {
             return None;
         }
 
@@ -1741,11 +1772,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .ancestor_ids(function.node_id())
             .collect();
         let captured = |binding: &Binding| matches!(self.declarations.of_binding(self.project,*binding),Some(Declaration::Parameter {file,function:owner,..}) if file==target && owner!=function && ancestors.contains(&owner.node_id()));
-        let count = self
-            .current_substitutions
-            .keys()
-            .filter(|binding| captured(binding))
-            .count();
+        let count = source.keys().filter(|binding| captured(binding)).count();
 
         if !self.charge_work(Event::CaptureEdge, count as u64) {
             return None;
@@ -1754,7 +1781,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let captured = |binding: &Binding| matches!(self.declarations.of_binding(self.project,*binding),Some(Declaration::Parameter {file,function:owner,..}) if file==target && owner!=function && ancestors.contains(&owner.node_id()));
 
         Some(
-            self.current_substitutions
+            source
                 .iter()
                 .filter(|(binding, _)| captured(binding))
                 .map(|(binding, facts)| (*binding, facts.clone()))
@@ -1767,9 +1794,35 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         argument: &'a Argument<'a>,
     ) -> ArgumentFacts {
-        let origin = self.source_span(file, argument.span());
+        self.expression_facts_of(file, argument.span(), argument.as_expression())
+    }
+
+    fn expression_facts_of(
+        &mut self,
+        file: FileId,
+        span: oxc_span::Span,
+        expression: Option<&'a Expression<'a>>,
+    ) -> ArgumentFacts {
+        let definedness = match expression {
+            Some(expression) => self.definedness_of(file, expression),
+            None => Definedness::Unknown,
+        };
+
+        ArgumentFacts {
+            definedness,
+            ..self.expression_value_facts_of(file, span, expression)
+        }
+    }
+
+    fn expression_value_facts_of(
+        &mut self,
+        file: FileId,
+        span: oxc_span::Span,
+        expression: Option<&'a Expression<'a>>,
+    ) -> ArgumentFacts {
+        let origin = self.source_span(file, span);
         let mut value = self.values.at(origin);
-        let expression = argument.as_expression().map(unwrap);
+        let expression = expression.map(unwrap);
 
         if let Some(Expression::NumericLiteral(number)) = expression {
             if number.value.is_finite()
@@ -1818,8 +1871,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some(binding) =
             declaration.and_then(|declaration| self.parameter_binding_of(declaration))
         {
-            if let Some(facts) = self.current_substitutions.get(&binding) {
-                return facts.clone();
+            if let Some(facts) = self
+                .current_substitutions
+                .get(&binding)
+                .cloned()
+                .filter(|_| self.is_parameter_unwritten(binding))
+            {
+                return facts;
             }
         }
 
@@ -1868,7 +1926,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     let function = self.function_at(known);
 
                     return self.callback_facts_of(
-                        (file, argument.span()),
+                        (file, span),
                         value,
                         (known.file, function),
                         targets.open,
@@ -1878,16 +1936,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         match function {
-            Some((target, function)) => self.callback_facts_of(
-                (file, argument.span()),
-                value,
-                (target, function),
-                callback_open,
-            ),
+            Some((target, function)) => {
+                self.callback_facts_of((file, span), value, (target, function), callback_open)
+            }
             None => ArgumentFacts {
                 value,
                 callback: None,
                 preference: Preference::Absent,
+                definedness: Definedness::Unknown,
             },
         }
     }
@@ -1902,6 +1958,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(captured) = self.inherited_substitutions_of(target, function) else {
             return self.exhausted_callback_facts_of(origin, value);
         };
+
+        self.captured_callback_facts_of(origin, value, (target, function), callback_open, captured)
+    }
+
+    fn captured_callback_facts_of(
+        &mut self,
+        origin: (FileId, oxc_span::Span),
+        value: ValueFacts,
+        (target, function): (FileId, FunctionNode<'a>),
+        callback_open: bool,
+        captured: Substitutions,
+    ) -> ArgumentFacts {
         let Ok(key) = self.key_of(target, function, &captured) else {
             self.scheduler.exhausted = true;
 
@@ -1943,6 +2011,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             preference: self
                 .function_preference_of(target, function)
                 .unwrap_or(Preference::Unmarked),
+            definedness: Definedness::Unknown,
         }
     }
 
@@ -1955,6 +2024,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             value,
             callback: Some(self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion)),
             preference: Preference::Unmarked,
+            definedness: Definedness::Unknown,
         }
     }
 
@@ -2074,7 +2144,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let argument = argument?;
         let facts = self.argument_facts_of(file, argument);
 
-        Some(self.invoke_argument(&facts, file, argument.span(), &[]))
+        Some(self.invoke_argument_with(&facts, file, argument.span(), &[], true))
     }
 
     pub(crate) fn apply_argument_effects(
@@ -2102,6 +2172,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         span: oxc_span::Span,
         arguments: &'a [Argument<'a>],
     ) -> Part {
+        self.invoke_argument_with(facts, file, span, arguments, false)
+    }
+
+    fn invoke_argument_with(
+        &mut self,
+        facts: &ArgumentFacts,
+        file: FileId,
+        span: oxc_span::Span,
+        arguments: &'a [Argument<'a>],
+        implicit: bool,
+    ) -> Part {
         if let Some(id) = self
             .scheduler
             .callback_values
@@ -2123,11 +2204,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let descriptor = descriptor.clone();
 
                 self.call_with_captures(
-                    target.file,
-                    function,
-                    file,
-                    arguments,
-                    span,
+                    (target.file, function),
+                    (file, arguments, span),
+                    implicit,
                     descriptor.captured,
                 )
             };
@@ -2197,17 +2276,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         };
 
-        self.call_with_captures(file, function, call_file, arguments, span, captured)
+        self.call_with_captures(
+            (file, function),
+            (call_file, arguments, span),
+            false,
+            captured,
+        )
     }
 
     fn call_with_captures(
         &mut self,
-        file: FileId,
-        function: FunctionNode<'a>,
-        call_file: FileId,
-        arguments: &'a [Argument<'a>],
-        span: oxc_span::Span,
-        mut substitutions: Substitutions,
+        (file, function): (FileId, FunctionNode<'a>),
+        (call_file, arguments, span): (FileId, &'a [Argument<'a>], oxc_span::Span),
+        implicit: bool,
+        substitutions: Substitutions,
     ) -> (Part, bool) {
         let target = FunctionId {
             file,
@@ -2253,47 +2335,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let parameters = match function {
-            FunctionNode::Function(inner) => &inner.params,
-            FunctionNode::Arrow(inner) => &inner.params,
-        };
-
-        for (index, parameter) in parameters.items.iter().enumerate() {
-            let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
-                let argument = arguments
-                    .get(index)
-                    .and_then(Argument::as_expression)
-                    .filter(|_| {
-                        !arguments[..index]
-                            .iter()
-                            .any(|argument| matches!(argument, Argument::SpreadElement(_)))
-                    });
-
-                if let Some(argument) = argument {
-                    self.substitute_pattern_callbacks(
-                        file,
-                        parameter,
-                        (call_file, argument),
-                        &mut substitutions,
-                    );
-                }
-
-                continue;
-            };
-            let facts = match arguments.get(index) {
-                Some(argument) => self.argument_facts_of(call_file, argument),
-                None => ArgumentFacts {
-                    value: self.values.at(self.source_span(file, identifier.span)),
-                    callback: None,
-                    preference: Preference::Unmarked,
-                },
-            };
-
-            if let Some(symbol) = identifier.symbol_id.get() {
-                substitutions.insert(Binding::Symbol { file, symbol }, facts);
-            }
-        }
-
+        let substitutions = self.invocation_substitutions_of(
+            (file, function),
+            (call_file, arguments),
+            implicit,
+            substitutions,
+        );
         let substitutions = self.function_inputs(file, function, substitutions);
         let Ok(key) = self.key_of(file, function, &substitutions) else {
             self.scheduler.exhausted = true;
@@ -2322,6 +2369,253 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (reading.total(&mut self.unknowns, &mut self.traces), cyclic)
     }
 
+    fn invocation_substitutions_of(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        (call_file, arguments): (FileId, &'a [Argument<'a>]),
+        implicit: bool,
+        mut substitutions: Substitutions,
+    ) -> Substitutions {
+        let parameters = match function {
+            FunctionNode::Function(inner) => &inner.params,
+            FunctionNode::Arrow(inner) => &inner.params,
+        };
+        let spread_at = arguments
+            .iter()
+            .position(|argument| matches!(argument, Argument::SpreadElement(_)));
+
+        for (index, parameter) in parameters.items.iter().enumerate() {
+            let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                let argument = arguments
+                    .get(index)
+                    .and_then(Argument::as_expression)
+                    .filter(|_| {
+                        !arguments[..index]
+                            .iter()
+                            .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+                    });
+
+                if let Some(argument) = argument {
+                    self.substitute_pattern_callbacks(
+                        file,
+                        parameter,
+                        (call_file, argument),
+                        &mut substitutions,
+                    );
+                }
+
+                continue;
+            };
+            let positional = spread_at.is_none_or(|spread| spread > index);
+            let undefined = match arguments.get(index).and_then(Argument::as_expression) {
+                Some(expression) => {
+                    positional
+                        && self.definedness_of(call_file, expression) == Definedness::Undefined
+                }
+                None => !implicit && spread_at.is_none(),
+            };
+            let facts = match arguments.get(index) {
+                _ if undefined => ArgumentFacts {
+                    value: self.values.undefined(),
+                    callback: None,
+                    preference: Preference::Unmarked,
+                    definedness: Definedness::Undefined,
+                },
+                Some(argument) if positional => self.argument_facts_of(call_file, argument),
+                _ => ArgumentFacts {
+                    value: self.values.at(self.source_span(file, identifier.span)),
+                    callback: None,
+                    preference: Preference::Unmarked,
+                    definedness: Definedness::Unknown,
+                },
+            };
+
+            if let Some(symbol) = identifier.symbol_id.get() {
+                substitutions.insert(Binding::Symbol { file, symbol }, facts);
+            }
+        }
+
+        substitutions
+    }
+
+    pub(crate) fn is_parameter_unwritten(&mut self, binding: Binding) -> bool {
+        if !self.declarations.is_write_free(self.project, binding) {
+            return false;
+        }
+
+        match self.declarations.of_binding(self.project, binding) {
+            Some(Declaration::Parameter { file, function, .. }) => {
+                self.dynamic_scope_of(file, function.node_id()) == (false, false)
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn parameter_definedness_of(
+        &self,
+        file: FileId,
+        parameter: &'a FormalParameter<'a>,
+    ) -> Definedness {
+        let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+            return Definedness::Unknown;
+        };
+        let Some(symbol) = identifier.symbol_id.get() else {
+            return Definedness::Unknown;
+        };
+
+        match self
+            .current_substitutions
+            .get(&Binding::Symbol { file, symbol })
+        {
+            Some(facts) => facts.definedness,
+            None => Definedness::Unknown,
+        }
+    }
+
+    pub(crate) fn bind_parameter_default(
+        &mut self,
+        file: FileId,
+        parameter: &'a FormalParameter<'a>,
+    ) {
+        let (BindingPattern::BindingIdentifier(identifier), Some(initializer)) =
+            (&parameter.pattern, &parameter.initializer)
+        else {
+            return;
+        };
+        let Some(symbol) = identifier.symbol_id.get() else {
+            return;
+        };
+        let facts = self.expression_facts_of(file, initializer.span(), Some(initializer));
+
+        self.current_substitutions
+            .insert(Binding::Symbol { file, symbol }, facts);
+    }
+
+    fn defaulted_substitutions_of(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        substitutions: Substitutions,
+    ) -> Substitutions {
+        let parameters = match function {
+            FunctionNode::Function(inner) => &inner.params,
+            FunctionNode::Arrow(inner) => &inner.params,
+        };
+        let saved = std::mem::replace(&mut self.current_substitutions, substitutions);
+
+        for parameter in &parameters.items {
+            if parameter.initializer.is_some()
+                && self.parameter_definedness_of(file, parameter) == Definedness::Undefined
+            {
+                self.bind_parameter_default(file, parameter);
+            }
+        }
+
+        std::mem::replace(&mut self.current_substitutions, saved)
+    }
+
+    pub(crate) fn returned_facts_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> Option<(Vec<ArgumentFacts>, bool)> {
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        if targets.known.is_empty() {
+            return None;
+        }
+
+        let mut open = targets.open;
+        let mut found: Vec<ArgumentFacts> = Vec::new();
+
+        for target in targets.known {
+            let function = self.function_at(target);
+            let deferred = match function {
+                FunctionNode::Function(inner) => inner.r#async || inner.generator,
+                FunctionNode::Arrow(arrow) => arrow.r#async,
+            };
+
+            if deferred {
+                open = true;
+
+                continue;
+            }
+
+            let captured = self.inherited_substitutions_of(target.file, function)?;
+            let substitutions = self.invocation_substitutions_of(
+                (target.file, function),
+                (file, &call.arguments),
+                false,
+                captured,
+            );
+            let substitutions =
+                self.defaulted_substitutions_of((target.file, function), substitutions);
+            let substitutions = self.function_inputs(target.file, function, substitutions);
+
+            for returned in self.returned_expressions_of(target) {
+                let (facts, unresolved) =
+                    self.returned_value_facts_of((target.file, returned), &substitutions)?;
+
+                open |= unresolved;
+
+                for facts in facts {
+                    if !found.contains(&facts) {
+                        found.push(facts);
+                    }
+                }
+            }
+        }
+
+        Some((found, open))
+    }
+
+    fn returned_value_facts_of(
+        &mut self,
+        (file, returned): (FileId, &'a Expression<'a>),
+        substitutions: &Substitutions,
+    ) -> Option<(Vec<ArgumentFacts>, bool)> {
+        let returned = unwrap(returned);
+
+        if let Expression::Identifier(reference) = returned {
+            let binding = self
+                .declarations
+                .of_reference(self.project, file, reference)
+                .and_then(|declaration| self.parameter_binding_of(declaration));
+
+            if let Some(binding) = binding {
+                let unwritten = self.is_parameter_unwritten(binding);
+                let facts = substitutions.get(&binding).filter(|facts| {
+                    self.scheduler
+                        .callback_values
+                        .contains_key(&facts.value.value)
+                });
+
+                return Some(match (facts, unwritten) {
+                    (Some(facts), true) => (vec![facts.clone()], false),
+                    _ => (Vec::new(), true),
+                });
+            }
+        }
+
+        let targets = self.callable_targets_of(file, returned);
+        let mut found = Vec::new();
+
+        for known in targets.known {
+            let function = self.function_at(known);
+            let captured = self.captured_substitutions_of(substitutions, known.file, function)?;
+            let value = self.values.at(self.source_span(file, returned.span()));
+
+            found.push(self.captured_callback_facts_of(
+                (file, returned.span()),
+                value,
+                (known.file, function),
+                false,
+                captured,
+            ));
+        }
+
+        Some((found, targets.open))
+    }
+
     fn substitute_parameter_values(
         &mut self,
         file: FileId,
@@ -2346,9 +2640,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 break;
             };
             let rebound = identifier.symbol_id.get().is_none_or(|symbol| {
-                !self
-                    .declarations
-                    .is_write_free(self.project, Binding::Symbol { file, symbol })
+                !self.is_parameter_unwritten(Binding::Symbol { file, symbol })
             });
 
             if rebound {
@@ -2376,15 +2668,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if self.scheduler.tasks[parent.0]
             .invocations
-            .contains_key(&site)
+            .get(&site)
+            .is_some_and(|(observed, _)| observed.contains(&target))
         {
             return;
         }
 
-        if self.charge_work(Event::InvocationObservation, 1) {
-            self.scheduler.tasks[parent.0]
-                .invocations
-                .insert(site, target);
+        let charged = self.charge_work(Event::InvocationObservation, 1);
+        let (observed, incomplete) = self.scheduler.tasks[parent.0]
+            .invocations
+            .entry(site)
+            .or_default();
+
+        match charged {
+            true => observed.push(target),
+            false => *incomplete = true,
         }
     }
 
@@ -2411,26 +2709,67 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         }
 
-        let observed = self.scheduler.active.and_then(|parent| {
-            let task = &self.scheduler.tasks[parent.0];
+        let (observed, incomplete): (Vec<TaskId>, bool) = self
+            .scheduler
+            .active
+            .map(|parent| {
+                let task = &self.scheduler.tasks[parent.0];
+                let (observed, incomplete) = task
+                    .invocations
+                    .get(&(self.source_span(file, span), target))
+                    .cloned()
+                    .unwrap_or_default();
 
-            task.invocations
-                .get(&(self.source_span(file, span), target))
-                .copied()
-                .or_else(|| {
-                    self.scheduler
-                        .closed_ready
-                        .get(&(target, false, task.root_id))
-                        .copied()
-                })
-        });
-        let Some(id) = observed else {
-            return (
+                match observed.is_empty() {
+                    false => (observed, incomplete),
+                    true => (
+                        self.scheduler
+                            .closed_ready
+                            .get(&(target, false, task.root_id))
+                            .copied()
+                            .into_iter()
+                            .collect(),
+                        incomplete,
+                    ),
+                }
+            })
+            .unwrap_or_default();
+        let mut joined: Option<(Part, bool)> = None;
+
+        for id in observed {
+            let (part, cyclic) = self.observed_invocation_of(id, file, span);
+
+            joined = Some(match joined {
+                Some((known, was_cyclic)) => (
+                    known.max(part, &mut self.unknowns, &mut self.traces),
+                    was_cyclic || cyclic,
+                ),
+                None => (part, cyclic),
+            });
+        }
+
+        match joined {
+            Some((mut part, cyclic)) if incomplete => {
+                let unknown = self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion);
+
+                part.unknowns = self.unknowns.join(part.unknowns, unknown.unknowns);
+
+                (part, cyclic)
+            }
+            Some(joined) => joined,
+            None => (
                 self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion),
                 false,
-            );
-        };
+            ),
+        }
+    }
 
+    fn observed_invocation_of(
+        &mut self,
+        id: TaskId,
+        file: FileId,
+        span: oxc_span::Span,
+    ) -> (Part, bool) {
         if self.scheduler.component.contains(&id) {
             self.current_effects.unknown_global = true;
 

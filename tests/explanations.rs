@@ -139,6 +139,7 @@ fn semantic_key_rejection_cannot_publish_a_fabricated_specialization() {
             value: analysis.values.at(source),
             callback: Some(callback),
             preference: Preference::Unmarked,
+            definedness: olint::values::Definedness::Unknown,
         };
         let inputs = Substitutions::from([(
             Binding::Symbol {

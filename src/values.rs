@@ -11,7 +11,7 @@ use crate::analysis::Analysis;
 use crate::constants::{constant_initializer_of, evaluate_enum};
 use crate::declarations::Declaration;
 use crate::project::FileId;
-use crate::syntax::member_expression_of;
+use crate::syntax::{member_expression_of, unwrap};
 use crate::unknowns::UnknownReason;
 
 #[path = "primitive_values.rs"]
@@ -58,11 +58,22 @@ pub struct ValueFacts {
     pub latent: Option<SummaryId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Definedness {
+    Undefined,
+    Defined,
+    #[default]
+    Unknown,
+}
+
+const MAXIMUM_DEFINEDNESS_DEPTH: usize = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArgumentFacts {
     pub value: ValueFacts,
     pub callback: Option<Part>,
     pub preference: Preference,
+    pub definedness: Definedness,
 }
 
 #[derive(Default)]
@@ -71,6 +82,7 @@ pub struct Values {
     spans: HashMap<ValueId, SourceSpan>,
     allocations: std::collections::HashSet<ValueId>,
     callbacks: HashMap<usize, ValueId>,
+    undefined: Option<ValueId>,
     next_value: u32,
     quantities: HashMap<(ValueId, SizeQuantity), u64>,
     labels: Vec<String>,
@@ -209,6 +221,29 @@ impl Values {
         }
     }
 
+    pub(crate) fn undefined(&mut self) -> ValueFacts {
+        let value = match self.undefined {
+            Some(value) => value,
+            None => {
+                let value = ValueId(self.next_value);
+                self.next_value = self
+                    .next_value
+                    .checked_add(1)
+                    .expect("value arena fits u32");
+                self.undefined = Some(value);
+
+                value
+            }
+        };
+
+        ValueFacts {
+            value,
+            size: None,
+            targets: TargetSet::default(),
+            latent: None,
+        }
+    }
+
     pub fn allocation(&mut self, origin: SourceSpan) -> ValueFacts {
         let facts = self.at(origin);
 
@@ -259,6 +294,145 @@ impl Values {
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn definedness_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Definedness {
+        self.definedness_at(file, e, 0)
+    }
+
+    fn definedness_at(&mut self, file: FileId, e: &'a Expression<'a>, depth: usize) -> Definedness {
+        if depth >= MAXIMUM_DEFINEDNESS_DEPTH {
+            return Definedness::Unknown;
+        }
+
+        let e = unwrap(e);
+        let found = match e {
+            Expression::Identifier(reference) => {
+                let Some(declaration) =
+                    self.declarations
+                        .of_reference(self.project, file, reference)
+                else {
+                    return match reference.name == "undefined" {
+                        true => Definedness::Undefined,
+                        false => Definedness::Unknown,
+                    };
+                };
+
+                if let Some(binding) = self.parameter_binding_of(declaration) {
+                    let written = !self.is_parameter_unwritten(binding);
+
+                    return match self.current_substitutions.get(&binding) {
+                        Some(facts) if !written => facts.definedness,
+                        _ => Definedness::Unknown,
+                    };
+                }
+
+                if matches!(
+                    declaration,
+                    Declaration::Function { .. } | Declaration::Class { .. }
+                ) && self
+                    .declarations
+                    .callable_reference(self.project, file, reference)
+                    .1
+                {
+                    return Definedness::Defined;
+                }
+
+                match constant_initializer_of(declaration) {
+                    Some((target, initializer)) => {
+                        self.definedness_at(target, initializer, depth + 1)
+                    }
+                    None => Definedness::Unknown,
+                }
+            }
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void => {
+                Definedness::Undefined
+            }
+            Expression::UnaryExpression(_)
+            | Expression::BinaryExpression(_)
+            | Expression::UpdateExpression(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::TemplateLiteral(_)
+            | Expression::ObjectExpression(_)
+            | Expression::ArrayExpression(_)
+            | Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_)
+            | Expression::ClassExpression(_)
+            | Expression::NewExpression(_) => Definedness::Defined,
+            Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
+                self.definedness_at(file, &assignment.right, depth + 1)
+            }
+            Expression::SequenceExpression(sequence) => match sequence.expressions.last() {
+                Some(last) => self.definedness_at(file, last, depth + 1),
+                None => Definedness::Unknown,
+            },
+            Expression::ConditionalExpression(conditional) => {
+                let consequent = self.definedness_at(file, &conditional.consequent, depth + 1);
+                let alternate = self.definedness_at(file, &conditional.alternate, depth + 1);
+
+                match consequent == alternate {
+                    true => consequent,
+                    false => Definedness::Unknown,
+                }
+            }
+            Expression::LogicalExpression(logical) => {
+                let right = self.definedness_at(file, &logical.right, depth + 1);
+
+                match logical.operator {
+                    LogicalOperator::And => {
+                        let left = self.definedness_at(file, &logical.left, depth + 1);
+
+                        match self.truthiness_at(file, &logical.left, depth + 1) {
+                            Some(true) => right,
+                            Some(false) => left,
+                            None if left == Definedness::Defined
+                                && right == Definedness::Defined =>
+                            {
+                                Definedness::Defined
+                            }
+                            None => Definedness::Unknown,
+                        }
+                    }
+                    LogicalOperator::Or | LogicalOperator::Coalesce => match right {
+                        Definedness::Defined => Definedness::Defined,
+                        _ => Definedness::Unknown,
+                    },
+                }
+            }
+            _ => Definedness::Unknown,
+        };
+
+        if found != Definedness::Unknown {
+            return found;
+        }
+
+        match self.known_value_at(file, e, depth).value.as_deref() {
+            Ok(Primitive::Undefined) => Definedness::Undefined,
+            Ok(_) => Definedness::Defined,
+            Err(_) => Definedness::Unknown,
+        }
+    }
+
+    fn truthiness_at(&mut self, file: FileId, e: &'a Expression<'a>, depth: usize) -> Option<bool> {
+        match unwrap(e) {
+            e if e.is_function() => Some(true),
+            Expression::ObjectExpression(_)
+            | Expression::ArrayExpression(_)
+            | Expression::ClassExpression(_)
+            | Expression::NewExpression(_)
+            | Expression::RegExpLiteral(_) => Some(true),
+            e if depth < MAXIMUM_DEFINEDNESS_DEPTH => self
+                .known_value_at(file, e, depth)
+                .value
+                .ok()
+                .map(|value| primitive::truthy(&value)),
+            _ => None,
+        }
+    }
+
     pub fn known_value(&mut self, file: FileId, expression: &'a Expression<'a>) -> KnownValue {
         self.known_value_at(file, expression, 0)
     }
