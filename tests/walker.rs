@@ -771,3 +771,145 @@ fn nearer_members_shadow_prototype_writes_and_rebound_prototypes_stay_open() {
 
     assert_dispatched(&cases);
 }
+
+const QUADRATIC: &str = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }";
+
+#[test]
+fn callee_and_constructor_subexpressions_run_before_their_invocation() {
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const table = {{ run() {{ return 1; }} }}; return table[(quadratic(xs), 'run')](); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function factory() {{ quadratic(xs); return () => 1; }} return factory()(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function factory() {{ return () => quadratic(xs); }} return factory()(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function constructor() {{ quadratic(xs); return class {{}}; }} return new (constructor())(); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function constructor() {{ return class {{ constructor() {{ quadratic(xs); }} }}; }} return new (constructor())(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ return xs['map'](() => quadratic(xs)); }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nconst k = 'map';\nexport function selected(xs: number[]) {{ return xs[k](() => quadratic(xs)); }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ return (() => quadratic(xs))(); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ return (function () {{ return quadratic(xs); }})(); }}")), "O(N^2)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn creating_a_function_costs_nothing_until_it_is_invoked() {
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const f = () => quadratic(xs); return f; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ function factory() {{ return () => quadratic(xs); }} return factory(); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const f = () => quadratic(xs); f(); return f; }}")), "O(N^2)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn optional_calls_and_side_effecting_arguments_keep_their_conditional_work() {
+    let scan = "function scan(xs: number[]) { for (const x of xs) void x; }";
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const obj = {{ run() {{ return quadratic(xs); }} }}; return obj?.run?.(); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], run?: (n: number) => number) {{ return run?.(quadratic(xs)); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], f?: () => number) {{ return (f ?? (() => quadratic(xs)))(); }}")), "O(N^2)", true),
+        (index_of(format!("{scan}\nexport function selected(xs: number[], run?: (n: number) => void) {{ let n = 1; run?.(n = xs.length); for (let i = 0; i < n; i++) scan(xs); }}")), "O(N^2)", true),
+        (index_of(format!("{scan}\nexport function selected(xs: number[]) {{ let n = 1; const table = {{ run() {{}} }}; table[(n = xs.length, 'run')](); for (let i = 0; i < n; i++) scan(xs); }}")), "O(N^2)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn destructured_method_callees_recover_their_known_bodies() {
+    let cube = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{}}\nconst o = {{ run: cube }};\nclass K {{ work(xs: number[]) {{ cube(xs); }} }}");
+    let cases = [
+        (index_of(format!("{cube}\nexport function selected(xs: number[]) {{ const {{ run }} = o; run(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected(xs: number[]) {{ const {{ run: r }} = o; r(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected(k: K, xs: number[]) {{ const {{ work }} = k; work(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected(xs: number[]) {{ const {{ work }} = new K(); work(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected({{ run }}: {{ run: (xs: number[]) => void }}, xs: number[]) {{ run(xs); }}\nselected(o, []);")), "O(N^3)", true),
+        (index_of(format!("{cube}\nfunction use({{ run }}: {{ run: (xs: number[]) => void }}, xs: number[]) {{ run(xs); }}\nexport function selected(xs: number[]) {{ use(o, xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nfunction use({{ run }}: {{ run: (xs: number[]) => void }}, xs: number[]) {{ run(xs); }}\nuse(o, []);\nexport function selected(xs: number[]) {{ use({{ run: cheap }}, xs); }}")), "O(1)", true),
+        (index_of(format!("{cube}\nfunction use({{ run }}: {{ run: (xs: number[]) => void }}, xs: number[]) {{ run = cube; run(xs); }}\nexport function selected(xs: number[]) {{ use({{ run: cheap }}, xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected(xs: number[]) {{ const {{ inner: {{ run }} }} = {{ inner: o }}; run(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected(xs: number[], p: {{ run?: (xs: number[]) => void }}) {{ const {{ run = cube }} = p; run(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nconst key = 'run';\nexport function selected(xs: number[]) {{ const {{ [key]: run }} = o; run(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{cube}\nexport function selected(xs: number[]) {{ const {{ run, other }} = {{ run: cheap, other: cube }}; run(xs); }}")), "O(1)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn super_member_calls_resolve_the_nearest_base_member() {
+    let classes = format!("function cube(xs: number[]) {{ {CUBIC} }}\nclass K0 {{ m(xs: number[]) {{ cube(xs); }} static s(xs: number[]) {{ cube(xs); }} }}\nclass K1 extends K0 {{ m(xs: number[]) {{}} }}");
+    let cases = [
+        (index_of(format!("{classes}\nclass K2 extends K0 {{ m(xs: number[]) {{ super.m(xs); }} }}\nexport function selected(xs: number[]) {{ new K2().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass K2 extends K1 {{ m(xs: number[]) {{ super.m(xs); }} }}\nexport function selected(xs: number[]) {{ new K2().m(xs); }}")), "O(1)", true),
+        (index_of(format!("{classes}\nclass K2 extends K1 {{ static s(xs: number[]) {{ super.s(xs); }} }}\nexport function selected(xs: number[]) {{ K2.s(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass K2 extends K0 {{ m(xs: number[]) {{ const run = () => super.m(xs); run(); }} }}\nexport function selected(xs: number[]) {{ new K2().m(xs); }}")), "O(N^3)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn imported_destructured_exports_resolve_their_own_declaring_bindings() {
+    let exports = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{ return xs; }}\nconst o = {{ cheapo: cheap, run: cube }};\nexport const {{ cheapo, run }} = o;\nexport const {{ run: renamed }} = o;");
+    let mut cases = vec![
+        (vec![("index.ts", "import { run } from './a';\nexport function selected(xs: number[]) { run(xs); }".to_string()), ("a.ts", exports.clone())], "O(N^3)", true),
+        (vec![("index.ts", "import { renamed } from './a';\nexport function selected(xs: number[]) { renamed(xs); }".to_string()), ("a.ts", exports.clone())], "O(N^3)", true),
+        (vec![("index.ts", "import { cheapo } from './a';\nexport function selected(xs: number[]) { cheapo(xs); }".to_string()), ("a.ts", exports)], "O(1)", true),
+    ];
+    let colliding = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{ return xs; }}\nconst o = {{ c: cheap, x: cube }};\nexport const {{ x, c }} = o;");
+
+    for padding in 0..16 {
+        let declarations: String = (0..padding)
+            .map(|index| format!("const d{index} = 0; "))
+            .collect();
+
+        cases.push((vec![("index.ts", format!("{declarations}\nimport {{ c }} from './a';\nexport function selected(xs: number[]) {{ c(xs); }}")), ("a.ts", colliding.clone())], "O(1)", true));
+    }
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn super_lookups_start_at_the_rewritten_home_prototype() {
+    let classes = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheap(xs: number[]) {{ return xs; }}\nclass K0 {{ m(xs: number[]) {{ cheap(xs); }} static s(xs: number[]) {{ cheap(xs); }} }}\nclass Other {{ m(xs: number[]) {{ cube(xs); }} static s(xs: number[]) {{ cube(xs); }} }}\nconst other = {{ m(xs: number[]) {{ cube(xs); }} }};");
+    let cases = [
+        (index_of(format!("{classes}\nclass A extends K0 {{ m(xs: number[]) {{ super.m(xs); }} }}\nObject.setPrototypeOf(A.prototype, Other.prototype);\nexport function selected(xs: number[]) {{ new A().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass A extends K0 {{ m(xs: number[]) {{ super.m(xs); }} }}\n(A.prototype as any).__proto__ = Other.prototype;\nexport function selected(xs: number[]) {{ new A().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass Mid extends K0 {{}}\nclass A extends Mid {{ m(xs: number[]) {{ super.m(xs); }} }}\nObject.setPrototypeOf(Mid.prototype, Other.prototype);\nexport function selected(xs: number[]) {{ new A().m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass A extends K0 {{ static s(xs: number[]) {{ super.s(xs); }} }}\nObject.setPrototypeOf(A, Other);\nexport function selected(xs: number[]) {{ A.s(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nconst lit = {{ __proto__: other, m(xs: number[]) {{ super.m(xs); }} }};\nexport function selected(xs: number[]) {{ lit.m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nconst lit = {{ m(xs: number[]) {{ super.m(xs); }} }};\nObject.setPrototypeOf(lit, other);\nexport function selected(xs: number[]) {{ lit.m(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{classes}\nclass A extends K0 {{ m(xs: number[]) {{ super.m(xs); }} }}\nexport function selected(xs: number[]) {{ new A().m(xs); }}")), "O(1)", true),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn member_constructor_callees_join_runtime_member_dispatch() {
+    let constructors = format!("function cube(xs: number[]) {{ {CUBIC} }}\nfunction cheapCtor(this: any, _xs: number[]) {{}}\nfunction cubeCtor(this: any, xs: number[]) {{ cube(xs); }}");
+    let cases = [
+        (index_of(format!("{constructors}\nconst ns = {{ F: cheapCtor }};\nexport function swap() {{ ns.F = cubeCtor; }}\nexport function selected(xs: number[]) {{ return new ((ns.F) as any)(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{constructors}\nconst ns = {{ F: cheapCtor }};\nexport function swap() {{ ns.F = cubeCtor; }}\nexport function selected(xs: number[]) {{ return new (ns as any).F(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{constructors}\nconst ns = {{ F: cheapCtor }};\nexport function swap() {{ ns['F'] = cubeCtor; }}\nexport function selected(xs: number[]) {{ return new (ns['F'] as any)(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{constructors}\nconst ns = {{ C: class {{ constructor(xs: number[]) {{ cube(xs); }} }} }};\nexport function selected(xs: number[]) {{ return new ns.C(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{constructors}\nclass D {{ constructor(xs: number[]) {{ cube(xs); }} }}\nconst ns = {{ D }};\nexport function selected(xs: number[]) {{ return new ns.D(xs); }}")), "O(N^3)", true),
+        (index_of(format!("{constructors}\nexport function selected(xs: number[]) {{ const C = class {{ constructor(ys: number[]) {{ cube(ys); }} }}; return new C(xs); }}")), "O(N^3)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn destructured_callback_arguments_keep_their_known_bodies() {
+    let helpers = format!("{QUADRATIC}\nconst qs = {{ f(ys: number[]) {{ return quadratic(ys); }} }};\nfunction each(xs: number[], cb: (ys: number[]) => number) {{ return cb(xs); }}");
+    let cases = [
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ const {{ f }} = qs; return each(xs, f); }}")), "O(N^2)", true),
+        (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ const f = qs.f; return each(xs, f); }}")), "O(N^2)", true),
+        (index_of(format!("{helpers}\nfunction use({{ run }}: {{ run: (ys: number[]) => number }}, xs: number[]) {{ return each(xs, run); }}\nexport function selected(xs: number[]) {{ return use({{ run: quadratic }}, xs); }}")), "O(N^2)", true),
+    ];
+
+    assert_dispatched(&cases);
+}

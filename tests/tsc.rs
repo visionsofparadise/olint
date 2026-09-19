@@ -622,6 +622,7 @@ export function swap() {
 #[test]
 fn compiler_member_constructors_keep_known_work_and_the_open_remainder() {
     let linear = Cost::parse("O(N)").unwrap();
+    let cubic = Cost::parse("O(N^3)").unwrap();
 
     assert_eq!(
         results_of(
@@ -629,11 +630,7 @@ fn compiler_member_constructors_keep_known_work_and_the_open_remainder() {
             TypeMode::Tsc,
             &["viaShorthand", "viaProperty", "direct"]
         ),
-        vec![
-            (linear.clone(), true),
-            (linear.clone(), true),
-            (linear, false)
-        ]
+        vec![(cubic.clone(), true), (cubic, true), (linear, false)]
     );
 }
 

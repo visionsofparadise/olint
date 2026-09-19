@@ -221,6 +221,23 @@ fn rest_parameter_of_identifier<'a>(
     }
 }
 
+type CallArguments<'a> = Vec<Option<(FileId, &'a Expression<'a>)>>;
+
+fn function_symbol_of(
+    nodes: &oxc_semantic::AstNodes<'_>,
+    function: FunctionNode<'_>,
+) -> Option<oxc_semantic::SymbolId> {
+    let name = match function {
+        FunctionNode::Function(inner) => inner.id.as_ref(),
+        FunctionNode::Arrow(arrow) => match nodes.parent_kind(arrow.node_id()) {
+            AstKind::VariableDeclarator(declarator) => declarator.id.get_binding_identifier(),
+            _ => None,
+        },
+    };
+
+    name.and_then(|name| name.symbol_id.get())
+}
+
 fn is_class_declaration(declaration: &Declaration<'_>) -> bool {
     matches!(declaration, Declaration::Class { class, .. } if class.is_declaration())
 }
@@ -773,26 +790,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         function: FunctionNode<'a>,
         parameter: &'a FormalParameter<'a>,
-    ) -> Option<Vec<Option<(FileId, &'a Expression<'a>)>>> {
+    ) -> Option<CallArguments<'a>> {
         let project = self.project;
         let nodes = project.file(file).semantic.nodes();
-        let (parameters, name) = match function {
-            FunctionNode::Function(inner) => (&inner.params, inner.id.as_ref()),
-            FunctionNode::Arrow(arrow) => (
-                &arrow.params,
-                match nodes.parent_kind(arrow.node_id()) {
-                    AstKind::VariableDeclarator(declarator) => {
-                        declarator.id.get_binding_identifier()
-                    }
-                    _ => None,
-                },
-            ),
-        };
-        let index = parameters
-            .items
-            .iter()
-            .position(|item| std::ptr::eq(item, parameter))?;
-        let symbol = name.and_then(|name| name.symbol_id.get())?;
+        let symbol = function_symbol_of(nodes, function)?;
         let binding = Binding::Symbol { file, symbol };
         let exported = project
             .file(file)
@@ -815,6 +816,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        self.local_call_arguments_of((file, function), parameter)
+    }
+
+    pub(crate) fn local_call_arguments_of(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        parameter: &'a FormalParameter<'a>,
+    ) -> Option<CallArguments<'a>> {
+        let project = self.project;
+        let parameters = match function {
+            FunctionNode::Function(inner) => &inner.params,
+            FunctionNode::Arrow(arrow) => &arrow.params,
+        };
+        let index = parameters
+            .items
+            .iter()
+            .position(|item| std::ptr::eq(item, parameter))?;
+        let symbol = function_symbol_of(project.file(file).semantic.nodes(), function)?;
+        let binding = Binding::Symbol { file, symbol };
         let references = self.declarations.surface_references_of(project, binding);
         let mut arguments = Vec::with_capacity(references.len());
 

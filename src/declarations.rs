@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, Class, ClassElement, ExportDefaultDeclarationKind, Expression,
-    FormalParameter, FormalParameterRest, Function, IdentifierReference, MethodDefinitionKind,
-    ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
+    ArrowFunctionExpression, BindingPattern, Class, ClassElement, ExportDefaultDeclarationKind,
+    Expression, FormalParameter, FormalParameterRest, Function, IdentifierReference,
+    MethodDefinitionKind, ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
     TSInterfaceDeclaration, TSModuleReference, TSSignature, TSTypeAliasDeclaration, TSTypeName,
     TSTypeParameter, VariableDeclarationKind, VariableDeclarator,
 };
@@ -314,6 +314,11 @@ impl<'a> Declarations<'a> {
             }
 
             match declaration {
+                Some(Declaration::Variable { declarator, .. })
+                    if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) =>
+                {
+                    break (None, false)
+                }
                 Some(Declaration::Variable {
                     file,
                     declarator,

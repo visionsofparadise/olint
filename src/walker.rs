@@ -18,7 +18,7 @@ use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
-    member_expression_of, member_name_of, unwrap, Root,
+    member_expression_of, unwrap, Root,
 };
 use crate::tables::{
     ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, GLOBAL_FUNCTIONS_LINEAR, GLOBAL_LINEAR,
@@ -883,8 +883,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
         part
     }
 
+    fn cost_of_callee(&mut self, file: FileId, callee: &'a Expression<'a>) -> Reading {
+        let callee = unwrap(callee);
+
+        if identifier_of(callee).is_some() {
+            return Reading::empty();
+        }
+
+        let Some(member) = member_expression_of(callee) else {
+            return self.cost_of_expression(file, callee);
+        };
+        let reading = self.cost_of_expression(file, member.object());
+
+        match member {
+            MemberExpression::ComputedMemberExpression(access) => {
+                let key = self.cost_of_expression(file, &access.expression);
+
+                reading.merge(key, &mut self.unknowns, &mut self.traces)
+            }
+            _ => reading,
+        }
+    }
+
+    fn method_name_of(&mut self, file: FileId, member: &'a MemberExpression<'a>) -> String {
+        self.static_member_name_of(file, member).unwrap_or_default()
+    }
+
     fn cost_of_new(&mut self, file: FileId, new: &'a NewExpression<'a>) -> Reading {
-        let mut reading = Reading::empty();
+        let mut reading = self.cost_of_callee(file, &new.callee);
 
         for argument in &new.arguments {
             let cost = self.cost_of_argument(file, argument);
@@ -995,11 +1021,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .declarations
                     .of_reference(self.project, file, reference);
 
-                self.resolved_of_declaration(declaration, true).targets
+                let targets = self.resolved_of_declaration(declaration, true).targets;
+
+                match targets.known.is_empty() {
+                    true => self.constructed_targets_of(file, &new.callee),
+                    false => targets,
+                }
             }
-            callee => match callee.as_member_expression() {
-                Some(member) => self.resolved_member_of(file, member).targets,
-                None => TargetSet::default(),
+            callee => match member_expression_of(unwrap(callee)) {
+                Some(member) => {
+                    let targets = self.resolved_member_of(file, member).targets;
+
+                    self.constructed_member_targets_of(file, (unwrap(callee), member), targets)
+                }
+                None => self.constructed_targets_of(file, callee),
             },
         }
     }
@@ -1023,7 +1058,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn cost_of_call(&mut self, file: FileId, call: &'a CallExpression<'a>) -> Reading {
-        let mut reading = Reading::empty();
+        let mut reading = self.cost_of_callee(file, &call.callee);
 
         for argument in &call.arguments {
             if !is_function_argument(argument) {
@@ -1034,14 +1069,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let callee = unwrap(&call.callee);
-        let member = member_expression_of(callee)
-            .filter(|member| !matches!(member, MemberExpression::ComputedMemberExpression(_)));
-
-        if let Some(member) = member {
-            let cost = self.cost_of_expression(file, member.object());
-
-            reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
-        }
+        let member = member_expression_of(callee).filter(|member| {
+            !matches!(member, MemberExpression::ComputedMemberExpression(_))
+                || self.static_member_name_of(file, member).is_some()
+        });
 
         let ResolvedCallee {
             declaration,
@@ -1063,11 +1094,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 ParameterNode::Rest(rest) => is_identifier_pattern(&rest.rest.argument),
             };
 
-            if identifier {
-                let substituted = self
-                    .parameter_binding_of(declaration.unwrap())
-                    .and_then(|binding| self.current_substitutions.get(&binding).cloned());
+            let substituted = if identifier {
+                self.parameter_binding_of(declaration.unwrap())
+                    .and_then(|binding| self.current_substitutions.get(&binding).cloned())
+            } else {
+                self.pattern_argument_facts_of(file, reference, closed)
+            };
 
+            if identifier || substituted.is_some() {
                 if let Some(facts) = substituted {
                     let mut part = self.invoke_argument(&facts, file, call.span, &call.arguments);
 
@@ -1192,7 +1226,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str())
             });
         };
-        let method = member_name_of(member).unwrap_or_default();
+        let method = self.method_name_of(file, member);
         let receiver = member.object();
 
         if identifier_of(receiver).is_some_and(|global| {
@@ -1253,7 +1287,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading: Reading,
         site: Site,
     ) -> Reading {
-        let method = member_name_of(member).unwrap_or_default();
+        let method = self.method_name_of(file, member);
         let receiver = member.object();
         let first = call.arguments.first();
 

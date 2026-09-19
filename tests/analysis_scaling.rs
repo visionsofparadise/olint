@@ -1451,3 +1451,73 @@ fn size_stability_work_grows_linearly_with_aliased_holders() {
         "{base:?} {single:?} {double:?}"
     );
 }
+
+fn pattern_source(callers: usize, alias: bool) -> String {
+    let body = match alias {
+        true => "const f = run; f(xs);",
+        false => "run(xs);",
+    };
+    let mut lines = vec![format!(
+        "function use({{ run }}: {{ run: (xs: number[]) => void }}, xs: number[]) {{ {body} }}"
+    )];
+
+    for index in 0..callers {
+        lines.push(format!(
+            "export function c{index}(xs: number[]) {{ use({{ run: (ys: number[]) => {{ for (const y of ys) void y; }} }}, xs); }}"
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn pattern_counts_of(callers: usize, alias: bool) -> (Vec<u64>, Cost) {
+    let mut found = None;
+
+    run_with_source(&pattern_source(callers, alias), |analysis, file| {
+        let functions = analysis.reportable();
+
+        analysis.summarize_reportable(&functions);
+
+        let part = summary_of(analysis, file, "c0");
+        let stats = analysis.scheduler_stats();
+        let events = [Event::DispatchStep, Event::TaskKey, Event::WalkerNode];
+
+        assert_terminal(stats);
+        assert!(
+            events.iter().all(|event| !stats.work.exhausted(*event)),
+            "{callers}: {stats:?}"
+        );
+
+        found = Some((
+            events
+                .iter()
+                .map(|event| stats.work.consumed(*event))
+                .collect(),
+            part.cost,
+        ));
+    });
+
+    found.expect("pattern counts")
+}
+
+#[test]
+fn destructured_parameter_targets_grow_linearly_with_callers() {
+    for alias in [false, true] {
+        let base = pattern_counts_of(32, alias);
+        let single = pattern_counts_of(64, alias);
+        let double = pattern_counts_of(96, alias);
+
+        assert!(!single.1.is_one(), "{alias}: {single:?}");
+
+        for (position, ((base, single), double)) in
+            base.0.iter().zip(&single.0).zip(&double.0).enumerate()
+        {
+            assert!(single > base, "{alias} {position}: {single} {base}");
+            assert_eq!(
+                double - base,
+                2 * (single - base),
+                "{alias} {position}: {base} {single} {double}"
+            );
+        }
+    }
+}

@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, CallExpression, Class, ClassElement, Expression,
-    IdentifierReference, MemberExpression, MethodDefinitionKind, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, PropertyKind,
+    Argument, AssignmentTarget, BindingPattern, BindingProperty, CallExpression, Class,
+    ClassElement, Expression, FormalParameter, IdentifierReference, MemberExpression,
+    MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey, PropertyKind,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
@@ -13,7 +13,9 @@ use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::constants::constant_initializer_of;
-use crate::declarations::{element_name_of, Declaration, FunctionId, TargetSet};
+use crate::declarations::{
+    element_name_of, Binding, Declaration, FunctionId, FunctionNode, ParameterNode, TargetSet,
+};
 use crate::declared_types::{declarator_of_identifier, Kind};
 use crate::effects::{value_flow_of, ValueFlow};
 use crate::project::FileId;
@@ -59,6 +61,18 @@ enum WriteKind {
     Removed,
     Defined,
     Prototype,
+}
+
+#[derive(Clone, Copy)]
+enum PatternSources<'a> {
+    Initializer(&'a Expression<'a>),
+    Parameter(FunctionNode<'a>, &'a FormalParameter<'a>),
+}
+
+#[derive(Clone, Debug)]
+struct PatternStep<'a> {
+    key: MemberKey,
+    default: Option<&'a Expression<'a>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +153,9 @@ pub(crate) struct TargetIndex {
     replaced_every_global: bool,
     rebound_functions: HashSet<Site>,
     rebound_every_function: bool,
+    patterns: HashMap<(FileId, oxc_semantic::SymbolId), TargetSet>,
+    resolving_patterns: HashSet<(FileId, oxc_semantic::SymbolId)>,
+    pattern_cuts: u64,
     depth: usize,
 }
 
@@ -160,6 +177,15 @@ enum Origin<'a> {
     },
     Function {
         function: Site,
+    },
+    HomeClass {
+        file: FileId,
+        class: &'a Class<'a>,
+        placement: Placement,
+    },
+    HomeObject {
+        file: FileId,
+        object: &'a ObjectExpression<'a>,
     },
 }
 
@@ -456,10 +482,87 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    pub(crate) fn static_member_name_of(
+        &mut self,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+    ) -> Option<String> {
+        match self.member_key_of(file, member)? {
+            MemberKey::Name(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn constructed_targets_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> TargetSet {
+        let mut found = self.callable_targets_of(file, expression);
+
+        self.push_class_constructors(file, expression, &mut found);
+
+        found.open |= found.known.is_empty();
+
+        found
+    }
+
+    pub(crate) fn constructed_member_targets_of(
+        &mut self,
+        file: FileId,
+        (callee, member): (&'a Expression<'a>, &'a MemberExpression<'a>),
+        mut found: TargetSet,
+    ) -> TargetSet {
+        let dispatch = self.member_dispatch_of(file, member);
+        let mut constructed = TargetSet {
+            known: dispatch.known,
+            open: dispatch.replaced,
+        };
+
+        self.index_targets();
+        self.push_class_constructors(file, callee, &mut constructed);
+
+        for known in constructed.known {
+            if !found.known.contains(&known) {
+                found.known.push(known);
+
+                found.open = true;
+            }
+        }
+
+        found.open |= constructed.open || found.known.is_empty();
+
+        found
+    }
+
+    fn push_class_constructors(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        found: &mut TargetSet,
+    ) {
+        for (target, class) in self.classes_of_expression(file, expression, 0) {
+            match self.declarations.function_of(Declaration::Class {
+                file: target,
+                class,
+            }) {
+                Some((target, function)) => push_target(
+                    found,
+                    FunctionId {
+                        file: target,
+                        node: function.node_id(),
+                    },
+                ),
+                None => found.open = true,
+            }
+        }
+    }
+
     pub(crate) fn forget_dispatches(&mut self) {
         self.values.targets.dispatches.clear();
         self.values.targets.summaries.clear();
         self.values.targets.exhausted_calls.clear();
+        self.values.targets.patterns.clear();
         self.prototype_members.clear();
         self.values.forget_sizes();
     }
@@ -1034,6 +1137,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         expression: &'a Expression<'a>,
     ) -> Option<MemberKey> {
+        if let Expression::SequenceExpression(sequence) = unwrap(expression) {
+            return self.member_key_of_expression(file, sequence.expressions.last()?);
+        }
+
         if let Expression::Identifier(reference) = unwrap(expression) {
             if let Some(Declaration::Variable {
                 file: target,
@@ -1337,14 +1444,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 constant,
             } => {
                 match (&declarator.id, &declarator.init) {
-                    (oxc_ast::ast::BindingPattern::BindingIdentifier(_), Some(init)) => {
+                    (BindingPattern::BindingIdentifier(_), Some(init)) => {
                         self.collect_callable_targets(target, init, visited, found)
                     }
+                    (pattern, Some(init)) => self.collect_pattern_targets(
+                        (file, reference),
+                        (target, pattern),
+                        PatternSources::Initializer(init),
+                        found,
+                    ),
                     _ => found.open = true,
                 }
 
                 found.open |= !constant || !closed;
             }
+            Declaration::Parameter {
+                file: target,
+                parameter: ParameterNode::Formal(parameter),
+                function,
+            } if !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)) => self
+                .collect_pattern_targets(
+                    (file, reference),
+                    (target, &parameter.pattern),
+                    PatternSources::Parameter(function, parameter),
+                    found,
+                ),
             _ => found.open = true,
         }
 
@@ -1354,6 +1478,238 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for (target, value) in written {
             self.collect_callable_targets(target, value, visited, found);
+        }
+    }
+
+    fn collect_pattern_targets(
+        &mut self,
+        (file, reference): (FileId, &'a IdentifierReference<'a>),
+        (target, pattern): (FileId, &'a BindingPattern<'a>),
+        sources: PatternSources<'a>,
+        found: &mut TargetSet,
+    ) {
+        found.open = true;
+
+        let Some(Binding::Symbol {
+            file: declared,
+            symbol,
+        }) = self
+            .declarations
+            .binding_of_reference(self.project, file, reference)
+        else {
+            return;
+        };
+
+        if declared != target {
+            return;
+        }
+
+        if let Some(cached) = self.values.targets.patterns.get(&(declared, symbol)) {
+            for known in cached.known.clone() {
+                push_target(found, known);
+            }
+
+            return;
+        }
+
+        if !self
+            .values
+            .targets
+            .resolving_patterns
+            .insert((declared, symbol))
+        {
+            self.values.targets.pattern_cuts += 1;
+
+            return;
+        }
+
+        let cuts = self.values.targets.pattern_cuts;
+        let exhaustions = self.values.targets.exhaustions;
+        let sources = match sources {
+            PatternSources::Initializer(init) => vec![(target, init)],
+            PatternSources::Parameter(function, parameter) => parameter
+                .initializer
+                .iter()
+                .map(|initializer| (target, &**initializer))
+                .chain(
+                    self.local_call_arguments_of((target, function), parameter)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect(),
+        };
+        let mut resolved = TargetSet {
+            known: Vec::new(),
+            open: true,
+        };
+
+        self.resolve_pattern(
+            (target, pattern),
+            symbol,
+            sources,
+            &mut HashSet::new(),
+            &mut resolved,
+        );
+        self.values
+            .targets
+            .resolving_patterns
+            .remove(&(declared, symbol));
+
+        if self.values.targets.pattern_cuts == cuts
+            && self.values.targets.exhaustions == exhaustions
+            && !self.work_exhausted()
+        {
+            self.values
+                .targets
+                .patterns
+                .insert((declared, symbol), resolved.clone());
+        }
+
+        for known in resolved.known {
+            push_target(found, known);
+        }
+    }
+
+    pub(crate) fn pattern_argument_targets_of(
+        &mut self,
+        file: FileId,
+        pattern: &'a BindingPattern<'a>,
+        symbol: oxc_semantic::SymbolId,
+        sources: Vec<Valued<'a>>,
+    ) -> TargetSet {
+        let mut resolved = TargetSet {
+            known: Vec::new(),
+            open: true,
+        };
+
+        self.index_targets();
+        self.resolve_pattern(
+            (file, pattern),
+            symbol,
+            sources,
+            &mut HashSet::new(),
+            &mut resolved,
+        );
+
+        resolved
+    }
+
+    fn resolve_pattern(
+        &mut self,
+        (target, pattern): (FileId, &'a BindingPattern<'a>),
+        symbol: oxc_semantic::SymbolId,
+        sources: Vec<Valued<'a>>,
+        visited: &mut HashSet<Site>,
+        resolved: &mut TargetSet,
+    ) {
+        let steps = self.pattern_steps_of(target, pattern, symbol);
+        let Some((last, steps)) = steps.as_ref().and_then(|steps| steps.split_last()) else {
+            return;
+        };
+        let mut values = sources;
+
+        for step in steps {
+            let mut next = Vec::new();
+
+            for (source, value) in values {
+                next.extend(self.pattern_members_of(source, value, step).values);
+            }
+
+            next.extend(step.default.map(|default| (target, default)));
+
+            values = next;
+        }
+
+        for (source, value) in values {
+            let members = self.pattern_members_of(source, value, last);
+
+            for function in members.functions {
+                push_target(resolved, function);
+            }
+
+            for (member, value) in members.values {
+                self.collect_callable_targets(member, value, visited, resolved);
+            }
+        }
+
+        if let Some(default) = last.default {
+            self.collect_callable_targets(target, default, visited, resolved);
+        }
+    }
+
+    fn pattern_members_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        step: &PatternStep<'a>,
+    ) -> MemberValues<'a> {
+        if !self.charge_dispatch() {
+            return MemberValues {
+                replaced: true,
+                ..MemberValues::default()
+            };
+        }
+
+        let mut receiver = Receiver::default();
+
+        self.collect_receiver(file, value, &mut HashSet::new(), &mut receiver);
+
+        self.member_candidates_of(file, value, &receiver, &step.key)
+    }
+
+    fn pattern_steps_of(
+        &mut self,
+        file: FileId,
+        pattern: &'a BindingPattern<'a>,
+        symbol: oxc_semantic::SymbolId,
+    ) -> Option<Vec<PatternStep<'a>>> {
+        match pattern {
+            BindingPattern::AssignmentPattern(assignment) => {
+                self.pattern_steps_of(file, &assignment.left, symbol)
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    let Some(mut steps) = self.pattern_steps_of(file, &property.value, symbol)
+                    else {
+                        continue;
+                    };
+                    let default = match &property.value {
+                        BindingPattern::AssignmentPattern(assignment) => Some(&assignment.right),
+                        _ => None,
+                    };
+
+                    steps.insert(
+                        0,
+                        PatternStep {
+                            key: self.binding_property_key_of(file, property)?,
+                            default,
+                        },
+                    );
+
+                    return Some(steps);
+                }
+
+                None
+            }
+            BindingPattern::BindingIdentifier(identifier) => {
+                (identifier.symbol_id.get() == Some(symbol)).then(Vec::new)
+            }
+            BindingPattern::ArrayPattern(_) => None,
+        }
+    }
+
+    fn binding_property_key_of(
+        &mut self,
+        file: FileId,
+        property: &'a BindingProperty<'a>,
+    ) -> Option<MemberKey> {
+        match (property.computed, property.key.as_expression()) {
+            (true, Some(expression)) => self.member_key_of_expression(file, expression),
+            _ => property
+                .key
+                .static_name()
+                .map(|name| MemberKey::Name(name.into_owned())),
         }
     }
 
@@ -1551,6 +1907,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 class,
                 exact: true,
             }),
+            Expression::Super(node) => match this_owner_of(project, file, node.node_id()) {
+                Some(ThisOwner::Class {
+                    file,
+                    class,
+                    placement,
+                }) => {
+                    let placements = match placement {
+                        Placement::Either => vec![Placement::Instance, Placement::Static],
+                        placement => vec![placement],
+                    };
+
+                    for placement in placements {
+                        receiver.origins.push(Origin::HomeClass {
+                            file,
+                            class,
+                            placement,
+                        });
+                    }
+
+                    if placement != Placement::Instance {
+                        let value = self.values.allocation(self.source_span(file, class.span));
+
+                        push_value(&mut receiver.values, value.value);
+                    }
+                }
+                Some(ThisOwner::Object { file, object }) => {
+                    receiver.origins.push(Origin::HomeObject { file, object });
+
+                    let value = self.values.allocation(self.source_span(file, object.span));
+
+                    push_value(&mut receiver.values, value.value);
+                }
+                None => {}
+            },
             Expression::ThisExpression(this) => {
                 match this_owner_of(project, file, this.node_id()) {
                     Some(ThisOwner::Class {
@@ -1878,11 +2268,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Origin::Object { file, object } => {
                     self.object_values_of(file, object, key, &mut found)
                 }
-                Origin::Instance { file, class, exact } => {
-                    self.class_values_of(file, class, exact, Placement::Instance, key, &mut found)
-                }
-                Origin::Constructor { file, class, exact } => {
-                    self.class_values_of(file, class, exact, Placement::Static, key, &mut found)
+                Origin::Instance { file, class, exact } => self.class_values_of(
+                    (file, class),
+                    (exact, false),
+                    Placement::Instance,
+                    key,
+                    &mut found,
+                ),
+                Origin::Constructor { file, class, exact } => self.class_values_of(
+                    (file, class),
+                    (exact, false),
+                    Placement::Static,
+                    key,
+                    &mut found,
+                ),
+                Origin::HomeClass {
+                    file,
+                    class,
+                    placement,
+                } => self.class_values_of((file, class), (true, true), placement, key, &mut found),
+                Origin::HomeObject { file, object } => {
+                    self.home_object_values_of(file, object, key, &mut found)
                 }
                 Origin::Function { function } => self.function_values_of(function, key, &mut found),
             }
@@ -1999,11 +2405,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn class_values_of(
+    fn home_object_values_of(
         &mut self,
         file: FileId,
-        class: &'a Class<'a>,
-        exact: bool,
+        object: &'a ObjectExpression<'a>,
+        key: &MemberKey,
+        found: &mut MemberValues<'a>,
+    ) {
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+
+            if !property.computed
+                && self.property_key_of(file, property)
+                    == Some(MemberKey::Name("__proto__".to_string()))
+            {
+                self.prototype_values_of(file, &property.value, key, found);
+            }
+        }
+    }
+
+    fn class_values_of(
+        &mut self,
+        (file, class): ClassSite<'a>,
+        (exact, inherited): (bool, bool),
         placement: Placement,
         key: &MemberKey,
         found: &mut MemberValues<'a>,
@@ -2011,7 +2437,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut classes = Vec::new();
         let lineage = self.lineage_of(file, class);
 
-        for (position, candidate) in lineage.iter().enumerate() {
+        for (position, candidate) in lineage.iter().enumerate().skip(usize::from(inherited)) {
             if !self.elements_keyed(*candidate, key, placement).is_empty() {
                 classes.push(*candidate);
 
@@ -2219,7 +2645,42 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 found
             }
-            _ => Vec::new(),
+            other => {
+                let Some(member) = member_expression_of(other) else {
+                    return Vec::new();
+                };
+                let Some(key) = self.member_key_of(file, member) else {
+                    return Vec::new();
+                };
+                let mut receiver = Receiver::default();
+
+                if !self.enter_targets() {
+                    self.leave_targets();
+
+                    return Vec::new();
+                }
+
+                self.collect_receiver(file, member.object(), &mut HashSet::new(), &mut receiver);
+
+                let values = self
+                    .member_candidates_of(file, member.object(), &receiver, &key)
+                    .values;
+                let mut found = Vec::new();
+
+                for (target, value) in values {
+                    for class in self.classes_of_expression(target, value, depth + 1) {
+                        if !found.iter().any(|(file, known): &ClassSite<'a>| {
+                            *file == class.0 && known.node_id() == class.1.node_id()
+                        }) {
+                            found.push(class);
+                        }
+                    }
+                }
+
+                self.leave_targets();
+
+                found
+            }
         }
     }
 
@@ -2998,30 +3459,36 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut classes: Vec<(Site, Placement)> = Vec::new();
 
         for origin in &receiver.origins {
-            match *origin {
-                Origin::Instance { file, class, exact }
-                | Origin::Constructor { file, class, exact } => {
-                    let placement = match origin {
-                        Origin::Constructor { .. } => Placement::Static,
-                        _ => Placement::Instance,
-                    };
-                    let mut related = self.lineage_sites_of(file, class);
-
-                    if !exact {
-                        related.extend(
-                            self.subclasses_of(file, class)
-                                .into_iter()
-                                .map(|(file, class)| (file, class.node_id())),
-                        );
-                    }
-
-                    for site in related {
-                        if !classes.contains(&(site, placement)) {
-                            classes.push((site, placement));
-                        }
-                    }
+            let (file, class, exact, placement) = match *origin {
+                Origin::Instance { file, class, exact } => {
+                    (file, class, exact, Placement::Instance)
                 }
-                Origin::Object { .. } | Origin::Function { .. } => {}
+                Origin::Constructor { file, class, exact } => {
+                    (file, class, exact, Placement::Static)
+                }
+                Origin::HomeClass {
+                    file,
+                    class,
+                    placement,
+                } => (file, class, true, placement),
+                Origin::Object { .. } | Origin::Function { .. } | Origin::HomeObject { .. } => {
+                    continue
+                }
+            };
+            let mut related = self.lineage_sites_of(file, class);
+
+            if !exact {
+                related.extend(
+                    self.subclasses_of(file, class)
+                        .into_iter()
+                        .map(|(file, class)| (file, class.node_id())),
+                );
+            }
+
+            for site in related {
+                if !classes.contains(&(site, placement)) {
+                    classes.push((site, placement));
+                }
             }
         }
 

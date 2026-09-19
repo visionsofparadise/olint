@@ -20,6 +20,8 @@ use crate::unknowns::UnknownReason;
 use crate::values::{ArgumentFacts, SizeQuantity, ValueFacts, ValueId};
 use crate::walker::tagged_reading_of;
 
+const MAXIMUM_PATTERN_ALIASES: usize = 8;
+
 #[cfg(test)]
 #[path = "summaries.test.rs"]
 mod tests;
@@ -1853,37 +1855,61 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             _ => declaration.and_then(|declaration| self.declarations.function_of(declaration)),
         };
-        let callback = None;
-        let mut preference = Preference::Absent;
 
-        if let Some((target, function)) = function {
-            let Some(captured) = self.inherited_substitutions_of(target, function) else {
-                return ArgumentFacts {
-                    value,
-                    callback: Some(self.deferred_unknown(
-                        file,
-                        argument.span(),
-                        UnknownReason::ResourceExhaustion,
-                    )),
-                    preference: Preference::Unmarked,
-                };
-            };
-            let Ok(key) = self.key_of(target, function, &captured) else {
-                self.scheduler.exhausted = true;
+        if let (None, Some(Expression::Identifier(reference))) = (function, expression) {
+            if let Some(facts) = self.pattern_argument_facts_of(file, reference, !callback_open) {
+                return facts;
+            }
 
-                return ArgumentFacts {
-                    value,
-                    callback: Some(self.deferred_unknown(
-                        file,
-                        argument.span(),
-                        UnknownReason::ResourceExhaustion,
-                    )),
-                    preference: Preference::Unmarked,
-                };
-            };
-            let descriptor = if let Some(id) = self.scheduler.callback_keys.get(&key) {
-                Some(*id)
-            } else if self.charge_work(Event::CallbackDescriptor, 1) {
+            if self.is_pattern_reference(file, reference) {
+                let targets = self.callable_targets_of(file, expression.unwrap());
+
+                if let [known] = targets.known[..] {
+                    let function = self.function_at(known);
+
+                    return self.callback_facts_of(
+                        (file, argument.span()),
+                        value,
+                        (known.file, function),
+                        targets.open,
+                    );
+                }
+            }
+        }
+
+        match function {
+            Some((target, function)) => self.callback_facts_of(
+                (file, argument.span()),
+                value,
+                (target, function),
+                callback_open,
+            ),
+            None => ArgumentFacts {
+                value,
+                callback: None,
+                preference: Preference::Absent,
+            },
+        }
+    }
+
+    fn callback_facts_of(
+        &mut self,
+        origin: (FileId, oxc_span::Span),
+        value: ValueFacts,
+        (target, function): (FileId, FunctionNode<'a>),
+        callback_open: bool,
+    ) -> ArgumentFacts {
+        let Some(captured) = self.inherited_substitutions_of(target, function) else {
+            return self.exhausted_callback_facts_of(origin, value);
+        };
+        let Ok(key) = self.key_of(target, function, &captured) else {
+            self.scheduler.exhausted = true;
+
+            return self.exhausted_callback_facts_of(origin, value);
+        };
+        let descriptor = match self.scheduler.callback_keys.get(&key).copied() {
+            Some(id) => id,
+            None if self.charge_work(Event::CallbackDescriptor, 1) => {
                 let id = self.scheduler.callbacks.len();
 
                 self.scheduler.callbacks.push(CallbackDescriptor {
@@ -1893,43 +1919,150 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 });
                 self.scheduler.callback_keys.insert(key, id);
 
-                Some(id)
-            } else {
-                return ArgumentFacts {
-                    value,
-                    callback: Some(self.deferred_unknown(
-                        file,
-                        argument.span(),
-                        UnknownReason::ResourceExhaustion,
-                    )),
-                    preference: Preference::Unmarked,
-                };
-            };
-
-            if let Some(descriptor) = descriptor {
-                value = self.values.callback(descriptor);
-                value.targets = TargetSet {
-                    known: vec![FunctionId {
-                        file: target,
-                        node: function.node_id(),
-                    }],
-                    open: callback_open,
-                };
-
-                self.scheduler
-                    .callback_values
-                    .insert(value.value, descriptor);
-
-                preference = self
-                    .function_preference_of(target, function)
-                    .unwrap_or(Preference::Unmarked);
+                id
             }
-        }
+            None => return self.exhausted_callback_facts_of(origin, value),
+        };
+        let mut value = self.values.callback(descriptor);
+
+        value.targets = TargetSet {
+            known: vec![FunctionId {
+                file: target,
+                node: function.node_id(),
+            }],
+            open: callback_open,
+        };
+
+        self.scheduler
+            .callback_values
+            .insert(value.value, descriptor);
 
         ArgumentFacts {
             value,
-            callback,
-            preference,
+            callback: None,
+            preference: self
+                .function_preference_of(target, function)
+                .unwrap_or(Preference::Unmarked),
+        }
+    }
+
+    fn exhausted_callback_facts_of(
+        &mut self,
+        (file, span): (FileId, oxc_span::Span),
+        value: ValueFacts,
+    ) -> ArgumentFacts {
+        ArgumentFacts {
+            value,
+            callback: Some(self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion)),
+            preference: Preference::Unmarked,
+        }
+    }
+
+    pub(crate) fn pattern_argument_facts_of(
+        &self,
+        file: FileId,
+        reference: &'a oxc_ast::ast::IdentifierReference<'a>,
+        closed: bool,
+    ) -> Option<ArgumentFacts> {
+        if !closed {
+            return None;
+        }
+
+        let (mut file, mut reference) = (file, reference);
+
+        for _ in 0..MAXIMUM_PATTERN_ALIASES {
+            let binding = self
+                .declarations
+                .binding_of_reference(self.project, file, reference)?;
+
+            if let Some(facts) = self.pattern_callback_of(binding) {
+                return Some(facts);
+            }
+
+            let Some(Declaration::Variable {
+                file: target,
+                declarator,
+                constant: true,
+            }) = self.declarations.of_binding(self.project, binding)
+            else {
+                return None;
+            };
+            let Some(Expression::Identifier(next)) = declarator.init.as_ref().map(unwrap) else {
+                return None;
+            };
+
+            (file, reference) = (target, next);
+        }
+
+        None
+    }
+
+    fn is_pattern_reference(
+        &self,
+        file: FileId,
+        reference: &'a oxc_ast::ast::IdentifierReference<'a>,
+    ) -> bool {
+        match self
+            .declarations
+            .of_reference(self.project, file, reference)
+        {
+            Some(Declaration::Variable { declarator, .. }) => {
+                !matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+            }
+            Some(Declaration::Parameter {
+                parameter: crate::declarations::ParameterNode::Formal(parameter),
+                ..
+            }) => !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)),
+            _ => false,
+        }
+    }
+
+    fn pattern_callback_of(&self, binding: Binding) -> Option<ArgumentFacts> {
+        self.current_substitutions
+            .get(&binding)
+            .filter(|facts| {
+                self.scheduler
+                    .callback_values
+                    .contains_key(&facts.value.value)
+            })
+            .cloned()
+    }
+
+    fn substitute_pattern_callbacks(
+        &mut self,
+        file: FileId,
+        parameter: &'a oxc_ast::ast::FormalParameter<'a>,
+        (call_file, argument): (FileId, &'a Expression<'a>),
+        substitutions: &mut Substitutions,
+    ) {
+        let mut sources = vec![(call_file, argument)];
+
+        sources.extend(
+            parameter
+                .initializer
+                .iter()
+                .map(|initializer| (file, &**initializer)),
+        );
+
+        for identifier in parameter.pattern.get_binding_identifiers() {
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            let targets =
+                self.pattern_argument_targets_of(file, &parameter.pattern, symbol, sources.clone());
+            let [known] = targets.known[..] else {
+                continue;
+            };
+            let function = self.function_at(known);
+            let value = self.values.at(self.source_span(file, identifier.span));
+            let facts = self.callback_facts_of(
+                (call_file, argument.span()),
+                value,
+                (known.file, function),
+                targets.open,
+            );
+
+            substitutions.insert(Binding::Symbol { file, symbol }, facts);
         }
     }
 
@@ -2127,6 +2260,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for (index, parameter) in parameters.items.iter().enumerate() {
             let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                let argument = arguments
+                    .get(index)
+                    .and_then(Argument::as_expression)
+                    .filter(|_| {
+                        !arguments[..index]
+                            .iter()
+                            .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+                    });
+
+                if let Some(argument) = argument {
+                    self.substitute_pattern_callbacks(
+                        file,
+                        parameter,
+                        (call_file, argument),
+                        &mut substitutions,
+                    );
+                }
+
                 continue;
             };
             let facts = match arguments.get(index) {

@@ -169,7 +169,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             }
 
-            let parameter = matches!(declaration, Some(Declaration::Parameter { .. }));
+            let parameter = declaration
+                .is_some_and(|declaration| self.parameter_binding_of(declaration).is_some());
 
             if !parameter && (!closed || resolved.targets.known.is_empty()) {
                 let values = self.callable_targets_of(file, callee);
@@ -185,7 +186,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let Some(member) = member_expression_of(callee) else {
-            return self.resolved_of_declaration(None, false);
+            let targets = self.callable_targets_of(file, callee);
+
+            return ResolvedCallee {
+                declaration: None,
+                closed: !targets.open,
+                targets,
+            };
         };
         let dispatch = self.member_dispatch_of(file, member);
         let mut resolved = if let Some(declaration) =
