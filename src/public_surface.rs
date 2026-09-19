@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, Class, ClassElement, Expression, ForStatementLeft,
-    IdentifierReference, ImportOrExportKind, ObjectPropertyKind, PropertyKey, Statement,
-    TSAccessibility, TSNamespaceDeclarationBody,
+    Argument, AssignmentTarget, Class, ClassElement, Expression, ForStatementLeft, Function,
+    IdentifierReference, ImportOrExportKind, ObjectPropertyKind, PropertyKey, PropertyKind,
+    Statement, TSAccessibility, TSNamespaceDeclarationBody,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
@@ -20,10 +20,13 @@ use crate::directives::PerfTag;
 use crate::effects::{value_flow_of, ValueFlow};
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Resolved};
+use crate::receivers::{this_owner_of, Placement, ThisOwner};
 use crate::syntax::{member_expression_of, unwrap};
 use crate::unknowns::{SourceSpan, UnknownReason};
 
 use super::{ApplicableLimit, PublicFunction};
+
+const MAXIMUM_RETURNED_DEPTH: usize = 8;
 
 pub(super) struct Discovery<'a> {
     pub functions: Vec<PublicFunction<'a>>,
@@ -903,6 +906,7 @@ impl<'a> Walk<'_, '_, 'a> {
             AstKind::Function(function) => {
                 if function.body.is_some() {
                     self.function(file, FunctionNode::Function(function));
+                    self.function_results(file, function);
                 } else {
                     self.issue(site, UnknownReason::Target);
                 }
@@ -984,6 +988,161 @@ impl<'a> Walk<'_, '_, 'a> {
             | AstKind::TSEnumDeclaration(_) => {}
             _ => self.issue(site, UnknownReason::Target),
         }
+    }
+
+    fn function_results(&mut self, file: FileId, function: &'a Function<'a>) {
+        let nodes = self.analysis.project.file(file).semantic.nodes();
+        let target = FunctionId {
+            file,
+            node: function.node_id(),
+        };
+        let getter = match nodes.parent_kind(function.node_id()) {
+            AstKind::MethodDefinition(method) => method.kind.is_get(),
+            AstKind::ObjectProperty(property) => property.kind == PropertyKind::Get,
+            _ => false,
+        };
+
+        if getter {
+            for value in self
+                .analysis
+                .returned_expressions_of(target)
+                .into_iter()
+                .rev()
+            {
+                self.surfaced_value(file, function.span, value, 0);
+            }
+        }
+
+        self.receiver_installs(target, &mut HashSet::new());
+    }
+
+    fn surfaced_value(
+        &mut self,
+        file: FileId,
+        scope: oxc_span::Span,
+        value: &'a Expression<'a>,
+        depth: usize,
+    ) {
+        if self.analysis.is_non_callable_expression(file, value) {
+            return;
+        }
+
+        let local = match unwrap(value) {
+            Expression::Identifier(reference) => matches!(
+                self.analysis.declarations.of_reference(self.analysis.project, file, reference),
+                Some(Declaration::Variable { file: owner, declarator, .. })
+                    if owner == file && scope.contains_inclusive(declarator.span)
+            )
+            .then_some(reference),
+            _ => None,
+        };
+        let Some(reference) = local else {
+            return self.node(file, value.node_id());
+        };
+
+        match self.analysis.local_values_of(file, reference) {
+            Some(values) if depth < MAXIMUM_RETURNED_DEPTH => {
+                for (owner, value) in values {
+                    self.surfaced_value(owner, scope, value, depth + 1);
+                }
+            }
+            _ => self.issue(self.site(file, value.node_id()), UnknownReason::Target),
+        }
+    }
+
+    fn receiver_installs(&mut self, function: FunctionId, visited: &mut HashSet<FunctionId>) {
+        if !visited.insert(function) {
+            return;
+        }
+
+        let file = function.file;
+        let nodes = self.analysis.project.file(file).semantic.nodes();
+
+        for receiver in self.analysis.receiver_nodes_of(function) {
+            match value_flow_of(nodes, receiver) {
+                ValueFlow::Member => {
+                    if let Some(write) = surface_write_of(nodes, receiver) {
+                        let scope = nodes.kind(function.node).span();
+
+                        self.receiver_install(file, scope, receiver, write);
+                    }
+                }
+                ValueFlow::Receiver(call) => {
+                    let AstKind::CallExpression(expression) = nodes.kind(call) else {
+                        continue;
+                    };
+
+                    for target in self
+                        .analysis
+                        .resolved_callee_of(file, expression)
+                        .targets
+                        .known
+                    {
+                        self.receiver_installs(target, visited);
+                    }
+                }
+                ValueFlow::Alias(site) | ValueFlow::Stored(site) | ValueFlow::Argument(site, _) => {
+                    self.issue(self.site(file, site), UnknownReason::Target)
+                }
+                ValueFlow::Read | ValueFlow::Escaped(_) => {}
+            }
+        }
+    }
+
+    fn receiver_install(
+        &mut self,
+        file: FileId,
+        scope: oxc_span::Span,
+        receiver: NodeId,
+        write: NodeId,
+    ) {
+        if !self.may_install_callable(file, write) {
+            return;
+        }
+
+        let project = self.analysis.project;
+        let instance = matches!(
+            this_owner_of(project, file, receiver),
+            Some(ThisOwner::Class {
+                placement: Placement::Instance,
+                ..
+            })
+        );
+
+        match project.file(file).semantic.nodes().kind(write) {
+            AstKind::AssignmentExpression(assignment)
+                if assignment.operator.is_assign() || assignment.operator.is_logical() =>
+            {
+                if !(instance && self.is_caller_value(file, &assignment.right)) {
+                    self.surfaced_value(file, scope, &assignment.right, 0);
+                }
+            }
+            AstKind::CallExpression(call)
+                if instance
+                    && call.arguments.iter().all(|argument| match argument {
+                        Argument::SpreadElement(spread) => {
+                            self.is_caller_value(file, &spread.argument)
+                        }
+                        argument => argument.as_expression().is_some_and(|argument| {
+                            self.is_caller_value(file, argument)
+                                || self.analysis.is_non_callable_expression(file, argument)
+                        }),
+                    }) => {}
+            _ => self.issue(self.site(file, write), UnknownReason::Target),
+        }
+    }
+
+    fn is_caller_value(&self, file: FileId, value: &Expression<'a>) -> bool {
+        matches!(
+            unwrap(value),
+            Expression::Identifier(reference)
+                if matches!(
+                    self.analysis
+                        .declarations
+                        .of_reference(self.analysis.project, file, reference),
+                    Some(Declaration::Parameter { .. })
+                )
+        )
     }
 
     fn class(&mut self, mut file: FileId, mut class: &'a Class<'a>) {

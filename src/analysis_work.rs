@@ -25,9 +25,10 @@ pub enum Event {
     RecurrenceContext,
     InvocationObservation,
     SemanticIdentity,
+    DispatchStep,
 }
 
-pub const EVENTS: [Event; 22] = [
+pub const EVENTS: [Event; 23] = [
     Event::TaskKey,
     Event::Publication,
     Event::BodyPass,
@@ -50,6 +51,7 @@ pub const EVENTS: [Event; 22] = [
     Event::RecurrenceContext,
     Event::InvocationObservation,
     Event::SemanticIdentity,
+    Event::DispatchStep,
 ];
 const COUNT: usize = EVENTS.len();
 

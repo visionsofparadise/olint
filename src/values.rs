@@ -16,9 +16,13 @@ use crate::unknowns::UnknownReason;
 
 #[path = "primitive_values.rs"]
 mod primitive;
+
+#[path = "value_targets.rs"]
+mod targets;
 pub use primitive::{
     CertifiedValues, Failure, Limits, Primitive, PrimitiveAdapter, ValueResult, Work,
 };
+pub(crate) use targets::PrototypeMembers;
 
 use crate::cost::{Cost, CostError, Domain, Part, Preference};
 use crate::declarations::TargetSet;
@@ -66,6 +70,7 @@ pub struct Values {
     labels: Vec<String>,
     primitive_limits: Limits,
     primitive_files: HashMap<FileId, PrimitiveFile>,
+    targets: targets::TargetIndex,
 }
 
 #[derive(Clone, Debug)]

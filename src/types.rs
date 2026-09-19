@@ -153,6 +153,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         call: &'a CallExpression<'a>,
     ) -> ResolvedCallee<'a> {
+        let exhaustions = self.target_exhaustions();
+        let resolved = self.resolved_callee_within(file, call);
+
+        if self.target_exhaustions() > exhaustions {
+            self.mark_call_exhausted(file, call.node_id());
+        }
+
+        resolved
+    }
+
+    fn resolved_callee_within(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> ResolvedCallee<'a> {
         let callee = unwrap(&call.callee);
 
         if let Expression::Identifier(reference) = callee {
@@ -167,16 +182,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         .runtime_candidates_of(self.project, file, reference)
                 {
                     if let Some((file, function)) = self.declarations.function_of(candidate) {
-                        let known = FunctionId {
-                            file,
-                            node: function.node_id(),
-                        };
-
-                        if !resolved.targets.known.contains(&known) {
-                            resolved.targets.known.push(known);
-                        }
+                        push_known(
+                            &mut resolved.targets,
+                            FunctionId {
+                                file,
+                                node: function.node_id(),
+                            },
+                        );
                     }
                 }
+            }
+
+            let parameter = matches!(declaration, Some(Declaration::Parameter { .. }));
+
+            if !parameter && (!closed || resolved.targets.known.is_empty()) {
+                let values = self.callable_targets_of(file, callee);
+
+                for known in values.known {
+                    push_known(&mut resolved.targets, known);
+                }
+
+                resolved.targets.open = !closed || values.open || resolved.targets.known.is_empty();
             }
 
             return resolved;
@@ -185,26 +211,43 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(member) = member_expression_of(callee) else {
             return self.resolved_of_declaration(None, false);
         };
-
-        if let Some(declaration) = self
-            .declarations
-            .member_of_receiver(self.project, file, member)
+        let dispatch = self.member_dispatch_of(file, member);
+        let mut resolved = if let Some(declaration) =
+            self.declarations
+                .member_of_receiver(self.project, file, member)
         {
             let declaration = self
                 .declarations
                 .executable_declaration(self.project, declaration);
 
-            return self.resolved_of_declaration(Some(declaration), false);
-        }
-
-        let MemberExpression::StaticMemberExpression(access) = member else {
-            return self.resolved_of_declaration(None, false);
+            self.resolved_of_declaration(Some(declaration), false)
+        } else {
+            match member {
+                MemberExpression::StaticMemberExpression(access) => {
+                    match self.callee_candidates_of(file, access.span) {
+                        Some(answer) => self.resolved_of_callee_answer(&answer),
+                        None => self.resolved_of_declaration(None, false),
+                    }
+                }
+                _ => self.resolved_of_declaration(None, false),
+            }
         };
 
-        match self.callee_candidates_of(file, access.span) {
-            Some(answer) => self.resolved_of_callee_answer(&answer),
-            None => self.resolved_of_declaration(None, false),
+        for known in dispatch.known {
+            if !resolved.targets.known.contains(&known) {
+                resolved.targets.known.push(known);
+
+                resolved.targets.open = true;
+                resolved.closed = false;
+            }
         }
+
+        if dispatch.replaced {
+            resolved.targets.open = true;
+            resolved.closed = false;
+        }
+
+        resolved
     }
 
     pub(crate) fn resolved_member_of(
@@ -247,6 +290,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     pub fn set_pass(&mut self, pass: TscPass) {
         self.pass = pass;
+
+        self.forget_dispatches();
     }
 
     pub fn needed_queries(&self) -> Vec<Query> {
@@ -279,6 +324,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.tsc_info = format!("typescript {} at {}", reply.typescript, reply.from);
 
         self.needed.clear();
+        self.forget_dispatches();
 
         Ok(())
     }
@@ -287,6 +333,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.reset_between_passes();
         self.needed.clear();
         self.answers.clear();
+        self.forget_dispatches();
 
         self.pass = TscPass::Off;
     }
@@ -412,6 +459,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 node: function.node_id(),
             },
         ))
+    }
+}
+
+fn push_known(targets: &mut TargetSet, known: FunctionId) {
+    if !targets.known.contains(&known) {
+        targets.known.push(known);
     }
 }
 

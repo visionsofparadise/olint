@@ -82,6 +82,7 @@ pub struct Analysis<'p, 'a> {
     pub(crate) budget_storage: HashMap<FunctionId, Storage>,
     pub(crate) dynamic_scopes: HashMap<(FileId, NodeId), (bool, bool)>,
     pub(crate) unclassified_writes: HashMap<(Binding, Option<NodeId>), bool>,
+    pub(crate) prototype_members: crate::values::PrototypeMembers<'a>,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -116,6 +117,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             budget_storage: HashMap::new(),
             dynamic_scopes: HashMap::new(),
             unclassified_writes: HashMap::new(),
+            prototype_members: HashMap::new(),
         }
     }
 }

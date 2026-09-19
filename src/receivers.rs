@@ -1,6 +1,6 @@
 use oxc_ast::ast::{
-    Class, ClassElement, Expression, IdentifierReference, MemberExpression, ObjectPropertyKind,
-    PropertyKey, TSType,
+    Class, ClassElement, Expression, IdentifierReference, MemberExpression, ObjectExpression,
+    ObjectPropertyKind, PropertyKey, TSType,
 };
 use oxc_ast::AstKind;
 
@@ -12,8 +12,8 @@ use crate::syntax::{member_name_of, unwrap, unwrap_to_cast};
 const MAXIMUM_BASE_CLASSES: usize = 32;
 const MAXIMUM_ALIASES: usize = 8;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Placement {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
     Static,
     Instance,
     Either,
@@ -30,7 +30,14 @@ impl<'a> Declarations<'a> {
         let object = unwrap_to_cast(callee.object());
 
         if let Expression::ThisExpression(_) = object {
-            let (target, class, placement) = class_of_this(project, file, callee)?;
+            let Some(ThisOwner::Class {
+                file: target,
+                class,
+                placement,
+            }) = this_owner_of(project, file, member_node_id_of(callee))
+            else {
+                return None;
+            };
 
             if self.is_member_first_declared_by_interface(project, target, class, &name) {
                 return None;
@@ -82,23 +89,7 @@ impl<'a> Declarations<'a> {
             _ => {}
         }
 
-        let annotation = declarator_of_identifier(&declaration)
-            .and_then(|(target, declarator, _)| {
-                declarator
-                    .type_annotation
-                    .as_ref()
-                    .map(|annotation| (target, &annotation.type_annotation))
-            })
-            .or_else(|| {
-                formal_parameter_of_identifier(&declaration).and_then(|(target, parameter)| {
-                    parameter
-                        .type_annotation
-                        .as_ref()
-                        .map(|annotation| (target, &annotation.type_annotation))
-                })
-            });
-
-        if let Some((target, annotated)) = annotation {
+        if let Some((target, annotated)) = annotation_of(&declaration) {
             let (class_file, class) = self.class_of_type(project, target, annotated)?;
 
             return self.inherited_member_of(
@@ -192,18 +183,27 @@ impl<'a> Declarations<'a> {
                 });
             }
 
-            let heritage = class.heritage.as_ref()?;
-            let Expression::Identifier(base) = unwrap_to_cast(&heritage.expression) else {
-                return None;
-            };
-
-            current = self.class_of_reference(project, file, base)?;
+            current = self.base_class_of(project, file, class)?;
         }
 
         None
     }
 
-    fn class_of_type(
+    pub(crate) fn base_class_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        class: &'a Class<'a>,
+    ) -> Option<(FileId, &'a Class<'a>)> {
+        let heritage = class.heritage.as_ref()?;
+        let Expression::Identifier(base) = unwrap_to_cast(&heritage.expression) else {
+            return None;
+        };
+
+        self.class_of_reference(project, file, base)
+    }
+
+    pub(crate) fn class_of_type(
         &self,
         project: &Project<'a>,
         file: FileId,
@@ -266,22 +266,69 @@ impl<'a> Declarations<'a> {
     }
 }
 
-fn class_of_this<'a>(
+pub(crate) fn annotation_of<'a>(declaration: &Declaration<'a>) -> Option<(FileId, &'a TSType<'a>)> {
+    declarator_of_identifier(declaration)
+        .and_then(|(target, declarator, _)| {
+            declarator
+                .type_annotation
+                .as_ref()
+                .map(|annotation| (target, &annotation.type_annotation))
+        })
+        .or_else(|| {
+            formal_parameter_of_identifier(declaration).and_then(|(target, parameter)| {
+                parameter
+                    .type_annotation
+                    .as_ref()
+                    .map(|annotation| (target, &annotation.type_annotation))
+            })
+        })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ThisOwner<'a> {
+    Class {
+        file: FileId,
+        class: &'a Class<'a>,
+        placement: Placement,
+    },
+    Object {
+        file: FileId,
+        object: &'a ObjectExpression<'a>,
+    },
+}
+
+pub(crate) fn this_owner_of<'a>(
     project: &Project<'a>,
     file: FileId,
-    callee: &'a MemberExpression<'a>,
-) -> Option<(FileId, &'a Class<'a>, Placement)> {
+    node: oxc_semantic::NodeId,
+) -> Option<ThisOwner<'a>> {
     let nodes = project.file(file).semantic.nodes();
     let mut placement = Placement::Either;
 
-    for ancestor in nodes.ancestors(member_node_id_of(callee)) {
+    for ancestor in nodes.ancestors(node) {
         match ancestor.kind() {
-            AstKind::Class(class) => return Some((file, class, placement)),
+            AstKind::Class(class) => {
+                return Some(ThisOwner::Class {
+                    file,
+                    class,
+                    placement,
+                })
+            }
             AstKind::Function(_) => match nodes.parent_kind(ancestor.id()) {
                 AstKind::MethodDefinition(method) if placement == Placement::Either => {
                     placement = placement_of(method.r#static);
                 }
                 AstKind::MethodDefinition(_) => {}
+                AstKind::ObjectProperty(_) if placement == Placement::Either => {
+                    let property = nodes.parent_id(ancestor.id());
+
+                    return match nodes.parent_kind(property) {
+                        AstKind::ObjectExpression(object) => {
+                            Some(ThisOwner::Object { file, object })
+                        }
+                        _ => None,
+                    };
+                }
                 _ => return None,
             },
             AstKind::PropertyDefinition(property) if placement == Placement::Either => {

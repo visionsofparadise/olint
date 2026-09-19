@@ -872,9 +872,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         span: Span,
         arguments: &'a [Argument<'a>],
+        reason: UnknownReason,
     ) -> Part {
         if targets.open {
-            let unknown = self.unknown_invocation(file, span, arguments, UnknownReason::Target);
+            let unknown = self.unknown_invocation(file, span, arguments, reason);
 
             part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
         }
@@ -918,7 +919,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             };
             let part = callee.called(self.source_span(file, new.span), &mut self.unknowns);
-            let part = self.with_open_remainder(part, &targets, file, new.span, &new.arguments);
+            let part = self.with_open_remainder(
+                part,
+                &targets,
+                file,
+                new.span,
+                &new.arguments,
+                UnknownReason::Target,
+            );
 
             reading = self.append_call(reading, target, function, part, cyclic);
         }
@@ -1041,6 +1049,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             targets,
         } = self.resolved_callee_of(file, call);
         let site = self.site_of_node(file, call.node_id());
+        let exhausted = self.is_call_exhausted(file, call.node_id());
+        let reason = match exhausted {
+            true => UnknownReason::ResourceExhaustion,
+            false => UnknownReason::Target,
+        };
 
         if let (Some(Declaration::Parameter { parameter, .. }), Some(reference)) =
             (declaration, identifier_of(callee))
@@ -1132,16 +1145,79 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
 
             let part = called.called(self.source_span(file, call.span), &mut self.unknowns);
-            let part = self.with_open_remainder(part, &targets, file, call.span, &call.arguments);
+            let part =
+                self.with_open_remainder(part, &targets, file, call.span, &call.arguments, reason);
 
             reading = self.append_call(reading, target, function, part, cyclic);
         }
 
         if !targets.known.is_empty() {
+            if self.intrinsic_replaced_of(file, callee)
+                && self.has_intrinsic_model(file, call, member)
+            {
+                let intrinsic =
+                    self.intrinsic_reading_of(file, call, member, Reading::empty(), site);
+
+                reading = reading.merge(intrinsic, &mut self.unknowns, &mut self.traces);
+            }
+
             return reading;
         }
 
         self.record_unknown_reach(file, Some(&call.callee), &call.arguments, call.span);
+
+        if exhausted {
+            let unknown = self.unknown_invocation(file, call.span, &call.arguments, reason);
+
+            return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        if self.intrinsic_replaced_of(file, callee) {
+            let unknown = self.unknown_invocation(file, call.span, &call.arguments, reason);
+
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        self.intrinsic_reading_of(file, call, member, reading, site)
+    }
+
+    fn has_intrinsic_model(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        member: Option<&'a MemberExpression<'a>>,
+    ) -> bool {
+        let Some(member) = member else {
+            return identifier_of(unwrap(&call.callee)).is_some_and(|reference| {
+                is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str())
+            });
+        };
+        let method = member_name_of(member).unwrap_or_default();
+        let receiver = member.object();
+
+        if identifier_of(receiver).is_some_and(|global| {
+            GLOBAL_LINEAR.iter().any(|(name, methods)| {
+                *name == global.name.as_str() && methods.contains(&method.as_str())
+            })
+        }) {
+            return true;
+        }
+
+        matches!(
+            self.kind_of(file, receiver, &method),
+            Kind::Array | Kind::Set | Kind::Map | Kind::String | Kind::RegExp
+        )
+    }
+
+    fn intrinsic_reading_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        member: Option<&'a MemberExpression<'a>>,
+        reading: Reading,
+        site: Site,
+    ) -> Reading {
+        let callee = unwrap(&call.callee);
 
         if let Some(member) = member {
             return self.cost_of_method_call(file, call, member, reading, site);

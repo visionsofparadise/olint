@@ -1167,3 +1167,223 @@ fn callee_target_spans_index_each_file_once() {
     assert_eq!(doubled, doubled_nodes);
     assert!(doubled <= 2 * nodes + 1, "{doubled} {nodes}");
 }
+
+fn dispatch_source(sites: usize) -> String {
+    let mut lines = vec![
+        "class C0 { work(xs: number[]) { for (const x of xs) void x; } run(xs: number[]) { this.work(xs); } }".to_string(),
+    ];
+
+    for index in 1..4 {
+        lines.push(format!(
+            "class C{index} extends C{} {{ work(xs: number[]) {{ for (const x of xs) void x; }} }}",
+            index - 1
+        ));
+    }
+
+    for index in 0..sites {
+        lines.push(format!(
+            "export function f{index}(c: C{}, xs: number[]) {{ const o = {{ m: (ys: number[]) => ys.length }}; o.m = (ys: number[]) => ys.indexOf(1); o.m(xs); c.work(xs); c.run(xs); return xs.includes(0); }}",
+            index % 4
+        ));
+        lines.push(format!(
+            "export class K{index} {{ items: number[] = []; constructor() {{ this.items = []; }} run(xs: number[]) {{ this.items.push(xs.length); }} }}"
+        ));
+        lines.push(format!(
+            "export function g{index}(target: any, name: string, xs: number[]) {{ target[name] = () => xs.length; return xs.includes(1); }}"
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn dispatch_counts_of(sites: usize) -> Vec<u64> {
+    let mut counts = Vec::new();
+
+    run_with_source(&dispatch_source(sites), |analysis, _| {
+        for (file, function) in analysis.reportable() {
+            analysis.summarize(file, function);
+        }
+
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+
+        counts = [
+            Event::DispatchStep,
+            Event::TaskKey,
+            Event::BodyPass,
+            Event::InvocationSite,
+            Event::WalkerNode,
+        ]
+        .iter()
+        .map(|event| stats.work.consumed(*event))
+        .collect();
+    });
+
+    counts
+}
+
+#[test]
+fn dispatch_work_grows_linearly_with_dispatch_sites() {
+    let base = dispatch_counts_of(0);
+    let single = dispatch_counts_of(32);
+    let double = dispatch_counts_of(64);
+
+    for (position, ((base, single), double)) in base.iter().zip(&single).zip(&double).enumerate() {
+        assert!(single > base, "{position}: {single} {base}");
+        assert_eq!(
+            double - base,
+            2 * (single - base),
+            "{position}: {base} {single} {double}"
+        );
+    }
+}
+
+fn prototype_chain_source(length: usize) -> String {
+    let mut lines = vec![
+        "function cube(xs: number[]) { for (const a of xs) for (const b of xs) void b; }"
+            .to_string(),
+    ];
+
+    for index in 0..length {
+        lines.push(format!("function C{index}() {{}}"));
+        lines.push(format!(
+            "(C{index} as any).prototype.m{index} = function (xs: number[]) {{ cube(xs); }};"
+        ));
+        lines.push(format!("const o{index}: any = {{ k{index}: cube }};"));
+    }
+
+    for index in 1..length {
+        lines.push(format!(
+            "Object.setPrototypeOf((C{index} as any).prototype, (C{} as any).prototype);",
+            index - 1
+        ));
+        lines.push(format!("Object.setPrototypeOf(o{}, o{index});", index - 1));
+    }
+
+    lines.push(format!(
+        "export function deep(xs: number[]) {{ o0.k{}(xs); new (C{} as any)().m0(xs); }}",
+        length - 1,
+        length - 1
+    ));
+    lines.push(
+        "export function unrelated(xs: number[]) { const ys = [1, 2]; return ys.includes(1) && xs.length; }"
+            .to_string(),
+    );
+
+    lines.join("\n")
+}
+
+fn prototype_chain_counts_of(length: usize) -> (u64, BTreeSet<UnknownReason>) {
+    let mut found = (0, BTreeSet::new());
+
+    run_with_source(&prototype_chain_source(length), |analysis, file| {
+        summary_of(analysis, file, "deep");
+
+        let unrelated = summary_of(analysis, file, "unrelated");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(
+            !stats.work.exhausted(Event::DispatchStep),
+            "{length}: {stats:?}"
+        );
+        assert!(
+            stats.work.consumed(Event::DispatchStep) <= 200 * length as u64,
+            "{length}: {stats:?}"
+        );
+
+        found = (
+            stats.work.consumed(Event::DispatchStep),
+            reasons(analysis, unrelated.unknowns),
+        );
+    });
+
+    found
+}
+
+#[test]
+fn prototype_chains_resolve_members_in_linear_dispatch_work() {
+    let counts: Vec<u64> = [8, 16, 32, 64]
+        .into_iter()
+        .map(|length| {
+            let (count, unrelated) = prototype_chain_counts_of(length);
+
+            assert!(
+                !unrelated.contains(&UnknownReason::Target),
+                "{length}: {unrelated:?}"
+            );
+
+            count
+        })
+        .collect();
+
+    for pair in counts.windows(2) {
+        assert!(4 * pair[1] <= 9 * pair[0], "{counts:?}");
+    }
+}
+
+fn inherited_same_member_tasks_of(length: usize) -> u64 {
+    let mut lines = vec![
+        "function cube(xs: number[]) { for (const a of xs) for (const b of xs) void b; }"
+            .to_string(),
+    ];
+
+    for index in 0..length {
+        lines.push(format!("function C{index}() {{}}"));
+        lines.push(format!(
+            "(C{index} as any).prototype.m = function (xs: number[]) {{ cube(xs); }};"
+        ));
+    }
+
+    for index in 1..length {
+        lines.push(format!(
+            "Object.setPrototypeOf((C{index} as any).prototype, (C{} as any).prototype);",
+            index - 1
+        ));
+    }
+
+    for index in 0..length {
+        lines.push(format!(
+            "export function f{index}(xs: number[]) {{ const c = new (C{index} as any)(); c.m(xs); }}"
+        ));
+    }
+
+    let mut tasks = 0;
+
+    run_with_source(
+        &lines.join(
+            "
+",
+        ),
+        |analysis, _| {
+            for (file, function) in analysis.reportable() {
+                analysis.summarize(file, function);
+            }
+
+            let stats = analysis.scheduler_stats();
+
+            assert_terminal(stats);
+            assert!(
+                !stats.work.exhausted(Event::DispatchStep),
+                "{length}: {stats:?}"
+            );
+
+            tasks = stats.work.consumed(Event::TaskKey);
+        },
+    );
+
+    tasks
+}
+
+#[test]
+fn inherited_same_members_keep_linear_task_counts() {
+    let counts: Vec<u64> = [8, 16, 32, 64]
+        .into_iter()
+        .map(inherited_same_member_tasks_of)
+        .collect();
+
+    for pair in counts.windows(2) {
+        assert!(4 * pair[1] <= 9 * pair[0], "{counts:?}");
+    }
+}

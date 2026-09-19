@@ -923,6 +923,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
         parameter: &'a FormalParameter<'a>,
         depth: u32,
     ) -> bool {
+        let Some(arguments) = self.call_arguments_of(file, function, parameter) else {
+            return false;
+        };
+
+        arguments.into_iter().all(|argument| {
+            argument.is_none_or(|(site, argument)| {
+                self.is_non_callable_nested_expression(site, argument, depth + 1)
+            })
+        })
+    }
+
+    pub(crate) fn call_arguments_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        parameter: &'a FormalParameter<'a>,
+    ) -> Option<Vec<Option<(FileId, &'a Expression<'a>)>>> {
         let project = self.project;
         let nodes = project.file(file).semantic.nodes();
         let (parameters, name) = match function {
@@ -937,16 +954,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 },
             ),
         };
-        let Some(index) = parameters
+        let index = parameters
             .items
             .iter()
-            .position(|item| std::ptr::eq(item, parameter))
-        else {
-            return false;
-        };
-        let Some(symbol) = name.and_then(|name| name.symbol_id.get()) else {
-            return false;
-        };
+            .position(|item| std::ptr::eq(item, parameter))?;
+        let symbol = name.and_then(|name| name.symbol_id.get())?;
         let binding = Binding::Symbol { file, symbol };
         let exported = project
             .file(file)
@@ -966,31 +978,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
             });
 
         if exported || !self.declarations.importers_of(project, binding).is_empty() {
-            return false;
+            return None;
         }
 
         let references = self.declarations.surface_references_of(project, binding);
+        let mut arguments = Vec::with_capacity(references.len());
 
-        references.into_iter().all(|(site, node, write)| {
+        for (site, node, write) in references {
             let nodes = project.file(site).semantic.nodes();
             let span = nodes.kind(node).span();
             let AstKind::CallExpression(call) = nodes.parent_kind(node) else {
-                return false;
+                return None;
             };
 
-            !write
-                && call.callee.span() == span
-                && call
+            if write
+                || call.callee.span() != span
+                || call
                     .arguments
                     .iter()
                     .take(index + 1)
-                    .all(|argument| !matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)))
-                && call.arguments.get(index).is_none_or(|argument| {
-                    argument.as_expression().is_some_and(|argument| {
-                        self.is_non_callable_nested_expression(site, argument, depth + 1)
-                    })
-                })
-        })
+                    .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)))
+            {
+                return None;
+            }
+
+            match call.arguments.get(index) {
+                Some(argument) => arguments.push(Some((site, argument.as_expression()?))),
+                None => arguments.push(None),
+            }
+        }
+
+        Some(arguments)
     }
 
     fn is_primitive_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {

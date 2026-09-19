@@ -226,3 +226,153 @@ fn declared_types_and_casts_hide_the_initializer() {
         ]
     );
 }
+
+fn label_of(
+    project: &olint::project::Project<'_>,
+    known: olint::declarations::FunctionId,
+) -> String {
+    use oxc_ast::AstKind;
+
+    let nodes = project.file(known.file).semantic.nodes();
+    let owner = |node| {
+        nodes
+            .ancestors(node)
+            .find_map(|ancestor| match ancestor.kind() {
+                AstKind::Class(class) => class.id.as_ref().map(|id| id.name.to_string()),
+                _ => None,
+            })
+    };
+
+    match nodes.parent_kind(known.node) {
+        AstKind::MethodDefinition(method) => format!(
+            "{}.{}",
+            owner(known.node).unwrap_or_default(),
+            method.key.static_name().unwrap_or_default()
+        ),
+        AstKind::ObjectProperty(property) => {
+            format!("{{}}.{}", property.key.static_name().unwrap_or_default())
+        }
+        _ => match nodes.kind(known.node) {
+            AstKind::Function(function) => function
+                .id
+                .as_ref()
+                .map_or_else(|| "function".to_string(), |id| id.name.to_string()),
+            _ => "arrow".to_string(),
+        },
+    }
+}
+
+fn dispatch_of(source: &str, callees: &[&str]) -> Vec<(Vec<String>, bool)> {
+    let files = [("tsconfig.json", "{}"), ("index.ts", source)];
+    let mut found = Vec::new();
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let mut analysis = olint::analysis::Analysis::new(project, support::SYNTACTIC);
+
+        for callee in callees {
+            let targets = analysis.callee_targets_of(file, support::call_of(project, file, callee));
+            let mut labels: Vec<String> = targets
+                .known
+                .iter()
+                .map(|known| label_of(project, *known))
+                .collect();
+
+            labels.sort();
+            found.push((labels, targets.open));
+        }
+    });
+
+    found
+}
+
+fn expected_of(cases: &[(&[&str], bool)]) -> Vec<(Vec<String>, bool)> {
+    cases
+        .iter()
+        .map(|(labels, open)| {
+            (
+                labels.iter().map(|label| label.to_string()).collect(),
+                *open,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn class_dispatch_joins_overrides_with_an_open_remainder() {
+    let source = "class Base {\n\twork(xs: number[]) {}\n\tinherited() {}\n\trun(xs: number[]) { this.work(xs); }\n\tstatic make() {}\n\tstatic build() { this.make(); }\n}\nclass Derived extends Base {\n\twork(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; }\n\tstatic make() {}\n}\nclass Leaf extends Derived {\n\twork(xs: number[]) {}\n}\nclass Unrelated {\n\twork(xs: number[]) {}\n}\nexport function f(x: Base, xs: number[]) {\n\tx.work(xs);\n\tnew Derived().work(xs);\n\tnew Leaf().inherited();\n\tBase.make();\n\t(x as any).work(xs);\n}";
+
+    assert_eq!(
+        dispatch_of(
+            source,
+            &[
+                "x.work",
+                "this.work",
+                "new Derived().work",
+                "new Leaf().inherited",
+                "Base.make",
+                "this.make",
+                "(x as any).work",
+            ]
+        ),
+        expected_of(&[
+            (&["Base.work", "Derived.work", "Leaf.work"], true),
+            (&["Base.work", "Derived.work", "Leaf.work"], true),
+            (&["Derived.work"], true),
+            (&["Base.inherited"], true),
+            (&["Base.make"], true),
+            (&["Base.make", "Derived.make"], true),
+            (&["Base.work", "Derived.work", "Leaf.work"], true),
+        ])
+    );
+}
+
+#[test]
+fn replaced_members_join_prototype_receiver_and_object_writes() {
+    let source = "function expensive(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; }\nfunction fast(xs: number[]) {}\nclass Base { work(xs: number[]) {} }\nclass Holder {\n\tconstructor() { this.run = fast; }\n\trun(xs: number[]) {}\n}\n(Base.prototype as any).work = expensive;\nconst obj = { work(xs: number[]) {} };\nobj.work = expensive;\nconst assigned = { work(xs: number[]) {} };\nObject.assign(assigned, { work: fast });\nconst holder = { inner: { run: fast } };\nclass K { get g() { return expensive; } }\nexport function f(x: Base, k: K, xs: number[]) {\n\tx.work(xs);\n\tnew Holder().run(xs);\n\tobj.work(xs);\n\tassigned.work(xs);\n\tholder.inner.run(xs);\n\tk.g(xs);\n}";
+
+    assert_eq!(
+        dispatch_of(
+            source,
+            &[
+                "x.work",
+                "new Holder().run",
+                "obj.work",
+                "assigned.work",
+                "holder.inner.run",
+                "k.g",
+            ]
+        ),
+        expected_of(&[
+            (&["Base.work", "expensive"], true),
+            (&["Holder.run", "fast"], true),
+            (&["expensive", "{}.work"], true),
+            (&["fast", "{}.work"], true),
+            (&["fast"], true),
+            (&["K.g", "expensive"], true),
+        ])
+    );
+}
+
+#[test]
+fn union_receivers_join_every_returned_object_member() {
+    let source = "function make(flag: boolean) {\n\treturn flag ? { work(xs: number[]) {} } : { work(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; } };\n}\nexport function f(flag: boolean, xs: number[], loose: { work(xs: number[]): void }) {\n\tmake(flag).work(xs);\n\tloose.work(xs);\n}";
+
+    assert_eq!(
+        dispatch_of(source, &["make(flag).work", "loose.work"]),
+        expected_of(&[(&["{}.work", "{}.work"], true), (&[], true)])
+    );
+}
+
+#[test]
+fn declared_types_keep_the_runtime_initializer_targets() {
+    let source = "interface IEngine { run(xs: number[]): void }\nclass Engine implements IEngine { run(xs: number[]) { for (const a of xs) for (const b of xs) void b; } }\nclass Base { run(xs: number[]) {} }\nclass Derived extends Base { run(xs: number[]) {} }\nexport function f(xs: number[]) {\n\tconst a: IEngine = new Engine();\n\ta.run(xs);\n\tconst b: Base = new Derived();\n\tb.run(xs);\n}";
+
+    assert_eq!(
+        dispatch_of(source, &["a.run", "b.run"]),
+        expected_of(&[
+            (&["Engine.run"], true),
+            (&["Base.run", "Derived.run"], true),
+        ])
+    );
+}

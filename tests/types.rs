@@ -23,7 +23,7 @@ fn recovered_callable_targets_keep_dispatch_closedness_separate() {
         &[
             ("work", 1, false),
             ("alias", 1, false),
-            ("mutable", 0, true),
+            ("mutable", 1, true),
             ("x", 0, true),
             ("helper.work", 1, true),
             ("new API().work", 1, true),
@@ -93,11 +93,69 @@ fn internal_import_equals_follows_assignments_and_qualified_names_with_cycle_gua
         &[
             ("work", 1, false),
             ("alias", 1, true),
-            ("equivalent", 1, true),
+            ("equivalent", 2, true),
             ("first", 0, true),
             ("forwarded", 1, true),
         ],
     );
+}
+
+#[test]
+fn runtime_values_join_initializer_and_write_targets() {
+    let files = [
+        ("tsconfig.json", r#"{"compilerOptions":{"allowJs":true}}"#),
+        (
+            "index.js",
+            "function dear(){} function a(){} function b(){} function work(){} var work = dear; const pick = globalThis.flag ? a : b; let current = a; current = b; function makeA(){ return a; } const made = makeA(); function run(xs, ys){work(); pick(); current(); made(); xs.map = b; xs.map(); const zs = [1]; zs.map(); ys.map();} const shared = [1]; shared.filter = a; other(shared); function other(ws){ws.filter();} const kept = [1]; kept.find = a; function third(vs){vs.find();}",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, "index.js");
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+        let expected: [(&str, &[&str], bool); 9] = [
+            ("work", &["dear", "work"], true),
+            ("pick", &["a", "b"], false),
+            ("current", &["a", "b"], true),
+            ("made", &["a"], false),
+            ("xs.map", &["b"], true),
+            ("zs.map", &["b"], true),
+            ("ys.map", &["b"], true),
+            ("ws.filter", &["a"], true),
+            ("vs.find", &[], true),
+        ];
+
+        for (callee, names, open) in expected {
+            let targets = analysis.callee_targets_of(file, call_of(project, file, callee));
+            let mut found: Vec<String> = targets
+                .known
+                .iter()
+                .map(
+                    |known| match project.file(file).semantic.nodes().kind(known.node) {
+                        oxc_ast::AstKind::Function(function) => function
+                            .id
+                            .as_ref()
+                            .map_or_else(String::new, |id| id.name.to_string()),
+                        _ => String::new(),
+                    },
+                )
+                .collect();
+
+            found.sort();
+
+            assert_eq!(
+                (found, targets.open),
+                (
+                    names
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect::<Vec<_>>(),
+                    open
+                ),
+                "{callee}"
+            );
+        }
+    });
 }
 
 fn assert_call_targets(files: &[(&str, &str)], expected: &[(&str, usize, bool)]) {
