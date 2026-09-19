@@ -270,3 +270,25 @@ fn deterministic_limits_precede_operations_and_allocations() {
         },
     );
 }
+
+#[test]
+fn value_origins_round_trip() {
+    let mut values = Values::default();
+    let origin = SourceSpan {
+        file: FileId(0),
+        start: 3,
+        end: 9,
+    };
+    let other = SourceSpan {
+        file: FileId(0),
+        start: 12,
+        end: 20,
+    };
+    let facts = values.allocation(origin);
+    let other_value = values.at(other).value;
+
+    assert_eq!(values.at(origin).value, facts.value);
+    assert_eq!(values.origin_of_value(facts.value), Some(origin));
+    assert_eq!(values.origin_of_value(other_value), Some(other));
+    assert_eq!(values.origin_of_value(ValueId(u32::MAX)), None);
+}

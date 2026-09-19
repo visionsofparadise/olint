@@ -461,6 +461,83 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.values.targets.summaries.clear();
         self.values.targets.exhausted_calls.clear();
         self.prototype_members.clear();
+        self.values.forget_sizes();
+    }
+
+    pub(crate) fn may_extend_inherited_keys(&mut self, kind: Kind) -> bool {
+        self.index_targets();
+
+        if OUTSIDE_SOURCES_REPLACE_BUILTINS || self.work_exhausted() {
+            return true;
+        }
+
+        if let Some(extended) = self.values.sizes.inherited.get(&kind) {
+            return *extended;
+        }
+
+        self.stats.count("sizes: inherited keys");
+
+        let mut extended = false;
+
+        for index in 0..self.values.targets.writes.len() {
+            if !self.charge_work(Event::SizeStep, 1) {
+                extended = true;
+
+                break;
+            }
+
+            let write = &self.values.targets.writes[index];
+            let (owner, _) = &self.values.targets.owners[index];
+
+            extended |= !matches!(write.kind, WriteKind::Removed | WriteKind::Prototype)
+                && match owner {
+                    Owner::Builtin { kind: written } => match written {
+                        None => true,
+                        Some(written) => {
+                            kind == Kind::Unknown || (kind != Kind::Other && *written == kind)
+                        }
+                    },
+                    Owner::Value {
+                        allocation,
+                        kind: written,
+                        ..
+                    } => {
+                        !allocation
+                            && (kind == Kind::Unknown
+                                || matches!(written, Kind::Unknown | Kind::Other)
+                                || *written == kind)
+                    }
+                    _ => false,
+                };
+
+            if extended {
+                break;
+            }
+        }
+
+        self.values.sizes.inherited.insert(kind, extended);
+
+        extended
+    }
+
+    pub(crate) fn builtin_members_replaced(&mut self, kind: Kind, names: &[&str]) -> bool {
+        self.index_targets();
+
+        if OUTSIDE_SOURCES_REPLACE_BUILTINS {
+            return true;
+        }
+
+        let keys = names
+            .iter()
+            .map(|name| Some(MemberKey::Name((*name).to_string())))
+            .chain(std::iter::once(None));
+        let mut replaced = false;
+
+        for key in keys {
+            replaced |= self.wide_summary_of(key, kind, false, true).replaced;
+        }
+
+        replaced || self.work_exhausted()
     }
 
     pub(crate) fn target_exhaustions(&self) -> u64 {

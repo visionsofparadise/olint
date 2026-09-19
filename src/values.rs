@@ -17,11 +17,16 @@ use crate::unknowns::UnknownReason;
 #[path = "primitive_values.rs"]
 mod primitive;
 
+#[path = "value_sizes.rs"]
+mod sizes;
+
 #[path = "value_targets.rs"]
 mod targets;
 pub use primitive::{
     CertifiedValues, Failure, Limits, Primitive, PrimitiveAdapter, ValueResult, Work,
 };
+pub(crate) use sizes::is_direct_call;
+pub use sizes::Cardinality;
 pub(crate) use targets::PrototypeMembers;
 
 use crate::cost::{Cost, CostError, Domain, Part, Preference};
@@ -63,6 +68,7 @@ pub struct ArgumentFacts {
 #[derive(Default)]
 pub struct Values {
     origins: HashMap<SourceSpan, ValueId>,
+    spans: HashMap<ValueId, SourceSpan>,
     allocations: std::collections::HashSet<ValueId>,
     callbacks: HashMap<usize, ValueId>,
     next_value: u32,
@@ -71,6 +77,7 @@ pub struct Values {
     primitive_limits: Limits,
     primitive_files: HashMap<FileId, PrimitiveFile>,
     targets: targets::TargetIndex,
+    sizes: sizes::SizeMemory,
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +217,14 @@ impl Values {
         facts
     }
 
+    pub fn origin_of_value(&self, value: ValueId) -> Option<SourceSpan> {
+        self.spans.get(&value).copied()
+    }
+
+    pub(crate) fn forget_sizes(&mut self) {
+        self.sizes = sizes::SizeMemory::default();
+    }
+
     pub fn is_allocation(&self, value: ValueId) -> bool {
         self.allocations.contains(&value)
     }
@@ -229,6 +244,7 @@ impl Values {
                 .expect("value arena fits u32");
 
             self.origins.insert(origin, value);
+            self.spans.insert(value, origin);
 
             value
         };
@@ -496,12 +512,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let Expression::Identifier(reference) = expression {
-            if let Some((target, initializer)) = self
+            if let Some(declaration) = self
                 .declarations
                 .of_reference(self.project, file, reference)
-                .and_then(constant_initializer_of)
             {
-                return self.primitive_length(target, initializer, depth + 1);
+                if let Some((target, initializer)) = constant_initializer_of(declaration) {
+                    if self.declaration_has_exact_size(declaration) {
+                        return self.primitive_length(target, initializer, depth + 1);
+                    }
+                }
             }
         }
 

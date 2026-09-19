@@ -8,7 +8,7 @@ use crate::analysis::Analysis;
 use crate::declarations::{
     declaration_of_node, Binding, Declaration, FunctionId, FunctionNode, ParameterNode, TargetSet,
 };
-use crate::declared_types::{DeclaredType, Kind};
+use crate::declared_types::Kind;
 use crate::project::FileId;
 use crate::syntax::{member_expression_of, unwrap};
 use crate::tables::method_matters;
@@ -86,30 +86,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.stats.count(&format!("kind: {}", kind_label_of(kind)));
 
         kind
-    }
-
-    pub fn is_tuple(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
-        let declared = self.declared_type_of_expression(file, e);
-
-        self.is_declared_tuple(declared)
-    }
-
-    pub(crate) fn is_declared_tuple(&mut self, declared: DeclaredType) -> bool {
-        if declared.tuple {
-            self.stats.count("types: tuple");
-        }
-
-        declared.tuple
-    }
-
-    pub fn is_closed(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
-        let declared = self.declared_type_of_expression(file, e);
-
-        if declared.closed {
-            self.stats.count("types: closed object");
-        }
-
-        declared.closed
     }
 
     pub fn callee_declaration_of(

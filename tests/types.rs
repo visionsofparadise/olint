@@ -384,7 +384,7 @@ fn compiler_type_descriptions_are_not_constant_size_evidence() {
 
         analysis.set_pass(TscPass::Recording);
 
-        assert!(!analysis.is_tuple(file, loose));
+        assert!(!analysis.is_constant_sized(file, loose));
         assert!(!analysis.is_closed(file, loose));
         assert!(analysis.needed_queries().is_empty());
 
@@ -399,7 +399,7 @@ fn compiler_type_descriptions_are_not_constant_size_evidence() {
         analysis.set_pass(TscPass::Answering);
 
         assert_eq!(analysis.kind_of(file, loose, "map"), Kind::Array);
-        assert!(!analysis.is_tuple(file, loose));
+        assert!(!analysis.is_constant_sized(file, loose));
         assert!(!analysis.is_closed(file, loose));
     });
 }

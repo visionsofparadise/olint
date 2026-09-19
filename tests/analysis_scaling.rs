@@ -1387,3 +1387,67 @@ fn inherited_same_members_keep_linear_task_counts() {
         assert!(4 * pair[1] <= 9 * pair[0], "{counts:?}");
     }
 }
+
+fn size_source(count: usize) -> String {
+    let mut lines = vec![
+        "export function f(flag: number): number {".to_string(),
+        "\tlet shared: number[] = [];".to_string(),
+        "\tlet total = 0;".to_string(),
+    ];
+
+    for index in 0..count {
+        lines.push(format!("\tconst a{index} = [1, 2];"));
+        lines.push(format!("\tif (flag === {index}) shared = a{index};"));
+        lines.push(format!("\tfor (const v of a{index}) total += v;"));
+        lines.push(format!("\tfor (const k in a{index}) total += k.length;"));
+        lines.push("\ttotal += shared.length;".to_string());
+    }
+
+    lines.push("\treturn total + shared.length;".to_string());
+    lines.push("}".to_string());
+
+    lines.join("\n")
+}
+
+fn size_counts_of(count: usize) -> (u64, usize, Cost) {
+    let mut found = None;
+
+    run_with_source(&size_source(count), |analysis, file| {
+        let part = summary_of(analysis, file, "f");
+        let stats = analysis.scheduler_stats();
+        let holders = analysis
+            .stats
+            .lines()
+            .iter()
+            .find_map(|line| line.strip_suffix("  sizes: holder"))
+            .map_or(0, |count| count.trim().parse::<usize>().unwrap());
+
+        assert_terminal(stats);
+        assert!(!stats.work.exhausted(Event::SizeStep), "{count}: {stats:?}");
+
+        found = Some((stats.work.consumed(Event::SizeStep), holders, part.cost));
+    });
+
+    found.expect("size counts")
+}
+
+#[test]
+fn size_stability_work_grows_linearly_with_aliased_holders() {
+    let base = size_counts_of(32);
+    let single = size_counts_of(64);
+    let double = size_counts_of(96);
+
+    assert_eq!(single.2, Cost::ONE);
+    assert_eq!(double.2, Cost::ONE);
+    assert!(single.0 > base.0, "{base:?} {single:?}");
+    assert_eq!(
+        double.0 - base.0,
+        2 * (single.0 - base.0),
+        "{base:?} {single:?} {double:?}"
+    );
+    assert_eq!(
+        double.1 - base.1,
+        2 * (single.1 - base.1),
+        "{base:?} {single:?} {double:?}"
+    );
+}

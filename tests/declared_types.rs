@@ -18,12 +18,8 @@ fn declared_types_of(types: &str, index: &str) -> Vec<DeclaredType> {
     ])
 }
 
-fn expected_type_of(kind: Kind, tuple: bool, closed: bool) -> DeclaredType {
-    DeclaredType {
-        kind,
-        tuple,
-        closed,
-    }
+fn expected_type_of(kind: Kind) -> DeclaredType {
+    DeclaredType { kind }
 }
 
 #[test]
@@ -36,12 +32,12 @@ fn parameters_read_their_annotations() {
     assert_eq!(
         found,
         vec![
-            expected_type_of(Kind::Array, true, false),
-            expected_type_of(Kind::Array, false, false),
-            expected_type_of(Kind::Other, false, false),
-            expected_type_of(Kind::Other, false, true),
-            expected_type_of(Kind::Other, false, true),
-            expected_type_of(Kind::Other, false, true),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
         ]
     );
 }
@@ -55,10 +51,7 @@ fn type_names_follow_aliases_imports_and_constraints() {
 
     assert_eq!(
         found,
-        vec![
-            expected_type_of(Kind::Other, false, true),
-            expected_type_of(Kind::Array, false, false),
-        ]
+        vec![expected_type_of(Kind::Other), expected_type_of(Kind::Array),]
     );
 }
 
@@ -72,13 +65,13 @@ fn expressions_read_calls_constructors_and_patterns() {
     assert_eq!(
         found,
         vec![
-            expected_type_of(Kind::Array, false, false),
-            expected_type_of(Kind::Set, false, false),
-            expected_type_of(Kind::Unknown, false, false),
-            expected_type_of(Kind::Unknown, false, false),
-            expected_type_of(Kind::Array, true, false),
-            expected_type_of(Kind::Array, true, false),
-            expected_type_of(Kind::Array, false, false),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Set),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Array),
         ]
     );
 }
@@ -104,12 +97,12 @@ fn package_declaration_aliases_resolve_and_lib_globals_read_as_other() {
     assert_eq!(
         probed_types_of(&files),
         vec![
-            expected_type_of(Kind::Array, false, false),
-            expected_type_of(Kind::Other, false, true),
-            expected_type_of(Kind::Other, false, false),
-            expected_type_of(Kind::Other, false, false),
-            expected_type_of(Kind::Other, false, false),
-            expected_type_of(Kind::Other, false, false),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
         ]
     );
 }
@@ -136,9 +129,49 @@ interface AmbientShape {
 
     assert_eq!(
         probed_types_of(&files),
+        vec![expected_type_of(Kind::Array), expected_type_of(Kind::Other),]
+    );
+}
+
+#[test]
+fn tuple_and_structural_annotations_describe_kinds_without_cardinality() {
+    let files = [
+        ("tsconfig.json", "{}"),
+        (
+            "index.ts",
+            "interface Shape {
+	a: number;
+}
+type Items<T> = [number, ...T[]];
+export function f<T extends Shape>(pair: [number, number], rest: [number, ...number[]], items: Items<string>, fixed: readonly [number, number], shape: Shape, literal: { a: number }, generic: T) {
+	probe(pair);
+	probe(rest);
+	probe(items);
+	probe(fixed);
+	probe(shape);
+	probe(literal);
+	probe(generic);
+}",
+        ),
+    ];
+    let found = probe_results_of(&files, |analysis, file, probe| {
+        (
+            analysis.declared_type_of_expression(file, probe).kind,
+            analysis.is_constant_sized(file, probe),
+            analysis.is_closed(file, probe),
+        )
+    });
+
+    assert_eq!(
+        found,
         vec![
-            expected_type_of(Kind::Array, false, false),
-            expected_type_of(Kind::Other, false, true),
+            (Kind::Array, false, false),
+            (Kind::Array, false, false),
+            (Kind::Array, false, false),
+            (Kind::Array, false, false),
+            (Kind::Other, false, false),
+            (Kind::Other, false, false),
+            (Kind::Other, false, false),
         ]
     );
 }

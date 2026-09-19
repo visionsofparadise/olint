@@ -18,7 +18,7 @@ use crate::syntax::{
 };
 use crate::tables::LINEAR_CONSTRUCTORS;
 use crate::types::ResolvedCallee;
-use crate::values::ValueId;
+use crate::values::{is_direct_call, ValueId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Effects {
@@ -1279,8 +1279,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .unwrap_or_default()
         };
         let evaluates = references("eval").into_iter().any(|node| {
-            matches!(nodes.parent_kind(node), AstKind::CallExpression(call) if call.callee.span() == nodes.kind(node).span())
-                && nodes.ancestor_ids(node).any(|ancestor| ancestor == function)
+            is_direct_call(nodes, node)
+                && nodes
+                    .ancestor_ids(node)
+                    .any(|ancestor| ancestor == function)
         });
         let arguments = references("arguments").into_iter().any(|node| {
             nodes

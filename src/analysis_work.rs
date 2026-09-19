@@ -26,9 +26,10 @@ pub enum Event {
     InvocationObservation,
     SemanticIdentity,
     DispatchStep,
+    SizeStep,
 }
 
-pub const EVENTS: [Event; 23] = [
+pub const EVENTS: [Event; 24] = [
     Event::TaskKey,
     Event::Publication,
     Event::BodyPass,
@@ -52,6 +53,7 @@ pub const EVENTS: [Event; 23] = [
     Event::InvocationObservation,
     Event::SemanticIdentity,
     Event::DispatchStep,
+    Event::SizeStep,
 ];
 const COUNT: usize = EVENTS.len();
 

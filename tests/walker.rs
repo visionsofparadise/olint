@@ -326,9 +326,17 @@ fn a_concatenation_with_a_parameter_is_linear() {
 }
 
 #[test]
-fn a_string_method_on_a_readonly_field_is_constant() {
+fn a_string_method_on_a_readonly_field_is_linear() {
     let (reading, _) = reading_of(
-        "class Holder {\n\treadonly separated = \"a,b\";\n\tloose = \"a,b\";\n}\nexport function f(holder: Holder) {\n\tholder.separated.split(\",\");\n\treturn holder.loose.split(\",\");\n}",
+        "class Holder {
+	readonly separated = \"a,b\";
+	constructor(text?: string) {
+		if (text) this.separated = text;
+	}
+}
+export function f(holder: Holder) {
+	return holder.separated.split(\",\");
+}",
         "f",
     );
 
@@ -338,7 +346,7 @@ fn a_string_method_on_a_readonly_field_is_constant() {
 
     assert_eq!(
         reading.traces.borrow().node(trace).unwrap().label,
-        "holder.loose.split() [string]"
+        "holder.separated.split() [string]"
     );
 }
 

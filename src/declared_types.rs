@@ -52,8 +52,6 @@ impl Kind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeclaredType {
     pub kind: Kind,
-    pub tuple: bool,
-    pub closed: bool,
 }
 
 const MAXIMUM_DEPTH: u32 = 8;
@@ -132,35 +130,19 @@ fn binding_parts_of<'a>(
 }
 
 fn declared_type_of(kind: Kind) -> DeclaredType {
-    DeclaredType {
-        kind,
-        tuple: false,
-        closed: false,
-    }
+    DeclaredType { kind }
 }
 
-fn joined_type_of(parts: &[DeclaredType], closed_all: bool) -> DeclaredType {
+fn joined_type_of(parts: &[DeclaredType]) -> DeclaredType {
     if parts.is_empty() {
         return DeclaredType::default();
     }
 
-    let kind = parts
-        .iter()
-        .fold(Kind::Other, |joined, part| joined.join(part.kind));
-    let closed = if closed_all {
-        parts.iter().all(|part| part.closed)
-    } else {
-        parts.iter().any(|part| part.closed)
-            && parts
-                .iter()
-                .all(|part| part.closed || part.kind == Kind::Unknown)
-    };
-
-    DeclaredType {
-        kind,
-        tuple: parts.iter().all(|part| part.tuple),
-        closed,
-    }
+    declared_type_of(
+        parts
+            .iter()
+            .fold(Kind::Other, |joined, part| joined.join(part.kind)),
+    )
 }
 
 fn type_name_text_of<'a>(name: &TSTypeName<'a>) -> &'a str {
@@ -306,27 +288,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn declaration_of_heritage(
-        &self,
-        file: FileId,
-        expression: &'a Expression<'a>,
-    ) -> Option<Declaration<'a>> {
-        match expression {
-            Expression::StaticMemberExpression(member) => {
-                match self.declaration_of_heritage(file, &member.object)? {
-                    Declaration::Namespace { file: target } => self
-                        .declarations
-                        .of_export(self.project, target, member.property.name.as_str())
-                        .into_iter()
-                        .next(),
-                    Declaration::External => Some(Declaration::External),
-                    _ => None,
-                }
-            }
-            _ => self.declaration_of_identifier(file, expression),
-        }
-    }
-
     fn declared_type_of_nested_type(
         &mut self,
         file: FileId,
@@ -344,11 +305,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             TSType::TSTypeOperatorType(operator) => {
                 self.declared_type_of_nested_type(file, &operator.type_annotation, depth + 1)
             }
-            TSType::TSTupleType(_) => DeclaredType {
-                kind: Kind::Array,
-                tuple: true,
-                closed: false,
-            },
+            TSType::TSTupleType(_) => declared_type_of(Kind::Array),
             TSType::TSArrayType(_) => declared_type_of(Kind::Array),
             TSType::TSStringKeyword(_) | TSType::TSTemplateLiteralType(_) => {
                 declared_type_of(Kind::String)
@@ -363,11 +320,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             TSType::TSAnyKeyword(_) | TSType::TSUnknownKeyword(_) => DeclaredType::default(),
             TSType::TSObjectKeyword(_) => declared_type_of(Kind::Other),
-            TSType::TSTypeLiteral(literal) => DeclaredType {
-                kind: Kind::Other,
-                tuple: false,
-                closed: self.is_closed_container(Container::TypeLiteral(file, literal), depth + 1),
-            },
+            TSType::TSTypeLiteral(_) => declared_type_of(Kind::Other),
             TSType::TSUnionType(union) => {
                 let parts: Vec<DeclaredType> = union
                     .types
@@ -375,7 +328,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .map(|part| self.declared_type_of_nested_type(file, part, depth + 1))
                     .collect();
 
-                joined_type_of(&parts, true)
+                joined_type_of(&parts)
             }
             TSType::TSIntersectionType(intersection) => {
                 let parts: Vec<DeclaredType> = intersection
@@ -384,7 +337,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .map(|part| self.declared_type_of_nested_type(file, part, depth + 1))
                     .collect();
 
-                joined_type_of(&parts, false)
+                joined_type_of(&parts)
             }
             TSType::TSTypeReference(reference) => {
                 self.declared_type_of_reference(file, reference, depth)
@@ -411,13 +364,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             if name == "Pick" || name == "Omit" {
-                return DeclaredType {
-                    kind: Kind::Other,
-                    tuple: false,
-                    closed: self
-                        .declared_type_of_nested_type(file, argument, depth + 1)
-                        .closed,
-                };
+                return declared_type_of(Kind::Other);
             }
         }
 
@@ -434,28 +381,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 file: target,
                 declaration,
             } => self.declared_type_of_nested_type(target, &declaration.type_annotation, depth + 1),
-            Declaration::Interface {
-                file: target,
-                declaration,
-            } => DeclaredType {
-                kind: Kind::Other,
-                tuple: false,
-                closed: self
-                    .is_closed_container(Container::Interface(target, declaration), depth + 1),
-            },
-            Declaration::Class {
-                file: target,
-                class,
-            } if class.is_declaration() => DeclaredType {
-                kind: Kind::Other,
-                tuple: false,
-                closed: self.is_closed_container(Container::Class(target, class), depth + 1),
-            },
-            Declaration::Enum { .. } => DeclaredType {
-                kind: Kind::Other,
-                tuple: false,
-                closed: true,
-            },
+            Declaration::Interface { .. } => declared_type_of(Kind::Other),
+            Declaration::Class { class, .. } if class.is_declaration() => {
+                declared_type_of(Kind::Other)
+            }
+            Declaration::Enum { .. } => declared_type_of(Kind::Other),
             Declaration::TypeParameter {
                 file: target,
                 parameter,
@@ -466,102 +396,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 None => DeclaredType::default(),
             },
             _ => DeclaredType::default(),
-        }
-    }
-
-    fn is_closed_container(&mut self, container: Container<'a>, depth: u32) -> bool {
-        if depth > MAXIMUM_DEPTH {
-            return false;
-        }
-
-        match container {
-            Container::Object(file, object) => {
-                !object.properties.is_empty()
-                    && object.properties.iter().all(|property| match property {
-                        ObjectPropertyKind::SpreadProperty(spread) => {
-                            self.declared_type_of_nested_expression(
-                                file,
-                                &spread.argument,
-                                depth + 1,
-                            )
-                            .closed
-                        }
-                        ObjectPropertyKind::ObjectProperty(_) => true,
-                    })
-            }
-            Container::TypeLiteral(_, literal) => {
-                !literal
-                    .members
-                    .iter()
-                    .any(|member| matches!(member, TSSignature::TSIndexSignature(_)))
-                    && !literal.members.is_empty()
-            }
-            Container::Interface(file, interface) => {
-                if interface
-                    .body
-                    .body
-                    .iter()
-                    .any(|member| matches!(member, TSSignature::TSIndexSignature(_)))
-                {
-                    return false;
-                }
-
-                for heritage in &interface.extends {
-                    let declaration = self.declaration_of_type_name(file, &heritage.type_name);
-
-                    if !self.is_closed_heritage(declaration, depth) {
-                        return false;
-                    }
-                }
-
-                !interface.body.body.is_empty() || !interface.extends.is_empty()
-            }
-            Container::Class(file, class) => {
-                if class
-                    .body
-                    .body
-                    .iter()
-                    .any(|element| matches!(element, ClassElement::TSIndexSignature(_)))
-                {
-                    return false;
-                }
-
-                if let Some(heritage) = &class.heritage {
-                    let declaration = self.declaration_of_heritage(file, &heritage.expression);
-
-                    if !self.is_closed_heritage(declaration, depth) {
-                        return false;
-                    }
-                }
-
-                for implemented in &class.implements {
-                    let declaration = self.declaration_of_type_name(file, &implemented.expression);
-
-                    if !self.is_closed_heritage(declaration, depth) {
-                        return false;
-                    }
-                }
-
-                !class.body.body.is_empty()
-                    || class.heritage.is_some()
-                    || !class.implements.is_empty()
-            }
-        }
-    }
-
-    fn is_closed_heritage(&mut self, declaration: Option<Declaration<'a>>, depth: u32) -> bool {
-        match declaration {
-            Some(Declaration::Interface { file, declaration }) => {
-                self.is_closed_container(Container::Interface(file, declaration), depth + 1)
-            }
-            Some(Declaration::Class { file, class }) if class.is_declaration() => {
-                self.is_closed_container(Container::Class(file, class), depth + 1)
-            }
-            Some(Declaration::TypeAlias { file, declaration }) => {
-                self.declared_type_of_nested_type(file, &declaration.type_annotation, depth + 1)
-                    .closed
-            }
-            _ => false,
         }
     }
 
@@ -1126,42 +960,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let expression = unwrap(expression);
 
         match expression {
-            Expression::ArrayExpression(array) => {
-                return DeclaredType {
-                    kind: Kind::Array,
-                    tuple: !array.elements.iter().any(|element| element.is_spread()),
-                    closed: false,
-                };
-            }
+            Expression::ArrayExpression(_) => return declared_type_of(Kind::Array),
             Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => {
                 return declared_type_of(Kind::String);
             }
             Expression::RegExpLiteral(_) => return declared_type_of(Kind::RegExp),
-            Expression::ObjectExpression(object) => {
-                return DeclaredType {
-                    kind: Kind::Other,
-                    tuple: false,
-                    closed: self.is_closed_container(Container::Object(file, object), depth + 1),
-                };
-            }
+            Expression::ObjectExpression(_) => return declared_type_of(Kind::Other),
             Expression::NewExpression(new) => {
                 if let Expression::Identifier(callee) = &new.callee {
                     if let Some(kind) = named_kind_of(callee.name.as_str()) {
                         return declared_type_of(kind);
                     }
 
-                    return match self.declarations.of_reference(self.project, file, callee) {
-                        Some(Declaration::Class {
-                            file: target,
-                            class,
-                        }) if class.is_declaration() => DeclaredType {
-                            kind: Kind::Other,
-                            tuple: false,
-                            closed: self
-                                .is_closed_container(Container::Class(target, class), depth + 1),
-                        },
-                        _ => declared_type_of(Kind::Other),
-                    };
+                    return declared_type_of(Kind::Other);
                 }
             }
             Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
@@ -1188,7 +999,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     ),
                 ];
 
-                return joined_type_of(&parts, true);
+                return joined_type_of(&parts);
             }
             Expression::LogicalExpression(logical)
                 if matches!(
@@ -1201,7 +1012,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     self.declared_type_of_nested_expression(file, &logical.right, depth + 1),
                 ];
 
-                return joined_type_of(&parts, true);
+                return joined_type_of(&parts);
             }
             _ => {}
         }
@@ -1354,11 +1165,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 function: FunctionNode::Function(function),
                 ..
             } if function.is_declaration() => declared_type_of(Kind::Other),
-            Declaration::Enum { .. } => DeclaredType {
-                kind: Kind::Other,
-                tuple: false,
-                closed: true,
-            },
+            Declaration::Enum { .. } => declared_type_of(Kind::Other),
             _ => DeclaredType::default(),
         }
     }

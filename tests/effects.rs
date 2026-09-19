@@ -205,3 +205,16 @@ fn direct_eval_reaches_every_binding() {
     assert!(reasoned_result_of(earlier, "f").2);
     assert!(!reasoned_result_of(&control, "f").2);
 }
+
+#[test]
+fn wrapped_direct_eval_callees_share_the_enclosing_scope() {
+    for call in [
+        "(eval)(code)",
+        "(eval as (source: string) => unknown)(code)",
+        "eval!(code)",
+    ] {
+        let source = format!("export function f(n: number, code: string) {{ let i = 0, total = 0; {call}; for (let j = 0; j < n; j++) {{ poke(); while (i < n) {{ i++; total++; }} }} return total; }}");
+
+        assert!(reasoned_result_of(&source, "f").2, "{call}");
+    }
+}

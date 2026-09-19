@@ -69,8 +69,8 @@ fn every_bound_reason_fires_on_the_model_fixture() {
         ("geometricStepLoop", "geometric step"),
         ("whileHalvingShift", "halving"),
         ("whileHalvingMidpoint", "halving"),
-        ("forOfTuple", "constant collection"),
-        ("forInClosed", "closed object type"),
+        ("forOfTuple", "N"),
+        ("forInClosed", "N"),
         ("forInRecord", "N"),
         ("singleIterationLoop", "single iteration"),
         ("boundedLoopStatement", "@perf bounded"),
@@ -82,6 +82,27 @@ fn every_bound_reason_fires_on_the_model_fixture() {
             "{function} reads {reason}: {reasons:?}"
         );
     }
+}
+
+#[test]
+fn fresh_collections_keep_constant_and_closed_bounds() {
+    run_with_source(
+        "export function f() {
+	const values = [1, 2];
+	const table = { a: 1 };
+	for (const value of values) void value;
+	for (const key in table) void key;
+}",
+        |analysis, file| {
+            assert_eq!(
+                loop_reasons_of(analysis, file),
+                vec![
+                    ("f".to_string(), "constant collection".to_string()),
+                    ("f".to_string(), "closed object type".to_string()),
+                ]
+            );
+        },
+    );
 }
 
 #[test]

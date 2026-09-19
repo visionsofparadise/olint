@@ -1779,6 +1779,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if let Some(expression) = expression.filter(|expression| {
+            !matches!(
+                expression,
+                Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+            )
+        }) {
+            if value.size.is_none() {
+                value.size = self.size_of_value(file, expression);
+            }
+        }
+
         let mut callback_open = false;
         let declaration = expression.and_then(|expression| match expression {
             Expression::Identifier(reference) => {

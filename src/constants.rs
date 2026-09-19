@@ -5,24 +5,18 @@ use oxc_ast::ast::{
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
 use oxc_semantic::NodeId;
-use oxc_syntax::operator::BinaryOperator;
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::Analysis;
 use crate::declarations::{Declaration, FunctionNode};
 use crate::declared_types::declarator_of_identifier;
 use crate::project::FileId;
-use crate::syntax::{call_of, member_expression_of, unwrap, unwrap_to_cast};
-use crate::tables::{DERIVED_METHODS, OBJECT_KEYED, TYPED_ARRAYS};
-use crate::values::Primitive;
+use crate::syntax::{member_expression_of, unwrap_to_cast};
+use crate::values::{Cardinality, Primitive};
 
 #[path = "enum_values.rs"]
 mod enum_values;
 pub use enum_values::{evaluate_enum, EnumInitializer};
-
-fn argument_expression_of<'a>(argument: Option<&'a Argument<'a>>) -> Option<&'a Expression<'a>> {
-    argument?.as_expression()
-}
 
 #[derive(Default)]
 struct ReturnStatements {
@@ -60,133 +54,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub fn is_constant_sized(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
-        let e = unwrap(e);
-
-        match e {
-            Expression::ArrayExpression(array) => {
-                return array.elements.iter().all(|element| match element {
-                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(spread) => {
-                        self.is_constant_sized(file, &spread.argument)
-                    }
-                    _ => true,
-                });
-            }
-            Expression::ConditionalExpression(conditional) => {
-                return self.is_constant_sized(file, &conditional.consequent)
-                    && self.is_constant_sized(file, &conditional.alternate);
-            }
-            Expression::BinaryExpression(binary)
-                if binary.operator == BinaryOperator::Addition
-                    && (self.is_constant_sized(file, &binary.left)
-                        || self.is_constant_sized(file, &binary.right)) =>
-            {
-                return (self.is_constant_sized(file, &binary.left)
-                    || self.is_numeric_constant(file, &binary.left))
-                    && (self.is_constant_sized(file, &binary.right)
-                        || self.is_numeric_constant(file, &binary.right));
-            }
-            _ => {}
-        }
-
-        if let Some(call) = call_of(e) {
-            if let Expression::StaticMemberExpression(callee) = &call.callee {
-                let method = callee.property.name.as_str();
-
-                if DERIVED_METHODS.contains(&method) && self.is_constant_sized(file, &callee.object)
-                {
-                    if method == "flatMap" {
-                        return match argument_expression_of(call.arguments.first()) {
-                            Some(Expression::FunctionExpression(function)) => {
-                                self.returns_constant_sized(file, FunctionNode::Function(function))
-                            }
-                            Some(Expression::ArrowFunctionExpression(arrow)) => {
-                                self.returns_constant_sized(file, FunctionNode::Arrow(arrow))
-                            }
-                            _ => false,
-                        };
-                    }
-
-                    if method == "concat" {
-                        return call
-                            .arguments
-                            .iter()
-                            .all(|argument| self.is_constant_sized_argument(file, argument));
-                    }
-
-                    return true;
-                }
-            }
-        }
-
-        match e {
-            Expression::StringLiteral(_) => return true,
-            Expression::TemplateLiteral(template) if template.expressions.is_empty() => {
-                return true
-            }
-            Expression::NewExpression(new) => {
-                if let Expression::Identifier(callee) = &new.callee {
-                    let name = callee.name.as_str();
-
-                    if (TYPED_ARRAYS.contains(&name) || name == "Array")
-                        && new.arguments.len() == 1
-                        && argument_expression_of(new.arguments.first())
-                            .is_some_and(|argument| self.is_numeric_constant(file, argument))
-                    {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let declaration = match e {
-            Expression::Identifier(reference) => {
-                self.declarations
-                    .of_reference(self.project, file, reference)
-            }
-            _ => {
-                member_expression_of(e).and_then(|member| self.declaration_of_access(file, member))
-            }
-        };
-
-        if let Some(declaration) = declaration {
-            if let Declaration::EnumMember {
-                file: target,
-                member,
-            } = declaration
-            {
-                if let Some(initializer) = &member.initializer {
-                    if self.is_constant_sized(target, initializer) {
-                        return true;
-                    }
-                }
-            }
-
-            if let Some((target, initializer)) = constant_initializer_of(declaration) {
-                if self.is_constant_sized(target, initializer) {
-                    return true;
-                }
-            }
-        }
-
-        if let Some(call) = call_of(e) {
-            if let Expression::StaticMemberExpression(callee) = &call.callee {
-                let keyed = matches!(&callee.object, Expression::Identifier(object) if object.name == "Object")
-                    && OBJECT_KEYED.contains(&callee.property.name.as_str());
-
-                if keyed {
-                    if let Some(argument) = call.arguments.first() {
-                        return argument
-                            .as_expression()
-                            .is_some_and(|argument| self.is_enum_object(file, argument))
-                            || self.is_closed_argument(file, argument)
-                            || self.is_constant_sized_argument(file, argument);
-                    }
-                }
-            }
-        }
-
-        self.is_tuple(file, e)
+        self.cardinality_of(file, e) == Cardinality::Constant
     }
 
     pub(crate) fn is_constant_sized_argument(
@@ -216,19 +84,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         reference: &'a IdentifierReference<'a>,
     ) -> bool {
-        let declaration = self
-            .declarations
-            .of_reference(self.project, file, reference);
-
-        if let Some((target, initializer)) = declaration.and_then(constant_initializer_of) {
-            if self.is_constant_sized(target, initializer) {
-                return true;
-            }
-        }
-
-        let declared = self.declared_type_of_identifier(file, reference);
-
-        self.is_declared_tuple(declared)
+        self.declarations
+            .of_reference(self.project, file, reference)
+            .is_some_and(|declaration| self.declaration_is_constant_sized(declaration))
     }
 
     pub fn returns_constant_sized(&mut self, file: FileId, function: FunctionNode<'a>) -> bool {
@@ -274,7 +132,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         constant && !returns.is_empty()
     }
 
-    pub fn is_enum_object(&self, file: FileId, e: &'a Expression<'a>) -> bool {
+    pub fn is_enum_object(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
         let declaration = match e {
             Expression::Identifier(reference) => {
                 self.declarations
@@ -296,7 +154,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => None,
         };
 
-        matches!(declaration, Some(Declaration::Enum { .. }))
+        match declaration {
+            Some(declaration @ Declaration::Enum { .. }) => {
+                self.declaration_has_constant_keys(declaration)
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn declaration_of_access(
