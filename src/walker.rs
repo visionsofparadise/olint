@@ -482,6 +482,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
             AstKind::AssignmentTargetRest(rest) => self.cost_of_rest_target(file, rest),
             AstKind::NewExpression(new) => self.cost_of_new(file, new),
             AstKind::CallExpression(call) => self.cost_of_call(file, call),
+            AstKind::TaggedTemplateExpression(tagged) => {
+                let mut reading = self.cost_of_callee(file, &tagged.tag);
+
+                for expression in &tagged.quasi.expressions {
+                    let cost = self.cost_of_expression(file, expression);
+
+                    reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
+                }
+
+                let tag = self.tag_part_of(file, tagged);
+
+                reading.merge(Reading::of_part(tag), &mut self.unknowns, &mut self.traces)
+            }
             _ => {
                 let mut reading = Reading::empty();
 
@@ -492,7 +505,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
                 }
 
-                reading
+                let implicit = self.implicit_reading_of(file, kind);
+
+                reading.merge(implicit, &mut self.unknowns, &mut self.traces)
             }
         }
     }
@@ -638,6 +653,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let body = loop_body_of(kind).expect("an iteration statement has a body");
         let body_node = body.node_id();
         let mut sibling = Reading::empty();
+        let mut visit = Reading::empty();
+        let mut unresolved = false;
+        let head = match kind {
+            AstKind::ForOfStatement(statement) => Some(statement.left.span()),
+            AstKind::ForInStatement(statement) => Some(statement.left.span()),
+            _ => None,
+        };
 
         for child in self.children_of(file, node) {
             if child == body_node {
@@ -647,10 +669,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let child = self.kind_of_node(file, child);
             let cost = self.cost_of_node(file, child);
 
-            sibling = sibling.merge(cost, &mut self.unknowns, &mut self.traces);
+            if Some(child.span()) == head {
+                visit = visit.merge(cost, &mut self.unknowns, &mut self.traces);
+            } else {
+                sibling = sibling.merge(cost, &mut self.unknowns, &mut self.traces);
+            }
         }
 
-        let invalidation = self.loop_invalidation_of(file, kind);
+        if let AstKind::ForOfStatement(statement) = kind {
+            let parts = self.iteration_parts_of(file, statement);
+
+            unresolved = parts.unresolved;
+            visit = visit.merge(
+                Reading::of_part(parts.next),
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+
+            for part in [parts.acquire, parts.close] {
+                sibling =
+                    sibling.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
+            }
+        }
+
+        let mut invalidation = self.loop_invalidation_of(file, kind);
+
+        invalidation.bound |= unresolved;
         let assumed_bound = self.perf_tags(file, kind).contains(&PerfTag::Bounded);
         let saved_budget = invalidation.budget.then(|| self.budget_context.take());
         let saved_shares = invalidation
@@ -668,7 +712,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.share_bindings.push(share);
         }
 
-        let body_raw = self.cost_of_statement(file, body);
+        let body_raw =
+            self.cost_of_statement(file, body)
+                .merge(visit, &mut self.unknowns, &mut self.traces);
 
         if budget.as_ref().is_some_and(|budget| budget.share.is_some()) {
             self.share_bindings.pop();
@@ -861,6 +907,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn cost_of_spread(&mut self, file: FileId, spread: &'a SpreadElement<'a>) -> Reading {
         let inner = self.cost_of_expression(file, &spread.argument);
+        let inner = match self.spread_iteration_part_of(file, spread) {
+            Some(part) => inner.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces),
+            None => inner,
+        };
 
         if self.is_rest_parameter(file, &spread.argument) {
             return inner;
@@ -1192,11 +1242,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             None => Reading::empty(),
         };
+        let elements: Vec<NodeId> = phases.keys.iter().map(|(element, _)| *element).collect();
         let evaluated = phases
             .heritage
             .into_iter()
             .chain(phases.keys.into_iter().map(|(_, key)| key));
-        let reading = self.merged_costs_of(file, reading, evaluated, false);
+        let mut reading = self.merged_costs_of(file, reading, evaluated, false);
+
+        for element in elements {
+            let part = self.class_key_part_of(file, element);
+
+            reading = reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
+        }
 
         self.merged_costs_of(
             file,

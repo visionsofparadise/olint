@@ -65,7 +65,10 @@ if (diagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(
     );
 }
 
-use support::{function_of_name, run_with_source};
+use support::{
+    assert_selected as assert_dispatched, function_of_name, index_of, run_with_source,
+    selected_result_in as dispatched_result_in, SelectedResult as DispatchedResult,
+};
 
 fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
     let mut found = (
@@ -406,66 +409,10 @@ fn an_erased_this_parameter_keeps_the_callback_work_in_its_call() {
 }
 
 const CUBIC: &str = "for (const a of xs) for (const b of xs) for (const c of xs) void c;";
-
-type DispatchedResult = (
-    Cost,
-    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
-);
+const INDEXED_CUBIC: &str = "for (let a = 0; a < xs.length; a++) for (let b = 0; b < xs.length; b++) for (let c = 0; c < xs.length; c++) void c;";
 
 fn dispatched_result_of(source: &str, types: olint::analysis::TypeMode) -> DispatchedResult {
     dispatched_result_in(&[("index.ts", source)], types)
-}
-
-fn dispatched_result_in(
-    sources: &[(&str, &str)],
-    types: olint::analysis::TypeMode,
-) -> DispatchedResult {
-    let entry = sources[0].0;
-    let options = match entry.ends_with(".ts") {
-        true => r#""strict":true,"noEmit":true"#,
-        false => r#""allowJs":true,"noEmit":true"#,
-    };
-    let tsconfig = format!(r#"{{"compilerOptions":{{{options}}},"files":["{entry}"]}}"#);
-    let mut files = vec![("tsconfig.json", tsconfig.as_str())];
-
-    files.extend_from_slice(sources);
-
-    let mut result = (Cost::ONE, std::collections::BTreeSet::new());
-
-    support::run_in_project(&files, |project, root| {
-        let file = support::file_of(project, root, entry);
-        let mut analysis = olint::analysis::Analysis::new(
-            project,
-            olint::analysis::Options {
-                minimum_exponent: 2,
-                types,
-            },
-        );
-
-        if types == olint::analysis::TypeMode::Tsc {
-            let functions = analysis.reportable();
-            let tsconfig = root.join("tsconfig.json");
-
-            analysis
-                .gather_answers(&functions, |queries| {
-                    olint::tsc::ask(
-                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-                        &tsconfig,
-                        queries,
-                    )
-                })
-                .expect("the compiler helper answers");
-        }
-
-        let part = support::summary_of(&mut analysis, file, "selected");
-        let reasons = support::unknown_reasons(&analysis, part.unknowns);
-        let selected = function_of_name(analysis.project, file, "selected");
-        let cost = support::legacy_class_of(&mut analysis, file, selected, &part.cost);
-
-        result = (cost, reasons);
-    });
-
-    result
 }
 
 #[test]
@@ -531,42 +478,10 @@ fn exact_calls_and_unreplaced_intrinsics_stay_precise() {
     }
 }
 
-type DispatchCase<'s> = (Vec<(&'s str, String)>, &'s str, bool);
-
-fn assert_dispatched(cases: &[DispatchCase<'_>]) {
-    for types in [
-        olint::analysis::TypeMode::Syntactic,
-        olint::analysis::TypeMode::Tsc,
-    ] {
-        for (sources, expected, partial) in cases {
-            let sources: Vec<(&str, &str)> = sources
-                .iter()
-                .map(|(name, source)| (*name, source.as_str()))
-                .collect();
-            let (cost, reasons) = dispatched_result_in(&sources, types);
-
-            assert_eq!(
-                cost,
-                Cost::parse(expected).unwrap(),
-                "{types:?} {sources:?}"
-            );
-            assert_eq!(
-                reasons.contains(&olint::unknowns::UnknownReason::Target),
-                *partial,
-                "{types:?} {sources:?}: {reasons:?}"
-            );
-        }
-    }
-}
-
-fn index_of(source: String) -> Vec<(&'static str, String)> {
-    vec![("index.ts", source)]
-}
-
 #[test]
 fn replacements_resolve_keys_prototypes_and_builtin_subclasses() {
-    let slow = format!("function slow(xs: number[]) {{ {CUBIC} return true; }}");
-    let cube = format!("function cube(xs: number[]) {{ {CUBIC} return 0; }}");
+    let slow = format!("function slow(xs: number[]) {{ {INDEXED_CUBIC} return true; }}");
+    let cube = format!("function cube(xs: number[]) {{ {INDEXED_CUBIC} return 0; }}");
     let cases = [
         (index_of(format!("{slow}\nconst k = 'includes';\nexport function selected(xs: number[]) {{ (xs as any)[k] = () => slow(xs); return xs.includes(0); }}")), "O(N^3)", true),
         (index_of(format!("{slow}\nexport function selected(xs: number[]) {{ (xs as any)[`includes`] = () => slow(xs); return xs.includes(0); }}")), "O(N^3)", true),
@@ -616,7 +531,7 @@ fn dispatch_follows_mixins_computed_symbol_and_created_members() {
 
 #[test]
 fn replacements_follow_prototype_provenance_globals_and_proven_numeric_keys() {
-    let slow = format!("function slow(xs: number[]) {{ {CUBIC} return true; }}");
+    let slow = format!("function slow(xs: number[]) {{ {INDEXED_CUBIC} return true; }}");
     let fresh = "export function selected(xs: number[]) { const zs = [1, 2, 3]; zs.includes(0); for (const x of xs) void x; }";
     let cases = [
         (index_of(format!("{slow}\nfunction install(target: any, k: number, value: unknown) {{ target[k] = value; }}\nexport function selected(xs: number[]) {{ install(xs, 'includes' as any, () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
@@ -760,8 +675,8 @@ fn global_object_aliases_and_assigned_prototypes_replace_constructors() {
 
 #[test]
 fn nearer_members_shadow_prototype_writes_and_rebound_prototypes_stay_open() {
-    let slow = format!("function slow(xs: number[]) {{ {CUBIC} return true; }}");
-    let cube = format!("function cube(xs: number[]) {{ {CUBIC} }}");
+    let slow = format!("function slow(xs: number[]) {{ {INDEXED_CUBIC} return true; }}");
+    let cube = format!("function cube(xs: number[]) {{ {INDEXED_CUBIC} }}");
     let selected = "export function selected(xs: number[]) { const zs = [1]; return zs.includes(0) && xs.includes(0); }";
     let cases = [
         (index_of(format!("{slow}\nfunction F() {{}}\nconst G: any = F;\nG.prototype = Array.prototype;\n(F as any).prototype.includes = function () {{ return slow([1]); }};\n{selected}")), "O(N^3)", true),
@@ -773,6 +688,60 @@ fn nearer_members_shadow_prototype_writes_and_rebound_prototypes_stay_open() {
     ];
 
     assert_dispatched(&cases);
+}
+
+#[test]
+fn replaced_array_iteration_leaves_for_of_multiplicity_unproven() {
+    let slow = format!("function slow(xs: number[]) {{ {CUBIC} return true; }}");
+    let cube = format!("function cube(xs: number[]) {{ {CUBIC} }}");
+    let fresh = "export function selected(xs: number[]) { const zs = [1, 2, 3]; zs.includes(0); for (const x of xs) void x; }";
+    let classes = format!(
+        "{cube}
+class K0 {{ m(xs: number[]) {{}} }}
+class Costly {{ constructor(xs: number[]) {{ cube(xs); }} }}"
+    );
+    let cases = [
+        format!("{cube}
+function C0() {{}}
+(C0 as any).prototype.m = function (xs: number[]) {{ cube(xs); }};
+function C1() {{}}
+Object.setPrototypeOf((C1 as any).prototype, (C0 as any).prototype);
+export function selected(xs: number[]) {{ const c = new (C1 as any)(); c.m(xs); }}"),
+        format!("{classes}
+export const table: any = {{ B: Costly }};
+export function set(t: any, k: string, v: any) {{ t[k] = v; }}
+class D extends table.B {{}}
+export function selected(xs: number[]) {{ return new D(xs); }}"),
+        format!("{slow}
+export function selected(xs: number[]) {{ let k: number = 'includes' as any; (xs as any)[k] = () => slow(xs); return xs.includes(0); }}"),
+        format!("{slow}
+declare const k: number;
+export function selected(xs: number[]) {{ (xs as any)[k] = () => slow(xs); return xs.includes(0); }}"),
+        format!("function patch(p: any, k: string, f: unknown) {{ p[k] = f; }}
+patch(Array.prototype, 'includes', () => true);
+{fresh}"),
+        format!("{slow}
+export function selected(xs: number[]) {{ (xs as any).__proto__ = {{ includes: () => slow(xs) }}; return xs.includes(0); }}"),
+        format!("{slow}
+export function selected(xs: number[]) {{ Object.setPrototypeOf(xs, {{ includes: () => slow(xs) }}); return xs.includes(0); }}"),
+    ];
+    let expected = ["O(1)", "O(1)", "O(N)", "O(N)", "O(N)", "O(N)", "O(N)"];
+
+    for types in [
+        olint::analysis::TypeMode::Syntactic,
+        olint::analysis::TypeMode::Tsc,
+    ] {
+        for (source, expected) in cases.iter().zip(expected) {
+            let (cost, reasons) = dispatched_result_in(&[("index.ts", source.as_str())], types);
+
+            assert_eq!(cost, Cost::parse(expected).unwrap(), "{types:?} {source}");
+            assert!(
+                reasons.contains(&olint::unknowns::UnknownReason::Bound)
+                    && reasons.contains(&olint::unknowns::UnknownReason::Target),
+                "{types:?} {source}: {reasons:?}"
+            );
+        }
+    }
 }
 
 const QUADRATIC: &str = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }";
@@ -1129,7 +1098,7 @@ fn inherited_initialization_follows_implicit_and_explicit_super_calls() {
 
 #[test]
 fn rebound_superclasses_join_their_possible_bases() {
-    let classes = format!("function cube(xs: number[]) {{ {CUBIC} }}\nclass K0 {{ m(xs: number[]) {{}} }}\nclass Other {{ m(xs: number[]) {{ cube(xs); }} }}\nclass Cheap {{ constructor(xs: number[]) {{}} }}\nclass Costly {{ constructor(xs: number[]) {{ cube(xs); }} }}");
+    let classes = format!("function cube(xs: number[]) {{ {INDEXED_CUBIC} }}\nclass K0 {{ m(xs: number[]) {{}} }}\nclass Other {{ m(xs: number[]) {{ cube(xs); }} }}\nclass Cheap {{ constructor(xs: number[]) {{}} }}\nclass Costly {{ constructor(xs: number[]) {{ cube(xs); }} }}");
     let cases = [
         (index_of(format!("{classes}\nlet B: any = K0;\nB = Other;\nclass A extends B {{}}\nexport function selected(xs: number[]) {{ new A().m(xs); }}")), "O(N^3)", true),
         (index_of(format!("{classes}\nlet B: any = Cheap;\nB = Costly;\nclass A extends B {{}}\nexport function selected(xs: number[]) {{ return new A(xs); }}")), "O(N^3)", false),

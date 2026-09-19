@@ -68,8 +68,14 @@ const OBJECT_READERS: [&str; 9] = [
     "freeze",
 ];
 const ITERATING_CONSTRUCTORS: [&str; 4] = ["Set", "Map", "WeakSet", "WeakMap"];
-const COERCED_MEMBERS: [&str; 4] = ["toString", "valueOf", "join", "toLocaleString"];
-const ITERATED_MEMBERS: [&str; 2] = ["values", "next"];
+const COERCED_MEMBERS: [&str; 5] = [
+    "toString",
+    "valueOf",
+    "join",
+    "toLocaleString",
+    "@@toPrimitive",
+];
+const ITERATED_MEMBERS: [&str; 5] = ["values", "next", "return", "@@iterator", "@@asyncIterator"];
 const AWAITED_MEMBERS: [&str; 1] = ["then"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1008,9 +1014,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let current = outermost_of(nodes, member);
         let span = nodes.kind(current).span();
 
-        match nodes.parent_kind(current) {
+        let stable = match nodes.parent_kind(current) {
             AstKind::CallExpression(call) if call.callee.span() == span => {
-                self.is_stable_receiver_call(file, call, member, holder, summary, depth)
+                return self.is_stable_receiver_call(file, call, member, holder, summary, depth)
             }
             AstKind::TaggedTemplateExpression(tagged) => tagged.tag.span() != span,
             AstKind::AssignmentExpression(assignment) => assignment.left.span() != span,
@@ -1024,7 +1030,38 @@ impl<'p, 'a> Analysis<'p, 'a> {
             | AstKind::ObjectAssignmentTarget(_)
             | AstKind::AssignmentTargetRest(_) => false,
             _ => true,
+        };
+
+        stable && self.is_inert_member_read(file, member, holder)
+    }
+
+    fn is_inert_member_read(&mut self, file: FileId, member: NodeId, holder: Holder) -> bool {
+        let kind = match holder.shape {
+            Shape::Primitive => Kind::String,
+            Shape::Fixed | Shape::Array => Kind::Array,
+            Shape::Object => Kind::Other,
+            Shape::Unknown => Kind::Unknown,
+        };
+        let indexed = matches!(holder.shape, Shape::Primitive | Shape::Fixed | Shape::Array);
+        let name = match self.kind_of_node(file, member) {
+            AstKind::StaticMemberExpression(access) => Some(access.property.name.to_string()),
+            AstKind::ComputedMemberExpression(access) => {
+                self.known_key(file, &access.expression).ok()
+            }
+            _ => return true,
+        };
+        let own = name.as_deref().is_none_or(|name| {
+            name == "length"
+                || name
+                    .parse::<u32>()
+                    .is_ok_and(|index| index.to_string() == name)
+        });
+
+        if indexed && own {
+            return true;
         }
+
+        !self.builtin_accessors_defined(kind, name.as_deref())
     }
 
     fn is_stable_receiver_call(

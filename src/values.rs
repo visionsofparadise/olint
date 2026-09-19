@@ -25,9 +25,11 @@ mod targets;
 pub use primitive::{
     CertifiedValues, Failure, Limits, Primitive, PrimitiveAdapter, ValueResult, Work,
 };
-pub(crate) use sizes::is_direct_call;
 pub use sizes::Cardinality;
-pub(crate) use targets::{Construction, ConstructionPlan, PrototypeMembers};
+pub(crate) use sizes::{is_direct_call, outermost_of};
+pub(crate) use targets::{
+    protocol_key_of, Construction, ConstructionPlan, Iteration, MemberKey, PrototypeMembers,
+};
 
 use crate::cost::{Cost, CostError, Domain, Part, Preference};
 use crate::declarations::TargetSet;

@@ -12,4 +12,4 @@ O((matrix * matrix^2)) > O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src
             in loop for-of                                   src/types.ts:72  x N
 
 2 over limit
-45 partial results
+47 partial results

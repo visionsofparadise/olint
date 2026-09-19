@@ -19,9 +19,10 @@ use crate::declarations::{
 };
 use crate::declared_types::{declarator_of_identifier, Kind};
 use crate::effects::{value_flow_of, ValueFlow};
+use crate::invocations::{construction_context_of, ImplicitSite};
 use crate::project::FileId;
 use crate::receivers::{annotation_of, this_owner_of, Placement, ThisOwner};
-use crate::syntax::{member_expression_of, unwrap, unwrap_to_cast};
+use crate::syntax::{call_of, is_iteration_kind, member_expression_of, unwrap, unwrap_to_cast};
 use crate::tables::{LINEAR_CONSTRUCTORS, REFLECTIVE_WRITES};
 
 use super::ValueId;
@@ -45,14 +46,14 @@ const INERT_CONSTRUCTORS: [&str; 7] = [
 type Site = (FileId, NodeId);
 type ClassSite<'a> = (FileId, &'a Class<'a>);
 pub(crate) type Valued<'a> = (FileId, &'a Expression<'a>);
-pub(crate) type PrototypeMembers<'a> =
-    HashMap<(usize, MemberKey), (Vec<Valued<'a>>, Vec<FunctionId>, bool)>;
+pub(crate) type PrototypeMembers<'a> = HashMap<(usize, MemberKey), MemberValues<'a>>;
 type BuiltinKind = Option<Kind>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum MemberKey {
     Name(String),
     Symbol(Site),
+    WellKnown(String),
     Index,
 }
 
@@ -134,6 +135,9 @@ struct Buckets {
 struct WideSummary {
     replaced: bool,
     known: Vec<FunctionId>,
+    getters: Vec<FunctionId>,
+    setters: Vec<FunctionId>,
+    accessors_open: bool,
     prototypes: Vec<usize>,
 }
 
@@ -167,6 +171,17 @@ pub(crate) struct TargetIndex {
     patterns: HashMap<(FileId, oxc_semantic::SymbolId), TargetSet>,
     parameter_classes: HashMap<Binding, (Vec<Site>, bool)>,
     plans: HashMap<Site, Rc<ConstructionPlan>>,
+    accessor_keys: HashSet<Option<MemberKey>>,
+    callable_keys: HashSet<Option<MemberKey>>,
+    written_keys: HashSet<Option<MemberKey>>,
+    invocations: HashMap<Binding, Option<Vec<Site>>>,
+    primitive_bindings: HashMap<Binding, bool>,
+    resolving_invocations: HashSet<Binding>,
+    implicit: HashMap<(Site, ImplicitKey), (TargetSet, bool)>,
+    extensible: HashMap<Site, bool>,
+    closing: HashMap<FileId, Rc<HashSet<NodeId>>>,
+    implicit_plans: HashMap<Site, Rc<Vec<ImplicitSite>>>,
+    builtin_accessors: HashMap<Kind, bool>,
     resolving_patterns: HashSet<(FileId, oxc_semantic::SymbolId)>,
     pattern_cuts: u64,
     depth: usize,
@@ -206,17 +221,42 @@ enum Origin<'a> {
 struct Receiver<'a> {
     origins: Vec<Origin<'a>>,
     values: Vec<ValueId>,
+    constrained: bool,
 }
 
 #[derive(Clone, Default)]
-struct MemberValues<'a> {
+pub(crate) struct MemberValues<'a> {
     values: Vec<Valued<'a>>,
     functions: Vec<FunctionId>,
+    getters: Vec<FunctionId>,
+    setters: Vec<FunctionId>,
     replaced: bool,
+    accessors_open: bool,
     hits: Vec<usize>,
     lookups: usize,
     defined: usize,
     below: Vec<Site>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ImplicitKey {
+    Get,
+    Set,
+    Methods(Vec<MemberKey>),
+    Returned(MemberKey),
+    Member(MemberKey, bool),
+    Construction,
+}
+
+#[derive(Clone, Copy)]
+enum Descriptor<'a> {
+    Absent,
+    Unknown,
+    Known {
+        value: Option<&'a Expression<'a>>,
+        getter: Option<&'a Expression<'a>>,
+        setter: Option<&'a Expression<'a>>,
+    },
 }
 
 enum KeySource<'a> {
@@ -234,12 +274,61 @@ pub(crate) struct Construction<'a> {
     pub(crate) implicit: Vec<(FileId, &'a Class<'a>)>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Iteration {
+    pub(crate) acquire: TargetSet,
+    pub(crate) next: TargetSet,
+    pub(crate) close: TargetSet,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ConstructionPlan {
     pub(crate) constructors: Vec<FunctionId>,
     pub(crate) initializers: Vec<Site>,
     pub(crate) owners: HashSet<Site>,
     pub(crate) open: bool,
+}
+
+impl<'a> MemberValues<'a> {
+    fn absorb(&mut self, other: &MemberValues<'a>) -> bool {
+        let before = self.counts_of();
+
+        for value in &other.values {
+            if !self
+                .values
+                .iter()
+                .any(|known| known.0 == value.0 && known.1.node_id() == value.1.node_id())
+            {
+                self.values.push(*value);
+            }
+        }
+
+        for (ours, theirs) in [
+            (&mut self.functions, &other.functions),
+            (&mut self.getters, &other.getters),
+            (&mut self.setters, &other.setters),
+        ] {
+            for function in theirs {
+                push_function(ours, *function);
+            }
+        }
+
+        self.replaced |= other.replaced;
+        self.accessors_open |= other.accessors_open;
+
+        self.counts_of() != before
+    }
+
+    fn counts_of(&self) -> (usize, usize, usize, usize, bool, bool) {
+        (
+            self.values.len(),
+            self.functions.len(),
+            self.getters.len(),
+            self.setters.len(),
+            self.replaced,
+            self.accessors_open,
+        )
+    }
 }
 
 impl Construction<'_> {
@@ -249,6 +338,13 @@ impl Construction<'_> {
         targets.open |= !self.implicit.is_empty();
 
         targets
+    }
+}
+
+pub(crate) fn protocol_key_of(name: &str) -> MemberKey {
+    match name.strip_prefix("@@") {
+        Some(symbol) => MemberKey::WellKnown(symbol.to_string()),
+        None => MemberKey::Name(name.to_string()),
     }
 }
 
@@ -339,6 +435,24 @@ fn is_fresh_literal(expression: &Expression<'_>) -> bool {
             | Expression::TemplateLiteral(_)
             | Expression::ThisExpression(_)
     )
+}
+
+fn closed_targets_of() -> TargetSet {
+    TargetSet {
+        known: Vec::new(),
+        open: false,
+    }
+}
+
+fn descriptor_value_of(descriptor: Descriptor<'_>) -> Option<&Expression<'_>> {
+    match descriptor {
+        Descriptor::Known { value, .. } => value,
+        _ => None,
+    }
+}
+
+fn is_unknown_prototype(prototype: &Expression<'_>, receiver: &Receiver<'_>) -> bool {
+    receiver.origins.is_empty() && !matches!(unwrap(prototype), Expression::NullLiteral(_))
 }
 
 fn is_builtin(kind: Kind) -> bool {
@@ -529,6 +643,821 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    pub(crate) fn accessor_targets_of(
+        &mut self,
+        file: FileId,
+        access: AstKind<'a>,
+        setter: bool,
+    ) -> TargetSet {
+        self.index_targets();
+
+        if self.values.targets.accessor_keys.is_empty() {
+            return closed_targets_of();
+        }
+
+        let implicit = match setter {
+            true => ImplicitKey::Set,
+            false => ImplicitKey::Get,
+        };
+
+        self.implicit_targets_of((file, access.node_id()), implicit, |analysis| {
+            analysis.accessor_targets_within(file, access, setter)
+        })
+    }
+
+    pub(crate) fn protocol_targets_of(
+        &mut self,
+        file: FileId,
+        receiver: &'a Expression<'a>,
+        keys: &[MemberKey],
+    ) -> TargetSet {
+        self.index_targets();
+
+        if !keys.iter().any(|key| self.may_implement(key)) {
+            return closed_targets_of();
+        }
+
+        let implicit = ImplicitKey::Methods(keys.to_vec());
+
+        self.implicit_targets_of((file, receiver.node_id()), implicit, |analysis| {
+            analysis.protocol_targets_within(file, receiver, keys)
+        })
+    }
+
+    pub(crate) fn iteration_of(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        asynchronous: bool,
+    ) -> Iteration {
+        let acquire_keys = match asynchronous {
+            true => vec![
+                MemberKey::WellKnown("asyncIterator".to_string()),
+                MemberKey::WellKnown("iterator".to_string()),
+            ],
+            false => vec![MemberKey::WellKnown("iterator".to_string())],
+        };
+        let site = (file, iterable.node_id());
+
+        self.index_targets();
+
+        if !["@@iterator", "@@asyncIterator", "next", "return"]
+            .iter()
+            .any(|name| self.may_implement(&protocol_key_of(name)))
+        {
+            return Iteration {
+                acquire: closed_targets_of(),
+                next: closed_targets_of(),
+                close: closed_targets_of(),
+            };
+        }
+
+        if self.is_generator_call(file, iterable) || self.is_intrinsic_iterator(file, iterable) {
+            return Iteration {
+                acquire: closed_targets_of(),
+                next: self.intrinsic_protocol_of(site, "next"),
+                close: self.intrinsic_protocol_of(site, "return"),
+            };
+        }
+
+        let acquire = self.protocol_targets_of(file, iterable, &acquire_keys);
+
+        if acquire.open {
+            return Iteration {
+                next: acquire.clone(),
+                close: acquire.clone(),
+                acquire,
+            };
+        }
+
+        if acquire.known.is_empty() {
+            let kind = self.declared_kind_of(file, iterable);
+
+            if !is_builtin(kind) {
+                return Iteration {
+                    acquire,
+                    next: closed_targets_of(),
+                    close: closed_targets_of(),
+                };
+            }
+
+            return Iteration {
+                acquire,
+                next: self.intrinsic_protocol_of(site, "next"),
+                close: self.intrinsic_protocol_of(site, "return"),
+            };
+        }
+
+        let [next, close] = ["next", "return"].map(|name| {
+            let key = MemberKey::Name(name.to_string());
+
+            self.implicit_targets_of(site, ImplicitKey::Returned(key.clone()), |analysis| {
+                let mut found = closed_targets_of();
+
+                for function in &acquire.known {
+                    let targets =
+                        analysis.returned_protocol_targets_of(*function, (file, iterable), &key);
+
+                    found.open |= targets.open;
+
+                    for known in targets.known {
+                        push_target(&mut found, known);
+                    }
+                }
+
+                found
+            })
+        });
+
+        Iteration {
+            acquire,
+            next,
+            close,
+        }
+    }
+
+    pub(crate) fn construction_dispatch_of(
+        &mut self,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+    ) -> Option<TargetSet> {
+        let object = unwrap(member.object());
+
+        if !matches!(object, Expression::ThisExpression(_) | Expression::Super(_)) {
+            return None;
+        }
+
+        let (class, placement) = construction_context_of(self.project, file, object.node_id())?;
+
+        self.index_targets();
+
+        Some(self.implicit_targets_of(
+            (file, member_node_of(member)),
+            ImplicitKey::Construction,
+            |analysis| analysis.construction_dispatch_within(file, member, (class, placement)),
+        ))
+    }
+
+    fn implicit_targets_of(
+        &mut self,
+        site: Site,
+        implicit: ImplicitKey,
+        resolve: impl FnOnce(&mut Self) -> TargetSet,
+    ) -> TargetSet {
+        let cache = (site, implicit);
+
+        if let Some((targets, exhausted)) = self.values.targets.implicit.get(&cache) {
+            let targets = targets.clone();
+
+            self.values.targets.exhaustions += u64::from(*exhausted);
+
+            return targets;
+        }
+
+        let outermost = self.values.targets.depth == 0;
+        let exhaustions = self.values.targets.exhaustions;
+
+        if !self.enter_targets() {
+            self.leave_targets();
+
+            return TargetSet {
+                known: Vec::new(),
+                open: true,
+            };
+        }
+
+        let mut targets = resolve(self);
+
+        targets.open |= self.work_exhausted();
+
+        self.leave_targets();
+
+        if outermost && !self.work_exhausted() {
+            let exhausted = self.values.targets.exhaustions > exhaustions;
+
+            self.values
+                .targets
+                .implicit
+                .insert(cache, (targets.clone(), exhausted));
+        }
+
+        targets
+    }
+
+    fn implicit_receiver_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Receiver<'a> {
+        let mut receiver = Receiver::default();
+
+        self.collect_receiver(file, expression, &mut HashSet::new(), &mut receiver);
+
+        receiver
+    }
+
+    fn is_defined_key(&self, keys: &HashSet<Option<MemberKey>>, key: &MemberKey) -> bool {
+        keys.contains(&Some(key.clone())) || keys.contains(&None)
+    }
+
+    pub(crate) fn may_implement_any(&mut self, keys: &[MemberKey]) -> bool {
+        self.index_targets();
+
+        keys.iter().any(|key| self.may_implement(key))
+    }
+
+    pub(crate) fn may_access(&mut self, key: Option<&MemberKey>) -> bool {
+        self.index_targets();
+
+        match key {
+            Some(key) => self.is_defined_key(&self.values.targets.accessor_keys, key),
+            None => !self.values.targets.accessor_keys.is_empty(),
+        }
+    }
+
+    pub(crate) fn member_key(
+        &mut self,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+    ) -> Option<MemberKey> {
+        self.member_key_of(file, member)
+    }
+
+    pub(crate) fn expression_key(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Option<MemberKey> {
+        match self.member_key_of_expression(file, expression) {
+            Some(key) => Some(key),
+            None if self.is_numeric_key(file, expression, 0) => Some(MemberKey::Index),
+            None => None,
+        }
+    }
+
+    pub(crate) fn property_key(
+        &mut self,
+        file: FileId,
+        key: &'a PropertyKey<'a>,
+        computed: bool,
+    ) -> Option<MemberKey> {
+        self.defined_key_of(file, key, computed)
+    }
+
+    pub(crate) fn implicit_plan(&self, site: Site) -> Option<Rc<Vec<ImplicitSite>>> {
+        self.values.targets.implicit_plans.get(&site).cloned()
+    }
+
+    pub(crate) fn store_implicit_plan(&mut self, site: Site, plan: Rc<Vec<ImplicitSite>>) {
+        self.values.targets.implicit_plans.insert(site, plan);
+    }
+
+    pub(crate) fn closes_early(&mut self, file: FileId, statement: NodeId) -> bool {
+        if let Some(closing) = self.values.targets.closing.get(&file) {
+            return closing.contains(&statement);
+        }
+
+        match self.closing_loops_of(file) {
+            Some(closing) => {
+                let closes = closing.contains(&statement);
+
+                self.values.targets.closing.insert(file, Rc::new(closing));
+
+                closes
+            }
+            None => true,
+        }
+    }
+
+    fn closing_loops_of(&mut self, file: FileId) -> Option<HashSet<NodeId>> {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let scoping = project.file(file).semantic.scoping();
+        let mut closing = HashSet::new();
+        let mut escaped = HashSet::new();
+
+        for node in nodes.iter() {
+            if !self.charge_work(Event::EffectPrepassNode, 1) {
+                return None;
+            }
+
+            self.stats.count("iterator exits: node");
+
+            let (target, inclusive) = match node.kind() {
+                AstKind::BreakStatement(statement) => match &statement.label {
+                    Some(label) => (labeled_target_of(nodes, node.id(), &label.name), true),
+                    None => (
+                        nodes.ancestor_ids(node.id()).find(|ancestor| {
+                            let kind = nodes.kind(*ancestor);
+
+                            is_iteration_kind(&kind) || matches!(kind, AstKind::SwitchStatement(_))
+                        }),
+                        true,
+                    ),
+                },
+                AstKind::ContinueStatement(statement) => match &statement.label {
+                    Some(label) => (labeled_target_of(nodes, node.id(), &label.name), false),
+                    None => continue,
+                },
+                kind if completes_normally(scoping, &kind) => continue,
+                _ => (None, false),
+            };
+            let span = node.kind().span();
+
+            for ancestor in nodes.ancestor_ids(node.id()) {
+                self.stats.count("iterator exits: step");
+
+                let kind = nodes.kind(ancestor);
+
+                if Some(ancestor) == target {
+                    if inclusive && matches!(kind, AstKind::ForOfStatement(_)) {
+                        closing.insert(ancestor);
+                    }
+
+                    break;
+                }
+
+                if matches!(
+                    kind,
+                    AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::Class(_)
+                ) {
+                    break;
+                }
+
+                let AstKind::ForOfStatement(statement) = kind else {
+                    continue;
+                };
+
+                if target.is_none() && escaped.contains(&ancestor) {
+                    break;
+                }
+
+                if statement.body.span().contains_inclusive(span) {
+                    closing.insert(ancestor);
+
+                    if target.is_none() {
+                        escaped.insert(ancestor);
+                    }
+                }
+            }
+        }
+
+        Some(closing)
+    }
+
+    fn may_implement(&self, key: &MemberKey) -> bool {
+        let targets = &self.values.targets;
+
+        [
+            &targets.accessor_keys,
+            &targets.callable_keys,
+            &targets.written_keys,
+        ]
+        .into_iter()
+        .any(|keys| self.is_defined_key(keys, key))
+    }
+
+    fn accessor_targets_within(
+        &mut self,
+        file: FileId,
+        access: AstKind<'a>,
+        setter: bool,
+    ) -> TargetSet {
+        let (object, key) = match access {
+            AstKind::StaticMemberExpression(member) => (
+                &member.object,
+                Some(MemberKey::Name(member.property.name.to_string())),
+            ),
+            AstKind::PrivateFieldExpression(member) => (
+                &member.object,
+                Some(MemberKey::Name(format!("#{}", member.field.name))),
+            ),
+            AstKind::ComputedMemberExpression(member) => {
+                let key = match self.member_key_of_expression(file, &member.expression) {
+                    Some(key) => Some(key),
+                    None if self.is_numeric_key(file, &member.expression, 0) => {
+                        Some(MemberKey::Index)
+                    }
+                    None => None,
+                };
+
+                (&member.object, key)
+            }
+            _ => return closed_targets_of(),
+        };
+
+        self.accessors_on(file, object, key, setter)
+    }
+
+    pub(crate) fn property_accessors_of(
+        &mut self,
+        (file, object): Valued<'a>,
+        key: MemberKey,
+        setter: bool,
+    ) -> TargetSet {
+        self.index_targets();
+
+        if !self.is_defined_key(&self.values.targets.accessor_keys, &key) {
+            return closed_targets_of();
+        }
+
+        let implicit = ImplicitKey::Member(key.clone(), setter);
+
+        self.implicit_targets_of((file, object.node_id()), implicit, |analysis| {
+            analysis.accessors_on(file, object, Some(key), setter)
+        })
+    }
+
+    pub(crate) fn property_values_of(
+        &mut self,
+        (file, object): Valued<'a>,
+        key: &MemberKey,
+    ) -> (Vec<Valued<'a>>, bool) {
+        self.index_targets();
+
+        let receiver = self.implicit_receiver_of(file, object);
+        let values = self.member_candidates_of(file, object, &receiver, key);
+
+        (
+            values.values,
+            values.replaced || receiver.origins.is_empty() || receiver.constrained,
+        )
+    }
+
+    pub(crate) fn proven_kind(&mut self, file: FileId, expression: &'a Expression<'a>) -> Kind {
+        self.index_targets();
+
+        self.proven_kind_of(file, expression, 0)
+    }
+
+    fn accessors_on(
+        &mut self,
+        file: FileId,
+        object: &'a Expression<'a>,
+        key: Option<MemberKey>,
+        setter: bool,
+    ) -> TargetSet {
+        let kind = self.proven_kind_of(file, object, 0);
+        let Some(key) = key else {
+            return TargetSet {
+                known: Vec::new(),
+                open: match is_builtin(kind) {
+                    true => self.builtin_accessors_defined(kind, None),
+                    false => true,
+                },
+            };
+        };
+
+        if !self.is_defined_key(&self.values.targets.accessor_keys, &key) {
+            return closed_targets_of();
+        }
+
+        let own = match &key {
+            MemberKey::Index => true,
+            MemberKey::Name(name) => name == "length" || is_index_name(name),
+            _ => false,
+        };
+
+        if own && matches!(kind, Kind::Array | Kind::String) {
+            return closed_targets_of();
+        }
+
+        let receiver = self.implicit_receiver_of(file, object);
+        let values = self.member_candidates_of(file, object, &receiver, &key);
+        let unresolved = receiver.origins.is_empty() || receiver.constrained;
+
+        TargetSet {
+            known: match setter {
+                true => values.setters,
+                false => values.getters,
+            },
+            open: values.accessors_open || (unresolved && !is_builtin(kind)),
+        }
+    }
+
+    fn protocol_targets_within(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        keys: &[MemberKey],
+    ) -> TargetSet {
+        let receiver = self.implicit_receiver_of(file, expression);
+        let coercing = keys
+            .iter()
+            .any(|key| matches!(key, MemberKey::WellKnown(name) if name == "toPrimitive"));
+        let kind = match coercing {
+            true => self.proven_kind_of(file, expression, 0),
+            false => self.declared_kind_of(file, expression),
+        };
+        let unresolved = (receiver.origins.is_empty() || receiver.constrained) && !is_builtin(kind);
+        let mut found = closed_targets_of();
+
+        for key in keys {
+            if !self.may_implement(key) {
+                continue;
+            }
+
+            let values = self.member_candidates_of(file, expression, &receiver, key);
+
+            self.absorb_callables(values, &mut found);
+
+            found.open |= unresolved
+                && (self.is_defined_key(&self.values.targets.callable_keys, key)
+                    || self.is_defined_key(&self.values.targets.accessor_keys, key));
+        }
+
+        found
+    }
+
+    fn absorb_callables(&mut self, values: MemberValues<'a>, found: &mut TargetSet) {
+        let mut visited = HashSet::new();
+
+        found.open |= values.replaced;
+
+        for function in values.functions {
+            push_target(found, function);
+        }
+
+        for (target, value) in values.values {
+            self.collect_callable_targets(target, value, &mut visited, found);
+        }
+    }
+
+    fn returned_protocol_targets_of(
+        &mut self,
+        function: FunctionId,
+        (file, iterable): Valued<'a>,
+        key: &MemberKey,
+    ) -> TargetSet {
+        let (generator, asynchronous) = match self.kind_of_node(function.file, function.node) {
+            AstKind::Function(inner) => (inner.generator, inner.r#async),
+            AstKind::ArrowFunctionExpression(arrow) => (false, arrow.r#async),
+            _ => (false, false),
+        };
+
+        if generator {
+            return self.wide_protocol_of(key, Kind::Other);
+        }
+
+        if asynchronous {
+            return closed_targets_of();
+        }
+
+        let mut found = closed_targets_of();
+
+        for returned in self.returned_expressions_of(function) {
+            if self.is_generator_call(function.file, returned)
+                || self.is_intrinsic_iterator(function.file, returned)
+            {
+                let wide = self.wide_protocol_of(key, Kind::Other);
+
+                found.open |= wide.open;
+
+                for known in wide.known {
+                    push_target(&mut found, known);
+                }
+
+                continue;
+            }
+
+            let (source, expression) = match unwrap(returned) {
+                Expression::ThisExpression(_) => (file, iterable),
+                _ => (function.file, returned),
+            };
+            let targets =
+                self.protocol_targets_within(source, expression, std::slice::from_ref(key));
+
+            found.open |= targets.open;
+
+            for known in targets.known {
+                push_target(&mut found, known);
+            }
+        }
+
+        found
+    }
+
+    fn intrinsic_protocol_of(&mut self, site: Site, name: &str) -> TargetSet {
+        let key = MemberKey::Name(name.to_string());
+
+        if !self.may_implement(&key) {
+            return closed_targets_of();
+        }
+
+        self.implicit_targets_of(site, ImplicitKey::Returned(key.clone()), |analysis| {
+            analysis.wide_protocol_of(&key, Kind::Other)
+        })
+    }
+
+    fn wide_protocol_of(&mut self, key: &MemberKey, kind: Kind) -> TargetSet {
+        let keyed = self.wide_summary_of(Some(key.clone()), kind, false, true);
+        let any = self.wide_summary_of(None, kind, false, true);
+
+        TargetSet {
+            known: keyed.known,
+            open: keyed.replaced || any.replaced,
+        }
+    }
+
+    fn is_generator_call(&mut self, file: FileId, expression: &'a Expression<'a>) -> bool {
+        let Some(call) = call_of(unwrap(expression)) else {
+            return false;
+        };
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        !targets.open
+            && !targets.known.is_empty()
+            && targets.known.iter().all(|target| {
+                matches!(self.kind_of_node(target.file, target.node), AstKind::Function(function) if function.generator)
+            })
+    }
+
+    fn is_intrinsic_iterator(&mut self, file: FileId, expression: &'a Expression<'a>) -> bool {
+        let Some(call) = call_of(unwrap(expression)) else {
+            return false;
+        };
+        let Some(member) = member_expression_of(unwrap(&call.callee)) else {
+            return false;
+        };
+        let iterating = match self.member_key_of(file, member) {
+            Some(MemberKey::Name(name)) => {
+                matches!(name.as_str(), "values" | "keys" | "entries" | "matchAll")
+            }
+            Some(MemberKey::WellKnown(name)) => name == "iterator",
+            _ => false,
+        };
+
+        if !iterating || !is_builtin(self.declared_kind_of(file, member.object())) {
+            return false;
+        }
+
+        let dispatch = self.member_dispatch_of(file, member);
+
+        dispatch.known.is_empty() && !dispatch.replaced
+    }
+
+    fn construction_dispatch_within(
+        &mut self,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+        (class, placement): (&'a Class<'a>, Placement),
+    ) -> TargetSet {
+        let Some(key) = self.member_key_of(file, member) else {
+            return TargetSet {
+                known: Vec::new(),
+                open: true,
+            };
+        };
+        let object = unwrap(member.object());
+        let mut receiver = Receiver::default();
+        let class_value = self.values.allocation(self.source_span(file, class.span));
+        let mut extensible = false;
+
+        match (object, placement) {
+            (Expression::Super(_), placement) => {
+                receiver.origins.push(Origin::HomeClass {
+                    file,
+                    class,
+                    placement,
+                });
+
+                if placement == Placement::Static {
+                    push_value(&mut receiver.values, class_value.value);
+
+                    extensible = self.is_class_surfaced(file, class);
+                }
+            }
+            (_, Placement::Static) => {
+                receiver.origins.push(Origin::Constructor {
+                    file,
+                    class,
+                    exact: true,
+                });
+                push_value(&mut receiver.values, class_value.value);
+
+                extensible = self.is_class_surfaced(file, class);
+            }
+            _ => {
+                receiver.origins.push(Origin::Instance {
+                    file,
+                    class,
+                    exact: false,
+                });
+
+                let value = self.storage_value_of(file, object);
+
+                push_value(&mut receiver.values, value);
+
+                extensible = self.is_class_extensible(file, class);
+            }
+        }
+
+        let values = self.member_candidates_of(file, object, &receiver, &key);
+        let mut found = closed_targets_of();
+
+        self.absorb_callables(values, &mut found);
+
+        found.open |= extensible;
+
+        found
+    }
+
+    fn is_class_extensible(&mut self, file: FileId, class: &'a Class<'a>) -> bool {
+        let site = (file, class.node_id());
+
+        if let Some(extensible) = self.values.targets.extensible.get(&site) {
+            return *extensible;
+        }
+
+        let extensible = self.class_extensibility_of(file, class);
+
+        self.values.targets.extensible.insert(site, extensible);
+
+        extensible
+    }
+
+    fn class_symbol_of(
+        &self,
+        file: FileId,
+        class: &'a Class<'a>,
+    ) -> Result<oxc_semantic::SymbolId, bool> {
+        let nodes = self.project.file(file).semantic.nodes();
+        let symbol = match &class.id {
+            Some(identifier) if class.is_declaration() => identifier.symbol_id.get(),
+            _ => {
+                let outer = crate::values::outermost_of(nodes, class.node_id());
+
+                match nodes.parent_kind(outer) {
+                    AstKind::NewExpression(new)
+                        if new.callee.span() == nodes.kind(outer).span() =>
+                    {
+                        return Err(false)
+                    }
+                    AstKind::VariableDeclarator(declarator)
+                        if matches!(nodes.parent_kind(declarator.node_id()), AstKind::VariableDeclaration(declaration) if declaration.kind.is_const())
+                            && declarator.init.as_ref().map(GetSpan::span)
+                                == Some(nodes.kind(outer).span()) =>
+                    {
+                        declarator
+                            .id
+                            .get_binding_identifier()
+                            .and_then(|identifier| identifier.symbol_id.get())
+                    }
+                    _ => return Err(true),
+                }
+            }
+        };
+
+        symbol.ok_or(true)
+    }
+
+    fn is_class_surfaced(&self, file: FileId, class: &'a Class<'a>) -> bool {
+        match self.class_symbol_of(file, class) {
+            Ok(symbol) => {
+                let declared = self
+                    .project
+                    .file(file)
+                    .semantic
+                    .scoping()
+                    .symbol_declaration(symbol);
+
+                self.is_surfaced_symbol(file, symbol, declared)
+            }
+            Err(fixed) => fixed,
+        }
+    }
+
+    fn class_extensibility_of(&mut self, file: FileId, class: &'a Class<'a>) -> bool {
+        let project = self.project;
+        let symbol = match self.class_symbol_of(file, class) {
+            Ok(symbol) => symbol,
+            Err(fixed) => return fixed,
+        };
+
+        if self.is_class_surfaced(file, class) {
+            return true;
+        }
+
+        let binding = Binding::Symbol { file, symbol };
+
+        for (target, node, write) in self.declarations.surface_references_of(project, binding) {
+            if !self.charge_dispatch() || write {
+                return true;
+            }
+
+            let nodes = project.file(target).semantic.nodes();
+
+            match value_flow_of(nodes, node) {
+                ValueFlow::Read | ValueFlow::Member | ValueFlow::Receiver(_) => {}
+                ValueFlow::Escaped(parent) if matches!(nodes.kind(parent), AstKind::Class(derived) if derived.heritage.as_ref().is_some_and(|heritage| heritage.expression.span() == nodes.kind(node).span())) =>
+                    {}
+                _ => return true,
+            }
+        }
+
+        false
+    }
+
     pub(crate) fn static_member_name_of(
         &mut self,
         file: FileId,
@@ -716,6 +1645,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.values.targets.patterns.clear();
         self.values.targets.parameter_classes.clear();
         self.values.targets.plans.clear();
+        self.values.targets.implicit.clear();
+        self.values.targets.extensible.clear();
+        self.values.targets.closing.clear();
+        self.values.targets.implicit_plans.clear();
+        self.values.targets.builtin_accessors.clear();
+        self.values.targets.invocations.clear();
+        self.values.targets.primitive_bindings.clear();
         self.forget_constructions();
         self.prototype_members.clear();
         self.values.forget_sizes();
@@ -786,7 +1722,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let keys = names
             .iter()
-            .map(|name| Some(MemberKey::Name((*name).to_string())))
+            .map(|name| Some(protocol_key_of(name)))
             .chain(std::iter::once(None));
         let mut replaced = false;
 
@@ -795,6 +1731,239 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         replaced || self.work_exhausted()
+    }
+
+    pub(crate) fn builtin_accessors_defined(&mut self, kind: Kind, name: Option<&str>) -> bool {
+        self.index_targets();
+
+        let Some(name) = name else {
+            return !self.values.targets.accessor_keys.is_empty()
+                && self.accessor_writes_reach(kind);
+        };
+        let key = protocol_key_of(name);
+
+        if !self.is_defined_key(&self.values.targets.accessor_keys, &key) {
+            return false;
+        }
+
+        if OUTSIDE_SOURCES_REPLACE_BUILTINS || self.work_exhausted() {
+            return true;
+        }
+
+        [Some(key), None].into_iter().any(|written| {
+            let summary = self.wide_summary_of(written, kind, false, true);
+
+            !summary.getters.is_empty() || summary.accessors_open || !summary.prototypes.is_empty()
+        })
+    }
+
+    pub(crate) fn holds_primitive(&mut self, file: FileId, operand: &'a Expression<'a>) -> bool {
+        let binding = match unwrap(operand) {
+            Expression::Identifier(reference) => {
+                self.declarations
+                    .binding_of_reference(self.project, file, reference)
+            }
+            _ => None,
+        };
+        let Some(binding) = binding else {
+            return self.is_primitive_value(file, operand);
+        };
+
+        if let Some(primitive) = self.values.targets.primitive_bindings.get(&binding) {
+            return *primitive;
+        }
+
+        let primitive = self.is_primitive_value(file, operand);
+
+        self.values
+            .targets
+            .primitive_bindings
+            .insert(binding, primitive);
+
+        primitive
+    }
+
+    pub(crate) fn invocation_sites_of(
+        &mut self,
+        binding: Binding,
+    ) -> Option<Vec<(FileId, &'a CallExpression<'a>)>> {
+        let sites = match self.values.targets.invocations.get(&binding) {
+            Some(sites) => sites.clone(),
+            None => {
+                if !self.values.targets.resolving_invocations.insert(binding) {
+                    return None;
+                }
+
+                let exhaustions = self.values.targets.exhaustions;
+                let sites = self.invocation_sites_within(binding);
+
+                self.values.targets.resolving_invocations.remove(&binding);
+
+                if exhaustions == self.values.targets.exhaustions {
+                    self.values
+                        .targets
+                        .invocations
+                        .insert(binding, sites.clone());
+                }
+
+                sites
+            }
+        }?;
+
+        Some(
+            sites
+                .into_iter()
+                .filter_map(|(file, node)| match self.kind_of_node(file, node) {
+                    AstKind::CallExpression(call) => Some((file, call)),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    fn invocation_sites_within(&mut self, binding: Binding) -> Option<Vec<Site>> {
+        let project = self.project;
+        let mut sites = Vec::new();
+        let mut visited = HashSet::from([binding]);
+        let mut pending = vec![binding];
+
+        while let Some(binding) = pending.pop() {
+            for (target, node, write) in self.declarations.surface_references_of(project, binding) {
+                if write || !self.charge_dispatch() {
+                    return None;
+                }
+
+                let nodes = project.file(target).semantic.nodes();
+                let span = nodes.kind(node).span();
+                let AstKind::CallExpression(call) = nodes.parent_kind(node) else {
+                    return None;
+                };
+
+                if call.callee.span() == span {
+                    sites.push((target, call.node_id()));
+
+                    continue;
+                }
+
+                let index = call
+                    .arguments
+                    .iter()
+                    .position(|argument| argument.span() == span)?;
+                let Expression::Identifier(callee) = unwrap(&call.callee) else {
+                    return None;
+                };
+                let (declaration, closed) = self
+                    .declarations
+                    .callable_reference(project, target, callee);
+                let (declared, function) = declaration
+                    .filter(|_| closed)
+                    .and_then(|declaration| self.declarations.function_of(declaration))?;
+                let parameters = match function {
+                    FunctionNode::Function(inner) => &inner.params,
+                    FunctionNode::Arrow(arrow) => &arrow.params,
+                };
+
+                if call.arguments[..index]
+                    .iter()
+                    .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+                {
+                    return None;
+                }
+
+                let Some(parameter) = parameters.items.get(index) else {
+                    if parameters.rest.is_some() {
+                        return None;
+                    }
+
+                    continue;
+                };
+                let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                    return None;
+                };
+                let forwarded = Binding::Symbol {
+                    file: declared,
+                    symbol: identifier.symbol_id.get()?,
+                };
+
+                if !self.is_parameter_unwritten(forwarded) {
+                    return None;
+                }
+
+                if visited.insert(forwarded) {
+                    pending.push(forwarded);
+                }
+            }
+        }
+
+        Some(sites)
+    }
+
+    fn accessor_writes_reach(&mut self, kind: Kind) -> bool {
+        if let Some(reached) = self.values.targets.builtin_accessors.get(&kind) {
+            return *reached;
+        }
+
+        let mut reached = OUTSIDE_SOURCES_REPLACE_BUILTINS;
+
+        for index in 0..self.values.targets.writes.len() {
+            if reached {
+                break;
+            }
+
+            let write = &self.values.targets.writes[index];
+
+            if write.kind != WriteKind::Defined
+                || matches!(self.descriptor_of(write.site), Descriptor::Absent)
+            {
+                continue;
+            }
+
+            if !self.charge_dispatch() {
+                reached = true;
+
+                break;
+            }
+
+            reached = match self.values.targets.owners[index].0 {
+                Owner::Builtin { kind: written } => affects(written, kind),
+                Owner::FunctionPrototype { .. } => !is_builtin(kind),
+                Owner::Value {
+                    allocation: false,
+                    kind: written,
+                    plain,
+                    ..
+                }
+                | Owner::Value {
+                    shared: true,
+                    kind: written,
+                    plain,
+                    ..
+                } => is_compatible(written, kind) && !(plain && is_builtin(kind)),
+                _ => false,
+            };
+        }
+
+        if !reached {
+            for ((file, node), builtin) in self.builtin_classes_of() {
+                if !affects(builtin, kind) {
+                    continue;
+                }
+
+                let AstKind::Class(class) = self.kind_of_node(file, node) else {
+                    continue;
+                };
+
+                reached |= class.body.body.iter().any(|element| {
+                    matches!(element, ClassElement::MethodDefinition(method) if matches!(method.kind, MethodDefinitionKind::Get | MethodDefinitionKind::Set))
+                });
+            }
+        }
+
+        if !self.work_exhausted() {
+            self.values.targets.builtin_accessors.insert(kind, reached);
+        }
+
+        reached
     }
 
     pub(crate) fn target_exhaustions(&self) -> u64 {
@@ -971,6 +2140,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let project = self.project;
         let mut pending: Vec<(Site, Option<KeySource<'a>>, WriteKind)> = Vec::new();
+        let mut definitions: Vec<(Site, bool)> = Vec::new();
 
         for source in &project.files {
             let file = source.id;
@@ -981,6 +2151,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let site = (file, node.id());
 
                 match node.kind() {
+                    AstKind::ObjectProperty(property) => match property.kind {
+                        PropertyKind::Get | PropertyKind::Set => definitions.push((site, true)),
+                        PropertyKind::Init => definitions.push((site, false)),
+                    },
+                    AstKind::MethodDefinition(method) if method.value.body.is_some() => {
+                        match method.kind {
+                            MethodDefinitionKind::Get | MethodDefinitionKind::Set => {
+                                definitions.push((site, true))
+                            }
+                            MethodDefinitionKind::Method => definitions.push((site, false)),
+                            MethodDefinitionKind::Constructor => {}
+                        }
+                    }
+                    AstKind::PropertyDefinition(property) if property.value.is_some() => {
+                        definitions.push((site, false))
+                    }
+                    AstKind::AccessorProperty(property) if property.value.is_some() => {
+                        definitions.push((site, false))
+                    }
                     AstKind::ReturnStatement(_) => {
                         if let Some(function) = nodes.ancestors(node.id()).find(|ancestor| {
                             matches!(
@@ -1070,11 +2259,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let key = match key {
                 Some(KeySource::Known(key)) => Some(key),
                 Some(KeySource::Computed(file, expression)) => {
-                    match self.member_key_of_expression(file, expression) {
-                        Some(key) => Some(key),
-                        None if self.is_numeric_key(file, expression, 0) => Some(MemberKey::Index),
-                        None => None,
-                    }
+                    self.expression_key(file, expression)
                 }
                 None => None,
             };
@@ -1198,10 +2383,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
             let file = write.site.0;
             let owner = self.owner_of(file, object);
-            let callable = match write.kind {
-                WriteKind::Assigned => value.is_none_or(|value| self.may_be_callable(file, value)),
-                WriteKind::Removed => false,
-                WriteKind::Defined | WriteKind::Prototype => true,
+            let callable = match (write.kind, self.descriptor_of(write.site)) {
+                (WriteKind::Assigned, _) => {
+                    value.is_none_or(|value| self.may_be_callable(file, value))
+                }
+                (WriteKind::Removed, _) => false,
+                (
+                    WriteKind::Defined,
+                    Descriptor::Known {
+                        value: described,
+                        getter,
+                        ..
+                    },
+                ) => [described, getter]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| self.may_be_callable(file, value)),
+                (WriteKind::Defined | WriteKind::Prototype, _) => true,
             };
 
             if write.key.is_none() && !callable {
@@ -1276,6 +2474,57 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        let mut accessor_keys = HashSet::new();
+        let mut callable_keys = HashSet::new();
+
+        for ((file, node), accessor) in definitions {
+            let (key, value) = match self.kind_of_node(file, node) {
+                AstKind::ObjectProperty(property) => (
+                    self.property_key_of(file, property),
+                    (property.kind == PropertyKind::Init).then_some(&property.value),
+                ),
+                AstKind::MethodDefinition(method) => (
+                    self.defined_key_of(file, &method.key, method.computed),
+                    None,
+                ),
+                AstKind::PropertyDefinition(property) => (
+                    self.defined_key_of(file, &property.key, property.computed),
+                    property.value.as_ref(),
+                ),
+                AstKind::AccessorProperty(property) => (
+                    self.defined_key_of(file, &property.key, property.computed),
+                    property.value.as_ref(),
+                ),
+                _ => continue,
+            };
+
+            if value.is_some_and(|value| !self.may_be_callable(file, value)) {
+                continue;
+            }
+
+            match accessor {
+                true => accessor_keys.insert(key),
+                false => callable_keys.insert(key),
+            };
+        }
+
+        let mut written_keys = HashSet::new();
+
+        for (index, write) in writes.iter().enumerate() {
+            if write.kind == WriteKind::Defined
+                && !matches!(self.descriptor_of(write.site), Descriptor::Absent)
+            {
+                accessor_keys.insert(write.key.clone());
+            }
+
+            if write.kind != WriteKind::Removed && owners[index].1 {
+                written_keys.insert(write.key.clone());
+            }
+        }
+
+        self.values.targets.accessor_keys = accessor_keys;
+        self.values.targets.callable_keys = callable_keys;
+        self.values.targets.written_keys = written_keys;
         self.values.targets.removals = removals;
         self.values.targets.writes = writes;
         self.values.targets.owners = owners;
@@ -1323,6 +2572,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if let Expression::StaticMemberExpression(member) = unwrap(expression) {
+            let scoping = self.project.file(file).semantic.scoping();
+
+            if matches!(unwrap(&member.object), Expression::Identifier(symbol) if symbol.name == "Symbol" && is_unbound(scoping, symbol))
+            {
+                return Some(MemberKey::WellKnown(member.property.name.to_string()));
+            }
+        }
+
         if let Expression::TemplateLiteral(template) = unwrap(expression) {
             if template.expressions.is_empty() {
                 return template
@@ -1346,6 +2604,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .map(|name| MemberKey::Name(name.into_owned())),
             },
             None => element_name_of(element).map(MemberKey::Name),
+        }
+    }
+
+    fn defined_key_of(
+        &mut self,
+        file: FileId,
+        key: &'a PropertyKey<'a>,
+        computed: bool,
+    ) -> Option<MemberKey> {
+        match key {
+            PropertyKey::PrivateIdentifier(identifier) => {
+                Some(MemberKey::Name(format!("#{}", identifier.name)))
+            }
+            _ if computed => key
+                .as_expression()
+                .and_then(|expression| self.member_key_of_expression(file, expression)),
+            _ => key
+                .static_name()
+                .map(|name| MemberKey::Name(name.into_owned())),
         }
     }
 
@@ -2082,6 +3359,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some((target, class)) =
             cast.and_then(|annotation| self.declarations.class_of_type(project, file, annotation))
         {
+            receiver.constrained = true;
+
             return receiver.origins.push(Origin::Instance {
                 file: target,
                 class,
@@ -2172,6 +3451,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 None => {}
             },
             Expression::ThisExpression(this) => {
+                receiver.constrained |=
+                    construction_context_of(project, file, this.node_id()).is_none();
+
                 match this_owner_of(project, file, this.node_id()) {
                     Some(ThisOwner::Class {
                         file,
@@ -2278,6 +3560,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let Some((target, annotation)) = annotation_of(&declaration) {
+            receiver.constrained |= declarator_of_identifier(&declaration)
+                .is_none_or(|(_, declarator, _)| declarator.init.is_none());
+
             if let Some((target, class)) =
                 self.declarations.class_of_type(project, target, annotation)
             {
@@ -2312,25 +3597,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut found = self.member_candidates_raw_of(file, expression, receiver, key);
 
         for hit in std::mem::take(&mut found.hits) {
-            let (values, functions, replaced) = self.prototype_members_of(hit, key);
+            let inherited = self.prototype_members_of(hit, key);
 
-            found.replaced |= replaced;
-
-            found.values.extend(values);
-
-            for function in functions {
-                push_function(&mut found.functions, function);
-            }
+            found.absorb(&inherited);
         }
 
         found
     }
 
-    fn prototype_members_of(
-        &mut self,
-        start: usize,
-        key: &MemberKey,
-    ) -> (Vec<Valued<'a>>, Vec<FunctionId>, bool) {
+    fn prototype_members_of(&mut self, start: usize, key: &MemberKey) -> MemberValues<'a> {
+        let unknown = MemberValues {
+            replaced: true,
+            accessors_open: true,
+            ..MemberValues::default()
+        };
+
         if let Some(found) = self.prototype_members.get(&(start, key.clone())) {
             return found.clone();
         }
@@ -2343,7 +3624,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         {
             self.values.targets.cuts += 1;
 
-            return (Vec::new(), Vec::new(), true);
+            return unknown;
         }
 
         let cuts = self.values.targets.cuts;
@@ -2359,13 +3640,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if !self.enter_targets() {
                 self.leave_targets();
 
-                own.insert(
-                    write,
-                    MemberValues {
-                        replaced: true,
-                        ..MemberValues::default()
-                    },
-                );
+                own.insert(write, unknown.clone());
 
                 continue;
             }
@@ -2379,12 +3654,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                     self.collect_receiver(site.0, prototype, &mut HashSet::new(), &mut receiver);
 
-                    self.member_candidates_raw_of(site.0, prototype, &receiver, key)
+                    let mut members =
+                        self.member_candidates_raw_of(site.0, prototype, &receiver, key);
+
+                    members.accessors_open |= is_unknown_prototype(prototype, &receiver);
+
+                    members
                 }
-                _ => MemberValues {
-                    replaced: true,
-                    ..MemberValues::default()
-                },
+                _ => unknown.clone(),
             };
 
             members.replaced = true;
@@ -2411,39 +3688,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let hits = results[write].hits.clone();
 
                 for hit in hits {
-                    let (values, functions, replaced) = match results.get(&hit) {
-                        Some(found) => (
-                            found.values.clone(),
-                            found.functions.clone(),
-                            found.replaced,
-                        ),
+                    let inherited = match results.get(&hit) {
+                        Some(found) => found.clone(),
                         None => self
                             .prototype_members
                             .get(&(hit, key.clone()))
                             .cloned()
-                            .unwrap_or((Vec::new(), Vec::new(), true)),
+                            .unwrap_or_else(|| unknown.clone()),
                     };
                     let target = results.get_mut(write).expect("explored write");
 
-                    target.replaced |= replaced;
-
-                    for value in values {
-                        if !target.values.iter().any(|known| {
-                            known.0 == value.0 && known.1.node_id() == value.1.node_id()
-                        }) {
-                            target.values.push(value);
-
-                            changed = true;
-                        }
-                    }
-
-                    for function in functions {
-                        if !target.functions.contains(&function) {
-                            target.functions.push(function);
-
-                            changed = true;
-                        }
-                    }
+                    changed |= target.absorb(&inherited);
                 }
             }
         }
@@ -2453,23 +3708,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let complete = self.values.targets.cuts == cuts;
-        let result = results
-            .get(&start)
-            .map(|found| {
-                (
-                    found.values.clone(),
-                    found.functions.clone(),
-                    found.replaced,
-                )
-            })
-            .unwrap_or((Vec::new(), Vec::new(), true));
+        let result = results.get(&start).cloned().unwrap_or(unknown);
 
         if complete {
             for (write, found) in results {
-                self.prototype_members.insert(
-                    (write, key.clone()),
-                    (found.values, found.functions, found.replaced),
-                );
+                self.prototype_members.insert((write, key.clone()), found);
             }
         }
 
@@ -2575,7 +3818,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         );
                     }
                 }
-                PropertyKind::Set => {}
+                PropertyKind::Set => {
+                    if let Expression::FunctionExpression(setter) = &property.value {
+                        push_function(
+                            &mut found.setters,
+                            FunctionId {
+                                file,
+                                node: setter.node_id(),
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -2618,17 +3871,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.values.targets.prototypes.remove(&site);
         self.leave_targets();
 
-        found.values.extend(inherited.values);
+        found.absorb(&inherited);
 
-        found.replaced |= inherited.replaced;
-
-        for function in inherited.functions {
-            push_function(&mut found.functions, function);
-        }
+        found.accessors_open |= is_unknown_prototype(prototype, &receiver);
     }
 
     fn push_getter(&mut self, getter: FunctionId, found: &mut MemberValues<'a>) {
         push_function(&mut found.functions, getter);
+        push_function(&mut found.getters, getter);
 
         for value in self.returned_expressions_of(getter) {
             found.values.push((getter.file, value));
@@ -2929,6 +4179,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             push_function(&mut found.functions, function)
                         }
                         MethodDefinitionKind::Get => self.push_getter(function, found),
+                        MethodDefinitionKind::Set => push_function(&mut found.setters, function),
                         _ => {}
                     }
                 }
@@ -3351,11 +4602,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         _ => None,
                     })?;
                 let object = call.arguments.first()?.as_expression()?;
+                let value = match reflective_name_of(&call.callee) {
+                    Some("defineProperties") => {
+                        descriptor_value_of(self.descriptor_of((file, node)))
+                    }
+                    _ => (property.kind == PropertyKind::Init).then_some(&property.value),
+                };
 
-                Some((
-                    object,
-                    (property.kind == PropertyKind::Init).then_some(&property.value),
-                ))
+                Some((object, value))
             }
             AstKind::CallExpression(call) => {
                 let object = call.arguments.first()?.as_expression()?;
@@ -3363,12 +4617,70 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Some("setPrototypeOf") => {
                         call.arguments.get(1).and_then(Argument::as_expression)
                     }
+                    Some("defineProperty") => descriptor_value_of(self.descriptor_of((file, node))),
                     _ => None,
                 };
 
                 Some((object, value))
             }
             _ => None,
+        }
+    }
+
+    fn descriptor_of(&self, (file, node): Site) -> Descriptor<'a> {
+        let nodes = self.project.file(file).semantic.nodes();
+        let descriptor = match self.kind_of_node(file, node) {
+            AstKind::CallExpression(call)
+                if reflective_name_of(&call.callee) == Some("defineProperty") =>
+            {
+                call.arguments.get(2).and_then(Argument::as_expression)
+            }
+            AstKind::ObjectProperty(property) => {
+                let defining = nodes
+                    .ancestors(node)
+                    .find_map(|ancestor| match ancestor.kind() {
+                        AstKind::CallExpression(call) => Some(call),
+                        _ => None,
+                    });
+
+                match defining.is_some_and(|call| {
+                    reflective_name_of(&call.callee) == Some("defineProperties")
+                }) {
+                    true => Some(&property.value),
+                    false => return Descriptor::Absent,
+                }
+            }
+            _ => return Descriptor::Absent,
+        };
+        let Some(Expression::ObjectExpression(object)) = descriptor.map(unwrap) else {
+            return Descriptor::Unknown;
+        };
+        let mut value = None;
+        let mut getter = None;
+        let mut setter = None;
+
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                return Descriptor::Unknown;
+            };
+
+            if property.computed || property.kind != PropertyKind::Init {
+                return Descriptor::Unknown;
+            }
+
+            match property.key.static_name().as_deref() {
+                Some("value") => value = Some(&property.value),
+                Some("get") => getter = Some(&property.value),
+                Some("set") => setter = Some(&property.value),
+                Some(_) => {}
+                None => return Descriptor::Unknown,
+            }
+        }
+
+        Descriptor::Known {
+            value,
+            getter,
+            setter,
         }
     }
 
@@ -3733,6 +5045,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Kind::String,
             Expression::RegExpLiteral(_) => Kind::RegExp,
             Expression::ObjectExpression(_) => Kind::Other,
+            Expression::AwaitExpression(awaited) => {
+                let kind = self.proven_kind_of(file, &awaited.argument, depth + 1);
+
+                match is_builtin(kind) && !self.builtin_members_replaced(kind, &["then"]) {
+                    true => kind,
+                    false => Kind::Unknown,
+                }
+            }
             Expression::NewExpression(new) => match unwrap(&new.callee) {
                 Expression::Identifier(constructor)
                     if is_unbound(self.project.file(file).semantic.scoping(), constructor)
@@ -3850,19 +5170,60 @@ impl<'p, 'a> Analysis<'p, 'a> {
         match write.kind {
             WriteKind::Prototype => {
                 found.replaced = true;
+                found.accessors_open |= value.is_none();
 
                 if value.is_some() && !found.hits.contains(&index) {
                     found.hits.push(index);
                 }
             }
-            _ => {
+            kind => {
                 found.replaced |= callable;
 
                 if let Some(value) = value {
                     found.values.push((write.site.0, value));
                 }
+
+                if kind == WriteKind::Defined {
+                    match self.descriptor_of(write.site) {
+                        Descriptor::Known { getter, setter, .. } => {
+                            let file = write.site.0;
+
+                            if let Some(getter) = getter {
+                                let targets = self.accessor_functions_of(file, getter);
+
+                                found.accessors_open |= targets.open;
+
+                                for known in targets.known {
+                                    self.push_getter(known, found);
+                                }
+                            }
+
+                            if let Some(setter) = setter {
+                                let targets = self.accessor_functions_of(file, setter);
+
+                                found.accessors_open |= targets.open;
+
+                                for known in targets.known {
+                                    push_function(&mut found.setters, known);
+                                }
+                            }
+                        }
+                        Descriptor::Unknown => found.accessors_open = true,
+                        Descriptor::Absent => {}
+                    }
+                }
             }
         }
+    }
+
+    fn accessor_functions_of(&mut self, file: FileId, value: &'a Expression<'a>) -> TargetSet {
+        let mut found = closed_targets_of();
+
+        if self.may_be_callable(file, value) {
+            self.collect_callable_targets(file, value, &mut HashSet::new(), &mut found);
+        }
+
+        found
     }
 
     fn wide_summary_of(
@@ -3931,8 +5292,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if written.is_some() {
                 self.apply_write(index, &mut found);
+            } else if self.values.targets.writes[index].kind == WriteKind::Defined
+                && !matches!(
+                    self.descriptor_of(self.values.targets.writes[index].site),
+                    Descriptor::Absent
+                )
+            {
+                summary.accessors_open = true;
             }
         }
+
+        summary.getters = std::mem::take(&mut found.getters);
+        summary.setters = std::mem::take(&mut found.setters);
+        summary.accessors_open |= found.accessors_open;
 
         let mut targets = TargetSet {
             known: found.functions,
@@ -4112,9 +5484,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let summary = self.wide_summary_of(written, kind, shared, receiver.origins.is_empty());
 
             found.replaced |= summary.replaced;
+            found.accessors_open |= summary.accessors_open;
 
             for function in summary.known {
                 push_function(&mut found.functions, function);
+            }
+
+            for getter in summary.getters {
+                push_function(&mut found.getters, getter);
+            }
+
+            for setter in summary.setters {
+                push_function(&mut found.setters, setter);
             }
 
             for index in summary.prototypes {
@@ -4269,34 +5650,118 @@ fn reflective_writes_of<'a>(
                     continue;
                 };
 
-                for property in &object.properties {
-                    match property {
-                        ObjectPropertyKind::ObjectProperty(property) => {
-                            let key = match (property.computed, &property.key) {
-                                (false, key) | (true, key @ PropertyKey::StringLiteral(_)) => {
-                                    key.static_name().map(|name| {
-                                        KeySource::Known(MemberKey::Name(name.into_owned()))
-                                    })
-                                }
-                                (true, key) => key
-                                    .as_expression()
-                                    .map(|key| KeySource::Computed(file, key)),
-                            };
-                            let kind = match property.kind {
-                                PropertyKind::Init => WriteKind::Assigned,
-                                _ => WriteKind::Defined,
-                            };
-
-                            pending.push(((file, property.node_id()), key, kind));
-                        }
-                        ObjectPropertyKind::SpreadProperty(_) => {
-                            pending.push((site, None, WriteKind::Defined))
-                        }
-                    }
-                }
+                property_writes_of(file, (site, object), false, pending);
             }
         }
         "setPrototypeOf" => pending.push((site, None, WriteKind::Prototype)),
+        "defineProperties" => {
+            let Some(Expression::ObjectExpression(object)) = call
+                .arguments
+                .get(1)
+                .and_then(Argument::as_expression)
+                .map(unwrap)
+            else {
+                return pending.push((site, None, WriteKind::Defined));
+            };
+
+            property_writes_of(file, (site, object), true, pending);
+        }
         _ => pending.push((site, None, WriteKind::Defined)),
+    }
+}
+
+fn property_writes_of<'a>(
+    file: FileId,
+    (site, object): (Site, &'a ObjectExpression<'a>),
+    defining: bool,
+    pending: &mut Vec<(Site, Option<KeySource<'a>>, WriteKind)>,
+) {
+    for property in &object.properties {
+        match property {
+            ObjectPropertyKind::ObjectProperty(property) => {
+                let key = match (property.computed, &property.key) {
+                    (false, key) | (true, key @ PropertyKey::StringLiteral(_)) => key
+                        .static_name()
+                        .map(|name| KeySource::Known(MemberKey::Name(name.into_owned()))),
+                    (true, key) => key
+                        .as_expression()
+                        .map(|key| KeySource::Computed(file, key)),
+                };
+                let kind = match (defining, property.kind) {
+                    (false, PropertyKind::Init) => WriteKind::Assigned,
+                    _ => WriteKind::Defined,
+                };
+
+                pending.push(((file, property.node_id()), key, kind));
+            }
+            ObjectPropertyKind::SpreadProperty(_) => pending.push((site, None, WriteKind::Defined)),
+        }
+    }
+}
+
+fn labeled_target_of(
+    nodes: &oxc_semantic::AstNodes<'_>,
+    node: NodeId,
+    label: &str,
+) -> Option<NodeId> {
+    nodes
+        .ancestor_ids(node)
+        .find_map(|ancestor| match nodes.kind(ancestor) {
+            AstKind::LabeledStatement(statement) if statement.label.name == label => {
+                Some(statement.body.node_id())
+            }
+            _ => None,
+        })
+}
+
+fn completes_normally(scoping: &oxc_semantic::Scoping, kind: &AstKind<'_>) -> bool {
+    if crate::syntax::is_type_kind(kind.ty()) {
+        return true;
+    }
+
+    match kind {
+        AstKind::BlockStatement(_)
+        | AstKind::EmptyStatement(_)
+        | AstKind::ExpressionStatement(_)
+        | AstKind::IfStatement(_)
+        | AstKind::SwitchStatement(_)
+        | AstKind::SwitchCase(_)
+        | AstKind::LabeledStatement(_)
+        | AstKind::LabelIdentifier(_)
+        | AstKind::ForStatement(_)
+        | AstKind::WhileStatement(_)
+        | AstKind::DoWhileStatement(_)
+        | AstKind::DebuggerStatement(_)
+        | AstKind::VariableDeclaration(_)
+        | AstKind::BindingIdentifier(_)
+        | AstKind::NumericLiteral(_)
+        | AstKind::StringLiteral(_)
+        | AstKind::BooleanLiteral(_)
+        | AstKind::NullLiteral(_)
+        | AstKind::BigIntLiteral(_)
+        | AstKind::ParenthesizedExpression(_)
+        | AstKind::SequenceExpression(_)
+        | AstKind::ConditionalExpression(_)
+        | AstKind::LogicalExpression(_)
+        | AstKind::Function(_)
+        | AstKind::ArrowFunctionExpression(_) => true,
+        AstKind::TemplateLiteral(template) => template.expressions.is_empty(),
+        AstKind::TemplateElement(_) => true,
+        AstKind::UnaryExpression(unary) => matches!(
+            unary.operator,
+            UnaryOperator::Void | UnaryOperator::LogicalNot | UnaryOperator::Typeof
+        ),
+        AstKind::VariableDeclarator(declarator) => {
+            matches!(declarator.id, BindingPattern::BindingIdentifier(_))
+        }
+        AstKind::IdentifierReference(reference) => !is_unbound(scoping, reference),
+        AstKind::AssignmentExpression(assignment) => {
+            assignment.operator.is_assign()
+                && matches!(
+                    assignment.left,
+                    AssignmentTarget::AssignmentTargetIdentifier(_)
+                )
+        }
+        _ => false,
     }
 }

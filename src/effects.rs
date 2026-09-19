@@ -726,6 +726,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
             header.join(&effects);
         }
 
+        if let AstKind::ForOfStatement(statement) = loop_kind {
+            let saved = std::mem::take(&mut self.current_effects);
+
+            self.record_iteration_effects(file, statement);
+
+            let effects = std::mem::replace(&mut self.current_effects, saved);
+
+            self.current_effects.join(&effects);
+            header.join(&effects);
+        }
+
         let mut effects = match loop_body_of(loop_kind) {
             Some(body) => self.called_effects_in(file, Root::Statement(body)),
             None => Effects::default(),
@@ -817,6 +828,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Prepass::Skipped => self.record_writes(file, kind, Writes::All),
                 Prepass::Loop => self.record_writes(file, kind, Writes::Qualified),
             }
+
+            self.record_implicit_effects(file, kind);
 
             match kind {
                 AstKind::CallExpression(call)
@@ -1072,6 +1085,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 | AstKind::TaggedTemplateExpression(_) => storage.calls = true,
                 _ => {}
             }
+
+            let kind = self.kind_of_node(file, node);
+
+            storage.calls |= self.has_implicit_calls(file, kind);
 
             pending.extend(self.children_of(file, node));
         }

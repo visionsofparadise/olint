@@ -1168,6 +1168,17 @@ fn callee_target_spans_index_each_file_once() {
     assert!(doubled <= 2 * nodes + 1, "{doubled} {nodes}");
 }
 
+fn assert_linear_growth(base: &[u64], single: &[u64], double: &[u64]) {
+    for (position, ((base, single), double)) in base.iter().zip(single).zip(double).enumerate() {
+        assert!(single > base, "{position}: {single} {base}");
+        assert_eq!(
+            double - base,
+            2 * (single - base),
+            "{position}: {base} {single} {double}"
+        );
+    }
+}
+
 fn dispatch_source(sites: usize) -> String {
     let mut lines = vec![
         "class C0 { work(xs: number[]) { for (const x of xs) void x; } run(xs: number[]) { this.work(xs); } }".to_string(),
@@ -1225,18 +1236,11 @@ fn dispatch_counts_of(sites: usize) -> Vec<u64> {
 
 #[test]
 fn dispatch_work_grows_linearly_with_dispatch_sites() {
-    let base = dispatch_counts_of(0);
-    let single = dispatch_counts_of(32);
-    let double = dispatch_counts_of(64);
+    let base = dispatch_counts_of(1);
+    let single = dispatch_counts_of(33);
+    let double = dispatch_counts_of(65);
 
-    for (position, ((base, single), double)) in base.iter().zip(&single).zip(&double).enumerate() {
-        assert!(single > base, "{position}: {single} {base}");
-        assert_eq!(
-            double - base,
-            2 * (single - base),
-            "{position}: {base} {single} {double}"
-        );
-    }
+    assert_linear_growth(&base, &single, &double);
 }
 
 fn prototype_chain_source(length: usize) -> String {
@@ -1785,4 +1789,124 @@ fn parameter_superclasses_resolve_once_across_construction_sites() {
         2 * (single - base),
         "{base} {single} {double}"
     );
+}
+
+fn implicit_source(sites: usize) -> String {
+    let mut lines = vec![
+        "function tag(parts: TemplateStringsArray, value: number) { return value; }".to_string(),
+        "function install(target: any, value: unknown) { target.probe = value; }".to_string(),
+        "function forward(write: (target: any, value: unknown) => void, target: any) { write(target, () => 0); }".to_string(),
+    ];
+
+    for index in 0..sites {
+        lines.push(format!(
+            "export function f{index}(xs: number[]) {{ const box = {{ get value() {{ return xs.length; }}, valueOf() {{ return 1; }} }}; const iterable = {{ [Symbol.iterator]() {{ let count = 0; return {{ next() {{ return {{ done: count++ > 2, value: count }}; }} }}; }} }}; const read = box.value; const coerced = +box; for (const v of iterable) void v; class Box {{ m() {{ return 1; }} v = this.m(); }} new Box(); forward(install, {{}}); return tag`${{coerced}}` === read; }}"
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn implicit_counts_of(sites: usize) -> Vec<u64> {
+    let mut counts = Vec::new();
+
+    run_with_source(&implicit_source(sites), |analysis, file| {
+        for (file, function) in analysis.reportable() {
+            analysis.summarize(file, function);
+        }
+
+        let part = summary_of(analysis, file, "f0");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(
+            part.is_complete(),
+            "{sites}: {:?}",
+            reasons(analysis, part.unknowns)
+        );
+
+        counts = [
+            Event::DispatchStep,
+            Event::InvocationEvaluation,
+            Event::TaskKey,
+            Event::WalkerNode,
+        ]
+        .iter()
+        .map(|event| {
+            assert!(!stats.work.exhausted(*event), "{event:?}: {stats:?}");
+
+            stats.work.consumed(*event)
+        })
+        .collect();
+    });
+
+    counts
+}
+
+#[test]
+fn implicit_invocations_resolve_once_per_site_in_linear_work() {
+    let base = implicit_counts_of(16);
+    let single = implicit_counts_of(32);
+    let double = implicit_counts_of(48);
+
+    assert_linear_growth(&base, &single, &double);
+}
+
+fn nested_iteration_source(depth: usize) -> String {
+    let mut body = "step(x0);".to_string();
+
+    for level in (0..depth).rev() {
+        body = format!("for (const x{level} of items) {{ {body} }}");
+    }
+
+    format!(
+        "function step(x: unknown) {{ return x; }}\nexport function selected(xs: number[]) {{ const items = {{ [Symbol.iterator]() {{ let count = 0; return {{ next() {{ return {{ done: count++ > xs.length, value: 1 }}; }}, return() {{ return {{ done: true, value: 0 }}; }} }}; }} }}; {body} }}"
+    )
+}
+
+fn stat_of(analysis: &Analysis<'_, '_>, label: &str) -> u64 {
+    analysis
+        .stats
+        .lines()
+        .iter()
+        .find_map(|line| {
+            let (count, name) = line.trim_start().split_once("  ")?;
+
+            (name == label).then(|| count.trim().parse().ok()).flatten()
+        })
+        .unwrap_or(0)
+}
+
+fn nested_iteration_counts_of(depth: usize) -> Vec<u64> {
+    let mut counts = Vec::new();
+
+    run_with_source(&nested_iteration_source(depth), |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(
+            part.is_complete(),
+            "{depth}: {:?}",
+            reasons(analysis, part.unknowns)
+        );
+        assert!(!stats.work.exhausted(Event::DispatchStep), "{stats:?}");
+
+        counts = vec![
+            stat_of(analysis, "iterator exits: node"),
+            stat_of(analysis, "iterator exits: step"),
+            stats.work.consumed(Event::DispatchStep),
+        ];
+    });
+
+    counts
+}
+
+#[test]
+fn nested_iteration_protocols_resolve_exits_and_targets_in_linear_work() {
+    let base = nested_iteration_counts_of(8);
+    let single = nested_iteration_counts_of(16);
+    let double = nested_iteration_counts_of(24);
+
+    assert_linear_growth(&base, &single, &double);
 }

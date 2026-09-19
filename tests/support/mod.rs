@@ -287,3 +287,92 @@ pub fn trace_nodes(
 
     out
 }
+
+pub type SelectedResult = (
+    olint::cost::Cost,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+);
+
+pub fn selected_result_in(
+    sources: &[(&str, &str)],
+    types: olint::analysis::TypeMode,
+) -> SelectedResult {
+    let entry = sources[0].0;
+    let options = match entry.ends_with(".ts") {
+        true => r#""strict":true,"noEmit":true"#,
+        false => r#""allowJs":true,"noEmit":true"#,
+    };
+    let tsconfig = format!(r#"{{"compilerOptions":{{{options}}},"files":["{entry}"]}}"#);
+    let mut files = vec![("tsconfig.json", tsconfig.as_str())];
+
+    files.extend_from_slice(sources);
+
+    let mut result = (olint::cost::Cost::ONE, std::collections::BTreeSet::new());
+
+    run_in_project(&files, |project, root| {
+        let file = file_of(project, root, entry);
+        let mut analysis = olint::analysis::Analysis::new(
+            project,
+            olint::analysis::Options {
+                minimum_exponent: 2,
+                types,
+            },
+        );
+
+        if types == olint::analysis::TypeMode::Tsc {
+            let functions = analysis.reportable();
+            let tsconfig = root.join("tsconfig.json");
+
+            analysis
+                .gather_answers(&functions, |queries| {
+                    olint::tsc::ask(
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+                        &tsconfig,
+                        queries,
+                    )
+                })
+                .expect("the compiler helper answers");
+        }
+
+        let part = summary_of(&mut analysis, file, "selected");
+        let reasons = unknown_reasons(&analysis, part.unknowns);
+        let selected = function_of_name(analysis.project, file, "selected");
+        let cost = legacy_class_of(&mut analysis, file, selected, &part.cost);
+
+        result = (cost, reasons);
+    });
+
+    result
+}
+
+pub type SelectedCase<'s> = (Vec<(&'s str, String)>, &'s str, bool);
+
+pub fn assert_selected(cases: &[SelectedCase<'_>]) {
+    for types in [
+        olint::analysis::TypeMode::Syntactic,
+        olint::analysis::TypeMode::Tsc,
+    ] {
+        for (sources, expected, partial) in cases {
+            let sources: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|(name, source)| (*name, source.as_str()))
+                .collect();
+            let (cost, reasons) = selected_result_in(&sources, types);
+
+            assert_eq!(
+                cost,
+                olint::cost::Cost::parse(expected).unwrap(),
+                "{types:?} {sources:?}"
+            );
+            assert_eq!(
+                reasons.contains(&olint::unknowns::UnknownReason::Target),
+                *partial,
+                "{types:?} {sources:?}: {reasons:?}"
+            );
+        }
+    }
+}
+
+pub fn index_of(source: String) -> Vec<(&'static str, String)> {
+    vec![("index.ts", source)]
+}

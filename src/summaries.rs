@@ -2517,6 +2517,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
+    pub(crate) fn call_implicit(
+        &mut self,
+        target: FunctionId,
+        call_file: FileId,
+        span: oxc_span::Span,
+    ) -> (Part, bool) {
+        if self.fallback_active() {
+            return self.fallback_invocation(target, call_file, span);
+        }
+
+        let function = self.function_at(target);
+        let Some(captured) = self.inherited_substitutions_of(target.file, function) else {
+            return (
+                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                false,
+            );
+        };
+
+        self.call_with_captures(
+            (target.file, function),
+            (call_file, &[], span),
+            true,
+            captured,
+        )
+    }
+
     fn call_with_captures(
         &mut self,
         (file, function): (FileId, FunctionNode<'a>),

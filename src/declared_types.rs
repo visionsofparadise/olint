@@ -666,6 +666,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     return self.is_proven_primitive_binding(&declaration, initializer, depth + 1);
                 }
 
+                if let Some((_, declarator, constant)) = declarator_of_identifier(&declaration) {
+                    let nodes = self.project.file(target).semantic.nodes();
+                    let headed = matches!(
+                        nodes.parent_kind(nodes.parent_id(declarator.node_id())),
+                        AstKind::ForOfStatement(_) | AstKind::ForInStatement(_)
+                    );
+
+                    if !constant && !headed && initializer.is_some() {
+                        return self.is_proven_primitive_binding(
+                            &declaration,
+                            initializer,
+                            depth + 1,
+                        );
+                    }
+                }
+
                 declarator_of_identifier(&declaration).is_some_and(|(_, _, constant)| constant)
                     && self
                         .declarations
@@ -791,32 +807,46 @@ impl<'p, 'a> Analysis<'p, 'a> {
         function: FunctionNode<'a>,
         parameter: &'a FormalParameter<'a>,
     ) -> Option<CallArguments<'a>> {
+        let symbol = function_symbol_of(self.project.file(file).semantic.nodes(), function)?;
+
+        if self.is_surfaced_symbol(file, symbol, function.node_id()) {
+            return None;
+        }
+
+        self.local_call_arguments_of((file, function), parameter)
+    }
+
+    pub(crate) fn is_surfaced_symbol(
+        &self,
+        file: FileId,
+        symbol: oxc_semantic::SymbolId,
+        node: oxc_semantic::NodeId,
+    ) -> bool {
         let project = self.project;
-        let nodes = project.file(file).semantic.nodes();
-        let symbol = function_symbol_of(nodes, function)?;
-        let binding = Binding::Symbol { file, symbol };
-        let exported = project
-            .file(file)
+        let source = project.file(file);
+        let name = source.semantic.scoping().symbol_name(symbol);
+        let exported = source
             .module_record
             .local_export_entries
             .iter()
             .any(|entry| {
-                entry.local_name.name().is_some_and(|local| {
-                    local.as_str() == project.file(file).semantic.scoping().symbol_name(symbol)
-                })
+                entry
+                    .local_name
+                    .name()
+                    .is_some_and(|local| local.as_str() == name)
             })
-            || nodes.ancestors(function.node_id()).any(|ancestor| {
+            || source.semantic.nodes().ancestors(node).any(|ancestor| {
                 matches!(
                     ancestor.kind(),
                     AstKind::ExportNamedDeclaration(_) | AstKind::ExportDefaultDeclaration(_)
                 )
             });
 
-        if exported || !self.declarations.importers_of(project, binding).is_empty() {
-            return None;
-        }
-
-        self.local_call_arguments_of((file, function), parameter)
+        exported
+            || !self
+                .declarations
+                .importers_of(project, Binding::Symbol { file, symbol })
+                .is_empty()
     }
 
     pub(crate) fn local_call_arguments_of(
@@ -835,23 +865,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .position(|item| std::ptr::eq(item, parameter))?;
         let symbol = function_symbol_of(project.file(file).semantic.nodes(), function)?;
         let binding = Binding::Symbol { file, symbol };
-        let references = self.declarations.surface_references_of(project, binding);
-        let mut arguments = Vec::with_capacity(references.len());
+        let calls = self.invocation_sites_of(binding)?;
+        let mut arguments = Vec::with_capacity(calls.len());
 
-        for (site, node, write) in references {
-            let nodes = project.file(site).semantic.nodes();
-            let span = nodes.kind(node).span();
-            let AstKind::CallExpression(call) = nodes.parent_kind(node) else {
-                return None;
-            };
-
-            if write
-                || call.callee.span() != span
-                || call
-                    .arguments
-                    .iter()
-                    .take(index + 1)
-                    .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)))
+        for (site, call) in calls {
+            if call
+                .arguments
+                .iter()
+                .take(index + 1)
+                .any(|argument| matches!(argument, oxc_ast::ast::Argument::SpreadElement(_)))
             {
                 return None;
             }
@@ -863,6 +885,343 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         Some(arguments)
+    }
+
+    pub(crate) fn is_declared_primitive(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        self.is_declared_primitive_at(file, expression, 0)
+    }
+
+    fn is_declared_primitive_at(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match expression {
+            Expression::ParenthesizedExpression(inner) => {
+                self.is_declared_primitive_at(file, &inner.expression, depth + 1)
+            }
+            Expression::TSNonNullExpression(inner) => {
+                self.is_declared_primitive_at(file, &inner.expression, depth + 1)
+            }
+            Expression::TSAsExpression(cast) if is_const_type(&cast.type_annotation) => {
+                self.is_declared_primitive_at(file, &cast.expression, depth + 1)
+            }
+            Expression::TSAsExpression(cast) => {
+                self.is_primitive_type(file, &cast.type_annotation, depth + 1)
+            }
+            Expression::TSTypeAssertion(cast) if is_const_type(&cast.type_annotation) => {
+                self.is_declared_primitive_at(file, &cast.expression, depth + 1)
+            }
+            Expression::TSTypeAssertion(cast) => {
+                self.is_primitive_type(file, &cast.type_annotation, depth + 1)
+            }
+            Expression::TSSatisfiesExpression(cast) => {
+                self.is_primitive_type(file, &cast.type_annotation, depth + 1)
+                    || self.is_declared_primitive_at(file, &cast.expression, depth + 1)
+            }
+            Expression::Identifier(reference) => {
+                let Some(declaration) =
+                    self.declarations
+                        .of_reference(self.project, file, reference)
+                else {
+                    return false;
+                };
+                let Some((target, annotation, _)) = binding_parts_of(&declaration) else {
+                    return false;
+                };
+
+                if let Some(annotation) = annotation {
+                    return self.is_primitive_type(target, annotation, depth + 1);
+                }
+
+                let Some((_, declarator, _)) = declarator_of_identifier(&declaration) else {
+                    return false;
+                };
+                let nodes = self.project.file(target).semantic.nodes();
+
+                match nodes.parent_kind(nodes.parent_id(declarator.node_id())) {
+                    AstKind::ForOfStatement(statement) => {
+                        match self.element_type_of(target, &statement.right, depth + 1) {
+                            Some((source, element)) => {
+                                self.is_primitive_type(source, element, depth + 1)
+                            }
+                            None => {
+                                self.declared_type_of_nested_expression(
+                                    target,
+                                    &statement.right,
+                                    depth + 1,
+                                )
+                                .kind
+                                    == Kind::String
+                            }
+                        }
+                    }
+                    AstKind::ForInStatement(_) => true,
+                    _ => match self.local_values_of(file, reference) {
+                        Some(values) if !values.is_empty() => {
+                            values.into_iter().all(|(source, value)| {
+                                is_primitive_result(unwrap(value))
+                                    || self.is_declared_primitive_at(source, value, depth + 1)
+                            })
+                        }
+                        _ => false,
+                    },
+                }
+            }
+            Expression::ComputedMemberExpression(member) => {
+                match self.element_type_of(file, &member.object, depth + 1) {
+                    Some((source, element)) => self.is_primitive_type(source, element, depth + 1),
+                    None => false,
+                }
+            }
+            Expression::LogicalExpression(logical) => {
+                [&logical.left, &logical.right].into_iter().all(|side| {
+                    is_primitive_result(unwrap(side))
+                        || self.is_declared_primitive_at(file, side, depth + 1)
+                })
+            }
+            Expression::ConditionalExpression(conditional) => {
+                [&conditional.consequent, &conditional.alternate]
+                    .into_iter()
+                    .all(|side| {
+                        is_primitive_result(unwrap(side))
+                            || self.is_declared_primitive_at(file, side, depth + 1)
+                    })
+            }
+            Expression::CallExpression(call) => {
+                let Expression::Identifier(callee) = unwrap(&call.callee) else {
+                    return false;
+                };
+                let declaration = self.declarations.of_reference(self.project, file, callee);
+
+                match return_type_of_callee(declaration) {
+                    Some((target, returned)) => self.is_primitive_type(target, returned, depth + 1),
+                    None => false,
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                if member.property.name == "length"
+                    && (matches!(
+                        self.declared_type_of_nested_expression(file, &member.object, depth + 1)
+                            .kind,
+                        Kind::Array | Kind::String
+                    ) || self.is_declared_primitive_at(file, &member.object, depth + 1))
+                {
+                    return true;
+                }
+
+                let container = self.container_of_expression(file, &member.object, depth + 1);
+                let found = member_of_container(container, member.property.name.as_str());
+
+                match typing_of_member(found) {
+                    Some(Typing::Annotation(target, annotation)) => {
+                        self.is_primitive_type(target, annotation, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_primitive_value(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        self.is_primitive_value_at(file, expression, 0)
+    }
+
+    fn is_primitive_value_at(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        let expression = unwrap(expression);
+
+        if self.is_non_callable_nested_expression(file, expression, depth + 1) {
+            return true;
+        }
+
+        match expression {
+            Expression::Identifier(reference) => self
+                .is_primitive_reference(file, reference, depth)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn declared_kind_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Kind {
+        let kind = self
+            .declared_type_of_nested_expression(file, expression, 0)
+            .kind;
+
+        if kind != Kind::Unknown {
+            return kind;
+        }
+
+        let Expression::Identifier(reference) = unwrap(expression) else {
+            return kind;
+        };
+        let Some(Declaration::Variable {
+            file: target,
+            declarator,
+            ..
+        }) = self
+            .declarations
+            .of_reference(self.project, file, reference)
+        else {
+            return kind;
+        };
+
+        if declarator.type_annotation.is_some() {
+            return kind;
+        }
+
+        let nodes = self.project.file(target).semantic.nodes();
+        let AstKind::ForOfStatement(statement) =
+            nodes.parent_kind(nodes.parent_id(declarator.node_id()))
+        else {
+            return kind;
+        };
+
+        match self.element_type_of(target, &statement.right, 1) {
+            Some((source, element)) => self.declared_type_of_nested_type(source, element, 2).kind,
+            None => Kind::Unknown,
+        }
+    }
+
+    fn element_type_of(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        depth: u32,
+    ) -> Option<(FileId, &'a TSType<'a>)> {
+        if depth > MAXIMUM_DEPTH {
+            return None;
+        }
+
+        let reference = match unwrap(iterable) {
+            Expression::Identifier(reference) => reference,
+            Expression::StaticMemberExpression(member) => {
+                let container = self.container_of_expression(file, &member.object, depth + 1);
+                let found = member_of_container(container, member.property.name.as_str());
+
+                return match typing_of_member(found) {
+                    Some(Typing::Annotation(target, annotation)) => {
+                        self.element_of_type(target, annotation, depth + 1)
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
+        };
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+
+        if let Some((target, Some(annotation), _)) = binding_parts_of(&declaration) {
+            return self.element_of_type(target, annotation, depth + 1);
+        }
+
+        let (target, declarator, _) = declarator_of_identifier(&declaration)?;
+
+        if declarator.init.is_some() {
+            return None;
+        }
+
+        let nodes = self.project.file(target).semantic.nodes();
+        let AstKind::ForOfStatement(statement) =
+            nodes.parent_kind(nodes.parent_id(declarator.node_id()))
+        else {
+            return None;
+        };
+        let (outer, element) = self.element_type_of(target, &statement.right, depth + 1)?;
+
+        self.element_of_type(outer, element, depth + 1)
+    }
+
+    fn element_of_type(
+        &mut self,
+        file: FileId,
+        ty: &'a TSType<'a>,
+        depth: u32,
+    ) -> Option<(FileId, &'a TSType<'a>)> {
+        if depth > MAXIMUM_DEPTH {
+            return None;
+        }
+
+        match ty {
+            TSType::TSArrayType(array) => Some((file, &array.element_type)),
+            TSType::TSParenthesizedType(parenthesized) => {
+                self.element_of_type(file, &parenthesized.type_annotation, depth + 1)
+            }
+            TSType::TSTypeOperatorType(operator) => {
+                self.element_of_type(file, &operator.type_annotation, depth + 1)
+            }
+            TSType::TSTypeReference(reference)
+                if matches!(
+                    type_name_text_of(&reference.type_name),
+                    "Array" | "ReadonlyArray" | "Set" | "ReadonlySet"
+                ) && self.is_global_type_name(file, &reference.type_name) =>
+            {
+                first_type_argument_of(reference).map(|element| (file, element))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_primitive_binding(
+        &mut self,
+        file: FileId,
+        reference: &'a oxc_ast::ast::IdentifierReference<'a>,
+    ) -> bool {
+        self.is_primitive_reference(file, reference, 0)
+            .unwrap_or(false)
+    }
+
+    fn is_primitive_reference(
+        &mut self,
+        file: FileId,
+        reference: &'a oxc_ast::ast::IdentifierReference<'a>,
+        depth: u32,
+    ) -> Option<bool> {
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+        let (target, _, initializer) = binding_parts_of(&declaration)?;
+
+        if let Some((_, declarator, _)) = declarator_of_identifier(&declaration) {
+            let nodes = self.project.file(target).semantic.nodes();
+
+            match nodes.parent_kind(nodes.parent_id(declarator.node_id())) {
+                AstKind::ForOfStatement(_) => return Some(false),
+                AstKind::ForInStatement(_) => {
+                    return Some(self.is_proven_primitive_binding(&declaration, None, depth + 1))
+                }
+                _ => {}
+            }
+        }
+
+        Some(self.is_proven_primitive_binding(&declaration, initializer, depth + 1))
     }
 
     fn is_primitive_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
@@ -1291,6 +1650,18 @@ fn member_of_container<'a>(container: Option<Container<'a>>, name: &str) -> Opti
                     property.value.as_ref(),
                 ))
             }
+            ClassElement::MethodDefinition(method)
+                if method.kind == MethodDefinitionKind::Constructor =>
+            {
+                method.value.params.items.iter().find_map(|parameter| {
+                    let property = parameter.accessibility.is_some() || parameter.readonly;
+                    let named = matches!(&parameter.pattern, oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) if identifier.name == name);
+
+                    (property && named).then(|| {
+                        Member::Field(file, annotation_of(&parameter.type_annotation), None)
+                    })
+                })
+            }
             _ => None,
         }),
     }
@@ -1310,4 +1681,19 @@ fn member_signature_of<'a>(
 
         named.then_some(Member::Signature(file, signature))
     })
+}
+
+pub(crate) fn is_primitive_result(expression: &Expression<'_>) -> bool {
+    matches!(
+        expression,
+        Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::TemplateLiteral(_)
+            | Expression::UnaryExpression(_)
+            | Expression::BinaryExpression(_)
+            | Expression::UpdateExpression(_)
+    )
 }

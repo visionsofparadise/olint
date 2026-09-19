@@ -1,10 +1,10 @@
 public coverage [partial]
 # tsconfig.json  (160 functions in 15 files)
 
-O(1)               32
-O(1) [partial]     21
-O(xs)              14
-O(rows^2)           8
+O(1)               30
+O(1) [partial]     23
+O(xs)              13
+O(rows^2)           9
 O(xs) [partial]     7
 O(rows^2) [partial]    7
 O((xs * log(xs)))    5
@@ -131,6 +131,11 @@ O((max(o, matrix))^(2)) unionOfClosed  src/types.ts:18
 O(rows^2)      WithStaticMethod.compute  src/classes.ts:54
     in loop for-of                                           src/classes.ts:56  x N
         in loop for-of                                       src/classes.ts:56  x N
+
+O(rows^2)      readsGetter  src/classes.ts:49
+    calls WithGetter.total() [getter]                      src/classes.ts:50  = O(rows^2)
+    in loop for-of                                           src/classes.ts:45  x N
+        in loop for-of                                       src/classes.ts:45  x N
 
 O(rows^2)      callsHashPrivateMethod  src/classes.ts:37 [partial]
     calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows^2)

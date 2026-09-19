@@ -2,6 +2,7 @@ use std::path::Path;
 
 use oxc_ast::ast::{CallExpression, Expression, MemberExpression};
 use oxc_ast::AstKind;
+use oxc_semantic::NodeId;
 use oxc_span::{GetSpan, Span};
 
 use crate::analysis::Analysis;
@@ -129,11 +130,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         call: &'a CallExpression<'a>,
     ) -> ResolvedCallee<'a> {
+        self.resolved_expression_callee_of(file, &call.callee, call.node_id())
+    }
+
+    pub(crate) fn resolved_expression_callee_of(
+        &mut self,
+        file: FileId,
+        callee: &'a Expression<'a>,
+        node: NodeId,
+    ) -> ResolvedCallee<'a> {
         let exhaustions = self.target_exhaustions();
-        let resolved = self.resolved_callee_within(file, call);
+        let resolved = self.resolved_callee_within(file, callee);
 
         if self.target_exhaustions() > exhaustions {
-            self.mark_call_exhausted(file, call.node_id());
+            self.mark_call_exhausted(file, node);
         }
 
         resolved
@@ -142,9 +152,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
     fn resolved_callee_within(
         &mut self,
         file: FileId,
-        call: &'a CallExpression<'a>,
+        callee: &'a Expression<'a>,
     ) -> ResolvedCallee<'a> {
-        let callee = unwrap(&call.callee);
+        let callee = unwrap(callee);
 
         if let Expression::Identifier(reference) = callee {
             let (declaration, closed) =
@@ -228,6 +238,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if dispatch.replaced {
             resolved.targets.open = true;
             resolved.closed = false;
+        }
+
+        if let Some(targets) = self.construction_dispatch_of(file, member) {
+            resolved.closed = !targets.open;
+            resolved.targets = targets;
         }
 
         resolved
