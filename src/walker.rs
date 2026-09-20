@@ -16,7 +16,9 @@ use crate::declarations::{
 };
 use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
-use crate::flow::class_phases_of;
+use crate::flow::{
+    class_phases_of, completion_of, enclosing_iteration_of, loop_phases_of, Completion,
+};
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
@@ -55,6 +57,31 @@ fn is_function_argument(argument: &Argument<'_>) -> bool {
 
 fn is_listed(table: &[&str], name: &str) -> bool {
     table.contains(&name)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Escape {
+    Loop,
+    Call,
+}
+
+impl Escape {
+    fn unit(self) -> &'static str {
+        match self {
+            Escape::Call => "call",
+            Escape::Loop => "loop",
+        }
+    }
+}
+
+fn completion_word_of(completion: Completion) -> &'static str {
+    match completion {
+        Completion::Normal => "normal",
+        Completion::Return => "return",
+        Completion::Throw => "throw",
+        Completion::Break(_) => "break",
+        Completion::Continue(_) => "continue",
+    }
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -655,6 +682,75 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
+    fn escape_of(&self, file: FileId, completion: Completion, enclosing: NodeId) -> Option<Escape> {
+        match completion {
+            Completion::Return | Completion::Throw => Some(Escape::Call),
+            Completion::Break(target)
+                if target == enclosing || self.is_ancestor(file, target, enclosing) =>
+            {
+                Some(Escape::Loop)
+            }
+            Completion::Continue(target)
+                if target != enclosing && self.is_ancestor(file, target, enclosing) =>
+            {
+                Some(Escape::Loop)
+            }
+            _ => None,
+        }
+    }
+
+    fn targets_within(&self, file: FileId, branch: NodeId, completion: Completion) -> bool {
+        match completion {
+            Completion::Break(target) | Completion::Continue(target) => {
+                target != branch && self.is_ancestor(file, branch, target)
+            }
+            _ => false,
+        }
+    }
+
+    fn branch_escape_of(
+        &mut self,
+        file: FileId,
+        body: &'a Statement<'a>,
+        site_node: NodeId,
+    ) -> Option<(Completion, Escape)> {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let branch = body.node_id();
+        let completion = completion_of(semantic, branch)?;
+        let enclosing = enclosing_iteration_of(semantic, site_node)?;
+        let mut escape = self.escape_of(file, completion, enclosing)?;
+        let mut pending = vec![branch];
+
+        while let Some(node) = pending.pop() {
+            let kind = self.kind_of_node(file, node);
+
+            if is_deferred_kind(&kind) {
+                continue;
+            }
+
+            if matches!(
+                kind,
+                AstKind::BreakStatement(_) | AstKind::ContinueStatement(_)
+            ) {
+                let transfer = completion_of(semantic, node)
+                    .filter(|transfer| !self.targets_within(file, branch, *transfer));
+
+                if let Some(transfer) = transfer {
+                    escape = escape.min(self.escape_of(file, transfer, enclosing)?);
+                }
+            }
+
+            pending.extend(self.children_of(file, node));
+        }
+
+        if self.work_exhausted() {
+            return None;
+        }
+
+        Some((completion, escape))
+    }
+
     fn branch_reading_of(
         &mut self,
         file: FileId,
@@ -662,51 +758,46 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site_node: NodeId,
     ) -> Reading {
         let reading = self.cost_of_statement(file, body);
-        let exit = self.ends_in(file, body);
 
-        if let Some(exit) = exit {
-            if self.inside_loop(file, site_node) && !reading.main.cost.is_one() {
-                let unit = if exit == crate::bounds::Exit::Break {
-                    "loop"
-                } else {
-                    "call"
-                };
-                let lifted = reading.main.explain(
-                    format_args!("[{} branch: runs once per {}]", exit.text(), unit),
-                    self.site_of_node(file, site_node),
-                    self.source_span(file, self.kind_of_node(file, site_node).span()),
-                    false,
-                    &mut self.traces,
-                    &mut self.unknowns,
-                );
-
-                if exit == crate::bounds::Exit::Break {
-                    return Reading {
-                        phases: [crate::cost::ExecutionPhase::Immediate; 3],
-                        main: Part::none(),
-                        function_exit: reading.function_exit,
-                        loop_exit: reading.loop_exit.max(
-                            lifted,
-                            &mut self.unknowns,
-                            &mut self.traces,
-                        ),
-                    };
-                }
-
-                return Reading {
-                    phases: [crate::cost::ExecutionPhase::Immediate; 3],
-                    main: Part::none(),
-                    function_exit: reading.function_exit.max(
-                        lifted,
-                        &mut self.unknowns,
-                        &mut self.traces,
-                    ),
-                    loop_exit: reading.loop_exit,
-                };
-            }
+        if reading.main.cost.is_one() {
+            return reading;
         }
 
-        reading
+        let Some((completion, escape)) = self.branch_escape_of(file, body, site_node) else {
+            return reading;
+        };
+        let lifted = reading.main.explain(
+            format_args!(
+                "[{} branch: runs once per {}]",
+                completion_word_of(completion),
+                escape.unit()
+            ),
+            self.site_of_node(file, site_node),
+            self.source_span(file, self.kind_of_node(file, site_node).span()),
+            false,
+            &mut self.traces,
+            &mut self.unknowns,
+        );
+
+        if escape == Escape::Loop {
+            return Reading {
+                phases: [crate::cost::ExecutionPhase::Immediate; 3],
+                main: Part::none(),
+                function_exit: reading.function_exit,
+                loop_exit: reading
+                    .loop_exit
+                    .max(lifted, &mut self.unknowns, &mut self.traces),
+            };
+        }
+
+        Reading {
+            phases: [crate::cost::ExecutionPhase::Immediate; 3],
+            main: Part::none(),
+            function_exit: reading
+                .function_exit
+                .max(lifted, &mut self.unknowns, &mut self.traces),
+            loop_exit: reading.loop_exit,
+        }
     }
 
     fn cost_of_loop(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
@@ -716,21 +807,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut sibling = Reading::empty();
         let mut visit = Reading::empty();
         let mut unresolved = false;
-        let head = match kind {
-            AstKind::ForOfStatement(statement) => Some(statement.left.span()),
-            AstKind::ForInStatement(statement) => Some(statement.left.span()),
-            _ => None,
-        };
+        let phases = loop_phases_of(kind);
 
         for child in self.children_of(file, node) {
             if child == body_node {
                 continue;
             }
 
+            let repeated = phases.is_some_and(|phases| phases.repeats(child));
             let child = self.kind_of_node(file, child);
             let cost = self.cost_of_node(file, child);
 
-            if Some(child.span()) == head {
+            if repeated {
                 visit = visit.merge(cost, &mut self.unknowns, &mut self.traces);
             } else {
                 sibling = sibling.merge(cost, &mut self.unknowns, &mut self.traces);

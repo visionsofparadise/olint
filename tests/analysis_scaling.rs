@@ -1986,3 +1986,109 @@ fn spread_copies_and_destructured_elements_scan_source_keys_once() {
         );
     }
 }
+
+fn loop_phase_walks_of(loops: usize) -> u64 {
+    let statements: String = (0..loops)
+        .map(|index| {
+            format!("for (let i{index} = 0; i{index} < scan(xs); i{index}++) total += i{index}; ")
+        })
+        .collect();
+    let source = format!(
+        "function scan(xs: number[]) {{ let found = 0; for (const x of xs) found += x; return found; }}
+export function selected(xs: number[]) {{ let total = 0; {statements}return total; }}"
+    );
+    let mut walks = 0;
+
+    run_with_source(&source, |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+
+        let selected = function_of_name(analysis.project, file, "selected");
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, selected, &part.cost),
+            Cost::parse("O(N^2)").unwrap(),
+            "{loops}"
+        );
+
+        walks = stats.work.consumed(Event::WalkerNode);
+    });
+
+    walks
+}
+
+#[test]
+fn loop_phases_walk_their_tests_and_updates_once() {
+    for loops in [16_u64, 32, 48] {
+        assert_eq!(
+            loop_phase_walks_of(loops as usize),
+            30 * loops + 30,
+            "{loops}"
+        );
+    }
+}
+
+fn branch_scan_source(sites: usize, escaping: bool) -> String {
+    let tail = match escaping {
+        true => "",
+        false => "if (value < 0) continue; ",
+    };
+    let branches: String = (0..sites)
+        .map(|index| {
+            format!(
+                "if (value > {index}) {{ total += scan(row); total += row.length; total += value; {tail}break; }} "
+            )
+        })
+        .collect();
+
+    format!(
+        "function scan(xs: number[]) {{ let found = 0; for (const x of xs) found += x; return found; }}
+export function selected(rows: number[][]) {{ let total = 0; for (const row of rows) {{ for (const value of row) {{ {branches}}} }} return total; }}"
+    )
+}
+
+fn branch_scan_edges_of(sites: usize, escaping: bool) -> u64 {
+    let mut edges = 0;
+
+    run_with_source(&branch_scan_source(sites, escaping), |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(!part.cost.is_one(), "{sites}");
+
+        let lifted = support::trace_nodes(&analysis.traces, part.trace)
+            .iter()
+            .any(|node| node.label == "[break branch: runs once per loop]");
+
+        assert_eq!(lifted, escaping, "{sites}");
+
+        edges = stats.work.consumed(Event::TraversalEdge);
+    });
+
+    edges
+}
+
+#[test]
+fn escaping_branches_scan_their_own_subtree_once() {
+    for sites in [8_u64, 16, 24, 32] {
+        assert_eq!(
+            branch_scan_edges_of(sites as usize, true),
+            290 * sites + 170,
+            "{sites}"
+        );
+    }
+}
+
+#[test]
+fn branches_that_cannot_leave_their_loop_stop_scanning_early() {
+    for sites in [8_u64, 16, 24, 32] {
+        assert_eq!(
+            branch_scan_edges_of(sites as usize, false),
+            329 * sites + 170,
+            "{sites}"
+        );
+    }
+}

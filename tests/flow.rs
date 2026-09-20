@@ -1,9 +1,10 @@
-use olint::flow::{class_phases_of, Completion, FlowError, Region};
+use olint::flow::{class_phases_of, completion_of, loop_phases_of, Completion, FlowError, Region};
 use olint::project::{DiagnosticPhase, Project, ProjectError};
 use olint::unknowns::UnknownReason;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
+use oxc_span::GetSpan;
 
 mod support;
 
@@ -14,6 +15,13 @@ fn first_function_of(project: &Project<'_>, file: olint::project::FileId) -> Nod
         AstKind::Function(function) => Some(function.node_id()),
         _ => None,
     })
+}
+
+fn run_in_file(source: &str, body: impl for<'a> FnOnce(&olint::project::SourceFile<'a>, &str)) {
+    run_in_project(
+        &[("tsconfig.json", "{}"), ("index.ts", source)],
+        |project, root| body(project.file(file_of(project, root, "index.ts")), source),
+    );
 }
 
 #[test]
@@ -241,4 +249,135 @@ fn decorated_elements_and_parameters_report_their_decorator_as_unsupported() {
             },
         );
     }
+}
+
+#[test]
+fn loop_phases_separate_once_only_initialization_from_repeated_tests() {
+    let source = "export function f(xs: number[], o: Record<string, number>) {\n\tfor (let i = 0; i < xs.length; i++) void i;\n\twhile (xs.length > 0) break;\n\tdo {\n\t\tvoid 0;\n\t} while (xs.length > 0);\n\tfor (const value of xs) void value;\n\tfor (const key in o) void key;\n}";
+
+    run_in_file(source, |file, source| {
+        let nodes = file.semantic.nodes();
+        let phases_of = |prefix: &str| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind(),
+                        AstKind::ForStatement(_)
+                            | AstKind::WhileStatement(_)
+                            | AstKind::DoWhileStatement(_)
+                            | AstKind::ForOfStatement(_)
+                            | AstKind::ForInStatement(_)
+                    )
+                })
+                .find(|node| node.kind().span().source_text(source).starts_with(prefix))
+                .and_then(|node| loop_phases_of(node.kind()))
+                .unwrap_or_else(|| panic!("{prefix} is an iteration statement"))
+        };
+        let text =
+            |node: Option<NodeId>| node.map(|node| nodes.kind(node).span().source_text(source));
+
+        let counted = phases_of("for (let i");
+
+        assert_eq!(text(counted.initialize), Some("let i = 0"));
+        assert_eq!(text(counted.test), Some("i < xs.length"));
+        assert_eq!(text(counted.update), Some("i++"));
+        assert_eq!(text(counted.iterable), None);
+        assert_eq!(text(counted.binding), None);
+        assert_eq!(text(Some(counted.body)), Some("void i;"));
+        assert!(!counted.tested_after);
+        assert!(!counted.iterates());
+        assert!(counted.repeats(counted.test.unwrap()));
+        assert!(counted.repeats(counted.update.unwrap()));
+        assert!(!counted.repeats(counted.initialize.unwrap()));
+        assert!(!counted.repeats(counted.body));
+
+        let tested = phases_of("while (xs.length");
+
+        assert_eq!(text(tested.initialize), None);
+        assert_eq!(text(tested.test), Some("xs.length > 0"));
+        assert!(!tested.tested_after);
+        assert!(tested.repeats(tested.test.unwrap()));
+
+        let tested_after = phases_of("do {");
+
+        assert_eq!(text(tested_after.test), Some("xs.length > 0"));
+        assert!(tested_after.tested_after);
+        assert!(tested_after.repeats(tested_after.test.unwrap()));
+
+        let iterated = phases_of("for (const value");
+
+        assert_eq!(text(iterated.iterable), Some("xs"));
+        assert_eq!(text(iterated.binding), Some("const value"));
+        assert_eq!(text(iterated.test), None);
+        assert!(iterated.iterates());
+        assert!(iterated.repeats(iterated.binding.unwrap()));
+        assert!(!iterated.repeats(iterated.iterable.unwrap()));
+
+        let enumerated = phases_of("for (const key");
+
+        assert_eq!(text(enumerated.iterable), Some("o"));
+        assert_eq!(text(enumerated.binding), Some("const key"));
+        assert!(enumerated.iterates());
+        assert!(!enumerated.repeats(enumerated.iterable.unwrap()));
+    });
+}
+
+#[test]
+fn break_and_continue_completions_resolve_their_labelled_and_switch_targets() {
+    let source = "export function f(rows: number[][], flag: boolean) {\n\touter: for (const row of rows) {\n\t\tfor (const value of row) {\n\t\t\tif (flag) break outer;\n\t\t\tif (value > 0) continue outer;\n\t\t\tif (value < 0) continue;\n\t\t\tif (flag) {\n\t\t\t\tcontinue;\n\t\t\t} else {\n\t\t\t\treturn value;\n\t\t\t}\n\t\t}\n\t\tswitch (row.length) {\n\t\t\tcase 1:\n\t\t\t\tif (flag) break;\n\t\t\t\tthrow new Error('no');\n\t\t}\n\t}\n\treturn -1;\n}";
+
+    run_in_file(source, |file, source| {
+        let nodes = file.semantic.nodes();
+        let node_of = |text: &str| {
+            nodes
+                .iter()
+                .find(|node| node.kind().span().source_text(source) == text)
+                .unwrap_or_else(|| panic!("{text} is a node"))
+                .id()
+        };
+        let first_of = |predicate: fn(&AstKind<'_>) -> bool| {
+            nodes
+                .iter()
+                .find(|node| predicate(&node.kind()))
+                .expect("a matching node")
+                .id()
+        };
+        let labelled = first_of(|kind| matches!(kind, AstKind::LabeledStatement(_)));
+        let switched = first_of(|kind| matches!(kind, AstKind::SwitchStatement(_)));
+        let loops: Vec<NodeId> = nodes
+            .iter()
+            .filter(|node| matches!(node.kind(), AstKind::ForOfStatement(_)))
+            .map(|node| node.id())
+            .collect();
+        let completion = |text: &str| completion_of(&file.semantic, node_of(text));
+
+        assert_eq!(loops.len(), 2);
+        assert_eq!(
+            completion("break outer;"),
+            Some(Completion::Break(labelled))
+        );
+        assert_eq!(
+            completion("continue outer;"),
+            Some(Completion::Continue(loops[0]))
+        );
+        assert_eq!(
+            completion("continue;"),
+            Some(Completion::Continue(loops[1]))
+        );
+        assert_eq!(completion("break;"), Some(Completion::Break(switched)));
+        assert_eq!(completion("return value;"), Some(Completion::Return));
+        assert_eq!(
+            completion("throw new Error('no');"),
+            Some(Completion::Throw)
+        );
+        assert_eq!(
+            completion(
+                "if (flag) {\n\t\t\t\tcontinue;\n\t\t\t} else {\n\t\t\t\treturn value;\n\t\t\t}"
+            ),
+            Some(Completion::Continue(loops[1]))
+        );
+        assert_eq!(completion("return -1;"), Some(Completion::Return));
+        assert_eq!(completion("rows"), None);
+    });
 }

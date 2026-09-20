@@ -1302,3 +1302,196 @@ fn parameter_decorators_are_unsupported_class_definition_syntax() {
         );
     }
 }
+
+const LOOP_QUADRATIC: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\treturn total;\n}\n";
+const LOOP_SCAN: &str = "function scan(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) total += x;\n\treturn total;\n}\n";
+const LOOP_TAPPED_VALUES: &str = "function tappedValues(xs: number[]) {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\tvoid total;\n\treturn xs;\n}\n";
+const LOOP_TAPPED_KEYS: &str = "function tappedKeys(o: Record<string, number>) {\n\tlet total = 0;\n\tfor (const a in o) for (const b in o) total += a.length + b.length;\n\tvoid total;\n\treturn o;\n}\n";
+
+fn loop_cost_of(source: &str) -> (Cost, Vec<String>) {
+    let (reading, labels) = reading_of(source, "f");
+
+    (reading.total().cost, labels)
+}
+
+#[test]
+fn loop_tests_and_updates_repeat_at_the_iteration_count() {
+    let cubic = Cost::parse("O(N^3)").unwrap();
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (test, test_labels) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = 0; i < quadratic(xs); i++) total += i;\n\treturn total;\n}}"
+    ));
+    let (update, update_labels) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length; quadratic(xs), i++) total += i;\n\treturn total;\n}}"
+    ));
+    let (while_test, while_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[]) {{\n\tlet i = 0;\n\twhile (i < scan(xs)) i++;\n\treturn i;\n}}"
+    ));
+    let (do_while_test, _) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[]) {{\n\tlet i = 0;\n\tdo {{\n\t\ti++;\n\t}} while (i < scan(xs));\n\treturn i;\n}}"
+    ));
+
+    assert_eq!(test, cubic);
+    assert_eq!(test_labels, vec!["for", "call quadratic()"]);
+    assert_eq!(update, cubic);
+    assert_eq!(update_labels, vec!["for", "call quadratic()"]);
+    assert_eq!(while_test, quadratic);
+    assert_eq!(
+        while_labels,
+        vec!["while [budget: i < scan(xs)]", "call scan()"]
+    );
+    assert_eq!(do_while_test, quadratic);
+}
+
+#[test]
+fn loop_initialization_and_iterable_evaluation_stay_once() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (initialization, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = quadratic(xs); i < xs.length; i++) total += i;\n\treturn total;\n}}"
+    ));
+    let (iterated, _) = loop_cost_of(&format!(
+        "{LOOP_TAPPED_VALUES}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const value of tappedValues(xs)) total += value;\n\treturn total;\n}}"
+    ));
+    let (enumerated, _) = loop_cost_of(&format!(
+        "{LOOP_TAPPED_KEYS}export function f(o: Record<string, number>) {{\n\tlet total = 0;\n\tfor (const key in tappedKeys(o)) total += key.length;\n\treturn total;\n}}"
+    ));
+
+    assert_eq!(initialization, quadratic);
+    assert_eq!(iterated, quadratic);
+    assert_eq!(enumerated, quadratic);
+}
+
+#[test]
+fn zero_trip_and_short_circuit_loops_keep_their_test_work() {
+    let (zero_trip, zero_trip_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[], n: number) {{\n\tlet total = 0;\n\twhile (scan(xs) > n) {{\n\t\ttotal += 1;\n\t\tbreak;\n\t}}\n\treturn total;\n}}"
+    ));
+    let (short_circuit, _) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[], n: number) {{\n\tlet i = 0;\n\twhile (i < n && scan(xs) >= 0) i++;\n\treturn i;\n}}"
+    ));
+
+    assert_eq!(zero_trip, Cost::N);
+    assert_eq!(zero_trip_labels, vec!["call scan()"]);
+    assert_eq!(short_circuit, Cost::parse("O(N^2)").unwrap());
+}
+
+#[test]
+fn a_continue_keeps_its_branch_and_the_update_inside_the_loop() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (updated, updated_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length; scan(xs), i++) {{\n\t\tif (flag) continue;\n\t\ttotal += 1;\n\t}}\n\treturn total;\n}}"
+    ));
+    let (branched, branched_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\tif (flag) {{\n\t\t\ttotal += scan(xs);\n\t\t\tcontinue;\n\t\t}}\n\t\ttotal += x;\n\t}}\n\treturn total;\n}}"
+    ));
+
+    assert_eq!(updated, quadratic);
+    assert_eq!(updated_labels, vec!["for", "call scan()"]);
+    assert_eq!(branched, quadratic);
+    assert_eq!(branched_labels, vec!["for-of", "call scan()"]);
+}
+
+#[test]
+fn break_targets_decide_whether_a_branch_leaves_its_loop() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (switched, switched_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\tswitch (x) {{\n\t\t\tcase 1:\n\t\t\t\tif (flag) {{\n\t\t\t\t\ttotal += scan(xs);\n\t\t\t\t\tbreak;\n\t\t\t\t}}\n\t\t\t\ttotal += 1;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (blocked, blocked_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\tinner: {{\n\t\t\tif (flag) {{\n\t\t\t\ttotal += scan(xs);\n\t\t\t\tbreak inner;\n\t\t\t}}\n\t\t\ttotal += x;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (labelled_break, labelled_break_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][], flag: boolean) {{\n\tlet total = 0;\n\touter: for (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (flag) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tbreak outer;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (labelled_continue, labelled_continue_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][], flag: boolean) {{\n\tlet total = 0;\n\touter: for (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (flag) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tcontinue outer;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+
+    assert_eq!(switched, quadratic);
+    assert_eq!(switched_labels, vec!["for-of", "call scan()"]);
+    assert_eq!(blocked, quadratic);
+    assert_eq!(blocked_labels, vec!["for-of", "call scan()"]);
+    assert_eq!(labelled_break, quadratic);
+    assert_eq!(
+        labelled_break_labels,
+        vec![
+            "for-of",
+            "[break branch: runs once per loop]",
+            "call scan()",
+            "for-of"
+        ]
+    );
+    assert_eq!(labelled_continue, quadratic);
+    assert_eq!(
+        labelled_continue_labels,
+        vec![
+            "for-of",
+            "[continue branch: runs once per loop]",
+            "call scan()",
+            "for-of"
+        ]
+    );
+}
+
+#[test]
+fn a_branch_that_can_return_to_its_loop_keeps_its_work_inside() {
+    let cubic = Cost::parse("O(N^3)").unwrap();
+    let (continued, continued_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\touter: for (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tif (value > 0) continue;\n\t\t\t\tcontinue outer;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (broken, _) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tif (value > 0) continue;\n\t\t\t\tbreak;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (returned, _) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tif (value > 0) continue;\n\t\t\t\treturn total;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+
+    assert_eq!(continued, cubic);
+    assert!(continued_labels
+        .iter()
+        .all(|label| !label.contains("runs once per")));
+    assert_eq!(broken, cubic);
+    assert_eq!(returned, cubic);
+}
+
+#[test]
+fn a_branch_that_only_transfers_within_itself_still_leaves_its_loop() {
+    let label_of = |reading: &TestReading, part: &Part| {
+        reading
+            .traces
+            .borrow()
+            .node(part.trace.unwrap())
+            .unwrap()
+            .label
+            .clone()
+    };
+    let (inner_loop, inner_loop_labels) = reading_of(
+        &format!(
+            "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\touter: for (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tfor (let index = 0; index < 3; index++) {{\n\t\t\t\t\ttotal += 1;\n\t\t\t\t\tif (total > 10) break;\n\t\t\t\t}}\n\t\t\t\tcontinue outer;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+        ),
+        "f",
+    );
+    let (inner_switch, _) = reading_of(
+        &format!(
+            "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\tif (row.length > 0) {{\n\t\t\ttotal += scan(row);\n\t\t\tswitch (row.length) {{\n\t\t\t\tcase 1:\n\t\t\t\t\tbreak;\n\t\t\t}}\n\t\t\treturn total;\n\t\t}}\n\t\ttotal += 1;\n\t}}\n\treturn total;\n}}"
+        ),
+        "f",
+    );
+    let (downgraded, downgraded_labels) = reading_of(
+        &format!(
+            "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\tif (value > 0) break;\n\t\t\t\treturn total;\n\t\t\t}}\n\t\t\ttotal += value;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+        ),
+        "f",
+    );
+
+    assert_eq!(inner_loop.total().cost, Cost::parse("O(N^2)").unwrap());
+    assert!(inner_loop_labels.contains(&"[continue branch: runs once per loop]".to_string()));
+    assert_eq!(inner_switch.total().cost, Cost::N);
+    assert_eq!(inner_switch.function_exit.cost, Cost::N);
+    assert_eq!(
+        label_of(&inner_switch, &inner_switch.function_exit),
+        "[return branch: runs once per call]"
+    );
+    assert_eq!(downgraded.total().cost, Cost::parse("O(N^2)").unwrap());
+    assert!(downgraded_labels.contains(&"[return branch: runs once per loop]".to_string()));
+}

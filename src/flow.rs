@@ -5,7 +5,7 @@ use oxc_cfg::BlockNodeId;
 use oxc_semantic::{NodeId, Semantic};
 
 use crate::project::FileId;
-use crate::syntax::is_type_kind;
+use crate::syntax::{is_iteration_kind, is_type_kind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Completion {
@@ -297,16 +297,6 @@ impl<'s, 'a> FlowContext<'s, 'a> {
 }
 
 impl<'s, 'a> Builder<'s, 'a> {
-    fn iteration_flow(
-        &mut self,
-        node: NodeId,
-        iterable: NodeId,
-        binding: NodeId,
-        body: NodeId,
-    ) -> Result<Fragment, FlowError> {
-        self.loop_flow(node, Some(iterable), Some(binding), None, body, false, true)
-    }
-
     fn control_target(
         &self,
         node: NodeId,
@@ -521,45 +511,15 @@ impl<'s, 'a> Builder<'s, 'a> {
 
                 Ok(self.append(conditional, left))
             }
-            AstKind::ForStatement(stmt) => self.loop_flow(
-                node,
-                stmt.init.as_ref().map(|n| n.node_id()),
-                stmt.test.as_ref().map(|n| n.node_id()),
-                stmt.update.as_ref().map(|n| n.node_id()),
-                stmt.body.node_id(),
-                false,
-                false,
-            ),
-            AstKind::WhileStatement(stmt) => self.loop_flow(
-                node,
-                None,
-                Some(stmt.test.node_id()),
-                None,
-                stmt.body.node_id(),
-                false,
-                false,
-            ),
-            AstKind::DoWhileStatement(stmt) => self.loop_flow(
-                node,
-                None,
-                Some(stmt.test.node_id()),
-                None,
-                stmt.body.node_id(),
-                true,
-                false,
-            ),
-            AstKind::ForOfStatement(stmt) => self.iteration_flow(
-                node,
-                stmt.right.node_id(),
-                stmt.left.node_id(),
-                stmt.body.node_id(),
-            ),
-            AstKind::ForInStatement(stmt) => self.iteration_flow(
-                node,
-                stmt.right.node_id(),
-                stmt.left.node_id(),
-                stmt.body.node_id(),
-            ),
+            AstKind::ForStatement(_)
+            | AstKind::WhileStatement(_)
+            | AstKind::DoWhileStatement(_)
+            | AstKind::ForOfStatement(_)
+            | AstKind::ForInStatement(_) => {
+                let phases = loop_phases_of(kind).ok_or(FlowError::Unsupported(node))?;
+
+                self.loop_flow(node, &phases)
+            }
             AstKind::LabeledStatement(stmt) => {
                 let body = stmt.body.node_id();
                 let mut labelled_body = body;
@@ -831,17 +791,18 @@ impl<'s, 'a> Builder<'s, 'a> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn loop_flow(
-        &mut self,
-        node: NodeId,
-        init: Option<NodeId>,
-        test: Option<NodeId>,
-        update: Option<NodeId>,
-        body: NodeId,
-        test_after: bool,
-        iteration: bool,
-    ) -> Result<Fragment, FlowError> {
+    fn loop_flow(&mut self, node: NodeId, phases: &LoopPhases) -> Result<Fragment, FlowError> {
+        let iteration = phases.iterates();
+        let test_after = phases.tested_after;
+        let init = phases.initialize.or(phases.iterable);
+        let test = if iteration {
+            phases.binding
+        } else {
+            phases.test
+        };
+        let update = phases.update;
+        let body = phases.body;
+
         self.targets.push(Target {
             node,
             label: None,
@@ -1179,6 +1140,210 @@ impl<'s, 'a> Builder<'s, 'a> {
 
         Ok(definition)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopPhases {
+    pub initialize: Option<NodeId>,
+    pub iterable: Option<NodeId>,
+    pub test: Option<NodeId>,
+    pub binding: Option<NodeId>,
+    pub update: Option<NodeId>,
+    pub body: NodeId,
+    pub tested_after: bool,
+}
+
+impl LoopPhases {
+    pub fn iterates(&self) -> bool {
+        self.iterable.is_some()
+    }
+
+    pub fn repeats(&self, node: NodeId) -> bool {
+        [self.test, self.binding, self.update].contains(&Some(node))
+    }
+}
+
+pub fn loop_phases_of(kind: AstKind<'_>) -> Option<LoopPhases> {
+    let phases = |body: NodeId| LoopPhases {
+        initialize: None,
+        iterable: None,
+        test: None,
+        binding: None,
+        update: None,
+        body,
+        tested_after: false,
+    };
+
+    match kind {
+        AstKind::ForStatement(statement) => Some(LoopPhases {
+            initialize: statement.init.as_ref().map(|init| init.node_id()),
+            test: statement.test.as_ref().map(|test| test.node_id()),
+            update: statement.update.as_ref().map(|update| update.node_id()),
+            ..phases(statement.body.node_id())
+        }),
+        AstKind::WhileStatement(statement) => Some(LoopPhases {
+            test: Some(statement.test.node_id()),
+            ..phases(statement.body.node_id())
+        }),
+        AstKind::DoWhileStatement(statement) => Some(LoopPhases {
+            test: Some(statement.test.node_id()),
+            tested_after: true,
+            ..phases(statement.body.node_id())
+        }),
+        AstKind::ForOfStatement(statement) => Some(LoopPhases {
+            iterable: Some(statement.right.node_id()),
+            binding: Some(statement.left.node_id()),
+            ..phases(statement.body.node_id())
+        }),
+        AstKind::ForInStatement(statement) => Some(LoopPhases {
+            iterable: Some(statement.right.node_id()),
+            binding: Some(statement.left.node_id()),
+            ..phases(statement.body.node_id())
+        }),
+        _ => None,
+    }
+}
+
+fn enclosing_of(
+    semantic: &Semantic<'_>,
+    node: NodeId,
+    mut selects: impl FnMut(NodeId, AstKind<'_>) -> Option<Option<NodeId>>,
+) -> Option<NodeId> {
+    for ancestor in semantic.nodes().ancestors(node) {
+        let kind = ancestor.kind();
+
+        if matches!(
+            kind,
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        ) {
+            return None;
+        }
+
+        if let Some(selected) = selects(ancestor.id(), kind) {
+            return selected;
+        }
+    }
+
+    None
+}
+
+pub fn enclosing_iteration_of(semantic: &Semantic<'_>, node: NodeId) -> Option<NodeId> {
+    enclosing_of(semantic, node, |ancestor, kind| {
+        is_iteration_kind(&kind).then_some(Some(ancestor))
+    })
+}
+
+pub fn control_target_of(
+    semantic: &Semantic<'_>,
+    node: NodeId,
+    label: Option<&str>,
+    continuing: bool,
+) -> Option<NodeId> {
+    match label {
+        Some(label) => enclosing_of(semantic, node, |ancestor, kind| {
+            let AstKind::LabeledStatement(statement) = kind else {
+                return None;
+            };
+
+            if statement.label.name.as_str() != label {
+                return None;
+            }
+
+            Some(match continuing {
+                true => labelled_iteration_of(semantic, statement.body.node_id()),
+                false => Some(ancestor),
+            })
+        }),
+        None if continuing => enclosing_iteration_of(semantic, node),
+        None => enclosing_of(semantic, node, |ancestor, kind| {
+            (is_iteration_kind(&kind) || matches!(kind, AstKind::SwitchStatement(_)))
+                .then_some(Some(ancestor))
+        }),
+    }
+}
+
+fn labelled_iteration_of(semantic: &Semantic<'_>, node: NodeId) -> Option<NodeId> {
+    let mut labelled = node;
+
+    while let AstKind::LabeledStatement(inner) = semantic.nodes().kind(labelled) {
+        labelled = inner.body.node_id();
+    }
+
+    is_iteration_kind(&semantic.nodes().kind(labelled)).then_some(labelled)
+}
+
+pub fn completion_of(semantic: &Semantic<'_>, node: NodeId) -> Option<Completion> {
+    let label_of =
+        |name: Option<&oxc_ast::ast::LabelIdentifier<'_>>| name.map(|label| label.name.to_string());
+
+    match semantic.nodes().kind(node) {
+        AstKind::ReturnStatement(_) => Some(Completion::Return),
+        AstKind::ThrowStatement(_) => Some(Completion::Throw),
+        AstKind::BreakStatement(statement) => {
+            let label = label_of(statement.label.as_ref());
+
+            control_target_of(semantic, node, label.as_deref(), false).map(Completion::Break)
+        }
+        AstKind::ContinueStatement(statement) => {
+            let label = label_of(statement.label.as_ref());
+
+            control_target_of(semantic, node, label.as_deref(), true).map(Completion::Continue)
+        }
+        AstKind::BlockStatement(block) => block
+            .body
+            .last()
+            .and_then(|statement| completion_of(semantic, statement.node_id())),
+        AstKind::IfStatement(statement) => {
+            let consequent = completion_of(semantic, statement.consequent.node_id())?;
+            let alternate = completion_of(
+                semantic,
+                statement
+                    .alternate
+                    .as_ref()
+                    .map(|alternate| alternate.node_id())?,
+            )?;
+
+            Some(nearer_completion_of(semantic, node, consequent, alternate))
+        }
+        _ => None,
+    }
+}
+
+fn nearer_completion_of(
+    semantic: &Semantic<'_>,
+    node: NodeId,
+    first: Completion,
+    second: Completion,
+) -> Completion {
+    let target_of = |completion: Completion| match completion {
+        Completion::Break(target) | Completion::Continue(target) => Some(target),
+        _ => None,
+    };
+    let (left, right) = (target_of(first), target_of(second));
+
+    if first == second {
+        return first;
+    }
+
+    if left == right {
+        return match (first, second) {
+            (Completion::Continue(_), _) => first,
+            (_, Completion::Continue(_)) => second,
+            _ => first,
+        };
+    }
+
+    for ancestor in semantic.nodes().ancestor_ids(node) {
+        if Some(ancestor) == left {
+            return first;
+        }
+
+        if Some(ancestor) == right {
+            return second;
+        }
+    }
+
+    first
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
