@@ -358,3 +358,97 @@ fn argument_facts_carry_computed_sizes() {
     assert_eq!(result_of(source, "copied"), (cost("O(N)"), false));
     assert_eq!(result_of(source, "passed"), (cost("O(N^2)"), true));
 }
+
+const HELPERS: &str = "function cubic(xs: number[]) { let t = 0; for (const a of xs) for (const b of xs) for (const c of xs) t += a + b + c; return t; } function cheap(xs: number[]) { return xs.length; }";
+
+fn helped(source: &str) -> String {
+    format!("{HELPERS} {source}")
+}
+
+#[test]
+fn destructured_element_callees_resolve_through_recorded_writes() {
+    let element = helped(
+        "const fns = [cubic]; export function f(xs: number[]) { const [run] = fns; return run(xs); }",
+    );
+    let written = helped(
+        "const fns: ((xs: number[]) => number)[] = [cheap]; fns[0] = cubic; export function f(xs: number[]) { const [run = cheap] = fns; return run(xs); }",
+    );
+    let cleared = helped(
+        "const fns: (((xs: number[]) => number) | undefined)[] = [cheap]; fns[0] = undefined; export function f(xs: number[]) { const [run = cubic] = fns; return run(xs); }",
+    );
+    let escaped = helped(
+        "declare function leak(o: unknown): void; const fns: ((xs: number[]) => number)[] = [cheap]; leak(fns); export function f(xs: number[]) { const [run = cubic] = fns; return run(xs); }",
+    );
+    let nested = helped(
+        "const holder: { a: ((xs: number[]) => number)[] } = { a: [cheap] }; holder.a[0] = cubic; export function f(xs: number[]) { const { a: [run] } = holder; return run(xs); }",
+    );
+
+    for source in [&element, &written, &cleared, &escaped, &nested] {
+        assert_eq!(result_of(source, "f"), (cost("O(N^3)"), false), "{source}");
+    }
+}
+
+#[test]
+fn pattern_defaults_join_unless_a_fresh_source_supplies_the_key() {
+    let fresh = helped(
+        "export function f(xs: number[]) { const { run = cubic } = { run: cheap }; return run(xs); }",
+    );
+    let element = helped(
+        "export function f(xs: number[]) { const [run = cubic] = [cheap]; return run(xs); }",
+    );
+    let aliased = helped(
+        "const holder = { run: cheap }; export function f(xs: number[]) { const { run = cubic } = holder; return run(xs); }",
+    );
+    let deleted = helped(
+        "const holder: { run?: (xs: number[]) => number } = { run: cheap }; delete holder.run; export function f(xs: number[]) { const { run = cubic } = holder; return run(xs); }",
+    );
+    let escaped = helped(
+        "declare function leak(o: unknown): void; const holder = { run: cheap }; leak(holder); export function f(xs: number[]) { const { run = cubic } = holder; return run(xs); }",
+    );
+    let inherited = helped(
+        "declare const outside: { run?: (xs: number[]) => number }; export function f(xs: number[]) { const holder = { __proto__: outside }; const { run = cubic } = holder; return run(xs); }",
+    );
+    let omitted = helped(
+        "export function f(xs: number[]) { const { run = cubic } = {} as { run?: (xs: number[]) => number }; return run(xs); }",
+    );
+
+    assert_eq!(result_of(&fresh, "f"), (cost("O(1)"), false));
+    assert_eq!(result_of(&element, "f"), (cost("O(1)"), false));
+
+    for source in [&aliased, &deleted, &escaped, &inherited, &omitted] {
+        assert_eq!(result_of(source, "f"), (cost("O(N^3)"), false), "{source}");
+    }
+}
+
+#[test]
+fn spread_object_copies_carry_their_source_members() {
+    let copied = helped(
+        "const base = { run: cubic }; const copy = { ...base }; export function f(xs: number[]) { return copy.run(xs); }",
+    );
+    let overridden = helped(
+        "const base = { run: cubic }; const copy = { run: cheap, ...base }; export function f(xs: number[]) { return copy.run(xs); }",
+    );
+    let control = helped(
+        "const base = { run: cheap }; const copy = { ...base }; export function f(xs: number[]) { return copy.run(xs); }",
+    );
+
+    assert_eq!(result_of(&copied, "f"), (cost("O(N^3)"), false));
+    assert_eq!(result_of(&overridden, "f"), (cost("O(N^3)"), false));
+    assert_eq!(result_of(&control, "f"), (cost("O(1)"), false));
+}
+
+#[test]
+fn rest_copies_compose_getter_and_custom_iterator_work() {
+    let getter = "export function f(n: number) { const source = { get a(): number { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; return t; } }; const { ...rest } = source; return rest; }";
+    let iterated = "export function f(n: number) { const source = { *[Symbol.iterator](): Generator<number> { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; yield t; } }; const [, ...rest] = source; return rest; }";
+    let inert = "export function f() { const source = { a: 1, b: 2 }; const { ...rest } = source; return rest; }";
+
+    let copied = "export function f(n: number) { const source = { get a(): number { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; return t; } }; return { ...source }; }";
+    let nested = "export function f(n: number) { const holder = { inner: { get a(): number { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; return t; } } }; const { inner: { ...rest } } = holder; return rest; }";
+
+    assert_eq!(result_of(getter, "f"), (cost("O(N^2)"), false));
+    assert_eq!(result_of(copied, "f"), (cost("O(N^2)"), false));
+    assert_eq!(result_of(nested, "f"), (cost("O(N^2)"), false));
+    assert_eq!(legacy_cost_of(iterated, "f"), cost("O(N^2)"));
+    assert_eq!(result_of(inert, "f"), (cost("O(1)"), true));
+}

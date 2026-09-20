@@ -312,7 +312,7 @@ fn unresolved_actuals_obey_unknown_policy_without_a_false_constant_limit_violati
         let config = format!(r#"{{"entrypoints":["index.ts"],"max":"O(1)","unknown":"{policy}"}}"#);
         let output = lint(&[("tsconfig.json", "{}"), ("olint.config.json", &config), ("index.ts", "/** @perf O(n^2) */ function kernel(n:number) {}\nexport function work(n:number) { kernel(n-n); }")]);
 
-        assert_size_relation_policy(&output, policy, exit);
+        assert_size_relation(&output, policy != "ignore", exit);
     }
 }
 
@@ -550,12 +550,12 @@ fn omitted_actual_arguments_do_not_acquire_unbounded_formal_sizes() {
                 ("index.ts", &source),
             ]);
 
-            assert_size_relation_policy(&output, policy, exit);
+            assert_size_relation(&output, policy != "ignore", exit);
         }
     }
 }
 
-fn assert_size_relation_policy(output: &std::process::Output, policy: &str, exit: i32) {
+fn assert_size_relation(output: &std::process::Output, unresolved: bool, exit: i32) {
     assert_eq!(
         output.status.code(),
         Some(exit),
@@ -565,19 +565,19 @@ fn assert_size_relation_policy(output: &std::process::Output, policy: &str, exit
     assert!(String::from_utf8_lossy(&output.stdout).contains("0 over limit"));
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).contains("input size relation"),
-        policy != "ignore"
+        unresolved
     );
 }
 
 #[test]
 fn parameter_patterns_supply_names_without_inventing_quantity_relations() {
-    for (parameters, cost, argument) in [
-        ("{n}:{n:number}", "n^2", "{n:1}"),
-        ("{n:local}:{n:number}", "local^2", "{n:1}"),
-        ("{xs}:{xs:string}", "xs.length", "{xs:'x'}"),
-        ("[n]:number[]", "n^2", "[1]"),
-        ("{a:[n]}:{a:number[]}", "n^2", "{a:[1]}"),
-        ("...xs:number[]", "xs.length", "1,2"),
+    for (parameters, cost, argument, unresolved) in [
+        ("{n}:{n:number}", "n^2", "{n:1}", true),
+        ("{n:local}:{n:number}", "local^2", "{n:1}", true),
+        ("{xs}:{xs:string}", "xs.length", "{xs:'x'}", true),
+        ("[n]:number[]", "n^2", "[1]", true),
+        ("{a:[n]}:{a:number[]}", "n^2", "{a:[1]}", true),
+        ("...xs:number[]", "xs.length", "1,2", false),
     ] {
         let source = format!("/** @perf O({cost}) */ function kernel({parameters}) {{}}\nexport function work() {{kernel({argument});}}");
         let output = lint(&[
@@ -589,7 +589,7 @@ fn parameter_patterns_supply_names_without_inventing_quantity_relations() {
             ("index.ts", &source),
         ]);
 
-        assert_size_relation_policy(&output, "warn", 0);
+        assert_size_relation(&output, unresolved, 0);
     }
 
     let invalid = lint(&[

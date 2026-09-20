@@ -2694,7 +2694,62 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if let Some(rest) = parameters.rest.as_ref() {
+            if let BindingPattern::BindingIdentifier(identifier) = &rest.rest.argument {
+                if let Some(symbol) = identifier.symbol_id.get() {
+                    let origin = self.source_span(file, identifier.span);
+                    let mut value = self.values.at(origin);
+
+                    let constant = self.collects_constant_arguments(
+                        (call_file, arguments),
+                        parameters.items.len(),
+                        implicit,
+                    );
+
+                    value.size = constant.then_some(Cost::ONE);
+
+                    substitutions.insert(
+                        Binding::Symbol { file, symbol },
+                        ArgumentFacts {
+                            value,
+                            callback: None,
+                            preference: Preference::Unmarked,
+                            definedness: Definedness::Defined,
+                        },
+                    );
+                }
+            }
+        }
+
         substitutions
+    }
+
+    fn collects_constant_arguments(
+        &mut self,
+        (call_file, arguments): (FileId, &'a [Argument<'a>]),
+        collected_from: usize,
+        implicit: bool,
+    ) -> bool {
+        if implicit {
+            return false;
+        }
+
+        if arguments[..collected_from.min(arguments.len())]
+            .iter()
+            .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+        {
+            return false;
+        }
+
+        arguments
+            .iter()
+            .skip(collected_from)
+            .all(|argument| match argument {
+                Argument::SpreadElement(spread) => {
+                    self.is_constant_sized(call_file, &spread.argument)
+                }
+                _ => true,
+            })
     }
 
     pub(crate) fn is_parameter_unwritten(&mut self, binding: Binding) -> bool {

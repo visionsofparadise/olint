@@ -1,6 +1,7 @@
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, AssignmentTargetRest, CallExpression, Class, Expression,
-    MemberExpression, MethodDefinitionKind, NewExpression, SpreadElement, Statement,
+    Argument, AssignmentTarget, AssignmentTargetRest, BindingPattern, BindingRestElement,
+    CallExpression, Class, Expression, FormalParameterRest, IdentifierReference, MemberExpression,
+    MethodDefinitionKind, NewExpression, SpreadElement, Statement,
 };
 use oxc_ast::{AstKind, AstType};
 use oxc_semantic::NodeId;
@@ -11,7 +12,7 @@ use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
 use crate::cost::{Cost, Part, Preference, Reading};
 use crate::declarations::{
-    function_of_initializer, Declaration, FunctionNode, ParameterNode, TargetSet,
+    function_of_initializer, Binding, Declaration, FunctionNode, ParameterNode, TargetSet,
 };
 use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
@@ -159,19 +160,78 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        if let Some(rest) = parameters
-            .rest
-            .as_ref()
-            .filter(|rest| !is_identifier_pattern(&rest.rest.argument))
-        {
-            let kind = self.kind_of_node(file, rest.rest.argument.node_id());
-            let cost = self.cost_of_node(file, kind);
-            let cost = self.sibling_of(file, kind, cost);
+        if let Some(rest) = parameters.rest.as_ref() {
+            if let Some(cost) = self.cost_of_parameter_rest(file, rest) {
+                reading = Some(self.merge_parameter(reading, cost));
+            }
 
-            reading = Some(self.merge_parameter(reading, cost));
+            if !is_identifier_pattern(&rest.rest.argument) {
+                let kind = self.kind_of_node(file, rest.rest.argument.node_id());
+                let cost = self.cost_of_node(file, kind);
+                let cost = self.sibling_of(file, kind, cost);
+
+                reading = Some(self.merge_parameter(reading, cost));
+            }
         }
 
         reading
+    }
+
+    fn cost_of_parameter_rest(
+        &mut self,
+        file: FileId,
+        rest: &'a FormalParameterRest<'a>,
+    ) -> Option<Reading> {
+        if self.collected_arguments_are_constant(file, &rest.rest.argument) {
+            return None;
+        }
+
+        let label = self.rest_label_of(file, rest.rest.span);
+        let site = self.site_of_node(file, rest.node_id());
+        let part = self.nest_part(
+            label,
+            site,
+            self.source_span(file, rest.rest.span),
+            Cost::N,
+            Part::none(),
+        );
+
+        Some(Reading::of_part(part))
+    }
+
+    fn collected_arguments_are_constant(
+        &mut self,
+        file: FileId,
+        argument: &'a BindingPattern<'a>,
+    ) -> bool {
+        let BindingPattern::BindingIdentifier(identifier) = argument else {
+            return false;
+        };
+        let Some(symbol) = identifier.symbol_id.get() else {
+            return false;
+        };
+
+        self.is_constant_collection(Binding::Symbol { file, symbol })
+    }
+
+    fn is_constant_collection(&mut self, binding: Binding) -> bool {
+        if !self.is_parameter_unwritten(binding) {
+            return false;
+        }
+
+        self.current_substitutions
+            .get(&binding)
+            .and_then(|facts| facts.value.size.as_ref())
+            .is_some_and(Cost::is_one)
+    }
+
+    fn rest_label_of(&self, file: FileId, span: Span) -> String {
+        let written = self.text_of(file, span);
+
+        format!(
+            "spread ...{}",
+            short(written.strip_prefix("...").unwrap_or(written).trim_start())
+        )
     }
 
     fn merge_parameter(&mut self, reading: Option<Reading>, cost: Reading) -> Reading {
@@ -480,6 +540,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             AstKind::SpreadElement(spread) => self.cost_of_spread(file, spread),
             AstKind::AssignmentTargetRest(rest) => self.cost_of_rest_target(file, rest),
+            AstKind::BindingRestElement(rest) => self.cost_of_binding_rest(file, rest),
             AstKind::NewExpression(new) => self.cost_of_new(file, new),
             AstKind::CallExpression(call) => self.cost_of_call(file, call),
             AstKind::TaggedTemplateExpression(tagged) => {
@@ -890,29 +951,48 @@ impl<'p, 'a> Analysis<'p, 'a> {
         inner
     }
 
-    fn is_rest_parameter(&self, file: FileId, e: &'a Expression<'a>) -> bool {
+    fn is_constant_rest_expression(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
         let Some(reference) = identifier_of(e) else {
             return false;
         };
 
-        matches!(
+        self.is_constant_rest_reference(file, reference)
+    }
+
+    fn is_constant_rest_reference(
+        &mut self,
+        file: FileId,
+        reference: &'a IdentifierReference<'a>,
+    ) -> bool {
+        if !matches!(
             self.declarations
                 .of_reference(self.project, file, reference),
             Some(Declaration::Parameter {
                 parameter: ParameterNode::Rest(_),
                 ..
             })
-        )
+        ) {
+            return false;
+        }
+
+        let Some(binding) = self
+            .declarations
+            .binding_of_reference(self.project, file, reference)
+        else {
+            return false;
+        };
+
+        self.is_constant_collection(binding)
     }
 
     fn cost_of_spread(&mut self, file: FileId, spread: &'a SpreadElement<'a>) -> Reading {
         let inner = self.cost_of_expression(file, &spread.argument);
-        let inner = match self.spread_iteration_part_of(file, spread) {
+        let inner = match self.spread_part_of(file, spread) {
             Some(part) => inner.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces),
             None => inner,
         };
 
-        if self.is_rest_parameter(file, &spread.argument) {
+        if self.is_constant_rest_expression(file, &spread.argument) {
             return inner;
         }
 
@@ -939,56 +1019,85 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    fn cost_of_rest_target(&mut self, file: FileId, rest: &'a AssignmentTargetRest<'a>) -> Reading {
+    fn cost_of_binding_rest(&mut self, file: FileId, rest: &'a BindingRestElement<'a>) -> Reading {
+        let constant = self.binding_rest_is_constant(file, rest);
+
+        self.cost_of_rest_copy(file, rest.node_id(), rest.span, constant)
+    }
+
+    fn cost_of_rest_copy(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        span: Span,
+        constant: bool,
+    ) -> Reading {
         let mut inner = Reading::empty();
 
-        for child in self.children_of(file, rest.node_id()) {
+        for child in self.children_of(file, node) {
             let child = self.kind_of_node(file, child);
             let cost = self.cost_of_node(file, child);
 
             inner = inner.merge(cost, &mut self.unknowns, &mut self.traces);
         }
 
-        let constant = match &rest.target {
-            AssignmentTarget::AssignmentTargetIdentifier(reference) => {
-                if matches!(
-                    self.declarations
-                        .of_reference(self.project, file, reference),
-                    Some(Declaration::Parameter {
-                        parameter: ParameterNode::Rest(_),
-                        ..
-                    })
-                ) {
-                    return inner;
-                }
-
-                self.is_constant_sized_reference(file, reference)
-            }
-            _ => false,
-        };
-
         if constant {
             return inner;
         }
 
-        let written = self.text_of(file, rest.span);
-        let label = format!(
-            "spread ...{}",
-            short(written.strip_prefix("...").unwrap_or(written).trim_start())
-        );
-        let site = self.site_of_node(file, rest.node_id());
+        let label = self.rest_label_of(file, span);
+        let site = self.site_of_node(file, node);
 
         inner.merge(
             Reading::of_part(self.nest_part(
                 label,
                 site,
-                self.source_span(file, rest.span),
+                self.source_span(file, span),
                 Cost::N,
                 Part::none(),
             )),
             &mut self.unknowns,
             &mut self.traces,
         )
+    }
+
+    fn binding_rest_is_constant(&mut self, file: FileId, rest: &'a BindingRestElement<'a>) -> bool {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let keys = match nodes.parent_kind(rest.node_id()) {
+            AstKind::ObjectPattern(_) => true,
+            AstKind::ArrayPattern(_) => false,
+            AstKind::FormalParameterRest(_) => return true,
+            _ => return false,
+        };
+        let pattern = nodes.parent_id(rest.node_id());
+        let span = nodes.kind(pattern).span();
+        let source = match nodes.parent_kind(pattern) {
+            AstKind::VariableDeclarator(declarator) if declarator.id.span() == span => {
+                declarator.init.as_ref()
+            }
+            _ => None,
+        };
+        let Some(source) = source else {
+            return false;
+        };
+
+        match keys {
+            true => self.is_closed(file, source),
+            false => self.is_constant_sized(file, source),
+        }
+    }
+
+    fn cost_of_rest_target(&mut self, file: FileId, rest: &'a AssignmentTargetRest<'a>) -> Reading {
+        let constant = match &rest.target {
+            AssignmentTarget::AssignmentTargetIdentifier(reference) => {
+                self.is_constant_rest_reference(file, reference)
+                    || self.is_constant_sized_reference(file, reference)
+            }
+            _ => false,
+        };
+
+        self.cost_of_rest_copy(file, rest.node_id(), rest.span, constant)
     }
 
     fn with_open_remainder(

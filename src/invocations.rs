@@ -1,8 +1,8 @@
 use oxc_ast::ast::{
     ArrayExpressionElement, AssignmentTarget, AssignmentTargetMaybeDefault,
     AssignmentTargetProperty, BindingPattern, Class, Expression, ForOfStatement, FormalParameter,
-    MethodDefinitionKind, SimpleAssignmentTarget, SpreadElement, TaggedTemplateExpression,
-    YieldExpression,
+    MethodDefinitionKind, ObjectPropertyKind, PropertyKind, SimpleAssignmentTarget, SpreadElement,
+    TaggedTemplateExpression, YieldExpression,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, NodeId};
@@ -11,7 +11,7 @@ use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
 use crate::cost::{Cost, Part, Preference, Reading};
-use crate::declarations::{FunctionNode, TargetSet};
+use crate::declarations::{FunctionId, FunctionNode, TargetSet};
 use crate::declared_types::{is_primitive_result, Kind};
 use crate::project::{FileId, Project};
 use crate::receivers::Placement;
@@ -240,7 +240,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.iteration_parts_of(file, statement);
             }
             AstKind::SpreadElement(spread) => {
-                self.spread_iteration_part_of(file, spread);
+                self.spread_part_of(file, spread);
             }
             _ => {}
         }
@@ -321,7 +321,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    pub(crate) fn spread_iteration_part_of(
+    pub(crate) fn spread_part_of(
         &mut self,
         file: FileId,
         spread: &'a SpreadElement<'a>,
@@ -334,10 +334,56 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .parent_kind(spread.node_id()),
             AstKind::ObjectExpression(_)
         ) {
-            return None;
+            return self.copied_part_of(file, spread);
         }
 
         self.delegated_part_of(file, spread.span, &spread.argument, false)
+    }
+
+    fn copied_part_of(&mut self, file: FileId, spread: &'a SpreadElement<'a>) -> Option<Part> {
+        Some(
+            self.implicit_plan_part_of((file, spread.node_id()), |analysis, plan| {
+                let sources = Sources {
+                    values: vec![(file, &spread.argument)],
+                    open: false,
+                };
+
+                analysis.plan_rest_reads_of((file, spread.span), &sources, &[], plan);
+            }),
+        )
+    }
+
+    fn implicit_plan_part_of(
+        &mut self,
+        site: (FileId, NodeId),
+        build: impl FnOnce(&mut Self, &mut Vec<ImplicitSite>),
+    ) -> Part {
+        let plan = match self.implicit_plan(site) {
+            Some(plan) => plan,
+            None => {
+                let exhaustions = self.target_exhaustions();
+                let mut plan = Vec::new();
+
+                build(self, &mut plan);
+
+                let plan = Rc::new(plan);
+
+                if exhaustions == self.target_exhaustions() && !self.work_exhausted() {
+                    self.store_implicit_plan(site, Rc::clone(&plan));
+                }
+
+                plan
+            }
+        };
+        let mut part = Part::none();
+
+        for planned in plan.iter() {
+            let found = self.planned_part_of(planned);
+
+            part = part.max(found, &mut self.unknowns, &mut self.traces);
+        }
+
+        part
     }
 
     fn delegated_part_of(
@@ -828,34 +874,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn pattern_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
-        let site = (file, kind.node_id());
-        let plan = match self.implicit_plan(site) {
-            Some(plan) => plan,
-            None => {
-                let sources = self.pattern_sources_of(file, kind)?;
-                let exhaustions = self.target_exhaustions();
-                let mut plan = Vec::new();
-
-                self.plan_pattern_of(file, kind, sources, &mut plan);
-
-                let plan = Rc::new(plan);
-
-                if exhaustions == self.target_exhaustions() && !self.work_exhausted() {
-                    self.store_implicit_plan(site, Rc::clone(&plan));
+        Some(
+            self.implicit_plan_part_of((file, kind.node_id()), |analysis, plan| {
+                if let Some(sources) = analysis.pattern_sources_of(file, kind) {
+                    analysis.plan_pattern_of(file, kind, sources, plan);
                 }
-
-                plan
-            }
-        };
-        let mut part = Part::none();
-
-        for planned in plan.iter() {
-            let found = self.planned_part_of(planned);
-
-            part = part.max(found, &mut self.unknowns, &mut self.traces);
-        }
-
-        Some(part)
+            }),
+        )
     }
 
     fn planned_part_of(&mut self, planned: &ImplicitSite) -> Part {
@@ -923,12 +948,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.plan_binding_pattern_of(file, &assignment.left, sources, plan);
             }
             BindingPattern::ObjectPattern(object) => {
+                let mut excluded = Vec::new();
+
                 for property in &object.properties {
                     let key = self.property_key(file, &property.key, property.computed);
-                    let child =
-                        self.plan_property_read_of(file, property.span, key, &sources, plan);
+                    let child = self.plan_property_read_of(
+                        file,
+                        property.span,
+                        key.clone(),
+                        &sources,
+                        plan,
+                    );
+
+                    excluded.extend(key);
 
                     self.plan_binding_pattern_of(file, &property.value, child, plan);
+                }
+
+                if let Some(rest) = &object.rest {
+                    self.plan_rest_reads_of((file, rest.span), &sources, &excluded, plan);
                 }
             }
             BindingPattern::ArrayPattern(array) => self.plan_elements_of(
@@ -950,21 +988,139 @@ impl<'p, 'a> Analysis<'p, 'a> {
         sources: Sources<'a>,
         plan: &mut Vec<ImplicitSite>,
     ) {
+        let mut excluded = Vec::new();
+
         for property in &object.properties {
             match property {
                 AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
                     let key = Some(MemberKey::Name(property.binding.name.to_string()));
 
-                    self.plan_property_read_of(file, property.span, key, &sources, plan);
+                    self.plan_property_read_of(file, property.span, key.clone(), &sources, plan);
+
+                    excluded.extend(key);
                 }
                 AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
                     let key = self.property_key(file, &property.name, property.computed);
-                    let child =
-                        self.plan_property_read_of(file, property.span, key, &sources, plan);
+                    let child = self.plan_property_read_of(
+                        file,
+                        property.span,
+                        key.clone(),
+                        &sources,
+                        plan,
+                    );
+
+                    excluded.extend(key);
 
                     self.plan_maybe_default_of(file, &property.binding, child, plan);
                 }
             }
+        }
+
+        if let Some(rest) = &object.rest {
+            self.plan_rest_reads_of((file, rest.span), &sources, &excluded, plan);
+        }
+    }
+
+    fn plan_rest_reads_of(
+        &mut self,
+        (file, span): (FileId, Span),
+        sources: &Sources<'a>,
+        excluded: &[MemberKey],
+        plan: &mut Vec<ImplicitSite>,
+    ) {
+        let mut receivers = Vec::new();
+        let mut constant = !sources.open;
+        let mut known = Vec::new();
+
+        for (source, value) in sources.values.iter().copied() {
+            for (key, getter) in self.literal_getters_of(source, value, 0) {
+                if !excluded.contains(&key) && !known.contains(&getter) {
+                    known.push(getter);
+                }
+            }
+
+            constant &= self.is_closed(source, value);
+
+            receivers.push(self.storage_value_of(source, value));
+        }
+
+        if !known.is_empty() {
+            plan.push(ImplicitSite {
+                file,
+                span,
+                targets: TargetSet { known, open: false },
+                operation: "getter",
+                receivers: Vec::new(),
+                visits: None,
+            });
+        }
+
+        if !self.may_access(None) {
+            return;
+        }
+
+        plan.push(ImplicitSite {
+            file,
+            span,
+            targets: TargetSet {
+                known: Vec::new(),
+                open: true,
+            },
+            operation: "getter",
+            receivers,
+            visits: (!constant).then_some(false),
+        });
+    }
+
+    fn literal_getters_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        depth: usize,
+    ) -> Vec<(MemberKey, FunctionId)> {
+        if depth > MAXIMUM_RETURN_DEPTH || !self.charge_targets(1) {
+            return Vec::new();
+        }
+
+        match unwrap(value) {
+            Expression::ObjectExpression(object) => {
+                let mut getters = Vec::new();
+
+                if !self.charge_targets(object.properties.len() as u64) {
+                    return getters;
+                }
+
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        continue;
+                    };
+                    let Expression::FunctionExpression(getter) = &property.value else {
+                        continue;
+                    };
+
+                    if property.kind != PropertyKind::Get {
+                        continue;
+                    }
+
+                    if let Some(key) = self.property_key(file, &property.key, property.computed) {
+                        getters.push((
+                            key,
+                            FunctionId {
+                                file,
+                                node: getter.node_id(),
+                            },
+                        ));
+                    }
+                }
+
+                getters
+            }
+            _ => match self.constant_source_of(file, value) {
+                Some((target, initializer)) => {
+                    self.literal_getters_of(target, initializer, depth + 1)
+                }
+                None => Vec::new(),
+            },
         }
     }
 

@@ -36,7 +36,7 @@ O(max(xs, n)) [partial]    1
 O(max(n, cb)) [partial]    1
 O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
-O(obj)              1
+O(obj) [partial]    1
 O(N^2)              1
 O(max(xs, other)) [partial]    1
 O(max(xs, needle))    1
@@ -297,7 +297,7 @@ O(max(1, n^2)) setCallback  src/methods.ts:80
 O(max(1, rows)) spreadAtCallSite  src/calls.ts:21 [partial]
     does spread ...xs                                     src/calls.ts:23  x N
         calls sumRest()                                    src/calls.ts:23  = O(rows)
-        does args.reduce()                                src/calls.ts:18  x N
+        does spread ...args                               src/calls.ts:17  x N
 
 O(log(max(xs, target))) unaryHalving  src/bounds.ts:95
     in loop while [halving]                                  src/bounds.ts:98  x log N
@@ -311,7 +311,7 @@ O(xs)          parenthesizedRest  src/calls.ts:74
 O(xs)          makeIdentity  src/calls.ts:65
     does xs.map()                                         src/calls.ts:66  x N
 
-O(obj)         destructureObjectRest  src/calls.ts:59
+O(obj)         destructureObjectRest  src/calls.ts:59 [partial]
     does spread ...rest                                   src/calls.ts:61  x N
 
 O(xs)          destructureRest  src/calls.ts:52
@@ -361,7 +361,7 @@ O(xs)          hotTryBranch  src/branches.ts:25
     in loop for-of                                           src/branches.ts:29  x N
 
 O(N)           sumRest  src/calls.ts:17
-    does args.reduce()                                    src/calls.ts:18  x N
+    does spread ...args                                   src/calls.ts:17  x N
 
 O(N)           MergedHolder.run  src/classes.ts:105
     does mergedItems.indexOf()                            src/classes.ts:106  x N
@@ -388,10 +388,10 @@ O(N)           useQuotedHolder  src/classes.ts:136 [partial]
     does mergedItems.indexOf()                            src/classes.ts:129  x N
 
 O(N)           spreadRestTupleSet  src/methods.ts:86
-    calls Set(...rows)                                     src/methods.ts:87  = O(N)
+    does spread ...rows                                   src/methods.ts:86  x N
 
 O(N)           spreadRestKeys  src/methods.ts:90
-    does Object.keys(...rows)                             src/methods.ts:91  x N
+    does spread ...rows                                   src/methods.ts:90  x N
 
 O(o)           forInIndexSig  src/types.ts:6
     in loop for-in                                           src/types.ts:8  x N

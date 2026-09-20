@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, BindingProperty, CallExpression, Class,
-    ClassElement, Expression, FormalParameter, IdentifierReference, MemberExpression,
-    MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey, PropertyKind,
+    Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, BindingProperty,
+    CallExpression, Class, ClassElement, Expression, FormalParameter, IdentifierReference,
+    MemberExpression, MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey,
+    PropertyKind,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
@@ -25,7 +26,7 @@ use crate::receivers::{annotation_of, this_owner_of, Placement, ThisOwner};
 use crate::syntax::{call_of, is_iteration_kind, member_expression_of, unwrap, unwrap_to_cast};
 use crate::tables::{LINEAR_CONSTRUCTORS, REFLECTIVE_WRITES};
 
-use super::ValueId;
+use super::{Definedness, ValueId};
 
 pub(crate) const OUTSIDE_SOURCES_REPLACE_BUILTINS: bool = false;
 
@@ -79,8 +80,14 @@ enum PatternSources<'a> {
 }
 
 #[derive(Clone, Debug)]
+enum StepKey {
+    Member(MemberKey),
+    Element(usize),
+}
+
+#[derive(Clone, Debug)]
 struct PatternStep<'a> {
-    key: MemberKey,
+    key: StepKey,
     default: Option<&'a Expression<'a>>,
 }
 
@@ -160,7 +167,7 @@ pub(crate) struct TargetIndex {
     exhaustions: u64,
     exhausted_calls: HashSet<Site>,
     summaries: HashMap<(Option<MemberKey>, Kind, bool, bool), WideSummary>,
-    prototypes: HashSet<(Site, MemberKey)>,
+    linked: HashSet<(Site, MemberKey)>,
     exploring: HashSet<(usize, MemberKey)>,
     cuts: u64,
     prototype_owners: Vec<(ValueId, bool)>,
@@ -448,6 +455,25 @@ fn descriptor_value_of(descriptor: Descriptor<'_>) -> Option<&Expression<'_>> {
     match descriptor {
         Descriptor::Known { value, .. } => value,
         _ => None,
+    }
+}
+
+fn is_unaliased_source(value: &Expression<'_>, key: &StepKey) -> bool {
+    match (value, key) {
+        (Expression::ObjectExpression(object), StepKey::Member(_)) => {
+            object.properties.iter().all(|property| {
+                matches!(
+                    property,
+                    ObjectPropertyKind::ObjectProperty(property)
+                        if property.kind == PropertyKind::Init && !property.computed
+                )
+            })
+        }
+        (Expression::ArrayExpression(array), StepKey::Element(_)) => array
+            .elements
+            .iter()
+            .all(|element| !matches!(element, ArrayExpressionElement::SpreadElement(_))),
+        _ => false,
     }
 }
 
@@ -1970,6 +1996,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.values.targets.exhaustions
     }
 
+    pub(crate) fn constant_source_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+    ) -> Option<Valued<'a>> {
+        let Expression::Identifier(reference) = unwrap(value) else {
+            return None;
+        };
+
+        self.declarations
+            .of_reference(self.project, file, reference)
+            .and_then(constant_initializer_of)
+    }
+
+    pub(crate) fn charge_targets(&mut self, amount: u64) -> bool {
+        let charged = self.charge_work(Event::DispatchStep, amount);
+
+        self.values.targets.exhaustions += u64::from(!charged);
+
+        charged
+    }
+
     pub(crate) fn mark_call_exhausted(&mut self, file: FileId, call: NodeId) {
         self.values.targets.exhausted_calls.insert((file, call));
     }
@@ -3115,21 +3163,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return;
         };
         let mut values = sources;
+        let mut fresh = true;
 
         for step in steps {
             let mut next = Vec::new();
+            let mut supplied = fresh && !values.is_empty();
 
             for (source, value) in values {
-                next.extend(self.pattern_members_of(source, value, step).values);
+                let members = self.pattern_members_of(source, value, step, fresh);
+
+                supplied &= self.supplies_step(value, step, &members);
+
+                next.extend(members.values);
             }
 
-            next.extend(step.default.map(|default| (target, default)));
+            if !supplied {
+                next.extend(step.default.map(|default| (target, default)));
+            }
 
             values = next;
+            fresh = false;
         }
 
+        let mut supplied = fresh && !values.is_empty();
+
         for (source, value) in values {
-            let members = self.pattern_members_of(source, value, last);
+            let members = self.pattern_members_of(source, value, last, fresh);
+
+            supplied &= self.supplies_step(value, last, &members);
 
             for function in members.functions {
                 push_target(resolved, function);
@@ -3140,9 +3201,36 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        if let Some(default) = last.default {
+        if let (false, Some(default)) = (supplied, last.default) {
             self.collect_callable_targets(target, default, visited, resolved);
         }
+    }
+
+    fn supplies_step(
+        &mut self,
+        value: &'a Expression<'a>,
+        step: &PatternStep<'a>,
+        members: &MemberValues<'a>,
+    ) -> bool {
+        if members.replaced
+            || members.accessors_open
+            || !members.below.is_empty()
+            || members.lookups == 0
+            || members.defined != members.lookups
+            || !members.getters.is_empty()
+            || members.values.is_empty()
+        {
+            return false;
+        }
+
+        if !is_unaliased_source(unwrap(value), &step.key) {
+            return false;
+        }
+
+        members
+            .values
+            .iter()
+            .all(|(file, value)| self.definedness_of(*file, value) == Definedness::Defined)
     }
 
     fn pattern_members_of(
@@ -3150,6 +3238,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         value: &'a Expression<'a>,
         step: &PatternStep<'a>,
+        fresh: bool,
     ) -> MemberValues<'a> {
         if !self.charge_dispatch() {
             return MemberValues {
@@ -3158,11 +3247,98 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
         }
 
+        let key = match &step.key {
+            StepKey::Member(key) => key,
+            StepKey::Element(index) => return self.element_values_of(file, value, *index, fresh),
+        };
         let mut receiver = Receiver::default();
 
         self.collect_receiver(file, value, &mut HashSet::new(), &mut receiver);
 
-        self.member_candidates_of(file, value, &receiver, &step.key)
+        self.member_candidates_of(file, value, &receiver, key)
+    }
+
+    fn element_values_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        index: usize,
+        fresh: bool,
+    ) -> MemberValues<'a> {
+        let mut found = self.literal_element_values_of(file, value, index, 0);
+
+        if fresh && matches!(unwrap(value), Expression::ArrayExpression(_)) {
+            return found;
+        }
+
+        let key = MemberKey::Name(index.to_string());
+        let mut receiver = Receiver::default();
+
+        self.collect_receiver(file, value, &mut HashSet::new(), &mut receiver);
+
+        let written = self.member_candidates_of(file, value, &receiver, &key);
+
+        found.absorb(&written);
+
+        found
+    }
+
+    fn literal_element_values_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        index: usize,
+        depth: usize,
+    ) -> MemberValues<'a> {
+        let unknown = MemberValues {
+            replaced: true,
+            lookups: 1,
+            ..MemberValues::default()
+        };
+
+        if depth > MAXIMUM_ALIAS_DEPTH || !self.charge_dispatch() {
+            return unknown;
+        }
+
+        match unwrap(value) {
+            Expression::ArrayExpression(array) => {
+                let elements = &array.elements;
+
+                if elements
+                    .iter()
+                    .take(index + 1)
+                    .any(|element| matches!(element, ArrayExpressionElement::SpreadElement(_)))
+                {
+                    return unknown;
+                }
+
+                let aliased = depth > 0;
+                let Some(element) = elements
+                    .get(index)
+                    .and_then(|element| element.as_expression())
+                else {
+                    return MemberValues {
+                        replaced: aliased,
+                        lookups: 1,
+                        ..MemberValues::default()
+                    };
+                };
+
+                MemberValues {
+                    values: vec![(file, element)],
+                    replaced: aliased,
+                    lookups: 1,
+                    defined: 1,
+                    ..MemberValues::default()
+                }
+            }
+            _ => match self.constant_source_of(file, value) {
+                Some((target, initializer)) => {
+                    self.literal_element_values_of(target, initializer, index, depth + 1)
+                }
+                None => unknown,
+            },
+        }
     }
 
     fn pattern_steps_of(
@@ -3189,7 +3365,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     steps.insert(
                         0,
                         PatternStep {
-                            key: self.binding_property_key_of(file, property)?,
+                            key: StepKey::Member(self.binding_property_key_of(file, property)?),
                             default,
                         },
                     );
@@ -3202,7 +3378,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
             BindingPattern::BindingIdentifier(identifier) => {
                 (identifier.symbol_id.get() == Some(symbol)).then(Vec::new)
             }
-            BindingPattern::ArrayPattern(_) => None,
+            BindingPattern::ArrayPattern(array) => {
+                for (index, element) in array.elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let Some(mut steps) = self.pattern_steps_of(file, element, symbol) else {
+                        continue;
+                    };
+                    let default = match element {
+                        BindingPattern::AssignmentPattern(assignment) => Some(&assignment.right),
+                        _ => None,
+                    };
+
+                    steps.insert(
+                        0,
+                        PatternStep {
+                            key: StepKey::Element(index),
+                            default,
+                        },
+                    );
+
+                    return Some(steps);
+                }
+
+                None
+            }
         }
     }
 
@@ -3781,9 +3982,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) {
         let mut own = false;
         let mut prototype = None;
+        let mut copied = Vec::new();
+
+        if !self.charge_targets(object.properties.len() as u64) {
+            found.replaced = true;
+
+            return;
+        }
 
         for property in &object.properties {
             let ObjectPropertyKind::ObjectProperty(property) = property else {
+                if let ObjectPropertyKind::SpreadProperty(spread) = property {
+                    copied.push(&spread.argument);
+                }
+
                 continue;
             };
             let property_key = self.property_key_of(file, property);
@@ -3832,21 +4044,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        for source in copied {
+            self.linked_values_of(file, source, key, found);
+        }
+
         if let (false, Some(prototype)) = (own, prototype) {
-            self.prototype_values_of(file, prototype, key, found);
+            self.linked_values_of(file, prototype, key, found);
         }
     }
 
-    fn prototype_values_of(
+    fn linked_values_of(
         &mut self,
         file: FileId,
-        prototype: &'a Expression<'a>,
+        linked: &'a Expression<'a>,
         key: &MemberKey,
         found: &mut MemberValues<'a>,
     ) {
-        let site = ((file, prototype.node_id()), key.clone());
+        let site = ((file, linked.node_id()), key.clone());
 
-        if self.values.targets.prototypes.contains(&site) {
+        if self.values.targets.linked.contains(&site) {
             found.replaced = true;
 
             return;
@@ -3860,20 +4076,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return;
         }
 
-        self.values.targets.prototypes.insert(site.clone());
+        self.values.targets.linked.insert(site.clone());
 
         let mut receiver = Receiver::default();
 
-        self.collect_receiver(file, prototype, &mut HashSet::new(), &mut receiver);
+        self.collect_receiver(file, linked, &mut HashSet::new(), &mut receiver);
 
-        let inherited = self.member_candidates_of(file, prototype, &receiver, key);
+        let inherited = self.member_candidates_of(file, linked, &receiver, key);
 
-        self.values.targets.prototypes.remove(&site);
+        self.values.targets.linked.remove(&site);
         self.leave_targets();
 
         found.absorb(&inherited);
 
-        found.accessors_open |= is_unknown_prototype(prototype, &receiver);
+        found.accessors_open |= is_unknown_prototype(linked, &receiver);
     }
 
     fn push_getter(&mut self, getter: FunctionId, found: &mut MemberValues<'a>) {
@@ -3901,7 +4117,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 && self.property_key_of(file, property)
                     == Some(MemberKey::Name("__proto__".to_string()))
             {
-                self.prototype_values_of(file, &property.value, key, found);
+                self.linked_values_of(file, &property.value, key, found);
             }
         }
     }
@@ -5473,7 +5689,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 if let AstKind::AssignmentExpression(assignment) = self.kind_of_node(site.0, site.1)
                 {
-                    self.prototype_values_of(site.0, &assignment.right, key, found);
+                    self.linked_values_of(site.0, &assignment.right, key, found);
                 }
             }
 

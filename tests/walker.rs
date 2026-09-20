@@ -133,8 +133,8 @@ fn a_return_inside_a_loop_moves_its_cost_to_the_function_exit() {
 }
 
 #[test]
-fn a_spread_of_a_rest_parameter_costs_nothing() {
-    let (rest, _) = reading_of(
+fn a_spread_of_a_rest_parameter_copies_its_collected_arguments() {
+    let (rest, rest_labels) = reading_of(
         "export function f(...xs: number[]) {\n\treturn Math.max(...xs);\n}",
         "f",
     );
@@ -143,9 +143,54 @@ fn a_spread_of_a_rest_parameter_costs_nothing() {
         "g",
     );
 
-    assert_eq!(rest.total().cost, Cost::ONE);
+    assert_eq!(rest.total().cost, Cost::N);
+    assert_eq!(rest_labels, vec!["spread ...xs"]);
     assert_eq!(plain.total().cost, Cost::N);
     assert_eq!(labels, vec!["spread ...xs"]);
+}
+
+#[test]
+fn rest_parameter_allocation_enters_the_function_summary() {
+    let (rest, labels) = reading_of(
+        "export function f(...xs: number[]) {\n\treturn xs.length;\n}",
+        "f",
+    );
+    let (pattern, pattern_labels) = reading_of(
+        "export function g(...[head]: number[]) {\n\treturn head;\n}",
+        "g",
+    );
+
+    assert_eq!(rest.total().cost, Cost::N);
+    assert_eq!(labels, vec!["spread ...xs"]);
+    assert_eq!(pattern.total().cost, Cost::N);
+    assert_eq!(pattern_labels, vec!["spread ...[head]"]);
+}
+
+#[test]
+fn binding_rests_copy_their_source_and_fixed_sources_stay_constant() {
+    let (array, array_labels) = reading_of(
+        "export function f(xs: number[]) {\n\tconst [head, ...rest] = xs;\n\treturn head + rest.length;\n}",
+        "f",
+    );
+    let (object, object_labels) = reading_of(
+        "export function g(o: Record<string, number>) {\n\tconst { a, ...rest } = o;\n\treturn a;\n}",
+        "g",
+    );
+    let (fixed_array, _) = reading_of(
+        "export function h() {\n\tconst [head, ...rest] = [1, 2, 3];\n\treturn head + rest.length;\n}",
+        "h",
+    );
+    let (fixed_object, _) = reading_of(
+        "export function k() {\n\tconst { a, ...rest } = { a: 1, b: 2 };\n\treturn a;\n}",
+        "k",
+    );
+
+    assert_eq!(array.total().cost, Cost::N);
+    assert_eq!(array_labels, vec!["spread ...rest"]);
+    assert_eq!(object.total().cost, Cost::N);
+    assert_eq!(object_labels, vec!["spread ...rest"]);
+    assert_eq!(fixed_array.total().cost, Cost::ONE);
+    assert_eq!(fixed_object.total().cost, Cost::ONE);
 }
 
 #[test]
@@ -1022,6 +1067,43 @@ fn arguments_after_a_spread_bind_open_facts() {
         (index_of(format!("{helpers}\nexport function selected(xs: number[], rest: any[]) {{ return (run as any)(...rest, cheap); }}")), "O(N)", true),
         (index_of(format!("{helpers}\nexport function selected(xs: number[], rest: any[]) {{ return (wrap as any)(...rest, cheap)(xs); }}")), "O(N)", true),
         (index_of(format!("{helpers}\nexport function selected(xs: number[]) {{ return run(xs, cheap); }}")), "O(1)", false),
+    ];
+
+    assert_dispatched(&cases);
+}
+
+#[test]
+fn collected_rest_arguments_specialize_their_length() {
+    let helpers = "function sum(...xs: number[]) { return Math.max(...xs) + xs.length; }";
+    let cases = [
+        (
+            index_of(format!(
+                "{helpers}\nexport function selected() {{ return sum(1, 2, 3); }}"
+            )),
+            "O(1)",
+            false,
+        ),
+        (
+            index_of(format!(
+                "{helpers}\nexport function selected() {{ return sum(...[1, 2]); }}"
+            )),
+            "O(1)",
+            false,
+        ),
+        (
+            index_of(format!(
+                "{helpers}\nexport function selected(ys: number[]) {{ return sum(...ys); }}"
+            )),
+            "O(N)",
+            false,
+        ),
+        (
+            index_of(format!(
+                "{helpers}\nexport function selected(ys: number[]) {{ return sum(1, ...ys, 2); }}"
+            )),
+            "O(N)",
+            false,
+        ),
     ];
 
     assert_dispatched(&cases);

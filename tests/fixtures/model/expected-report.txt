@@ -36,7 +36,7 @@ O(max(xs, n)) [partial]    1
 O(max(n, cb)) [partial]    1
 O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
-O(obj)              1
+O(obj) [partial]    1
 O(N^2)              1
 O(max(xs, other)) [partial]    1
 O(max(xs, needle))    1

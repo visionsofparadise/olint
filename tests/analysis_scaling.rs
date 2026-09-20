@@ -1910,3 +1910,79 @@ fn nested_iteration_protocols_resolve_exits_and_targets_in_linear_work() {
 
     assert_linear_growth(&base, &single, &double);
 }
+
+fn rest_copy_source(sites: usize, keys: usize) -> String {
+    let properties: String = (0..keys)
+        .map(|index| format!("k{index}: {index}, "))
+        .collect();
+    let mut lines = vec![
+        "function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void (a + b + c); }".to_string(),
+        format!("const base = {{ {properties}run: cube, get probe(): number {{ return 1; }} }};"),
+        "const fns = [cube];".to_string(),
+    ];
+
+    for index in 0..sites {
+        lines.push(format!("const copy{index} = {{ ...base }};"));
+    }
+
+    let uses: String = (0..sites)
+        .map(|index| {
+            format!("copy{index}.run(xs); const [run{index}] = fns; run{index}(xs); const {{ k0: key{index}, ...rest{index} }} = base; void key{index}; void rest{index}; ")
+        })
+        .collect();
+
+    lines.push(format!(
+        "export function selected(xs: number[]) {{ {uses} }}"
+    ));
+
+    lines.join(
+        "
+",
+    )
+}
+
+fn rest_copy_steps_of(sites: usize, keys: usize) -> u64 {
+    let mut steps = 0;
+
+    run_with_source(&rest_copy_source(sites, keys), |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(!stats.work.exhausted(Event::DispatchStep), "{stats:?}");
+
+        let selected = function_of_name(analysis.project, file, "selected");
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, selected, &part.cost),
+            Cost::parse("O(N^3)").unwrap(),
+            "{sites} {keys}"
+        );
+
+        steps = stats.work.consumed(Event::DispatchStep);
+    });
+
+    steps
+}
+
+#[test]
+fn spread_copies_and_destructured_elements_scan_source_keys_once() {
+    for (sites, keys) in [
+        (8, 8),
+        (16, 8),
+        (24, 8),
+        (8, 16),
+        (8, 24),
+        (16, 16),
+        (24, 24),
+    ] {
+        let sites = sites as u64;
+        let keys = keys as u64;
+
+        assert_eq!(
+            rest_copy_steps_of(sites as usize, keys as usize),
+            29 * sites + 3 * sites * keys,
+            "{sites} {keys}"
+        );
+    }
+}
