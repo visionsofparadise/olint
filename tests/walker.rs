@@ -244,6 +244,28 @@ fn set_union_uses_a_callable_set_like_object_as_data() {
 }
 
 #[test]
+fn an_object_assign_is_charged_by_every_argument_it_copies() {
+    let (fresh_target, fresh_labels) = reading_of(
+        "export function f(source: Record<string, number>) {\n\treturn Object.assign({}, source);\n}",
+        "f",
+    );
+    let (constant_sources, _) = reading_of(
+        "export function g() {\n\treturn Object.assign({}, { a: 1 }, { b: 2 });\n}",
+        "g",
+    );
+    let (named_target, named_labels) = reading_of(
+        "export function h(out: Record<string, number>, a: Record<string, number>, b: Record<string, number>) {\n\treturn Object.assign(out, a, b);\n}",
+        "h",
+    );
+
+    assert_eq!(fresh_target.total().cost, Cost::N);
+    assert_eq!(fresh_labels, vec!["Object.assign({})"]);
+    assert_eq!(constant_sources.total().cost, Cost::ONE);
+    assert_eq!(named_target.total().cost, Cost::N);
+    assert_eq!(named_labels, vec!["Object.assign(out)"]);
+}
+
+#[test]
 fn a_cold_statement_yields_to_an_unmarked_sibling() {
     let (reading, labels) = reading_of(
         "export function f(rows: number[][]) {\n\t// @perf cold\n\tfor (const row of rows) for (const cell of row) void cell;\n\tfor (const row of rows) void row;\n}",

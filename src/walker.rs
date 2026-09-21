@@ -2230,6 +2230,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading.merge(unknown, &mut self.unknowns, &mut self.traces)
     }
 
+    fn is_bounded_global_argument(
+        &mut self,
+        file: FileId,
+        global_name: &str,
+        method: &str,
+        argument: &'a Argument<'a>,
+    ) -> bool {
+        self.is_constant_sized_argument(file, argument)
+            || (global_name == "Object"
+                && is_listed(OBJECT_KEYED, method)
+                && (argument
+                    .as_expression()
+                    .is_some_and(|expression| self.is_enum_object(file, expression))
+                    || self.is_closed_argument(file, argument)))
+    }
+
     fn cost_of_method_call(
         &mut self,
         file: FileId,
@@ -2249,17 +2265,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .any(|(name, methods)| *name == global_name && methods.contains(&method.as_str()));
 
             if listed {
-                let bounded = match first {
-                    Some(argument) => {
-                        self.is_constant_sized_argument(file, argument)
-                            || (global_name == "Object"
-                                && is_listed(OBJECT_KEYED, &method)
-                                && (argument
-                                    .as_expression()
-                                    .is_some_and(|argument| self.is_enum_object(file, argument))
-                                    || self.is_closed_argument(file, argument)))
+                let copies_every_argument = global_name == "Object" && method == "assign";
+                let bounded = match (first, copies_every_argument) {
+                    (Some(_), true) => call.arguments.iter().all(|argument| {
+                        self.is_bounded_global_argument(file, global_name, &method, argument)
+                    }),
+                    (Some(argument), false) => {
+                        self.is_bounded_global_argument(file, global_name, &method, argument)
                     }
-                    None => false,
+                    (None, _) => false,
                 };
                 let callback = if method == "from" {
                     self.callback_part_of(file, call.arguments.get(1))
