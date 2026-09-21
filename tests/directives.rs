@@ -119,3 +119,32 @@ fn comments_before_the_first_line_break_are_not_leading() {
         );
     });
 }
+
+#[test]
+fn a_mark_follows_retained_completion_work_to_the_channel_that_carries_it() {
+    let quadratic = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\treturn total;\n}\n";
+    let caught = |mark: &str| {
+        format!(
+            "{quadratic}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\t{mark}try {{\n\t\t\tthrow quadratic(xs);\n\t\t}} catch (error) {{\n\t\t\ttotal += 1;\n\t\t}}\n\t\ttotal += xs.length;\n\t}}\n\treturn total;\n}}"
+        )
+    };
+    let cost_of = |source: String| {
+        let mut found = olint::cost::Cost::ONE;
+
+        support::run_with_source(&source, |analysis, file| {
+            let function = support::function_of_name(analysis.project, file, "f");
+            let reading = support::legacy_reading_of(analysis, file, function);
+            let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+            found = part.cost;
+        });
+
+        found
+    };
+
+    assert_eq!(
+        cost_of(caught("")),
+        olint::cost::Cost::parse("O(N^3)").unwrap()
+    );
+    assert_eq!(cost_of(caught("// @perf cold\n\t\t")), olint::cost::Cost::N);
+}

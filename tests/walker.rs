@@ -1495,3 +1495,103 @@ fn a_branch_that_only_transfers_within_itself_still_leaves_its_loop() {
     assert_eq!(downgraded.total().cost, Cost::parse("O(N^2)").unwrap());
     assert!(downgraded_labels.contains(&"[return branch: runs once per loop]".to_string()));
 }
+
+#[test]
+fn caught_throws_and_overridden_returns_stay_at_their_loop_frequency() {
+    let cubic = Cost::parse("O(N^3)").unwrap();
+    let (caught, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\tthrow quadratic(xs);\n\t\t}} catch (error) {{\n\t\t\ttotal += 1;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (continued, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\treturn quadratic(xs);\n\t\t}} finally {{\n\t\t\tcontinue;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (nested, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\ttry {{\n\t\t\t\treturn quadratic(xs);\n\t\t\t}} finally {{\n\t\t\t\ttotal += 1;\n\t\t\t}}\n\t\t}} finally {{\n\t\t\tcontinue;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+
+    assert_eq!(caught, cubic);
+    assert_eq!(continued, cubic);
+    assert_eq!(nested, cubic);
+}
+
+#[test]
+fn genuine_exits_rethrows_and_plain_finalizers_still_run_once_per_call() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (returned, _) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\ttotal += 1;\n\t\tif (row.length > 0) {{\n\t\t\treturn scan(row);\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (rethrown, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\ttotal += x;\n\t\t}} catch (error) {{\n\t\t\tthrow quadratic(xs);\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (finalized, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\treturn quadratic(xs);\n\t\t}} finally {{\n\t\t\ttotal += 1;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+
+    assert_eq!(returned, Cost::N);
+    assert_eq!(rethrown, quadratic);
+    assert_eq!(finalized, quadratic);
+}
+
+#[test]
+fn an_overridden_exit_is_charged_at_the_boundary_it_crosses() {
+    let (continued, continued_labels) = reading_of(
+        &format!(
+            "{LOOP_QUADRATIC}export function f(rows: number[][]) {{\n\tlet total = 0;\n\touter: for (const row of rows) {{\n\t\tfor (const value of row) {{\n\t\t\ttry {{\n\t\t\t\treturn quadratic(row);\n\t\t\t}} finally {{\n\t\t\t\tcontinue outer;\n\t\t\t}}\n\t\t}}\n\t}}\n\treturn total;\n}}"
+        ),
+        "f",
+    );
+
+    assert!(continued.function_exit.cost.is_one());
+    assert_eq!(
+        continued_labels,
+        vec!["for-of", "call quadratic()", "for-of"]
+    );
+}
+
+#[test]
+fn a_branch_a_catch_or_finally_can_re_enter_keeps_its_work_inside() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (caught, caught_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\ttry {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\treturn total;\n\t\t\t}}\n\t\t\ttotal += 1;\n\t\t}} catch (error) {{\n\t\t\ttotal += 1;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (overridden, _) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\ttry {{\n\t\t\tif (row.length > 0) {{\n\t\t\t\ttotal += scan(row);\n\t\t\t\treturn total;\n\t\t\t}}\n\t\t}} finally {{\n\t\t\tcontinue;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (within, within_labels) = loop_cost_of(&format!(
+        "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\tif (row.length > 0) {{\n\t\t\ttotal += scan(row);\n\t\t\ttry {{\n\t\t\t\tthrow new Error('stop');\n\t\t\t}} catch (error) {{\n\t\t\t\ttotal += 1;\n\t\t\t}}\n\t\t\treturn total;\n\t\t}}\n\t\ttotal += 1;\n\t}}\n\treturn total;\n}}"
+    ));
+    let (outside, outside_labels) = reading_of(
+        &format!(
+            "{LOOP_SCAN}export function f(rows: number[][]) {{\n\tlet total = 0;\n\tfor (const row of rows) {{\n\t\ttry {{\n\t\t\tfor (const value of row) {{\n\t\t\t\tif (row.length > 0) {{\n\t\t\t\t\ttotal += scan(row);\n\t\t\t\t\treturn total;\n\t\t\t\t}}\n\t\t\t\ttotal += value;\n\t\t\t}}\n\t\t}} catch (error) {{\n\t\t\ttotal += 1;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+        ),
+        "f",
+    );
+
+    assert_eq!(caught, quadratic);
+    assert!(caught_labels
+        .iter()
+        .all(|label| !label.contains("runs once per")));
+    assert_eq!(overridden, quadratic);
+    assert_eq!(within, Cost::N);
+    assert!(within_labels.contains(&"[return branch: runs once per call]".to_string()));
+    assert!(outside.function_exit.cost.is_one());
+    assert!(outside_labels.contains(&"[return branch: runs once per loop]".to_string()));
+}
+
+#[test]
+fn a_finalizer_transfer_that_lands_inside_it_does_not_replace_the_completion() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (looped, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\treturn quadratic(xs);\n\t\t}} finally {{\n\t\t\tfor (const y of xs) if (y > 0) break;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (caught, _) = loop_cost_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\treturn quadratic(xs);\n\t\t}} finally {{\n\t\t\ttry {{\n\t\t\t\tthrow new Error('stop');\n\t\t\t}} catch (error) {{\n\t\t\t\ttotal += 1;\n\t\t\t}}\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ));
+    let (escaping, _) = reading_of(&format!(
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\ttry {{\n\t\t\treturn quadratic(xs);\n\t\t}} finally {{\n\t\t\tfor (const y of xs) if (y > 0) total += 1;\n\t\t\tcontinue;\n\t\t}}\n\t}}\n\treturn total;\n}}"
+    ), "f");
+
+    assert_eq!(looped, quadratic);
+    assert_eq!(caught, quadratic);
+    assert!(escaping.function_exit.cost.is_one());
+}

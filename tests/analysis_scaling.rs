@@ -1997,7 +1997,12 @@ fn loop_phase_walks_of(loops: usize) -> u64 {
         "function scan(xs: number[]) {{ let found = 0; for (const x of xs) found += x; return found; }}
 export function selected(xs: number[]) {{ let total = 0; {statements}return total; }}"
     );
-    let mut walks = 0;
+
+    quadratic_work_of(source, Event::WalkerNode)
+}
+
+fn quadratic_work_of(source: String, event: Event) -> u64 {
+    let mut consumed = 0;
 
     run_with_source(&source, |analysis, file| {
         let part = summary_of(analysis, file, "selected");
@@ -2010,13 +2015,13 @@ export function selected(xs: number[]) {{ let total = 0; {statements}return tota
         assert_eq!(
             support::legacy_class_of(analysis, file, selected, &part.cost),
             Cost::parse("O(N^2)").unwrap(),
-            "{loops}"
+            "{source}"
         );
 
-        walks = stats.work.consumed(Event::WalkerNode);
+        consumed = stats.work.consumed(event);
     });
 
-    walks
+    consumed
 }
 
 #[test]
@@ -2049,26 +2054,34 @@ export function selected(rows: number[][]) {{ let total = 0; for (const row of r
     )
 }
 
-fn branch_scan_edges_of(sites: usize, escaping: bool) -> u64 {
+fn lift_scan_edges_of(source: String, label: &str, lifts: bool) -> u64 {
     let mut edges = 0;
 
-    run_with_source(&branch_scan_source(sites, escaping), |analysis, file| {
+    run_with_source(&source, |analysis, file| {
         let part = summary_of(analysis, file, "selected");
         let stats = analysis.scheduler_stats();
 
         assert_terminal(stats);
-        assert!(!part.cost.is_one(), "{sites}");
+        assert!(!part.cost.is_one(), "{source}");
 
         let lifted = support::trace_nodes(&analysis.traces, part.trace)
             .iter()
-            .any(|node| node.label == "[break branch: runs once per loop]");
+            .any(|node| node.label == label);
 
-        assert_eq!(lifted, escaping, "{sites}");
+        assert_eq!(lifted, lifts, "{source}");
 
         edges = stats.work.consumed(Event::TraversalEdge);
     });
 
     edges
+}
+
+fn branch_scan_edges_of(sites: usize, escaping: bool) -> u64 {
+    lift_scan_edges_of(
+        branch_scan_source(sites, escaping),
+        "[break branch: runs once per loop]",
+        escaping,
+    )
 }
 
 #[test]
@@ -2089,6 +2102,99 @@ fn branches_that_cannot_leave_their_loop_stop_scanning_early() {
             branch_scan_edges_of(sites as usize, false),
             329 * sites + 170,
             "{sites}"
+        );
+    }
+}
+
+fn finalizer_scan_source(sites: usize, overriding: bool) -> String {
+    let cleanup = match overriding {
+        true => "continue;",
+        false => "total += 1;",
+    };
+    let statements: String = (0..sites)
+        .map(|index| {
+            format!(
+                "try {{ if (row.length > {index}) {{ total += scan(row); return total; }} }} finally {{ {cleanup} }} "
+            )
+        })
+        .collect();
+
+    format!(
+        "function scan(xs: number[]) {{ let found = 0; for (const a of xs) for (const b of xs) found += a + b; return found; }}
+export function selected(rows: number[][]) {{ let total = 0; for (const row of rows) {{ {statements}}} return total; }}"
+    )
+}
+
+fn finalizer_scan_edges_of(sites: usize, overriding: bool) -> u64 {
+    lift_scan_edges_of(
+        finalizer_scan_source(sites, overriding),
+        "[return branch: runs once per call]",
+        !overriding,
+    )
+}
+
+#[test]
+fn finalizers_scan_their_own_subtree_once_per_resolved_completion() {
+    for sites in [8_u64, 16, 24, 32] {
+        assert_eq!(
+            finalizer_scan_edges_of(sites as usize, false),
+            273 * sites + 120,
+            "{sites}"
+        );
+    }
+}
+
+#[test]
+fn overriding_finalizers_stop_their_branch_from_leaving_the_loop() {
+    for sites in [8_u64, 16, 24, 32] {
+        assert_eq!(
+            finalizer_scan_edges_of(sites as usize, true),
+            235 * sites + 120,
+            "{sites}"
+        );
+    }
+}
+
+fn nested_finalizer_source(depth: usize, transfers: usize) -> String {
+    let cleanup: String = (0..transfers)
+        .map(|index| format!("if (x > {index}) break; "))
+        .collect();
+    let opens: String = (0..depth).map(|_| "try { ".to_string()).collect();
+    let closes: String = (0..depth)
+        .map(|_| format!("}} finally {{ {cleanup}}} "))
+        .collect();
+
+    format!(
+        "function quadratic(xs: number[]) {{ let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }}
+export function selected(xs: number[]) {{ let total = 0; for (const x of xs) {{ {opens}throw quadratic(xs); {closes}}} return total; }}"
+    )
+}
+
+fn nested_finalizer_edges_of(depth: usize, transfers: usize) -> u64 {
+    quadratic_work_of(
+        nested_finalizer_source(depth, transfers),
+        Event::TraversalEdge,
+    )
+}
+
+#[test]
+fn nested_finalizers_resolve_each_completion_once_per_exit_site() {
+    for depth in [4_u64, 8, 12, 16] {
+        assert_eq!(
+            nested_finalizer_edges_of(depth as usize, 1),
+            65 * depth + 234,
+            "{depth}"
+        );
+    }
+}
+
+#[test]
+fn transfer_bearing_nested_finalizers_stay_linear_in_their_depth() {
+    for depth in [4_u64, 8, 12, 16] {
+        assert_eq!(
+            nested_finalizer_edges_of(depth as usize, 4),
+            197 * depth + 234,
+            "{depth}"
         );
     }
 }

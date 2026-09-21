@@ -17,7 +17,8 @@ use crate::declarations::{
 use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::flow::{
-    class_phases_of, completion_of, enclosing_iteration_of, loop_phases_of, Completion,
+    class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, loop_phases_of,
+    Completion, Resumption,
 };
 use crate::project::{FileId, Site};
 use crate::syntax::{
@@ -60,10 +61,19 @@ fn is_listed(table: &[&str], name: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Escape {
+pub enum Escape {
     Loop,
     Call,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replacement {
+    pub transfer: NodeId,
+    pub completion: Completion,
+}
+
+pub type FinalizerReplacements =
+    std::collections::HashMap<(FileId, NodeId), Option<Vec<Replacement>>>;
 
 impl Escape {
     fn unit(self) -> &'static str {
@@ -72,6 +82,16 @@ impl Escape {
             Escape::Loop => "loop",
         }
     }
+}
+
+fn is_transfer_kind(kind: &AstKind<'_>) -> bool {
+    matches!(
+        kind,
+        AstKind::BreakStatement(_)
+            | AstKind::ContinueStatement(_)
+            | AstKind::ReturnStatement(_)
+            | AstKind::ThrowStatement(_)
+    )
 }
 
 fn completion_word_of(completion: Completion) -> &'static str {
@@ -559,12 +579,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.cost_of_statements(file, case.test.as_ref(), &case.consequent)
             }
             _ if iteration => self.cost_of_loop(file, kind),
-            AstKind::ReturnStatement(statement) => {
-                self.cost_of_exit(file, statement.argument.as_ref(), statement.node_id())
-            }
-            AstKind::ThrowStatement(statement) => {
-                self.cost_of_exit(file, Some(&statement.argument), statement.node_id())
-            }
+            AstKind::ReturnStatement(statement) => self.cost_of_exit(
+                file,
+                statement.argument.as_ref(),
+                statement.node_id(),
+                Completion::Return,
+            ),
+            AstKind::ThrowStatement(statement) => self.cost_of_exit(
+                file,
+                Some(&statement.argument),
+                statement.node_id(),
+                Completion::Throw,
+            ),
             AstKind::SpreadElement(spread) => self.cost_of_spread(file, spread),
             AstKind::AssignmentTargetRest(rest) => self.cost_of_rest_target(file, rest),
             AstKind::BindingRestElement(rest) => self.cost_of_binding_rest(file, rest),
@@ -699,13 +725,165 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn targets_within(&self, file: FileId, branch: NodeId, completion: Completion) -> bool {
+    fn targets_within(
+        &self,
+        file: FileId,
+        branch: NodeId,
+        node: NodeId,
+        completion: Completion,
+    ) -> bool {
         match completion {
             Completion::Break(target) | Completion::Continue(target) => {
                 target != branch && self.is_ancestor(file, branch, target)
             }
+            Completion::Throw => self.caught_within(file, branch, node),
             _ => false,
         }
+    }
+
+    fn caught_within(&self, file: FileId, region: NodeId, node: NodeId) -> bool {
+        let semantic = &self.project.file(file).semantic;
+
+        interceptions_of(semantic, node)
+            .into_iter()
+            .find_map(|interception| match interception.resumption {
+                Resumption::Handler(_) => Some(interception.statement),
+                Resumption::Finalizer(_) => None,
+            })
+            .is_some_and(|statement| {
+                statement == region || self.is_ancestor(file, region, statement)
+            })
+    }
+
+    fn finalizer_replacements_of(
+        &mut self,
+        file: FileId,
+        finalizer: NodeId,
+    ) -> Option<Vec<Replacement>> {
+        if let Some(cached) = self.finalizer_replacements.get(&(file, finalizer)) {
+            return cached.clone();
+        }
+
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let mut found = Vec::new();
+        let mut pending = vec![finalizer];
+        let mut resolved = true;
+
+        while let Some(node) = pending.pop() {
+            let kind = self.kind_of_node(file, node);
+
+            if is_deferred_kind(&kind) {
+                continue;
+            }
+
+            if is_transfer_kind(&kind) {
+                match completion_of(semantic, node) {
+                    Some(completion) if !self.targets_within(file, finalizer, node, completion) => {
+                        found.push(Replacement {
+                            transfer: node,
+                            completion,
+                        })
+                    }
+                    Some(_) => {}
+                    None => resolved = false,
+                }
+            }
+
+            pending.extend(self.children_of(file, node));
+        }
+
+        let replacements = resolved.then_some(found);
+
+        if !self.work_exhausted() {
+            self.finalizer_replacements
+                .insert((file, finalizer), replacements.clone());
+        }
+
+        replacements
+    }
+
+    fn escape_of_completion(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        completion: Completion,
+        enclosing: NodeId,
+    ) -> Option<Escape> {
+        let key = (file, node, completion, enclosing);
+
+        if let Some(cached) = self.completion_escapes.get(&key) {
+            return *cached;
+        }
+
+        self.completion_escapes.insert(key, None);
+
+        let resolved = self.resolved_escape_of(file, node, completion, enclosing);
+
+        if !self.work_exhausted() {
+            self.completion_escapes.insert(key, resolved);
+        } else {
+            self.completion_escapes.remove(&key);
+        }
+
+        resolved
+    }
+
+    fn resolved_escape_of(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        completion: Completion,
+        enclosing: NodeId,
+    ) -> Option<Escape> {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let mut escape = self.escape_of(file, completion, enclosing)?;
+
+        for interception in interceptions_of(semantic, node) {
+            let inside = self.is_ancestor(file, enclosing, interception.statement);
+
+            match interception.resumption {
+                Resumption::Handler(_) if inside => return None,
+                Resumption::Handler(_) => escape = escape.min(Escape::Loop),
+                Resumption::Finalizer(finalizer) => {
+                    let replacements = self.finalizer_replacements_of(file, finalizer);
+
+                    if self.work_exhausted() {
+                        return None;
+                    }
+
+                    let Some(replacements) = replacements else {
+                        if inside {
+                            return None;
+                        }
+
+                        escape = escape.min(Escape::Loop);
+
+                        continue;
+                    };
+
+                    if !inside {
+                        if !replacements.is_empty() {
+                            escape = escape.min(Escape::Loop);
+                        }
+
+                        continue;
+                    }
+
+                    for replacement in replacements {
+                        escape = escape.min(self.escape_of_completion(
+                            file,
+                            replacement.transfer,
+                            replacement.completion,
+                            enclosing,
+                        )?);
+                    }
+                }
+            }
+        }
+
+        Some(escape)
     }
 
     fn branch_escape_of(
@@ -719,7 +897,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let branch = body.node_id();
         let completion = completion_of(semantic, branch)?;
         let enclosing = enclosing_iteration_of(semantic, site_node)?;
-        let mut escape = self.escape_of(file, completion, enclosing)?;
+        let mut escape = self.escape_of_completion(file, branch, completion, enclosing)?;
         let mut pending = vec![branch];
 
         while let Some(node) = pending.pop() {
@@ -729,15 +907,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             }
 
-            if matches!(
-                kind,
-                AstKind::BreakStatement(_) | AstKind::ContinueStatement(_)
-            ) {
+            if is_transfer_kind(&kind) {
                 let transfer = completion_of(semantic, node)
-                    .filter(|transfer| !self.targets_within(file, branch, *transfer));
+                    .filter(|transfer| !self.targets_within(file, branch, node, *transfer));
 
                 if let Some(transfer) = transfer {
-                    escape = escape.min(self.escape_of(file, transfer, enclosing)?);
+                    escape =
+                        escape.min(self.escape_of_completion(file, node, transfer, enclosing)?);
                 }
             }
 
@@ -1021,22 +1197,36 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         argument: Option<&'a Expression<'a>>,
         node: NodeId,
+        completion: Completion,
     ) -> Reading {
         let inner = match argument {
             Some(argument) => self.cost_of_expression(file, argument),
             None => Reading::empty(),
         };
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let Some(enclosing) = enclosing_iteration_of(semantic, node) else {
+            return inner;
+        };
+        let Some(escape) = self.escape_of_completion(file, node, completion, enclosing) else {
+            return inner;
+        };
+        let lifted = inner.total(&mut self.unknowns, &mut self.traces);
 
-        if self.inside_loop(file, node) {
-            return Reading {
+        match escape {
+            Escape::Call => Reading {
                 phases: [crate::cost::ExecutionPhase::Immediate; 3],
                 main: Part::none(),
-                function_exit: inner.total(&mut self.unknowns, &mut self.traces),
+                function_exit: lifted,
                 loop_exit: Part::none(),
-            };
+            },
+            Escape::Loop => Reading {
+                phases: [crate::cost::ExecutionPhase::Immediate; 3],
+                main: Part::none(),
+                function_exit: Part::none(),
+                loop_exit: lifted,
+            },
         }
-
-        inner
     }
 
     fn is_constant_rest_expression(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {

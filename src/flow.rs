@@ -159,18 +159,10 @@ struct Fragment {
     exits: Ports,
 }
 
-struct Target {
-    node: NodeId,
-    label: Option<String>,
-    iteration: Option<NodeId>,
-    unlabelled_break: bool,
-}
-
 struct Builder<'s, 'a> {
     semantic: &'s Semantic<'a>,
     children: &'s [Vec<NodeId>],
     summary: FlowSummary,
-    targets: Vec<Target>,
     region: Region,
     limit: usize,
     depth: usize,
@@ -249,7 +241,6 @@ impl<'s, 'a> FlowContext<'s, 'a> {
         let mut builder = Builder {
             semantic,
             children,
-            targets: Vec::new(),
             region: Region::Invocation(function),
             limit,
             depth: 0,
@@ -303,21 +294,7 @@ impl<'s, 'a> Builder<'s, 'a> {
         label: Option<&str>,
         continuing: bool,
     ) -> Result<NodeId, FlowError> {
-        self.targets
-            .iter()
-            .rev()
-            .find(|target| match label {
-                Some(label) => target.label.as_deref() == Some(label),
-                None if continuing => target.label.is_none() && target.iteration.is_some(),
-                None => target.unlabelled_break,
-            })
-            .and_then(|target| {
-                if continuing {
-                    target.iteration
-                } else {
-                    Some(target.node)
-                }
-            })
+        control_target_of(self.semantic, node, label, continuing)
             .ok_or(FlowError::InvalidTarget(node))
     }
 
@@ -521,36 +498,7 @@ impl<'s, 'a> Builder<'s, 'a> {
                 self.loop_flow(node, &phases)
             }
             AstKind::LabeledStatement(stmt) => {
-                let body = stmt.body.node_id();
-                let mut labelled_body = body;
-
-                while let AstKind::LabeledStatement(inner) =
-                    self.semantic.nodes().kind(labelled_body)
-                {
-                    labelled_body = inner.body.node_id();
-                }
-
-                let iteration = matches!(
-                    self.semantic.nodes().kind(labelled_body),
-                    AstKind::ForStatement(_)
-                        | AstKind::WhileStatement(_)
-                        | AstKind::DoWhileStatement(_)
-                        | AstKind::ForOfStatement(_)
-                        | AstKind::ForInStatement(_)
-                )
-                .then_some(labelled_body);
-
-                self.targets.push(Target {
-                    node,
-                    label: Some(stmt.label.name.to_string()),
-                    iteration,
-                    unlabelled_break: false,
-                });
-
-                let mut fragment = self.build(body)?;
-
-                self.targets.pop();
-
+                let mut fragment = self.build(stmt.body.node_id())?;
                 let after = self.point(node, Step::Exit)?;
                 let mut reaches = false;
 
@@ -803,13 +751,6 @@ impl<'s, 'a> Builder<'s, 'a> {
         let update = phases.update;
         let body = phases.body;
 
-        self.targets.push(Target {
-            node,
-            label: None,
-            iteration: Some(node),
-            unlabelled_break: true,
-        });
-
         let init_point = self.atom(
             node,
             if iteration {
@@ -871,9 +812,6 @@ impl<'s, 'a> Builder<'s, 'a> {
         let continue_target = update
             .as_ref()
             .map_or(test_fragment.entry, |update| update.entry);
-
-        self.targets.pop();
-
         let after = self.point(node, Step::Exit)?;
         let mut exits = Vec::new();
 
@@ -1260,6 +1198,65 @@ pub fn control_target_of(
                 .then_some(Some(ancestor))
         }),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resumption {
+    Handler(NodeId),
+    Finalizer(NodeId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interception {
+    pub statement: NodeId,
+    pub resumption: Resumption,
+}
+
+pub fn interceptions_of(semantic: &Semantic<'_>, node: NodeId) -> Vec<Interception> {
+    let nodes = semantic.nodes();
+    let mut found = Vec::new();
+    let mut child = node;
+    let mut parent = nodes.parent_id(child);
+
+    while parent != child {
+        let kind = nodes.kind(parent);
+
+        if matches!(
+            kind,
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        ) {
+            break;
+        }
+
+        if let AstKind::TryStatement(statement) = kind {
+            let handler = statement.handler.as_ref().map(|handler| handler.node_id());
+            let guarded = statement.block.node_id() == child;
+            let handled = handler == Some(child);
+
+            if guarded {
+                if let Some(handler) = handler {
+                    found.push(Interception {
+                        statement: parent,
+                        resumption: Resumption::Handler(handler),
+                    });
+                }
+            }
+
+            if let Some(finalizer) = &statement.finalizer {
+                if guarded || handled {
+                    found.push(Interception {
+                        statement: parent,
+                        resumption: Resumption::Finalizer(finalizer.node_id()),
+                    });
+                }
+            }
+        }
+
+        child = parent;
+        parent = nodes.parent_id(child);
+    }
+
+    found
 }
 
 fn labelled_iteration_of(semantic: &Semantic<'_>, node: NodeId) -> Option<NodeId> {

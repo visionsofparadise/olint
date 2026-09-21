@@ -1,4 +1,7 @@
-use olint::flow::{class_phases_of, completion_of, loop_phases_of, Completion, FlowError, Region};
+use olint::flow::{
+    class_phases_of, completion_of, interceptions_of, loop_phases_of, Completion, FlowError,
+    Interception, Region, Resumption,
+};
 use olint::project::{DiagnosticPhase, Project, ProjectError};
 use olint::unknowns::UnknownReason;
 use oxc_allocator::Allocator;
@@ -323,34 +326,36 @@ fn loop_phases_separate_once_only_initialization_from_repeated_tests() {
     });
 }
 
+fn node_of(file: &olint::project::SourceFile<'_>, source: &str, text: &str) -> NodeId {
+    file.semantic
+        .nodes()
+        .iter()
+        .find(|node| node.kind().span().source_text(source) == text)
+        .unwrap_or_else(|| panic!("{text} is a node"))
+        .id()
+}
+
+fn nodes_matching(
+    file: &olint::project::SourceFile<'_>,
+    predicate: fn(&AstKind<'_>) -> bool,
+) -> Vec<NodeId> {
+    file.semantic
+        .nodes()
+        .iter()
+        .filter(|node| predicate(&node.kind()))
+        .map(|node| node.id())
+        .collect()
+}
+
 #[test]
 fn break_and_continue_completions_resolve_their_labelled_and_switch_targets() {
     let source = "export function f(rows: number[][], flag: boolean) {\n\touter: for (const row of rows) {\n\t\tfor (const value of row) {\n\t\t\tif (flag) break outer;\n\t\t\tif (value > 0) continue outer;\n\t\t\tif (value < 0) continue;\n\t\t\tif (flag) {\n\t\t\t\tcontinue;\n\t\t\t} else {\n\t\t\t\treturn value;\n\t\t\t}\n\t\t}\n\t\tswitch (row.length) {\n\t\t\tcase 1:\n\t\t\t\tif (flag) break;\n\t\t\t\tthrow new Error('no');\n\t\t}\n\t}\n\treturn -1;\n}";
 
     run_in_file(source, |file, source| {
-        let nodes = file.semantic.nodes();
-        let node_of = |text: &str| {
-            nodes
-                .iter()
-                .find(|node| node.kind().span().source_text(source) == text)
-                .unwrap_or_else(|| panic!("{text} is a node"))
-                .id()
-        };
-        let first_of = |predicate: fn(&AstKind<'_>) -> bool| {
-            nodes
-                .iter()
-                .find(|node| predicate(&node.kind()))
-                .expect("a matching node")
-                .id()
-        };
-        let labelled = first_of(|kind| matches!(kind, AstKind::LabeledStatement(_)));
-        let switched = first_of(|kind| matches!(kind, AstKind::SwitchStatement(_)));
-        let loops: Vec<NodeId> = nodes
-            .iter()
-            .filter(|node| matches!(node.kind(), AstKind::ForOfStatement(_)))
-            .map(|node| node.id())
-            .collect();
-        let completion = |text: &str| completion_of(&file.semantic, node_of(text));
+        let labelled = nodes_matching(file, |kind| matches!(kind, AstKind::LabeledStatement(_)))[0];
+        let switched = nodes_matching(file, |kind| matches!(kind, AstKind::SwitchStatement(_)))[0];
+        let loops = nodes_matching(file, |kind| matches!(kind, AstKind::ForOfStatement(_)));
+        let completion = |text: &str| completion_of(&file.semantic, node_of(file, source, text));
 
         assert_eq!(loops.len(), 2);
         assert_eq!(
@@ -379,5 +384,103 @@ fn break_and_continue_completions_resolve_their_labelled_and_switch_targets() {
         );
         assert_eq!(completion("return -1;"), Some(Completion::Return));
         assert_eq!(completion("rows"), None);
+    });
+}
+
+#[test]
+fn catch_and_finally_interceptions_resolve_their_resumption_targets() {
+    let source = "export function f(rows: number[][]) {
+	for (const row of rows) {
+		try {
+			try {
+				return row.length;
+			} finally {
+				continue;
+			}
+		} catch (error) {
+			throw error;
+		} finally {
+			row.pop();
+		}
+	}
+	return -1;
+}";
+
+    run_in_file(source, |file, source| {
+        let tries = nodes_matching(file, |kind| matches!(kind, AstKind::TryStatement(_)));
+        let handler = nodes_matching(file, |kind| matches!(kind, AstKind::CatchClause(_)))[0];
+        let finalizer = |text: &str| Resumption::Finalizer(node_of(file, source, text));
+        let overriding = Interception {
+            statement: tries[1],
+            resumption: finalizer(
+                "{
+				continue;
+			}",
+            ),
+        };
+        let catching = Interception {
+            statement: tries[0],
+            resumption: Resumption::Handler(handler),
+        };
+        let cleaning = Interception {
+            statement: tries[0],
+            resumption: finalizer(
+                "{
+			row.pop();
+		}",
+            ),
+        };
+        let interceptions =
+            |text: &str| interceptions_of(&file.semantic, node_of(file, source, text));
+
+        assert_eq!(tries.len(), 2);
+        assert_eq!(
+            interceptions("return row.length;"),
+            vec![overriding, catching, cleaning]
+        );
+        assert_eq!(interceptions("continue;"), vec![catching, cleaning]);
+        assert_eq!(interceptions("throw error;"), vec![cleaning]);
+        assert!(interceptions("row.pop();").is_empty());
+    });
+}
+
+#[test]
+fn nested_function_boundaries_stop_interception_and_control_resolution() {
+    let source = "export function f(rows: number[][]) {\n\ttry {\n\t\tconst inner = () => {\n\t\t\tthrow new Error('inner');\n\t\t};\n\t\tinner();\n\t} catch (error) {\n\t\treturn 0;\n\t}\n\treturn rows.length;\n}";
+
+    run_in_file(source, |file, source| {
+        let thrown = node_of(file, source, "throw new Error('inner');");
+
+        assert!(interceptions_of(&file.semantic, thrown).is_empty());
+    });
+}
+
+#[test]
+fn built_flow_resolves_the_same_control_targets_as_the_shared_resolver() {
+    let source = "export function f(rows: number[][]) {\n\touter: inner: for (const row of rows) {\n\t\tfor (const value of row) {\n\t\t\tif (value > 0) continue outer;\n\t\t\tif (value < 0) break inner;\n\t\t}\n\t}\n\treturn rows.length;\n}";
+
+    run_in_file(source, |file, source| {
+        let labels = nodes_matching(file, |kind| matches!(kind, AstKind::LabeledStatement(_)));
+        let iteration = nodes_matching(file, |kind| matches!(kind, AstKind::ForOfStatement(_)))[0];
+        let function = nodes_matching(file, |kind| matches!(kind, AstKind::Function(_)))[0];
+        let summary = file.flow(function).unwrap();
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            completion_of(&file.semantic, node_of(file, source, "continue outer;")),
+            Some(Completion::Continue(iteration))
+        );
+        assert_eq!(
+            completion_of(&file.semantic, node_of(file, source, "break inner;")),
+            Some(Completion::Break(labels[1]))
+        );
+        assert!(summary.exits.iter().all(|exit| !matches!(
+            exit.completion,
+            Completion::Break(_) | Completion::Continue(_)
+        )));
+        assert!(summary
+            .exits
+            .iter()
+            .any(|exit| exit.completion == Completion::Return));
     });
 }
