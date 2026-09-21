@@ -325,3 +325,76 @@ fn captured(command: &mut Command) -> (Option<i32>, String, String) {
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
+
+#[test]
+fn an_absent_channel_neither_cancels_a_cold_cost_nor_hides_an_open_target() {
+    let helpers = "export function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nexport function coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nexport class Engine {\n\t// @perf cold\n\trebuild(xs: number[]) {\n\t\treturn quadratic(xs);\n\t}\n}\n";
+
+    for (body, cost, partial, over_limit) in [
+        (
+            "export function selected(xs: number[]) {\n\tfor (const x of xs) {\n\t\treturn coldQuadratic(xs);\n\t}\n}\n",
+            "O(xs^2)",
+            false,
+            true,
+        ),
+        (
+            "export function selected(xs: number[], flag: boolean, f: (xs: number[]) => number) {\n\tconst g = flag ? coldQuadratic : f;\n\n\treturn g(xs);\n}\n",
+            "O(1)",
+            true,
+            false,
+        ),
+        (
+            "export function selected(xs: number[]) {\n\treturn new Engine().rebuild(xs);\n}\n",
+            "O(xs^2)",
+            true,
+            true,
+        ),
+    ] {
+        let source =
+            format!("import {{ coldQuadratic, Engine }} from \"./helpers\";\n\nvoid Engine;\n\n{body}");
+        let directory = support::project_of(&[
+            (
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"strict\":true},\"files\":[\"index.ts\"]}",
+            ),
+            ("helpers.ts", helpers),
+            ("index.ts", &source),
+            (
+                "olint.config.json",
+                "{\"entrypoints\":[\"index.ts\"],\"max\":\"O(N)\"}",
+            ),
+        ]);
+        let (code, stdout, stderr) = captured(
+            Command::new(env!("CARGO_BIN_EXE_olint"))
+                .args(["--types", "syntactic", "--report", "--min", "0"])
+                .current_dir(directory.path()),
+        );
+
+        assert_eq!(code, Some(0), "{stderr}");
+
+        let row = stdout
+            .lines()
+            .find(|line| line.contains(" selected  index.ts:"))
+            .unwrap_or_else(|| panic!("{stdout}"));
+
+        assert!(row.starts_with(cost), "{row}");
+        assert_eq!(row.contains("[partial]"), partial, "{row}");
+        assert_eq!(stderr.contains("unknown call target"), partial, "{stderr}");
+
+        let (code, stdout, stderr) = captured(
+            Command::new(env!("CARGO_BIN_EXE_olint"))
+                .args(["--types", "syntactic"])
+                .current_dir(directory.path()),
+        );
+
+        assert_eq!(code, Some(if over_limit { 1 } else { 0 }), "{stdout}{stderr}");
+        assert!(
+            stdout.contains(if over_limit {
+                "1 over limit"
+            } else {
+                "0 over limit"
+            }),
+            "{stdout}"
+        );
+    }
+}

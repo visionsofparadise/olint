@@ -1240,7 +1240,7 @@ fn unresolved_bases_stay_partial_beside_instance_fields() {
     let cold = "class Cold {\n// @perf cold\nconstructor(ys: number[]) { quadratic(ys); }\n}";
     let cases = [
         (index_of(format!("{QUADRATIC}\n{cold}\nexport function selected(xs: number[], flag: boolean, B: any) {{ class A extends (flag ? Cold : B) {{ v = [1]; }} return new A(xs); }}")), "O(1)", true),
-        (index_of(format!("{QUADRATIC}\n{cold}\nexport function selected(xs: number[], flag: boolean, B: any) {{ class A extends (flag ? Cold : B) {{}} return new A(xs); }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\n{cold}\nexport function selected(xs: number[], flag: boolean, B: any) {{ class A extends (flag ? Cold : B) {{}} return new A(xs); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], B: any) {{ class A extends B {{ v = quadratic(xs); }} return new A(xs); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], B: any) {{ class A extends B {{ v = quadratic(xs); constructor(ys: number[]) {{ super(ys); }} }} return new A(xs); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class E extends Error {{ v = quadratic(xs); }} return new E(); }}")), "O(N^2)", true),

@@ -440,12 +440,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if unresolved {
             let bound = self.unknowns.origin(origin, UnknownReason::Bound);
-            let scaled = self.unknowns.scale(next.unknowns, None);
+            let scaled = next.scaled(None, &mut self.unknowns);
 
             return Part {
-                unknowns: self.unknowns.join(scaled, Some(bound)),
-                preference: next.preference.max(Preference::Unmarked),
-                ..next
+                unknowns: self.unknowns.join(scaled.unknowns, Some(bound)),
+                preference: scaled.preference.max(Preference::Unmarked),
+                ..scaled
             };
         }
 
@@ -1375,14 +1375,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match targets.known.is_empty() {
             true => unknown,
-            false => {
-                part.unknowns = self.unknowns.join(part.unknowns, unknown.unknowns);
-
-                match part.preference {
-                    Preference::Absent => part.preferred(Preference::Unmarked),
-                    _ => part,
-                }
-            }
+            false => part.retaining(unknown.unknowns, &mut self.unknowns),
         }
     }
 

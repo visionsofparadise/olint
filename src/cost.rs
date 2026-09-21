@@ -1469,12 +1469,28 @@ pub struct Part {
     pub trace: Option<TraceId>,
     pub preference: Preference,
     pub unknowns: Option<UnknownId>,
+    pub retained: Option<UnknownId>,
 }
 
 impl Part {
     pub fn called(mut self, origin: SourceSpan, unknowns: &mut Unknowns) -> Self {
         self.origin = Some(origin);
         self.unknowns = unknowns.called(self.unknowns, origin);
+        self.retained = unknowns.called(self.retained, origin);
+
+        self
+    }
+
+    pub fn retaining(mut self, retained: Option<UnknownId>, unknowns: &mut Unknowns) -> Self {
+        self.unknowns = unknowns.join(self.unknowns, retained);
+        self.retained = unknowns.join(self.retained, retained);
+
+        self
+    }
+
+    pub fn scaled(mut self, factor: Option<Cost>, unknowns: &mut Unknowns) -> Self {
+        self.unknowns = unknowns.scale(self.unknowns, factor.clone());
+        self.retained = unknowns.scale(self.retained, factor);
 
         self
     }
@@ -1531,12 +1547,24 @@ impl Part {
             trace,
             preference: Preference::Unmarked,
             unknowns: None,
+            retained: None,
         }
     }
 
+    pub fn is_absent(&self) -> bool {
+        self.preference == Preference::Absent && self.cost.is_one()
+    }
+
+    pub fn holds_no_work(&self) -> bool {
+        self.cost.is_one() && self.unknowns == self.retained
+    }
+
     fn rank(&self) -> u8 {
+        if self.is_absent() {
+            return 0;
+        }
+
         match self.preference {
-            Preference::Absent if self.cost.is_one() => 0,
             Preference::Cold => 1,
             Preference::Absent | Preference::Unmarked => 2,
             Preference::Hot => 3,
@@ -1557,6 +1585,7 @@ impl Part {
         } else {
             self.origin.or(other.origin)
         };
+        let retained = unknowns.join(self.retained, other.retained);
         let selected_unknowns = if mine == theirs {
             unknowns.join(self.unknowns, other.unknowns)
         } else if theirs > mine {
@@ -1564,6 +1593,7 @@ impl Part {
         } else {
             self.unknowns
         };
+        let selected_unknowns = unknowns.join(selected_unknowns, retained);
 
         let comparison = other.cost.compare_legacy(&self.cost);
         let mut selected =
@@ -1592,6 +1622,7 @@ impl Part {
                 self
             };
         selected.unknowns = selected_unknowns;
+        selected.retained = retained;
         selected.cost_error = selected.cost_error.or(selected_error);
         selected.origin = selected.origin.or(selected_origin);
 
@@ -1658,7 +1689,7 @@ impl Reading {
 
     pub fn preferred(self, preference: Preference) -> Reading {
         let exit = |part: Part| {
-            if part.preference == Preference::Absent && part.cost.is_one() {
+            if part.is_absent() {
                 part
             } else {
                 part.preferred(preference)
@@ -1673,8 +1704,12 @@ impl Reading {
         }
     }
 
+    fn retains_exit_work(&self) -> bool {
+        !self.function_exit.is_absent() || !self.loop_exit.is_absent()
+    }
+
     pub fn sibling(self) -> Reading {
-        if self.main.preference != Preference::Absent {
+        if self.main.preference != Preference::Absent || self.retains_exit_work() {
             return self;
         }
 
@@ -1704,6 +1739,7 @@ pub fn nest(
     let trace = traces.factor(label, site, origin, factor.clone(), None, inner.trace);
     let trace_error = trace.is_err();
 
+    let retained = unknowns.scale(inner.retained, Some(factor.clone()));
     let mut selected_unknowns = unknowns.scale(inner.unknowns, Some(factor.clone()));
 
     if trace_error {
@@ -1727,6 +1763,7 @@ pub fn nest(
             .cost_error
             .or(trace_error.then_some(CostError::Resource)),
         unknowns: selected_unknowns,
+        retained,
         cost,
         trace: trace.ok(),
         preference: if inner.preference == Preference::Absent {

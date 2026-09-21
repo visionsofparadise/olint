@@ -2476,9 +2476,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match mark {
             Some(mark) => part.preferred(mark),
-            None if part.cost.is_one() && part.unknowns.is_none() => {
-                part.preferred(Preference::Absent)
-            }
+            None if part.holds_no_work() => part.preferred(Preference::Absent),
             None => part.preferred(Preference::Unmarked),
         }
     }

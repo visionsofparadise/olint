@@ -704,3 +704,102 @@ fn logarithmic_filter_keeps_independent_axes_and_rejects_exponent_overflow() {
 
     assert_eq!(envelope_growth(&overflowing, &n.0), None);
 }
+
+#[test]
+fn an_absent_main_channel_beside_retained_exit_work_never_becomes_a_sibling() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+
+    for loop_exit in [false, true] {
+        let mut traces = TraceArena::default();
+        let cold = part_of(&mut traces, quadratic.clone(), "cold").preferred(Preference::Cold);
+        let escaped = Reading {
+            phases: [ExecutionPhase::Immediate; 3],
+            main: Part::none(),
+            function_exit: if loop_exit {
+                Part::none()
+            } else {
+                cold.clone()
+            },
+            loop_exit: if loop_exit {
+                cold.clone()
+            } else {
+                Part::none()
+            },
+        }
+        .sibling();
+
+        assert!(escaped.main.is_absent());
+        assert_eq!(
+            escaped.total(&mut Unknowns::default(), &mut traces).cost,
+            quadratic
+        );
+
+        let constant = Reading::empty().sibling();
+
+        assert_eq!(constant.main.preference, Preference::Unmarked);
+        assert_eq!(
+            constant
+                .main
+                .max(cold, &mut Unknowns::default(), &mut traces)
+                .cost,
+            Cost::ONE
+        );
+    }
+}
+
+#[test]
+fn retained_provenance_survives_rank_selection_and_wraps_with_its_part() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let origin = SourceSpan {
+        file: FileId(0),
+        start: 4,
+        end: 9,
+    };
+    let site = Site {
+        file: FileId(0),
+        line: 1,
+    };
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let target = unknowns.origin(origin, UnknownReason::Target);
+    let cold = part_of(&mut traces, quadratic.clone(), "cold").preferred(Preference::Cold);
+    let provenance = Part::none().retaining(Some(target), &mut unknowns);
+
+    assert_eq!(provenance.unknowns, Some(target));
+    assert_eq!(provenance.retained, provenance.unknowns);
+    assert!(provenance.holds_no_work());
+    assert!(provenance.is_absent());
+    assert!(!provenance.is_complete());
+
+    for (first, second) in [
+        (provenance.clone(), cold.clone()),
+        (cold.clone(), provenance.clone()),
+    ] {
+        let selected = first.max(second, &mut unknowns, &mut traces);
+
+        assert_eq!(selected.cost, quadratic);
+        assert_eq!(selected.preference, Preference::Cold);
+        assert_eq!(selected.retained, Some(target));
+        assert!(!selected.is_complete());
+    }
+
+    let wrapped = [
+        provenance.clone().called(origin, &mut unknowns),
+        provenance.clone().scaled(Some(Cost::N), &mut unknowns),
+        provenance.clone().scaled(None, &mut unknowns),
+        nest(
+            "loop".to_string(),
+            site,
+            origin,
+            Cost::N,
+            provenance,
+            &mut unknowns,
+            &mut traces,
+        ),
+    ];
+
+    for part in wrapped {
+        assert_eq!(part.retained, part.unknowns, "{part:?}");
+        assert!(part.retained.is_some(), "{part:?}");
+    }
+}

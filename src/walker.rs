@@ -30,7 +30,7 @@ use crate::tables::{
     LINEAR_CONSTRUCTORS, MAP_LINEAR, OBJECT_KEYED, REGEXP_LINEAR, SET_LINEAR, STRING_LINEAR,
 };
 use crate::types::ResolvedCallee;
-use crate::unknowns::{SourceSpan, UnknownReason};
+use crate::unknowns::{SourceSpan, UnknownId, UnknownReason};
 use crate::values::Construction;
 use crate::values::{ArgumentFacts, Definedness};
 
@@ -1075,7 +1075,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 unknown = self.unknowns.join(unknown, Some(resource));
             }
 
-            body.main.unknowns = self.unknowns.scale(body.main.unknowns, None);
+            body.main = body.main.scaled(None, &mut self.unknowns);
 
             let unresolved = Part {
                 unknowns: self.unknowns.scale(unknown, None),
@@ -1378,22 +1378,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.cost_of_rest_copy(file, rest.node_id(), rest.span, constant)
     }
 
-    fn with_open_remainder(
+    fn open_remainder_of(
         &mut self,
-        mut part: Part,
         targets: &TargetSet,
+        resolved: bool,
         file: FileId,
         span: Span,
         arguments: &'a [Argument<'a>],
         reason: UnknownReason,
-    ) -> Part {
-        if targets.open {
-            let unknown = self.unknown_invocation(file, span, arguments, reason);
-
-            part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
+    ) -> Option<UnknownId> {
+        if !targets.open || !resolved {
+            return None;
         }
 
-        part
+        self.unknown_invocation(file, span, arguments, reason)
+            .main
+            .unknowns
     }
 
     fn cost_of_callee(&mut self, file: FileId, callee: &'a Expression<'a>) -> Reading {
@@ -1435,6 +1435,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let targets = &construction.targets;
         let site = self.site_of_node(file, new.node_id());
         let origin = self.source_span(file, new.span);
+        let resolved = !targets.known.is_empty() || !construction.implicit.is_empty();
+        let remainder = self.open_remainder_of(
+            targets,
+            resolved,
+            file,
+            new.span,
+            &new.arguments,
+            UnknownReason::Target,
+        );
 
         for known in &targets.known {
             let function = self.function_at(*known);
@@ -1460,14 +1469,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             };
             let part = callee.called(origin, &mut self.unknowns);
-            let part = self.with_open_remainder(
-                part,
-                targets,
-                file,
-                new.span,
-                &new.arguments,
-                UnknownReason::Target,
-            );
+            let part = part.retaining(remainder, &mut self.unknowns);
 
             reading = self.append_call(reading, target, function, part, cyclic);
         }
@@ -1487,19 +1489,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 )
             };
             let part = constructed_part_of(part.called(origin, &mut self.unknowns));
-            let part = self.with_open_remainder(
-                part,
-                targets,
-                file,
-                new.span,
-                &new.arguments,
-                UnknownReason::Target,
-            );
+            let part = part.retaining(remainder, &mut self.unknowns);
 
             reading = reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
         }
 
-        if !targets.known.is_empty() || !construction.implicit.is_empty() {
+        if resolved {
             return reading;
         }
 
@@ -1813,9 +1808,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if plan.open {
             let unknown = self
                 .unknown_invocation(file, span, arguments, UnknownReason::Target)
-                .main;
+                .main
+                .unknowns;
 
-            part = part.max(unknown, &mut self.unknowns, &mut self.traces);
+            part = part.retaining(unknown, &mut self.unknowns);
         }
 
         part
@@ -1936,6 +1932,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             unknowns: self
                                 .unknowns
                                 .called(part.unknowns, self.source_span(file, call.span)),
+                            retained: self
+                                .unknowns
+                                .called(part.retained, self.source_span(file, call.span)),
                         }),
                         &mut self.unknowns,
                         &mut self.traces,
@@ -1953,6 +1952,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        let remainder = self.open_remainder_of(
+            &targets,
+            !targets.known.is_empty(),
+            file,
+            call.span,
+            &call.arguments,
+            reason,
+        );
+
         for target in &targets.known {
             let function = self.function_at(*target);
             let target = target.file;
@@ -1965,8 +1973,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
 
             let part = called.called(self.source_span(file, call.span), &mut self.unknowns);
-            let part =
-                self.with_open_remainder(part, &targets, file, call.span, &call.arguments, reason);
+            let part = part.retaining(remainder, &mut self.unknowns);
 
             reading = self.append_call(reading, target, function, part, cyclic);
         }
@@ -2331,7 +2338,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 }
 
 fn constructed_part_of(part: Part) -> Part {
-    match part.cost.is_one() && part.unknowns.is_none() {
+    match part.holds_no_work() {
         true => part.preferred(Preference::Absent),
         false => part.preferred(Preference::Unmarked),
     }

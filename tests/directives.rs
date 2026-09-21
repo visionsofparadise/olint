@@ -148,3 +148,162 @@ fn a_mark_follows_retained_completion_work_to_the_channel_that_carries_it() {
     );
     assert_eq!(cost_of(caught("// @perf cold\n\t\t")), olint::cost::Cost::N);
 }
+
+const HELPERS: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nfunction coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\n/** @perf hot */\nfunction hotQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nclass Cold {\n\t// @perf cold\n\tconstructor(xs: number[]) {\n\t\tquadratic(xs);\n\t}\n}\n";
+
+fn selected_result_of(body: &str) -> support::SelectedResult {
+    selected_result_with(HELPERS, body)
+}
+
+fn selected_result_with(prefix: &str, body: &str) -> support::SelectedResult {
+    let source = format!("{prefix}export function selected{body}");
+
+    support::selected_result_in(&[("index.ts", &source)], TypeMode::Syntactic)
+}
+
+#[test]
+fn an_absent_completion_channel_keeps_the_only_cold_contribution() {
+    let quadratic = olint::cost::Cost::parse("O(N^2)").unwrap();
+
+    for body in [
+        "(xs: number[]) {\n\tfor (const x of xs) {\n\t\treturn coldQuadratic(xs);\n\t}\n}",
+        "(xs: number[]) {\n\tfor (const x of xs) {\n\t\tthrow coldQuadratic(xs);\n\t}\n}",
+        "(xs: number[]) {\n\treturn coldQuadratic(xs);\n}",
+    ] {
+        assert_eq!(selected_result_of(body).0, quadratic, "{body}");
+    }
+}
+
+#[test]
+fn executed_constant_statements_still_outrank_a_cold_contribution() {
+    for (body, expected) in [
+        (
+            "(xs: number[]) {\n\tfor (const x of xs) {\n\t\tcoldQuadratic(xs);\n\t}\n}",
+            "O(N^3)",
+        ),
+        (
+            "(xs: number[]) {\n\tfor (const x of xs) {\n\t\tconst y = x + 1;\n\n\t\tif (y > 0) {\n\t\t\treturn coldQuadratic(xs);\n\t\t}\n\t}\n}",
+            "O(N)",
+        ),
+        (
+            "(xs: number[]) {\n\tfor (const x of xs) {\n\t\treturn coldQuadratic(xs);\n\t}\n\n\treturn 0;\n}",
+            "O(1)",
+        ),
+        ("(xs: number[]) {\n\tfor (const x of xs) {\n\t}\n}", "O(N)"),
+    ] {
+        assert_eq!(
+            selected_result_of(body).0,
+            olint::cost::Cost::parse(expected).unwrap(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn an_open_call_target_stays_partial_beside_every_known_mark() {
+    use olint::unknowns::UnknownReason;
+
+    for (body, expected) in [
+        (
+            "(xs: number[], flag: boolean, f: (xs: number[]) => number) {\n\tconst g = flag ? coldQuadratic : f;\n\n\treturn g(xs);\n}",
+            "O(1)",
+        ),
+        (
+            "(xs: number[], flag: boolean, k: new (xs: number[]) => object) {\n\tconst c = flag ? Cold : k;\n\n\treturn new c(xs);\n}",
+            "O(1)",
+        ),
+        (
+            "(xs: number[], flag: boolean, f: (xs: number[]) => number) {\n\tconst g = flag ? quadratic : f;\n\n\treturn g(xs);\n}",
+            "O(N^2)",
+        ),
+        (
+            "(xs: number[], flag: boolean, f: (xs: number[]) => number) {\n\tconst g = flag ? hotQuadratic : f;\n\n\treturn g(xs);\n}",
+            "O(N^2)",
+        ),
+    ] {
+        let (cost, reasons) = selected_result_of(body);
+
+        assert_eq!(cost, olint::cost::Cost::parse(expected).unwrap(), "{body}");
+        assert!(reasons.contains(&UnknownReason::Target), "{body} {reasons:?}");
+    }
+}
+
+const ENGINE: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\nclass Engine {\n\t// @perf cold\n\trebuild(xs: number[]) {\n\t\treturn quadratic(xs);\n\t}\n}\n";
+
+const HOLDERS: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\nclass Holder {\n\txs: number[] = [];\n\n\t// @perf cold\n\tget value() {\n\t\treturn quadratic(this.xs);\n\t}\n}\n";
+
+#[test]
+fn an_open_target_marks_a_known_cold_contribution_without_cancelling_it() {
+    use olint::unknowns::UnknownReason;
+
+    for (prefix, body, expected) in [
+        (
+            ENGINE,
+            "(xs: number[]) {\n\treturn new Engine().rebuild(xs);\n}",
+            "O(N^2)",
+        ),
+        (
+            HELPERS,
+            "(xs: number[], flag: boolean, base: any) {\n\tclass Derived extends (flag ? Cold : base) {}\n\n\treturn new Derived(xs);\n}",
+            "O(N^2)",
+        ),
+        (
+            HOLDERS,
+            "(flag: boolean, other: { value: number }) {\n\tconst holder = flag ? new Holder() : other;\n\n\treturn holder.value;\n}",
+            "O(1)",
+        ),
+    ] {
+        let (cost, reasons) = selected_result_with(prefix, body);
+
+        assert_eq!(cost, olint::cost::Cost::parse(expected).unwrap(), "{body}");
+        assert!(reasons.contains(&UnknownReason::Target), "{body} {reasons:?}");
+    }
+}
+
+const OPEN_BASE: &str = "declare const OpenBase: new () => object;\ndeclare function opaque(): number;\nfunction quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nfunction coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nclass Empty {}\nclass ClosedChild extends Empty {}\nclass OpenChild extends OpenBase {}\nclass ExplicitChild extends OpenBase {\n\tconstructor() {\n\t\tsuper();\n\t}\n}\nclass MixedOpenChild extends OpenBase {\n\tv = opaque();\n}\nclass MixedClosedChild extends Empty {\n\tv = opaque();\n}\n";
+
+#[test]
+fn an_unresolved_construction_never_manufactures_a_competing_statement() {
+    use olint::unknowns::UnknownReason;
+
+    for (body, selected, partial) in [
+        (
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new ClosedChild()];\n}",
+            "O(N^2)",
+            false,
+        ),
+        (
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new OpenChild()];\n}",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new ExplicitChild()];\n}",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new MixedOpenChild()];\n}",
+            "O(1)",
+            true,
+        ),
+        (
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new MixedClosedChild()];\n}",
+            "O(1)",
+            true,
+        ),
+    ] {
+        let (cost, reasons) = selected_result_with(OPEN_BASE, body);
+
+        assert_eq!(
+            cost,
+            olint::cost::Cost::parse(selected).unwrap(),
+            "{body} {reasons:?}"
+        );
+        assert_eq!(
+            reasons.contains(&UnknownReason::Target),
+            partial,
+            "{body} {reasons:?}"
+        );
+    }
+}
