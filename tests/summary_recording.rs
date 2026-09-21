@@ -167,7 +167,7 @@ fn raw_and_selected_tasks_survive_three_answer_generations_without_aliasing() {
 
             let again = analysis.summarize(file, tagged);
 
-            assert_eq!(again.main.cost, selected.main.cost);
+            assert_eq!(again.main().cost, selected.main().cost);
 
             let raw_again = analysis.summarize_with(file, tagged, Substitutions::new(), true);
 

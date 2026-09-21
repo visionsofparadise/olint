@@ -15,7 +15,7 @@ use crate::tsc::{Query, TscAnswer};
 use crate::types::{QueryKind, TscPass};
 use crate::unknowns::Unknowns;
 use crate::values::Values;
-use crate::walker::{Escape, FinalizerReplacements};
+use crate::walker::FinalizerReplacements;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum TypeMode {
@@ -81,7 +81,9 @@ pub struct Analysis<'p, 'a> {
     pub(crate) bound_seen: HashSet<(FileId, NodeId)>,
     pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
     pub(crate) finalizer_replacements: FinalizerReplacements,
-    pub(crate) completion_escapes: HashMap<(FileId, NodeId, Completion, NodeId), Option<Escape>>,
+    pub(crate) completion_escapes:
+        HashMap<(FileId, NodeId, Completion, NodeId), Option<Completion>>,
+    pub(crate) escape_depth_exhausted: bool,
     pub(crate) isolated_bindings: HashMap<(Binding, NodeId), bool>,
     pub(crate) budget_storage: HashMap<FunctionId, Storage>,
     pub(crate) dynamic_scopes: HashMap<(FileId, NodeId), (bool, bool)>,
@@ -119,6 +121,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             children: HashMap::new(),
             finalizer_replacements: FinalizerReplacements::new(),
             completion_escapes: HashMap::new(),
+            escape_depth_exhausted: false,
             isolated_bindings: HashMap::new(),
             budget_storage: HashMap::new(),
             dynamic_scopes: HashMap::new(),

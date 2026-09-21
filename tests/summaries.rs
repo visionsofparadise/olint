@@ -343,7 +343,7 @@ fn a_costed_callback_multiplies_inside_its_caller() {
 
             assert_eq!(support::legacy_class_of(analysis, file, f, &actual), Cost::parse("O(N^2)").unwrap());
             assert_eq!(first, second);
-            assert_eq!(labels_of(&analysis.traces,first.main.trace), vec!["call each()"]);
+            assert_eq!(labels_of(&analysis.traces,first.main().trace), vec!["call each()"]);
         },
     );
 }

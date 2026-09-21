@@ -704,7 +704,7 @@ fn dense_recurrence_contexts_stop_before_their_work_limit() {
             assert!((0..4).any(|index| analysis
                 .summary_records_for(function_id(analysis, file, &format!("f{index}")))
                 .iter()
-                .any(|record| reasons(analysis, record.reading.main.unknowns)
+                .any(|record| reasons(analysis, record.reading.main().unknowns)
                     .contains(&UnknownReason::ResourceExhaustion))));
             assert!(analysis
                 .scheduler_stats()
@@ -820,9 +820,13 @@ fn context_exhaustion_keeps_resource_at_the_selected_invocation() {
             |analysis, file| {
                 limit_work(analysis, Event::RecurrenceContext, limit);
 
-                let part = complete_one(analysis, file, "root");
+                let part = summary_of(analysis, file, "root");
 
+                assert_eq!(part.cost, Cost::ONE);
                 assert_eq!(part.preference, olint::cost::Preference::Hot);
+                assert!(reasons(analysis, part.unknowns)
+                    .iter()
+                    .all(|reason| *reason == UnknownReason::ResourceExhaustion));
                 assert_terminal(analysis.scheduler_stats());
             },
         );
@@ -2183,6 +2187,45 @@ fn nested_finalizers_resolve_each_completion_once_per_exit_site() {
         assert_eq!(
             nested_finalizer_edges_of(depth as usize, 1),
             65 * depth + 234,
+            "{depth}"
+        );
+    }
+}
+
+fn capped_finalizer_edges_of(depth: usize) -> u64 {
+    let source = nested_finalizer_source(depth, 1);
+    let mut edges = 0;
+
+    run_with_source(&source, |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(
+            reasons(analysis, part.unknowns).contains(&UnknownReason::ResourceExhaustion),
+            "{depth}"
+        );
+
+        let selected = function_of_name(analysis.project, file, "selected");
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, selected, &part.cost),
+            Cost::parse("O(N^3)").unwrap(),
+            "{depth}"
+        );
+
+        edges = stats.work.consumed(Event::TraversalEdge);
+    });
+
+    edges
+}
+
+#[test]
+fn escape_resolution_past_its_depth_cap_stays_linear_and_partial() {
+    for depth in [36_u64, 40, 44, 48] {
+        assert_eq!(
+            capped_finalizer_edges_of(depth as usize),
+            60 * depth + 394,
             "{depth}"
         );
     }

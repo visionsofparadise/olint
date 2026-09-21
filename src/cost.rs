@@ -1,3 +1,4 @@
+use crate::flow::Completion;
 use crate::project::Site;
 use crate::trace::{TraceArena, TraceId};
 use crate::unknowns::{SourceSpan, UnknownId, UnknownReason, Unknowns};
@@ -1552,7 +1553,14 @@ impl Part {
     }
 
     pub fn is_absent(&self) -> bool {
-        self.preference == Preference::Absent && self.cost.is_one()
+        self.preference == Preference::Absent
+    }
+
+    pub fn executed(self) -> Part {
+        match self.is_absent() {
+            true => self.preferred(Preference::Unmarked),
+            false => self,
+        }
     }
 
     pub fn holds_no_work(&self) -> bool {
@@ -1649,12 +1657,26 @@ pub enum ExecutionPhase {
     Lazy,
 }
 
+fn channel_order_of(phase: ExecutionPhase, completion: Completion) -> (u8, u8, usize) {
+    let phase = match phase {
+        ExecutionPhase::Immediate => 0,
+        ExecutionPhase::Scheduled => 1,
+        ExecutionPhase::Lazy => 2,
+    };
+    let (kind, target) = match completion {
+        Completion::Normal => (0, 0),
+        Completion::Return => (1, 0),
+        Completion::Throw => (2, 0),
+        Completion::Break(target) => (3, target.index()),
+        Completion::Continue(target) => (4, target.index()),
+    };
+
+    (phase, kind, target)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reading {
-    pub main: Part,
-    pub function_exit: Part,
-    pub loop_exit: Part,
-    pub phases: [ExecutionPhase; 3],
+    pub completions: Vec<(ExecutionPhase, Completion, Part)>,
 }
 
 impl Reading {
@@ -1663,67 +1685,148 @@ impl Reading {
     }
 
     pub fn of_part(part: Part) -> Reading {
-        Reading {
-            main: part,
-            function_exit: Part::none(),
-            loop_exit: Part::none(),
-            phases: [ExecutionPhase::Immediate; 3],
+        Reading::of_completion(ExecutionPhase::Immediate, Completion::Normal, part)
+    }
+
+    pub fn of_completion(phase: ExecutionPhase, completion: Completion, part: Part) -> Reading {
+        let mut reading = Reading::empty();
+
+        reading.set(phase, completion, part);
+
+        reading
+    }
+
+    pub fn set(&mut self, phase: ExecutionPhase, completion: Completion, part: Part) {
+        let order = channel_order_of(phase, completion);
+        let position = self
+            .completions
+            .iter()
+            .position(|channel| channel_order_of(channel.0, channel.1) >= order);
+
+        match position {
+            Some(position)
+                if channel_order_of(self.completions[position].0, self.completions[position].1)
+                    == order =>
+            {
+                match part == Part::none() {
+                    true => {
+                        self.completions.remove(position);
+                    }
+                    false => self.completions[position].2 = part,
+                }
+            }
+            _ if part == Part::none() => {}
+            Some(position) => self.completions.insert(position, (phase, completion, part)),
+            None => self.completions.push((phase, completion, part)),
         }
     }
 
+    pub fn part_of(&self, phase: ExecutionPhase, completion: Completion) -> Part {
+        let order = channel_order_of(phase, completion);
+
+        self.completions
+            .iter()
+            .find(|channel| channel_order_of(channel.0, channel.1) == order)
+            .map(|channel| channel.2.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn main(&self) -> Part {
+        self.part_of(ExecutionPhase::Immediate, Completion::Normal)
+    }
+
+    pub fn with_main(mut self, part: Part) -> Reading {
+        self.set(ExecutionPhase::Immediate, Completion::Normal, part);
+
+        self
+    }
+
+    pub fn escapes(&self) -> impl Iterator<Item = &(ExecutionPhase, Completion, Part)> {
+        self.completions
+            .iter()
+            .filter(|channel| channel.1 != Completion::Normal)
+    }
+
+    fn beside_main(&self) -> impl Iterator<Item = &(ExecutionPhase, Completion, Part)> {
+        let main = channel_order_of(ExecutionPhase::Immediate, Completion::Normal);
+
+        self.completions
+            .iter()
+            .filter(move |channel| channel_order_of(channel.0, channel.1) != main)
+    }
+
+    pub fn join(
+        &mut self,
+        phase: ExecutionPhase,
+        completion: Completion,
+        part: Part,
+        unknowns: &mut Unknowns,
+        traces: &mut TraceArena,
+    ) {
+        let held = self.part_of(phase, completion);
+
+        self.set(phase, completion, held.max(part, unknowns, traces));
+    }
+
     pub fn merge(
-        self,
+        mut self,
         other: Reading,
         unknowns: &mut Unknowns,
         traces: &mut TraceArena,
     ) -> Reading {
-        Reading {
-            main: self.main.max(other.main, unknowns, traces),
-            function_exit: self
-                .function_exit
-                .max(other.function_exit, unknowns, traces),
-            loop_exit: self.loop_exit.max(other.loop_exit, unknowns, traces),
-            phases: self.phases,
+        for (phase, completion, part) in other.completions {
+            self.join(phase, completion, part, unknowns, traces);
         }
+
+        self
     }
 
     pub fn preferred(self, preference: Preference) -> Reading {
-        let exit = |part: Part| {
-            if part.is_absent() {
-                part
-            } else {
-                part.preferred(preference)
-            }
+        let main = self.main().preferred(preference);
+        let held = channel_order_of(ExecutionPhase::Immediate, Completion::Normal);
+        let mut reading = Reading {
+            completions: self
+                .completions
+                .into_iter()
+                .filter(|channel| channel_order_of(channel.0, channel.1) != held)
+                .map(|(phase, completion, part)| {
+                    let part = match part.is_absent() {
+                        true => part,
+                        false => part.preferred(preference),
+                    };
+
+                    (phase, completion, part)
+                })
+                .collect(),
         };
 
-        Reading {
-            main: self.main.preferred(preference),
-            function_exit: exit(self.function_exit),
-            loop_exit: exit(self.loop_exit),
-            phases: self.phases,
-        }
+        reading.set(ExecutionPhase::Immediate, Completion::Normal, main);
+
+        reading
     }
 
     fn retains_exit_work(&self) -> bool {
-        !self.function_exit.is_absent() || !self.loop_exit.is_absent()
+        self.escapes().any(|channel| !channel.2.is_absent())
     }
 
     pub fn sibling(self) -> Reading {
-        if self.main.preference != Preference::Absent || self.retains_exit_work() {
+        if !self.main().is_absent() || self.retains_exit_work() {
             return self;
         }
 
-        Reading {
-            main: self.main.preferred(Preference::Unmarked),
-            ..self
-        }
+        let main = self.main().preferred(Preference::Unmarked);
+
+        self.with_main(main)
     }
 
     pub fn total(&self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
-        self.main
-            .clone()
-            .max(self.function_exit.clone(), unknowns, traces)
-            .max(self.loop_exit.clone(), unknowns, traces)
+        let mut total = self.main();
+
+        for channel in self.beside_main() {
+            total = total.max(channel.2.clone(), unknowns, traces);
+        }
+
+        total
     }
 }
 
@@ -1766,11 +1869,7 @@ pub fn nest(
         retained,
         cost,
         trace: trace.ok(),
-        preference: if inner.preference == Preference::Absent {
-            Preference::Unmarked
-        } else {
-            inner.preference
-        },
+        preference: inner.preference,
     }
 }
 

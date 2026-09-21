@@ -621,10 +621,23 @@ fn part_max_prefers_hot_then_unmarked_then_cold_over_absent() {
 fn reading_total_takes_the_largest_part() {
     let mut traces = TraceArena::default();
     let reading = Reading {
-        phases: [ExecutionPhase::Immediate; 3],
-        main: part_of(&mut traces, Cost::N, "main"),
-        function_exit: part_of(&mut traces, Cost::LOG, "function exit"),
-        loop_exit: part_of(&mut traces, Cost::N_LOG_N, "loop exit"),
+        completions: vec![
+            (
+                ExecutionPhase::Immediate,
+                Completion::Normal,
+                part_of(&mut traces, Cost::N, "main"),
+            ),
+            (
+                ExecutionPhase::Immediate,
+                Completion::Return,
+                part_of(&mut traces, Cost::LOG, "function exit"),
+            ),
+            (
+                ExecutionPhase::Immediate,
+                Completion::Break(oxc_semantic::NodeId::DUMMY),
+                part_of(&mut traces, Cost::N_LOG_N, "loop exit"),
+            ),
+        ],
     };
 
     assert_eq!(
@@ -712,23 +725,14 @@ fn an_absent_main_channel_beside_retained_exit_work_never_becomes_a_sibling() {
     for loop_exit in [false, true] {
         let mut traces = TraceArena::default();
         let cold = part_of(&mut traces, quadratic.clone(), "cold").preferred(Preference::Cold);
-        let escaped = Reading {
-            phases: [ExecutionPhase::Immediate; 3],
-            main: Part::none(),
-            function_exit: if loop_exit {
-                Part::none()
-            } else {
-                cold.clone()
-            },
-            loop_exit: if loop_exit {
-                cold.clone()
-            } else {
-                Part::none()
-            },
-        }
-        .sibling();
+        let completion = match loop_exit {
+            true => Completion::Break(oxc_semantic::NodeId::DUMMY),
+            false => Completion::Return,
+        };
+        let escaped =
+            Reading::of_completion(ExecutionPhase::Immediate, completion, cold.clone()).sibling();
 
-        assert!(escaped.main.is_absent());
+        assert!(escaped.main().is_absent());
         assert_eq!(
             escaped.total(&mut Unknowns::default(), &mut traces).cost,
             quadratic
@@ -736,10 +740,10 @@ fn an_absent_main_channel_beside_retained_exit_work_never_becomes_a_sibling() {
 
         let constant = Reading::empty().sibling();
 
-        assert_eq!(constant.main.preference, Preference::Unmarked);
+        assert_eq!(constant.main().preference, Preference::Unmarked);
         assert_eq!(
             constant
-                .main
+                .main()
                 .max(cold, &mut Unknowns::default(), &mut traces)
                 .cost,
             Cost::ONE
@@ -802,4 +806,97 @@ fn retained_provenance_survives_rank_selection_and_wraps_with_its_part() {
         assert_eq!(part.retained, part.unknowns, "{part:?}");
         assert!(part.retained.is_some(), "{part:?}");
     }
+}
+
+fn escape_channel_of(target: u32) -> Completion {
+    Completion::Break(oxc_semantic::NodeId::from_usize(target as usize))
+}
+
+#[test]
+fn completion_channels_stay_separate_until_the_reading_is_totalled() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let inner = escape_channel_of(3);
+    let outer = escape_channel_of(7);
+    let reading = Reading::of_part(part_of(&mut traces, Cost::N, "main"))
+        .merge(
+            Reading::of_completion(
+                ExecutionPhase::Immediate,
+                inner,
+                part_of(&mut traces, Cost::LOG, "inner"),
+            ),
+            &mut unknowns,
+            &mut traces,
+        )
+        .merge(
+            Reading::of_completion(
+                ExecutionPhase::Immediate,
+                outer,
+                part_of(&mut traces, Cost::N_LOG_N, "outer"),
+            ),
+            &mut unknowns,
+            &mut traces,
+        );
+
+    assert_eq!(
+        reading
+            .completions
+            .iter()
+            .map(|channel| channel.1)
+            .collect::<Vec<_>>(),
+        vec![Completion::Normal, inner, outer]
+    );
+    assert_eq!(reading.main().cost, Cost::N);
+    assert_eq!(
+        reading.part_of(ExecutionPhase::Immediate, outer).cost,
+        Cost::N_LOG_N
+    );
+    assert_eq!(
+        reading.total(&mut unknowns, &mut traces).cost,
+        Cost::N_LOG_N
+    );
+    assert_eq!(
+        reading
+            .part_of(ExecutionPhase::Immediate, escape_channel_of(9))
+            .cost,
+        Cost::ONE
+    );
+}
+
+#[test]
+fn a_scaled_absent_channel_never_outranks_a_cold_contribution() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let cold = part_of(&mut traces, quadratic.clone(), "cold").preferred(Preference::Cold);
+    let scaled = nest(
+        "for-of".to_string(),
+        Site {
+            file: FileId(0),
+            line: 1,
+        },
+        SourceSpan {
+            file: FileId(0),
+            start: 0,
+            end: 1,
+        },
+        Cost::N,
+        Part::none(),
+        &mut unknowns,
+        &mut traces,
+    );
+
+    assert_eq!(scaled.cost, Cost::N);
+    assert!(scaled.is_absent());
+    assert_eq!(
+        scaled
+            .clone()
+            .max(cold.clone(), &mut unknowns, &mut traces)
+            .cost,
+        quadratic
+    );
+    assert_eq!(
+        scaled.executed().max(cold, &mut unknowns, &mut traces).cost,
+        Cost::N
+    );
 }

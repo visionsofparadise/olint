@@ -247,11 +247,7 @@ pub fn legacy_reading_of<'a>(
     let mut reading =
         analysis.summarize_with(file, function, olint::summaries::Substitutions::new(), true);
 
-    for part in [
-        &mut reading.main,
-        &mut reading.function_exit,
-        &mut reading.loop_exit,
-    ] {
+    for (_, _, part) in &mut reading.completions {
         part.cost = legacy_class_of(analysis, file, function, &part.cost);
     }
 

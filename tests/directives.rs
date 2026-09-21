@@ -307,3 +307,40 @@ fn an_unresolved_construction_never_manufactures_a_competing_statement() {
         );
     }
 }
+
+#[test]
+fn an_absent_completion_channel_stays_absent_through_every_enclosing_loop() {
+    let quadratic = olint::cost::Cost::parse("O(N^2)").unwrap();
+
+    for body in [
+        "(xs: number[]) {\n\tfor (const a of xs) {\n\t\tfor (const x of xs) {\n\t\t\treturn coldQuadratic(xs);\n\t\t}\n\t}\n}",
+        "(xs: number[]) {\n\tfor (const a of xs) {\n\t\tfor (const b of xs) {\n\t\t\tfor (const x of xs) {\n\t\t\t\treturn coldQuadratic(xs);\n\t\t\t}\n\t\t}\n\t}\n}",
+        "(xs: number[]) {\n\tfor (const a of xs) {\n\t\tfor (const x of xs) {\n\t\t\tthrow coldQuadratic(xs);\n\t\t}\n\t}\n}",
+    ] {
+        assert_eq!(selected_result_of(body).0, quadratic, "{body}");
+    }
+}
+
+#[test]
+fn nested_loops_around_an_executed_body_still_charge_their_iterations() {
+    for (body, expected) in [
+        (
+            "(xs: number[]) {\n\tfor (const a of xs) {\n\t\tfor (const b of xs) {\n\t\t}\n\t}\n}",
+            "O(N^2)",
+        ),
+        (
+            "(xs: number[]) {\n\tfor (const a of xs) {\n\t\tfor (const b of xs) {\n\t\t\tfor (const c of xs) {\n\t\t\t}\n\t\t}\n\t}\n}",
+            "O(N^3)",
+        ),
+        (
+            "(xs: number[]) {\n\tfor (const a of xs) {\n\t\tfor (const x of xs) {\n\t\t\treturn coldQuadratic(xs);\n\t\t}\n\t}\n\n\treturn 0;\n}",
+            "O(1)",
+        ),
+    ] {
+        assert_eq!(
+            selected_result_of(body).0,
+            olint::cost::Cost::parse(expected).unwrap(),
+            "{body}"
+        );
+    }
+}

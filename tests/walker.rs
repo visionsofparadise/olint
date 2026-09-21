@@ -15,6 +15,19 @@ impl TestReading {
             &mut self.traces.borrow_mut(),
         )
     }
+
+    fn channel(&self, completion: olint::flow::Completion) -> Part {
+        self.reading
+            .part_of(olint::cost::ExecutionPhase::Immediate, completion)
+    }
+
+    fn function_exit(&self) -> Part {
+        self.channel(olint::flow::Completion::Return).max(
+            self.channel(olint::flow::Completion::Throw),
+            &mut self.unknowns.borrow_mut(),
+            &mut self.traces.borrow_mut(),
+        )
+    }
 }
 impl Deref for TestReading {
     type Target = Reading;
@@ -120,12 +133,14 @@ fn a_return_inside_a_loop_moves_its_cost_to_the_function_exit() {
         "f",
     );
 
-    assert_eq!(reading.function_exit.cost, Cost::N);
+    let exit = reading.function_exit();
+
+    assert_eq!(exit.cost, Cost::N);
     assert_eq!(
         reading
             .traces
             .borrow()
-            .node(reading.function_exit.trace.unwrap())
+            .node(exit.trace.unwrap())
             .unwrap()
             .label,
         "ys.indexOf()"
@@ -1411,13 +1426,16 @@ fn break_targets_decide_whether_a_branch_leaves_its_loop() {
     assert_eq!(switched_labels, vec!["for-of", "call scan()"]);
     assert_eq!(blocked, quadratic);
     assert_eq!(blocked_labels, vec!["for-of", "call scan()"]);
-    assert_eq!(labelled_break, quadratic);
+    assert_eq!(
+        labelled_break.text(),
+        "O(max(1, size_0, size_1, (max(size_0, size_1))^(2)))"
+    );
     assert_eq!(
         labelled_break_labels,
         vec![
-            "for-of",
             "[break branch: runs once per loop]",
             "call scan()",
+            "for-of",
             "for-of"
         ]
     );
@@ -1487,9 +1505,9 @@ fn a_branch_that_only_transfers_within_itself_still_leaves_its_loop() {
     assert_eq!(inner_loop.total().cost, Cost::parse("O(N^2)").unwrap());
     assert!(inner_loop_labels.contains(&"[continue branch: runs once per loop]".to_string()));
     assert_eq!(inner_switch.total().cost, Cost::N);
-    assert_eq!(inner_switch.function_exit.cost, Cost::N);
+    assert_eq!(inner_switch.function_exit().cost, Cost::N);
     assert_eq!(
-        label_of(&inner_switch, &inner_switch.function_exit),
+        label_of(&inner_switch, &inner_switch.function_exit()),
         "[return branch: runs once per call]"
     );
     assert_eq!(downgraded.total().cost, Cost::parse("O(N^2)").unwrap());
@@ -1541,7 +1559,7 @@ fn an_overridden_exit_is_charged_at_the_boundary_it_crosses() {
         "f",
     );
 
-    assert!(continued.function_exit.cost.is_one());
+    assert!(continued.function_exit().cost.is_one());
     assert_eq!(
         continued_labels,
         vec!["for-of", "call quadratic()", "for-of"]
@@ -1574,7 +1592,7 @@ fn a_branch_a_catch_or_finally_can_re_enter_keeps_its_work_inside() {
     assert_eq!(overridden, quadratic);
     assert_eq!(within, Cost::N);
     assert!(within_labels.contains(&"[return branch: runs once per call]".to_string()));
-    assert!(outside.function_exit.cost.is_one());
+    assert!(outside.function_exit().cost.is_one());
     assert!(outside_labels.contains(&"[return branch: runs once per loop]".to_string()));
 }
 
@@ -1593,5 +1611,107 @@ fn a_finalizer_transfer_that_lands_inside_it_does_not_replace_the_completion() {
 
     assert_eq!(looped, quadratic);
     assert_eq!(caught, quadratic);
-    assert!(escaping.function_exit.cost.is_one());
+    assert!(escaping.function_exit().cost.is_one());
+}
+
+const NESTED_QUADRATIC: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\n\treturn total;\n}\n";
+
+fn escape_target_cost_of(transfer: &str, labels: &str) -> (Cost, Vec<String>) {
+    loop_cost_of(&format!(
+        "{NESTED_QUADRATIC}export function f(xs: number[], flag: boolean) {{\n\t{labels}for (const a of xs) {{\n\t\tfor (const b of xs) {{\n\t\t\tif (flag) {{\n\t\t\t\tquadratic(xs);\n\n\t\t\t\t{transfer}\n\t\t\t}}\n\t\t}}\n\t}}\n}}"
+    ))
+}
+
+#[test]
+fn an_escaping_branch_is_charged_at_the_loop_its_completion_targets() {
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let (outer_break, outer_break_labels) = escape_target_cost_of("break outer;", "outer: ");
+    let (inner_break, inner_break_labels) = escape_target_cost_of("break;", "");
+    let (outer_continue, outer_continue_labels) =
+        escape_target_cost_of("continue outer;", "outer: ");
+
+    assert_eq!(outer_break, quadratic);
+    assert_eq!(
+        outer_break_labels,
+        vec![
+            "[break branch: runs once per loop]",
+            "call quadratic()",
+            "for-of",
+            "for-of"
+        ]
+    );
+    assert_ne!(inner_break, quadratic);
+    assert_eq!(
+        inner_break_labels,
+        vec![
+            "for-of",
+            "[break branch: runs once per loop]",
+            "call quadratic()",
+            "for-of"
+        ]
+    );
+    assert_ne!(outer_continue, quadratic);
+    assert_eq!(
+        outer_continue_labels,
+        vec![
+            "for-of",
+            "[continue branch: runs once per loop]",
+            "call quadratic()",
+            "for-of"
+        ]
+    );
+}
+
+#[test]
+fn a_transfer_leaving_three_loops_is_charged_once_per_call() {
+    let (cost, labels) = loop_cost_of(&format!(
+        "{NESTED_QUADRATIC}export function f(xs: number[], flag: boolean) {{\n\touter: for (const a of xs) {{\n\t\tfor (const b of xs) {{\n\t\t\tfor (const c of xs) {{\n\t\t\t\tif (flag) {{\n\t\t\t\t\tquadratic(xs);\n\n\t\t\t\t\tbreak outer;\n\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}"
+    ));
+
+    assert_eq!(cost, Cost::parse("O(N^3)").unwrap());
+    assert_eq!(
+        labels,
+        vec![
+            "[break branch: runs once per loop]",
+            "call quadratic()",
+            "for-of",
+            "for-of",
+            "for-of"
+        ]
+    );
+}
+
+#[test]
+fn a_caught_throw_is_charged_at_the_loop_its_handler_sits_outside() {
+    let (outside, outside_labels) = loop_cost_of(&format!(
+        "{NESTED_QUADRATIC}export function f(xs: number[]) {{
+	try {{
+		for (const a of xs) {{
+			for (const b of xs) {{
+				if (a > b) {{
+					throw quadratic(xs);
+				}}
+			}}
+		}}
+	}} catch {{}}
+}}"
+    ));
+    let (inside, inside_labels) = loop_cost_of(&format!(
+        "{NESTED_QUADRATIC}export function f(xs: number[]) {{
+	for (const a of xs) {{
+		for (const b of xs) {{
+			try {{
+				if (a > b) {{
+					throw quadratic(xs);
+				}}
+			}} catch {{}}
+		}}
+	}}
+}}"
+    ));
+
+    assert_eq!(outside, Cost::parse("O(N^2)").unwrap());
+    assert_eq!(outside_labels, vec!["call quadratic()", "for-of", "for-of"]);
+    assert_eq!(inside, Cost::parse("O(N^4)").unwrap());
+    assert_eq!(inside_labels, vec!["for-of", "for-of", "call quadratic()"]);
 }

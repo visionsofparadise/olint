@@ -125,7 +125,10 @@ fn known_callback_specialization_resolves_generic_unknown_without_leaking_it() {
         let second = analysis.summarize(file, f);
 
         assert_eq!(first, second);
-        assert_eq!(first.phases, [ExecutionPhase::Immediate; 3]);
+        assert!(first
+            .completions
+            .iter()
+            .all(|channel| channel.0 == ExecutionPhase::Immediate));
         assert!(first.total(&mut analysis.unknowns, &mut analysis.traces).unknowns.is_none());
         assert!(analysis.summaries_arena.iter().any(|record| record.effects == olint::effects::Effects::default()));
     });
@@ -345,27 +348,41 @@ fn cached_summary_preserves_phase_latent_and_comparison_facts() {
             },
             UnknownReason::Comparison,
         );
-        let phases = [
-            ExecutionPhase::Scheduled,
-            ExecutionPhase::Lazy,
-            ExecutionPhase::Immediate,
+        let phased = vec![
+            (
+                ExecutionPhase::Immediate,
+                olint::flow::Completion::Normal,
+                olint::cost::Part {
+                    unknowns: Some(unknown),
+                    ..olint::cost::Part::unmarked(Cost::ONE, None)
+                },
+            ),
+            (
+                ExecutionPhase::Scheduled,
+                olint::flow::Completion::Normal,
+                olint::cost::Part::unmarked(Cost::N, None),
+            ),
+            (
+                ExecutionPhase::Lazy,
+                olint::flow::Completion::Throw,
+                olint::cost::Part::unmarked(Cost::LOG, None),
+            ),
         ];
         let record = &mut analysis.summaries_arena[0];
-        record.reading.phases = phases;
-        record.reading.main.unknowns = Some(unknown);
+        record.reading.completions = phased.clone();
         record.result.latent = Some(olint::summaries::SummaryId(0));
         let nodes = analysis.unknowns.len();
         let cached = analysis.summarize(file, function);
 
-        assert_eq!(cached.phases, phases);
-        assert_eq!(cached.main.unknowns, Some(unknown));
+        assert_eq!(cached.completions, phased);
+        assert_eq!(cached.main().unknowns, Some(unknown));
         assert_eq!(analysis.unknowns.len(), nodes);
         assert_eq!(analysis.summaries_arena.len(), 1);
         assert_eq!(
             analysis.summaries_arena[0].result.latent,
             Some(olint::summaries::SummaryId(0))
         );
-        assert!(unknown_lines(analysis, cached.main)
+        assert!(unknown_lines(analysis, cached.main())
             .iter()
             .any(|line| line.contains("comparison")));
     });

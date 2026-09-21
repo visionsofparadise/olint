@@ -10,7 +10,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
-use crate::cost::{Cost, Part, Preference, Reading};
+use crate::cost::{Cost, Part, Reading};
 use crate::declarations::{FunctionId, FunctionNode, TargetSet};
 use crate::declared_types::{is_primitive_result, Kind};
 use crate::project::{FileId, Project};
@@ -440,13 +440,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if unresolved {
             let bound = self.unknowns.origin(origin, UnknownReason::Bound);
-            let scaled = next.scaled(None, &mut self.unknowns);
 
-            return Part {
-                unknowns: self.unknowns.join(scaled.unknowns, Some(bound)),
-                preference: scaled.preference.max(Preference::Unmarked),
-                ..scaled
-            };
+            return next
+                .scaled(None, &mut self.unknowns)
+                .retaining(Some(bound), &mut self.unknowns);
         }
 
         crate::cost::nest(
@@ -454,7 +451,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             site,
             origin,
             Cost::N,
-            next,
+            next.executed(),
             &mut self.unknowns,
             &mut self.traces,
         )

@@ -15,6 +15,7 @@ use crate::cost::{Cost, CostError, Part, Preference, Reading};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, TargetSet};
 use crate::directives::{cost_tag_of, PerfTag};
 use crate::effects::Effects;
+use crate::flow::Completion;
 use crate::project::{FileId, Site};
 use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
@@ -424,11 +425,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Reading {
         let origin = self.source_span(file, self.kind_of_node(file, function.node_id()).span());
 
-        for part in [
-            &mut reading.main,
-            &mut reading.function_exit,
-            &mut reading.loop_exit,
-        ] {
+        reading.set(
+            crate::cost::ExecutionPhase::Immediate,
+            Completion::Normal,
+            Part {
+                origin: Some(origin),
+                ..reading.main()
+            },
+        );
+
+        for (_, _, part) in &mut reading.completions {
             part.origin = part.origin.or(Some(origin));
 
             match self.bind_cost_in(&part.cost, inputs) {
@@ -1457,12 +1463,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let unknown = self
             .unknowns
             .origin(origin, UnknownReason::ResourceExhaustion);
-        let mut part = reading.total(&mut self.unknowns, &mut self.traces);
-        part.unknowns = self.unknowns.join(part.unknowns, Some(unknown));
-
-        if part.preference == Preference::Absent {
-            part.preference = Preference::Unmarked;
-        }
+        let part = reading
+            .total(&mut self.unknowns, &mut self.traces)
+            .retaining(Some(unknown), &mut self.unknowns);
 
         reading = Reading::of_part(part);
 
@@ -1699,9 +1702,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         self.kind_of_node(file, function.node_id()).span(),
                         UnknownReason::SizeRelation,
                     );
-                    reading.main.unknowns = self
-                        .unknowns
-                        .join(reading.main.unknowns, unknown.main.unknowns);
+                    let mut main = reading.main();
+                    main.unknowns = self.unknowns.join(main.unknowns, unknown.main().unknowns);
+                    reading = reading.with_main(main);
                 }
 
                 let reading = self.finish_reading(file, function, reading, substitutions);
@@ -1747,14 +1750,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let body = self.cost_of_function_body(file, function);
 
             match parameters {
-                Some(parameters) => {
-                    let phases = body.phases;
-                    let mut reading = parameters.merge(body, &mut self.unknowns, &mut self.traces);
-
-                    reading.phases = phases;
-
-                    reading
-                }
+                Some(parameters) => parameters.merge(body, &mut self.unknowns, &mut self.traces),
                 None => body,
             }
         } else {
@@ -2447,7 +2443,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if facts.value.targets.open {
                 let unknown = self.unknown_invocation(file, span, arguments, UnknownReason::Target);
 
-                part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
+                part = part.retaining(unknown.main().unknowns, &mut self.unknowns);
             }
 
             return self.called_part_of(target.file, function, part, cyclic);
@@ -3061,10 +3057,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         match joined {
-            Some((mut part, cyclic)) if incomplete => {
+            Some((part, cyclic)) if incomplete => {
                 let unknown = self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion);
-
-                part.unknowns = self.unknowns.join(part.unknowns, unknown.unknowns);
+                let part = part.retaining(unknown.unknowns, &mut self.unknowns);
 
                 (part, cyclic)
             }

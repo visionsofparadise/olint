@@ -60,11 +60,7 @@ fn is_listed(table: &[&str], name: &str) -> bool {
     table.contains(&name)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Escape {
-    Loop,
-    Call,
-}
+pub const MAXIMUM_ESCAPE_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Replacement {
@@ -75,12 +71,10 @@ pub struct Replacement {
 pub type FinalizerReplacements =
     std::collections::HashMap<(FileId, NodeId), Option<Vec<Replacement>>>;
 
-impl Escape {
-    fn unit(self) -> &'static str {
-        match self {
-            Escape::Call => "call",
-            Escape::Loop => "loop",
-        }
+fn escape_unit_of(escape: Completion) -> &'static str {
+    match escape {
+        Completion::Return | Completion::Throw => "call",
+        _ => "loop",
     }
 }
 
@@ -240,7 +234,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             site,
             self.source_span(file, rest.rest.span),
             Cost::N,
-            Part::none(),
+            Part::unmarked(Cost::ONE, None),
         );
 
         Some(Reading::of_part(part))
@@ -483,9 +477,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if unresolved {
                 let unknown = self.unknown_reading(file, kind.span(), UnknownReason::SizeRelation);
-                reading.main.unknowns = self
-                    .unknowns
-                    .join(reading.main.unknowns, unknown.main.unknowns);
+                let mut main = reading.main();
+                main.unknowns = self.unknowns.join(main.unknowns, unknown.main().unknowns);
+                reading = reading.with_main(main);
             }
 
             return reading;
@@ -678,17 +672,56 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    fn loop_result(&mut self, sibling: Reading, function_exit: Part, main: Part) -> Reading {
-        Reading {
-            main,
-            function_exit: sibling.function_exit.max(
-                function_exit,
-                &mut self.unknowns,
-                &mut self.traces,
-            ),
-            loop_exit: sibling.loop_exit,
-            phases: sibling.phases,
+    fn loop_result(&mut self, sibling: Reading, escaping: Reading, main: Part) -> Reading {
+        sibling
+            .merge(escaping, &mut self.unknowns, &mut self.traces)
+            .with_main(main)
+    }
+
+    fn absorbed_escapes_of(
+        &mut self,
+        file: FileId,
+        iteration: NodeId,
+        reading: &mut Reading,
+    ) -> Part {
+        let mut absorbed: Option<Part> = None;
+        let mut kept = Vec::new();
+
+        for (phase, completion, part) in std::mem::take(&mut reading.completions) {
+            if completion != Completion::Normal && self.absorbs_escape(file, completion, iteration)
+            {
+                absorbed = Some(match absorbed {
+                    Some(held) => held.max(part, &mut self.unknowns, &mut self.traces),
+                    None => part,
+                });
+
+                continue;
+            }
+
+            kept.push((phase, completion, part));
         }
+
+        reading.completions = kept;
+
+        absorbed.unwrap_or_default()
+    }
+
+    fn append_linear_operation(
+        &mut self,
+        reading: Reading,
+        label: String,
+        site: Site,
+        (file, span): (FileId, Span),
+    ) -> Reading {
+        let part = self.nest_part(
+            label,
+            site,
+            self.source_span(file, span),
+            Cost::N,
+            Part::unmarked(Cost::ONE, None),
+        );
+
+        reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces)
     }
 
     fn append_call(
@@ -708,18 +741,73 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    fn escape_of(&self, file: FileId, completion: Completion, enclosing: NodeId) -> Option<Escape> {
-        match completion {
-            Completion::Return | Completion::Throw => Some(Escape::Call),
-            Completion::Break(target)
-                if target == enclosing || self.is_ancestor(file, target, enclosing) =>
-            {
-                Some(Escape::Loop)
+    pub(crate) fn exits_iteration(
+        &self,
+        file: FileId,
+        escape: Completion,
+        iteration: NodeId,
+    ) -> bool {
+        match escape {
+            Completion::Break(target) => {
+                target == iteration || self.is_ancestor(file, target, iteration)
             }
-            Completion::Continue(target)
-                if target != enclosing && self.is_ancestor(file, target, enclosing) =>
+            Completion::Continue(target) => {
+                target != iteration && self.is_ancestor(file, target, iteration)
+            }
+            _ => false,
+        }
+    }
+
+    fn absorbs_escape(&self, file: FileId, escape: Completion, iteration: NodeId) -> bool {
+        if !self.exits_iteration(file, escape, iteration) {
+            return false;
+        }
+
+        let semantic = &self.project.file(file).semantic;
+
+        match enclosing_iteration_of(semantic, iteration) {
+            Some(outer) => !self.exits_iteration(file, escape, outer),
+            None => true,
+        }
+    }
+
+    fn weaker_escape_of(&self, file: FileId, held: Completion, other: Completion) -> Completion {
+        let boundary_of = |escape: Completion| match escape {
+            Completion::Break(target) | Completion::Continue(target) => Some(target),
+            _ => None,
+        };
+        let (Some(mine), Some(theirs)) = (boundary_of(held), boundary_of(other)) else {
+            return match boundary_of(other).is_some() {
+                true => other,
+                false => held,
+            };
+        };
+
+        if mine == theirs {
+            return match matches!(other, Completion::Continue(_)) {
+                true => other,
+                false => held,
+            };
+        }
+
+        match self.is_ancestor(file, mine, theirs) {
+            true => other,
+            false => held,
+        }
+    }
+
+    fn escape_of(
+        &self,
+        file: FileId,
+        completion: Completion,
+        enclosing: NodeId,
+    ) -> Option<Completion> {
+        match completion {
+            Completion::Return | Completion::Throw => Some(completion),
+            Completion::Break(_) | Completion::Continue(_)
+                if self.exits_iteration(file, completion, enclosing) =>
             {
-                Some(Escape::Loop)
+                Some(completion)
             }
             _ => None,
         }
@@ -809,7 +897,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         node: NodeId,
         completion: Completion,
         enclosing: NodeId,
-    ) -> Option<Escape> {
+        depth: usize,
+    ) -> Option<Completion> {
+        if depth >= MAXIMUM_ESCAPE_DEPTH {
+            self.escape_depth_exhausted = true;
+
+            return None;
+        }
+
         let key = (file, node, completion, enclosing);
 
         if let Some(cached) = self.completion_escapes.get(&key) {
@@ -818,9 +913,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.completion_escapes.insert(key, None);
 
-        let resolved = self.resolved_escape_of(file, node, completion, enclosing);
+        let held = self.escape_depth_exhausted;
+        self.escape_depth_exhausted = false;
 
-        if !self.work_exhausted() {
+        let resolved = self.resolved_escape_of(file, node, completion, enclosing, depth);
+        let exhausted = self.escape_depth_exhausted;
+
+        self.escape_depth_exhausted = held || exhausted;
+
+        if !self.work_exhausted() && !exhausted {
             self.completion_escapes.insert(key, resolved);
         } else {
             self.completion_escapes.remove(&key);
@@ -835,17 +936,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         node: NodeId,
         completion: Completion,
         enclosing: NodeId,
-    ) -> Option<Escape> {
+        depth: usize,
+    ) -> Option<Completion> {
         let project = self.project;
         let semantic = &project.file(file).semantic;
         let mut escape = self.escape_of(file, completion, enclosing)?;
 
         for interception in interceptions_of(semantic, node) {
             let inside = self.is_ancestor(file, enclosing, interception.statement);
+            let caught = Completion::Break(interception.statement);
 
             match interception.resumption {
                 Resumption::Handler(_) if inside => return None,
-                Resumption::Handler(_) => escape = escape.min(Escape::Loop),
+                Resumption::Handler(_) => escape = self.weaker_escape_of(file, escape, caught),
                 Resumption::Finalizer(finalizer) => {
                     let replacements = self.finalizer_replacements_of(file, finalizer);
 
@@ -858,26 +961,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             return None;
                         }
 
-                        escape = escape.min(Escape::Loop);
+                        escape = self.weaker_escape_of(file, escape, caught);
 
                         continue;
                     };
 
                     if !inside {
                         if !replacements.is_empty() {
-                            escape = escape.min(Escape::Loop);
+                            escape = self.weaker_escape_of(file, escape, caught);
                         }
 
                         continue;
                     }
 
                     for replacement in replacements {
-                        escape = escape.min(self.escape_of_completion(
+                        let replaced = self.escape_of_completion(
                             file,
                             replacement.transfer,
                             replacement.completion,
                             enclosing,
-                        )?);
+                            depth + 1,
+                        )?;
+
+                        escape = self.weaker_escape_of(file, escape, replaced);
                     }
                 }
             }
@@ -891,13 +997,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         body: &'a Statement<'a>,
         site_node: NodeId,
-    ) -> Option<(Completion, Escape)> {
+    ) -> Option<(Completion, Completion)> {
         let project = self.project;
         let semantic = &project.file(file).semantic;
         let branch = body.node_id();
         let completion = completion_of(semantic, branch)?;
         let enclosing = enclosing_iteration_of(semantic, site_node)?;
-        let mut escape = self.escape_of_completion(file, branch, completion, enclosing)?;
+        let mut escape = self.escape_of_completion(file, branch, completion, enclosing, 0)?;
         let mut pending = vec![branch];
 
         while let Some(node) = pending.pop() {
@@ -912,8 +1018,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .filter(|transfer| !self.targets_within(file, branch, node, *transfer));
 
                 if let Some(transfer) = transfer {
-                    escape =
-                        escape.min(self.escape_of_completion(file, node, transfer, enclosing)?);
+                    let resolved = self.escape_of_completion(file, node, transfer, enclosing, 0)?;
+
+                    escape = self.weaker_escape_of(file, escape, resolved);
                 }
             }
 
@@ -934,19 +1041,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site_node: NodeId,
     ) -> Reading {
         let reading = self.cost_of_statement(file, body);
+        let main = reading.main();
 
-        if reading.main.cost.is_one() {
+        if main.cost.is_one() {
             return reading;
         }
 
-        let Some((completion, escape)) = self.branch_escape_of(file, body, site_node) else {
-            return reading;
+        self.escape_depth_exhausted = false;
+
+        let escaped = self.branch_escape_of(file, body, site_node);
+        let exhausted = std::mem::take(&mut self.escape_depth_exhausted);
+
+        let Some((completion, escape)) = escaped else {
+            return self.depth_exhausted_reading(file, site_node, reading, exhausted);
         };
-        let lifted = reading.main.explain(
+        let lifted = main.explain(
             format_args!(
                 "[{} branch: runs once per {}]",
                 completion_word_of(completion),
-                escape.unit()
+                escape_unit_of(escape)
             ),
             self.site_of_node(file, site_node),
             self.source_span(file, self.kind_of_node(file, site_node).span()),
@@ -954,26 +1067,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
             &mut self.traces,
             &mut self.unknowns,
         );
+        let mut lifted_reading = reading.with_main(Part::none());
 
-        if escape == Escape::Loop {
-            return Reading {
-                phases: [crate::cost::ExecutionPhase::Immediate; 3],
-                main: Part::none(),
-                function_exit: reading.function_exit,
-                loop_exit: reading
-                    .loop_exit
-                    .max(lifted, &mut self.unknowns, &mut self.traces),
-            };
+        lifted_reading.join(
+            crate::cost::ExecutionPhase::Immediate,
+            escape,
+            lifted,
+            &mut self.unknowns,
+            &mut self.traces,
+        );
+
+        lifted_reading
+    }
+
+    fn depth_exhausted_reading(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        reading: Reading,
+        exhausted: bool,
+    ) -> Reading {
+        if !exhausted {
+            return reading;
         }
 
-        Reading {
-            phases: [crate::cost::ExecutionPhase::Immediate; 3],
-            main: Part::none(),
-            function_exit: reading
-                .function_exit
-                .max(lifted, &mut self.unknowns, &mut self.traces),
-            loop_exit: reading.loop_exit,
-        }
+        let origin = self.source_span(file, self.kind_of_node(file, node).span());
+        let unknown = self
+            .unknowns
+            .origin(origin, UnknownReason::ResourceExhaustion);
+        let main = reading.main().retaining(Some(unknown), &mut self.unknowns);
+
+        reading.with_main(main)
     }
 
     fn cost_of_loop(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
@@ -1055,14 +1179,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let hoisted = self.pending_scoped.remove(&(file, node));
         let mut body = match hoisted {
-            Some(hoisted) => Reading {
-                main: body_raw
-                    .main
-                    .max(hoisted, &mut self.unknowns, &mut self.traces),
-                ..body_raw
-            },
+            Some(hoisted) => {
+                let main = body_raw
+                    .main()
+                    .max(hoisted, &mut self.unknowns, &mut self.traces);
+
+                body_raw.with_main(main)
+            }
             None => body_raw,
         };
+        let absorbed = self.absorbed_escapes_of(file, node, &mut body);
+        let body_main = body.main();
+        let escaping = body.with_main(Part::none());
+        let escaped =
+            !absorbed.is_absent() || escaping.escapes().any(|channel| !channel.2.is_absent());
 
         if invalidation.bound && !assumed_bound {
             let origin = self.source_span(file, kind.span());
@@ -1075,38 +1205,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 unknown = self.unknowns.join(unknown, Some(resource));
             }
 
-            body.main = body.main.scaled(None, &mut self.unknowns);
-
-            let unresolved = Part {
-                unknowns: self.unknowns.scale(unknown, None),
-                preference: body.main.preference.max(Preference::Unmarked),
-                ..Part::unmarked(Cost::ONE, None)
-            };
-
-            body.main = body
-                .main
-                .max(unresolved, &mut self.unknowns, &mut self.traces);
-
-            let main = body
-                .main
-                .max(body.loop_exit, &mut self.unknowns, &mut self.traces);
-
+            let unresolved = self.unknowns.scale(unknown, None);
+            let body_main = body_main
+                .scaled(None, &mut self.unknowns)
+                .retaining(unresolved, &mut self.unknowns);
+            let main = body_main.max(absorbed, &mut self.unknowns, &mut self.traces);
             let main = sibling
-                .main
-                .clone()
+                .main()
                 .max(main, &mut self.unknowns, &mut self.traces);
 
-            return self.loop_result(sibling, body.function_exit, main);
+            return self.loop_result(sibling, escaping, main);
         }
 
         if bound.factor.is_one() {
             let main = sibling
-                .main
-                .clone()
-                .max(body.main, &mut self.unknowns, &mut self.traces)
-                .max(body.loop_exit, &mut self.unknowns, &mut self.traces);
+                .main()
+                .max(body_main, &mut self.unknowns, &mut self.traces)
+                .max(absorbed, &mut self.unknowns, &mut self.traces);
 
-            return self.loop_result(sibling, body.function_exit, main);
+            return self.loop_result(sibling, escaping, main);
         }
 
         let scope = budget
@@ -1152,14 +1269,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
             site,
             self.source_span(file, kind.span()),
             bound.factor,
-            body.main,
+            body_main,
         );
+        let looped = match escaped {
+            true => looped,
+            false => looped.executed(),
+        };
 
         let main = sibling
-            .main
-            .clone()
-            .max(body.loop_exit, &mut self.unknowns, &mut self.traces);
-        let mut result = self.loop_result(sibling, body.function_exit, main);
+            .main()
+            .max(absorbed, &mut self.unknowns, &mut self.traces);
+        let mut result = self.loop_result(sibling, escaping, main);
 
         if let (Some(_), Some(scope)) = (&budget, scope) {
             let pending = self
@@ -1170,14 +1290,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             self.pending_scoped.insert((file, scope), pending);
         } else if budget.is_some() && self.inside_loop(file, node) {
-            result.function_exit =
-                result
-                    .function_exit
-                    .max(looped, &mut self.unknowns, &mut self.traces);
+            result.join(
+                crate::cost::ExecutionPhase::Immediate,
+                Completion::Return,
+                looped,
+                &mut self.unknowns,
+                &mut self.traces,
+            );
         } else {
-            result.main = result
-                .main
+            let main = result
+                .main()
                 .max(looped, &mut self.unknowns, &mut self.traces);
+
+            result = result.with_main(main);
         }
 
         result
@@ -1208,25 +1333,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(enclosing) = enclosing_iteration_of(semantic, node) else {
             return inner;
         };
-        let Some(escape) = self.escape_of_completion(file, node, completion, enclosing) else {
-            return inner;
+
+        self.escape_depth_exhausted = false;
+
+        let resolved = self.escape_of_completion(file, node, completion, enclosing, 0);
+        let exhausted = std::mem::take(&mut self.escape_depth_exhausted);
+
+        let Some(escape) = resolved else {
+            return self.depth_exhausted_reading(file, node, inner, exhausted);
         };
         let lifted = inner.total(&mut self.unknowns, &mut self.traces);
 
-        match escape {
-            Escape::Call => Reading {
-                phases: [crate::cost::ExecutionPhase::Immediate; 3],
-                main: Part::none(),
-                function_exit: lifted,
-                loop_exit: Part::none(),
-            },
-            Escape::Loop => Reading {
-                phases: [crate::cost::ExecutionPhase::Immediate; 3],
-                main: Part::none(),
-                function_exit: Part::none(),
-                loop_exit: lifted,
-            },
-        }
+        Reading::of_completion(crate::cost::ExecutionPhase::Immediate, escape, lifted)
     }
 
     fn is_constant_rest_expression(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
@@ -1290,7 +1408,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 site,
                 self.source_span(file, spread.span),
                 Cost::N,
-                Part::none(),
+                Part::unmarked(Cost::ONE, None),
             )),
             &mut self.unknowns,
             &mut self.traces,
@@ -1332,7 +1450,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 site,
                 self.source_span(file, span),
                 Cost::N,
-                Part::none(),
+                Part::unmarked(Cost::ONE, None),
             )),
             &mut self.unknowns,
             &mut self.traces,
@@ -1392,7 +1510,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.unknown_invocation(file, span, arguments, reason)
-            .main
+            .main()
             .unknowns
     }
 
@@ -1528,7 +1646,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             site,
                             self.source_span(file, new.span),
                             Cost::N,
-                            Part::none(),
+                            Part::unmarked(Cost::ONE, None),
                         )),
                         &mut self.unknowns,
                         &mut self.traces,
@@ -1741,7 +1859,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(class) = self.enclosing_constructed_class_of(file, call.node_id()) else {
             return self
                 .unknown_invocation(file, call.span, &call.arguments, UnknownReason::Target)
-                .main;
+                .main();
         };
         let site = self.site_of_node(file, call.node_id());
         let origin = self.source_span(file, call.span);
@@ -1808,7 +1926,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if plan.open {
             let unknown = self
                 .unknown_invocation(file, span, arguments, UnknownReason::Target)
-                .main
+                .main()
                 .unknowns;
 
             part = part.retaining(unknown, &mut self.unknowns);
@@ -1906,7 +2024,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             UnknownReason::Target,
                         );
 
-                        part.unknowns = self.unknowns.join(part.unknowns, unknown.main.unknowns);
+                        part = part.retaining(unknown.main().unknowns, &mut self.unknowns);
                     }
 
                     let part = if part.cost.is_one() {
@@ -2097,16 +2215,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(reference) = identifier_of(callee) {
             if is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str()) {
-                return reading.merge(
-                    Reading::of_part(self.nest_part(
-                        format!("{}()", reference.name),
-                        site,
-                        self.source_span(file, call.span),
-                        Cost::N,
-                        Part::none(),
-                    )),
-                    &mut self.unknowns,
-                    &mut self.traces,
+                return self.append_linear_operation(
+                    reading,
+                    format!("{}()", reference.name),
+                    site,
+                    (file, call.span),
                 );
             }
         }
@@ -2178,7 +2291,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         site,
                         self.source_span(file, call.span),
                         Cost::N,
-                        callback,
+                        callback.executed(),
                     )),
                     &mut self.unknowns,
                     &mut self.traces,
@@ -2237,7 +2350,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         site,
                         self.source_span(file, call.span),
                         Cost::N_LOG_N,
-                        callback,
+                        callback.executed(),
                     )
                 };
 
@@ -2258,7 +2371,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         site,
                         self.source_span(file, call.span),
                         Cost::N,
-                        callback,
+                        callback.executed(),
                     )
                 };
 
@@ -2281,7 +2394,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     site,
                     self.source_span(file, call.span),
                     Cost::N,
-                    callback,
+                    callback.executed(),
                 )),
                 &mut self.unknowns,
                 &mut self.traces,
@@ -2289,32 +2402,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if kind == Kind::String && is_listed(STRING_LINEAR, &method) && !bounded {
-            return reading.merge(
-                Reading::of_part(self.nest_part(
-                    label(" [string]"),
-                    site,
-                    self.source_span(file, call.span),
-                    Cost::N,
-                    Part::none(),
-                )),
-                &mut self.unknowns,
-                &mut self.traces,
+            return self.append_linear_operation(
+                reading,
+                label(" [string]"),
+                site,
+                (file, call.span),
             );
         }
 
         if kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method) {
             if let Some(argument) = first {
                 if !self.is_constant_sized_argument(file, argument) {
-                    return reading.merge(
-                        Reading::of_part(self.nest_part(
-                            label(" [regexp]"),
-                            site,
-                            self.source_span(file, call.span),
-                            Cost::N,
-                            Part::none(),
-                        )),
-                        &mut self.unknowns,
-                        &mut self.traces,
+                    return self.append_linear_operation(
+                        reading,
+                        label(" [regexp]"),
+                        site,
+                        (file, call.span),
                     );
                 }
             }
