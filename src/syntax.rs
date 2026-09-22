@@ -75,6 +75,7 @@ pub(crate) fn body_root_of<'a>(function: FunctionNode<'a>) -> Option<Root<'a>> {
                     .expect("an arrow body is a block or an expression"),
             ),
         }),
+        FunctionNode::Construction(_) => None,
     }
 }
 

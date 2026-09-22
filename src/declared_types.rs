@@ -10,7 +10,7 @@ use oxc_span::GetSpan;
 use oxc_syntax::operator::{BinaryOperator, LogicalOperator};
 
 use crate::analysis::Analysis;
-use crate::declarations::{Binding, Declaration, FunctionNode, ParameterNode};
+use crate::declarations::{parameters_of, Binding, Declaration, FunctionNode, ParameterNode};
 use crate::project::FileId;
 use crate::syntax::{call_of, is_const_type, is_identifier_pattern, member_expression_of, unwrap};
 use crate::tables::{KIND_OF_NAME, STRING_LINEAR, STRING_TO_ARRAY, TYPED_ARRAYS};
@@ -233,6 +233,7 @@ fn function_symbol_of(
             AstKind::VariableDeclarator(declarator) => declarator.id.get_binding_identifier(),
             _ => None,
         },
+        FunctionNode::Construction(class) => class.id.as_ref(),
     };
 
     name.and_then(|name| name.symbol_id.get())
@@ -855,10 +856,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         parameter: &'a FormalParameter<'a>,
     ) -> Option<CallArguments<'a>> {
         let project = self.project;
-        let parameters = match function {
-            FunctionNode::Function(inner) => &inner.params,
-            FunctionNode::Arrow(arrow) => &arrow.params,
-        };
+        let parameters = parameters_of(function)?;
         let index = parameters
             .items
             .iter()

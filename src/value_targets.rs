@@ -16,7 +16,8 @@ use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::constants::constant_initializer_of;
 use crate::declarations::{
-    element_name_of, Binding, Declaration, FunctionId, FunctionNode, ParameterNode, TargetSet,
+    element_name_of, parameters_of, Binding, Declaration, FunctionId, FunctionNode, ParameterNode,
+    TargetSet,
 };
 use crate::declared_types::{declarator_of_identifier, Kind};
 use crate::effects::{value_flow_of, ValueFlow};
@@ -1884,10 +1885,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let (declared, function) = declaration
                     .filter(|_| closed)
                     .and_then(|declaration| self.declarations.function_of(declaration))?;
-                let parameters = match function {
-                    FunctionNode::Function(inner) => &inner.params,
-                    FunctionNode::Arrow(arrow) => &arrow.params,
-                };
+                let parameters = parameters_of(function)?;
 
                 if call.arguments[..index]
                     .iter()

@@ -33,6 +33,7 @@ fn target_answer(analysis: &Analysis<'_, '_>, file: FileId, target: FunctionNode
     let span = match target {
         FunctionNode::Function(inner) => inner.span,
         FunctionNode::Arrow(inner) => inner.span,
+        FunctionNode::Construction(class) => class.span,
     };
 
     TscAnswer::Callee(CalleeAnswer {

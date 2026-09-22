@@ -14,6 +14,7 @@ fn description_of(declarations: &Declarations<'_>, declaration: Option<Declarati
         .map(|(_, function)| match function {
             FunctionNode::Function(_) => " function",
             FunctionNode::Arrow(_) => " arrow",
+            FunctionNode::Construction(_) => " construction",
         })
         .unwrap_or("");
 

@@ -247,6 +247,63 @@ fn written_callback_alias_retains_open_cost_and_effects() {
     assert_eq!(cost, Cost::ONE);
 }
 
+#[test]
+fn implicit_construction_charges_fields_and_base_construction() {
+    let quadratic = "function quadratic(xs:number[]):number{let total=0;for(const a of xs) for(const b of xs) total+=a*b; return total;} const xs:number[]=[];";
+
+    for (source, name, expected) in [
+        (
+            format!("{quadratic} export class Heavy {{ value=quadratic(xs); }}"),
+            "new Heavy()",
+            Some("O(N^2)"),
+        ),
+        (
+            format!("{quadratic} class Base {{ value=quadratic(xs); }} export class Derived extends Base {{}}"),
+            "new Derived()",
+            Some("O(N^2)"),
+        ),
+        (
+            format!("{quadratic} export class Light {{ value=1; }}"),
+            "new Light()",
+            Some("O(1)"),
+        ),
+        (
+            format!("{quadratic} class Base {{ constructor(){{quadratic(xs);}} }} export class Derived extends Base {{ label=1; }}"),
+            "new Derived()",
+            None,
+        ),
+    ] {
+        run_in_project(
+            &[("tsconfig.json", "{}"), ("index.ts", source.as_str())],
+            |project, _| {
+                let mut analysis = Analysis::new(project, SYNTACTIC);
+                let found = analysis
+                    .reportable()
+                    .into_iter()
+                    .find(|(target, function)| {
+                        analysis.name_of(*target, *function) == name
+                    });
+
+                let Some((target, function)) = found else {
+                    assert_eq!(expected, None, "{source}");
+
+                    return;
+                };
+                let part = analysis
+                    .summarize(target, function)
+                    .total(&mut analysis.unknowns, &mut analysis.traces);
+                let legacy = support::legacy_class_of(&mut analysis, target, function, &part.cost);
+
+                assert_eq!(
+                    Some(legacy),
+                    expected.map(|text| Cost::parse(text).unwrap()),
+                    "{source}"
+                );
+            },
+        );
+    }
+}
+
 fn selected_result(
     source: &str,
 ) -> (

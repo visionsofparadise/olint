@@ -102,6 +102,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     None => return false,
                 },
             },
+            FunctionNode::Construction(_) => return false,
         };
         let mut statements = ReturnStatements::default();
 

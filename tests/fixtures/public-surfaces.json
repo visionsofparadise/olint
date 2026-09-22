@@ -2698,7 +2698,7 @@
     "expected_contains": {
       "lint": [
         "cube",
-        "3 public functions"
+        "4 public functions"
       ],
       "report": [
         "cube"
@@ -2844,6 +2844,195 @@
     "expected_absent": {
       "lint": [],
       "report": []
+    }
+  },
+  {
+    "name": "surface_implicit_construction_is_gated",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a * b; return total; }\nconst xs: number[] = [];\nexport class HeavyField {\n\tvalue = quadratic(xs);\n}\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "new HeavyField()",
+        "1 public functions",
+        "1 over limit"
+      ],
+      "report": [
+        "new HeavyField()"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "HeavyField.constructor"
+      ],
+      "report": [
+        "HeavyField.constructor"
+      ]
+    }
+  },
+  {
+    "name": "surface_explicit_constructor_stays_the_reported_entry",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a * b; return total; }\nconst xs: number[] = [];\nexport class HeavyField {\n\tvalue = quadratic(xs);\n\tconstructor() {}\n}\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "HeavyField.constructor",
+        "1 public functions",
+        "1 over limit"
+      ],
+      "report": [
+        "HeavyField.constructor"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "new HeavyField()"
+      ],
+      "report": [
+        "new HeavyField()"
+      ]
+    }
+  },
+  {
+    "name": "surface_inherited_explicit_constructor_is_not_reported_twice",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a * b; return total; }\nconst xs: number[] = [];\nclass Base {\n\tconstructor() {\n\t\tquadratic(xs);\n\t}\n}\nexport class Derived extends Base {\n\tlabel = \"derived\";\n}\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "Base.constructor",
+        "1 public functions",
+        "1 over limit"
+      ],
+      "report": [
+        "Base.constructor"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "new Derived()"
+      ],
+      "report": [
+        "new Derived()"
+      ]
+    }
+  },
+  {
+    "name": "surface_implicit_construction_follows_an_implicit_base_chain",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a * b; return total; }\nconst xs: number[] = [];\nclass Base {\n\tvalue = quadratic(xs);\n}\nexport class Derived extends Base {}\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 1,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "new Derived()",
+        "1 public functions",
+        "1 over limit"
+      ],
+      "report": [
+        "new Derived()"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "new Base()"
+      ],
+      "report": []
+    }
+  },
+  {
+    "name": "surface_uninitialized_abstract_and_ambient_classes_construct_nothing",
+    "files": {
+      "tsconfig.json": {},
+      "olint.config.json": {
+        "max": "O(N)",
+        "entrypoints": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export class Empty {}\nexport class Uninitialized {\n\tcount: number;\n}\nexport class Statics {\n\tstatic total = 1;\n}\nexport abstract class Shape {\n\tsize = 1;\n}\nexport declare class Ambient {\n\tsize: number;\n}\n"
+    },
+    "args": [],
+    "kind": "surface",
+    "expected_exits": {
+      "lint": 0,
+      "report": 0
+    },
+    "expected_contains": {
+      "lint": [
+        "0 public functions"
+      ],
+      "report": [
+        "0 functions in 0 files"
+      ]
+    },
+    "expected_absent": {
+      "lint": [
+        "new Empty()",
+        "new Uninitialized()",
+        "new Statics()",
+        "new Shape()",
+        "new Ambient()"
+      ],
+      "report": [
+        "new Empty()",
+        "new Uninitialized()",
+        "new Statics()",
+        "new Shape()",
+        "new Ambient()"
+      ]
     }
   }
 ]

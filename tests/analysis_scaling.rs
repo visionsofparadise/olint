@@ -2244,3 +2244,44 @@ fn transfer_bearing_nested_finalizers_stay_linear_in_their_depth() {
         );
     }
 }
+
+fn construction_lineage_visits_of(depth: usize) -> (usize, usize) {
+    let mut declarations = vec!["class Link0 { first = 1; }".to_string()];
+
+    for index in 1..depth {
+        declarations.push(format!(
+            "class Link{index} extends Link{} {{ value{index} = 1; }}",
+            index - 1
+        ));
+    }
+
+    let source = format!(
+        "{} export class Surface extends Link{} {{}}",
+        declarations.join(" "),
+        depth - 1
+    );
+    let mut found = (0, 0);
+
+    run_with_source(&source, |analysis, _| {
+        let first = analysis.reportable().len();
+
+        found.0 = analysis.declarations.resolution_stats().construction_visits;
+
+        assert_eq!(analysis.reportable().len(), first, "{source}");
+
+        found.1 = analysis.declarations.resolution_stats().construction_visits;
+    });
+
+    found
+}
+
+#[test]
+fn construction_lineage_visits_each_class_once_across_its_chain() {
+    for depth in [8_usize, 16, 32, 64] {
+        assert_eq!(
+            construction_lineage_visits_of(depth),
+            (depth + 1, depth + 1),
+            "{depth}"
+        );
+    }
+}

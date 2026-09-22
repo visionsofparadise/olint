@@ -12,7 +12,9 @@ use oxc_span::GetSpan;
 use crate::analysis::work::{Charges, Event, FallbackCredit, Limits, Snapshot, WorkBudget};
 use crate::analysis::{Analysis, Stats};
 use crate::cost::{Cost, CostError, Part, Preference, Reading};
-use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, TargetSet};
+use crate::declarations::{
+    parameters_of, Binding, Declaration, FunctionId, FunctionNode, TargetSet,
+};
 use crate::directives::{cost_tag_of, PerfTag};
 use crate::effects::Effects;
 use crate::flow::Completion;
@@ -250,9 +252,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         scopes.extend(self.enclosing_functions_of(file, function.node_id()));
 
         for scope in scopes {
-            let parameters = match scope {
-                FunctionNode::Function(inner) => &inner.params,
-                FunctionNode::Arrow(inner) => &inner.params,
+            let Some(parameters) = parameters_of(scope) else {
+                continue;
             };
 
             let patterns = parameters
@@ -739,6 +740,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         match self.kind_of_node(id.file, id.node) {
             AstKind::Function(function) => FunctionNode::Function(function),
             AstKind::ArrowFunctionExpression(function) => FunctionNode::Arrow(function),
+            AstKind::Class(class) => FunctionNode::Construction(class),
             _ => unreachable!("summary target is a function"),
         }
     }
@@ -1715,9 +1717,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if let FunctionNode::Construction(class) = function {
+            if self.fallback_active() {
+                self.current_effects = Effects::unknown();
+            }
+
+            return Reading::of_part(
+                self.construction_part_of((file, &[], class.span), (file, class)),
+            );
+        }
+
         let has_body = match function {
             FunctionNode::Function(inner) => inner.body.is_some(),
             FunctionNode::Arrow(_) => true,
+            FunctionNode::Construction(_) => unreachable!("construction returns above"),
         };
 
         if has_body {
@@ -2629,9 +2642,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         implicit: bool,
         mut substitutions: Substitutions,
     ) -> Substitutions {
-        let parameters = match function {
-            FunctionNode::Function(inner) => &inner.params,
-            FunctionNode::Arrow(inner) => &inner.params,
+        let Some(parameters) = parameters_of(function) else {
+            return substitutions;
         };
         let spread_at = arguments
             .iter()
@@ -2804,9 +2816,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (file, function): (FileId, FunctionNode<'a>),
         substitutions: Substitutions,
     ) -> Substitutions {
-        let parameters = match function {
-            FunctionNode::Function(inner) => &inner.params,
-            FunctionNode::Arrow(inner) => &inner.params,
+        let Some(parameters) = parameters_of(function) else {
+            return substitutions;
         };
         let saved = std::mem::replace(&mut self.current_substitutions, substitutions);
 
@@ -2840,6 +2851,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let deferred = match function {
                 FunctionNode::Function(inner) => inner.r#async || inner.generator,
                 FunctionNode::Arrow(arrow) => arrow.r#async,
+                FunctionNode::Construction(_) => false,
             };
 
             if deferred {
@@ -2936,9 +2948,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return;
         }
 
-        let parameters = match function {
-            FunctionNode::Function(inner) => &inner.params,
-            FunctionNode::Arrow(inner) => &inner.params,
+        let Some(parameters) = parameters_of(function) else {
+            return;
         };
 
         for (parameter, argument) in parameters.items.iter().zip(arguments) {
@@ -3209,6 +3220,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         };
 
+        if let FunctionNode::Construction(class) = function {
+            out.write_str("new ")?;
+
+            match &class.id {
+                Some(id) => out.write_str(id.name.as_str())?,
+                None => match nodes.kind(parent) {
+                    AstKind::VariableDeclarator(declaration) => {
+                        out.write_str(self.text_of(file, declaration.id.span()))?
+                    }
+                    AstKind::ExportDefaultDeclaration(_) => out.write_str("<default>")?,
+                    _ => out.write_str("<class>")?,
+                },
+            }
+
+            return out.write_str("()");
+        }
+
         if let FunctionNode::Function(inner) = function {
             if inner.is_declaration() {
                 return out.write_str(inner.id.as_ref().map_or("<default>", |id| id.name.as_str()));
@@ -3314,6 +3342,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         .then_some(FunctionNode::Function(function)),
                         AstKind::ArrowFunctionExpression(arrow) => {
                             (!inline).then_some(FunctionNode::Arrow(arrow))
+                        }
+                        AstKind::Class(class) => {
+                            self.declarations.construction_of(project, file, class)
                         }
                         _ => None,
                     }

@@ -675,6 +675,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let deferred = match self.function_at(target) {
                 FunctionNode::Function(function) => function.r#async || function.generator,
                 FunctionNode::Arrow(arrow) => arrow.r#async,
+                FunctionNode::Construction(_) => false,
             };
 
             !deferred

@@ -1,7 +1,7 @@
 public coverage [partial]
-# tsconfig.json  (160 functions in 15 files)
+# tsconfig.json  (164 functions in 15 files)
 
-O(1)               30
+O(1)               34
 O(1) [partial]     23
 O(xs)              13
 O(rows^2)           9
@@ -478,7 +478,13 @@ O(1)           instantiationExpression  src/calls.ts:69
 
 O(1)           WithGetter.constructor  src/classes.ts:42
 
+O(1)           new WithArrowProperty()  src/classes.ts:64
+
+O(1)           new WithReadonlyItems()  src/classes.ts:75
+
 O(1)           ComputedKeys.[ Symbol.iterator ]  src/classes.ts:118 [partial]
+
+O(1)           new AccessorHolder()  src/classes.ts:140
 
 O(1)           arrayLiteralSpread  src/constants.ts:1
 
@@ -487,6 +493,8 @@ O(1)           conditionalConstants  src/constants.ts:6
 O(1)           derivedConstantArrays  src/constants.ts:10
 
 O(1)           newArrayConstant  src/constants.ts:20
+
+O(1)           new SizedConst()  src/constants.ts:24
 
 O(1)           SizedConst.values  src/constants.ts:26
 

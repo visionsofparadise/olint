@@ -13,8 +13,8 @@ use oxc_syntax::symbol::SymbolId;
 use crate::analysis::Analysis;
 use crate::config::{validate_entries, Config, ConfigError};
 use crate::declarations::{
-    element_name_of, surface_write_of, Binding, Declaration, FunctionId, FunctionNode,
-    SurfaceTarget,
+    element_name_of, parameters_of, surface_write_of, Binding, Declaration, FunctionId,
+    FunctionNode, SurfaceTarget,
 };
 use crate::directives::PerfTag;
 use crate::effects::{value_flow_of, ValueFlow};
@@ -820,9 +820,10 @@ impl<'a> Walk<'_, '_, 'a> {
         }
 
         for target in targets.known {
-            let parameters = match self.analysis.function_at(target) {
-                FunctionNode::Function(function) => &function.params,
-                FunctionNode::Arrow(arrow) => &arrow.params,
+            let Some(parameters) = parameters_of(self.analysis.function_at(target)) else {
+                self.issue(self.site(file, call), UnknownReason::Target);
+
+                continue;
             };
             let identifiers = match parameters.items.get(index) {
                 Some(parameter) => parameter.pattern.get_binding_identifiers(),
@@ -1146,6 +1147,14 @@ impl<'a> Walk<'_, '_, 'a> {
     }
 
     fn class(&mut self, mut file: FileId, mut class: &'a Class<'a>) {
+        if let Some(construction) =
+            self.analysis
+                .declarations
+                .construction_of(self.analysis.project, file, class)
+        {
+            self.function(file, construction);
+        }
+
         let mut lineage = Vec::new();
         let mut visited = HashSet::new();
         let mut complete = true;

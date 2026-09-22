@@ -12,7 +12,8 @@ use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
 use crate::cost::{Cost, Part, Preference, Reading};
 use crate::declarations::{
-    function_of_initializer, Binding, Declaration, FunctionNode, ParameterNode, TargetSet,
+    function_of_initializer, parameters_of, Binding, Declaration, FunctionNode, ParameterNode,
+    TargetSet,
 };
 use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
@@ -166,10 +167,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         function: FunctionNode<'a>,
     ) -> Option<Reading> {
-        let parameters = match function {
-            FunctionNode::Function(inner) => &inner.params,
-            FunctionNode::Arrow(inner) => &inner.params,
-        };
+        let parameters = parameters_of(function)?;
         let mut reading: Option<Reading> = None;
 
         for parameter in &parameters.items {

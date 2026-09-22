@@ -4,10 +4,11 @@ use std::hash::{Hash, Hasher};
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, BindingPattern, Class, ClassElement, ExportDefaultDeclarationKind,
-    Expression, FormalParameter, FormalParameterRest, Function, IdentifierReference,
-    MethodDefinitionKind, ObjectProperty, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
-    TSInterfaceDeclaration, TSModuleReference, TSSignature, TSTypeAliasDeclaration, TSTypeName,
-    TSTypeParameter, VariableDeclarationKind, VariableDeclarator,
+    Expression, FormalParameter, FormalParameterRest, FormalParameters, Function,
+    IdentifierReference, MethodDefinitionKind, ObjectProperty, PropertyKey, Statement,
+    TSEnumDeclaration, TSEnumMember, TSInterfaceDeclaration, TSModuleReference, TSSignature,
+    TSTypeAliasDeclaration, TSTypeName, TSTypeParameter, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, NodeId};
@@ -20,6 +21,7 @@ use oxc_syntax::scope::ScopeId;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::project::{FileId, Project, Resolved, SourceFile};
+use crate::syntax::unwrap;
 use crate::tables::{MUTATORS, REFLECTIVE_WRITES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -86,6 +88,7 @@ pub enum Declaration<'a> {
 pub enum FunctionNode<'a> {
     Function(&'a Function<'a>),
     Arrow(&'a ArrowFunctionExpression<'a>),
+    Construction(&'a Class<'a>),
 }
 
 impl FunctionNode<'_> {
@@ -93,6 +96,7 @@ impl FunctionNode<'_> {
         match self {
             FunctionNode::Function(function) => function.node_id(),
             FunctionNode::Arrow(arrow) => arrow.node_id(),
+            FunctionNode::Construction(class) => class.node_id(),
         }
     }
 }
@@ -104,6 +108,9 @@ impl PartialEq for FunctionNode<'_> {
                 std::ptr::eq(*left, *right)
             }
             (FunctionNode::Arrow(left), FunctionNode::Arrow(right)) => std::ptr::eq(*left, *right),
+            (FunctionNode::Construction(left), FunctionNode::Construction(right)) => {
+                std::ptr::eq(*left, *right)
+            }
             _ => false,
         }
     }
@@ -116,7 +123,16 @@ impl Hash for FunctionNode<'_> {
         match self {
             FunctionNode::Function(function) => std::ptr::hash(*function, state),
             FunctionNode::Arrow(arrow) => std::ptr::hash(*arrow, state),
+            FunctionNode::Construction(class) => std::ptr::hash(*class, state),
         }
+    }
+}
+
+pub fn parameters_of<'a>(function: FunctionNode<'a>) -> Option<&'a FormalParameters<'a>> {
+    match function {
+        FunctionNode::Function(inner) => Some(&inner.params),
+        FunctionNode::Arrow(inner) => Some(&inner.params),
+        FunctionNode::Construction(_) => None,
     }
 }
 
@@ -182,6 +198,13 @@ pub struct ResolutionStats {
     pub write_reference_visits: usize,
     pub stack_peak: usize,
     pub span_index_visits: usize,
+    pub construction_visits: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ConstructionLineage {
+    constructor: bool,
+    initialized: bool,
 }
 
 enum ResolutionStep<'a> {
@@ -204,6 +227,7 @@ pub struct Declarations<'a> {
     block_functions: RefCell<HashMap<FileId, BlockFunctions>>,
     declaration_spans: RefCell<HashMap<FileId, DeclarationSpans>>,
     assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
+    constructions: RefCell<HashMap<(FileId, NodeId), ConstructionLineage>>,
     resolution_epoch: Cell<usize>,
     resolution_stats: Cell<ResolutionStats>,
     module_records: Vec<&'a ModuleRecord<'a>>,
@@ -224,6 +248,7 @@ impl<'a> Declarations<'a> {
             block_functions: RefCell::new(HashMap::new()),
             declaration_spans: RefCell::new(HashMap::new()),
             assignments: RefCell::new(HashMap::new()),
+            constructions: RefCell::new(HashMap::new()),
             resolution_epoch: Cell::new(0),
             resolution_stats: Cell::new(ResolutionStats::default()),
             module_records: project
@@ -826,6 +851,75 @@ impl<'a> Declarations<'a> {
             }
             _ => None,
         }
+    }
+
+    pub fn construction_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        class: &'a Class<'a>,
+    ) -> Option<FunctionNode<'a>> {
+        if class.declare || class.r#abstract {
+            return None;
+        }
+
+        let lineage = self.construction_lineage_of(project, file, class);
+
+        (!lineage.constructor && lineage.initialized).then_some(FunctionNode::Construction(class))
+    }
+
+    fn construction_lineage_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        class: &'a Class<'a>,
+    ) -> ConstructionLineage {
+        let mut chain = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut current = Some((file, class));
+        let mut inherited = ConstructionLineage::default();
+        let mut truncated = false;
+
+        while let Some((file, class)) = current {
+            let site = (file, class.node_id());
+
+            if let Some(known) = self.constructions.borrow().get(&site) {
+                inherited = *known;
+
+                break;
+            }
+
+            if !visiting.insert(site) || chain.len() == MAXIMUM_LINEAGE {
+                truncated = true;
+
+                break;
+            }
+
+            let mut stats = self.resolution_stats.get();
+
+            stats.construction_visits += 1;
+
+            self.resolution_stats.set(stats);
+
+            chain.push((site, own_construction_of(class)));
+
+            current = class.heritage.as_ref().and_then(|heritage| {
+                self.class_of_expression(project, file, unwrap(&heritage.expression))
+            });
+        }
+
+        for (site, own) in chain.into_iter().rev() {
+            inherited = ConstructionLineage {
+                constructor: inherited.constructor || own.constructor,
+                initialized: inherited.initialized || own.initialized,
+            };
+
+            if !truncated {
+                self.constructions.borrow_mut().insert(site, inherited);
+            }
+        }
+
+        inherited
     }
 
     fn symbol_of_reference(
@@ -1561,6 +1655,32 @@ impl<'a> Declarations<'a> {
             self.collect_export_names(project, target, false, visited, seen, names);
         }
     }
+}
+
+const MAXIMUM_LINEAGE: usize = 256;
+
+fn own_construction_of(class: &Class<'_>) -> ConstructionLineage {
+    let mut lineage = ConstructionLineage::default();
+
+    for element in &class.body.body {
+        match element {
+            ClassElement::MethodDefinition(method)
+                if method.kind == MethodDefinitionKind::Constructor =>
+            {
+                lineage.constructor = true;
+            }
+            ClassElement::PropertyDefinition(property) => {
+                lineage.initialized |=
+                    property.value.is_some() && !property.r#static && !property.declare;
+            }
+            ClassElement::AccessorProperty(property) => {
+                lineage.initialized |= property.value.is_some() && !property.r#static;
+            }
+            _ => {}
+        }
+    }
+
+    lineage
 }
 
 pub fn is_declaration_kind(kind: &AstKind<'_>) -> bool {

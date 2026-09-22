@@ -2,6 +2,7 @@ use std::path::Path;
 
 use olint::analysis::Analysis;
 use olint::config::read_config;
+use olint::declarations::FunctionNode;
 use olint::project::Project;
 use olint::public::public_functions;
 use oxc_allocator::Allocator;
@@ -37,8 +38,10 @@ fn descriptor_order_keeps_only_surviving_getters_setters_and_data() {
                 _ => format!("export const api={{{body}}};"),
             };
 
+            let constructed = usize::from(shape == "class" && definitions.contains(&"data"));
+
             with_surface(&source, |_, coverage| {
-                assert_eq!(coverage.functions.len(), expected, "{source}");
+                assert_eq!(coverage.functions.len(), expected + constructed, "{source}");
                 assert!(coverage.unknowns.is_none(), "{source}");
             });
         }
@@ -75,19 +78,24 @@ fn computed_methods_require_a_structurally_surviving_definition() {
         with_surface(
             &format!("declare const key:string; export class API {{{members}}}"),
             |analysis, coverage| {
-                let present = coverage.functions.iter().any(|public| {
-                    let span = oxc_span::GetSpan::span(
-                        &analysis
-                            .project
-                            .file(public.file)
-                            .semantic
-                            .nodes()
-                            .kind(public.function.node_id()),
-                    );
+                let present = coverage
+                    .functions
+                    .iter()
+                    .filter(|public| !matches!(public.function, FunctionNode::Construction(_)))
+                    .any(|public| {
+                        let span = oxc_span::GetSpan::span(
+                            &analysis
+                                .project
+                                .file(public.file)
+                                .semantic
+                                .nodes()
+                                .kind(public.function.node_id()),
+                        );
 
-                    analysis.project.file(public.file).text[span.start as usize..span.end as usize]
-                        .contains("987654")
-                });
+                        analysis.project.file(public.file).text
+                            [span.start as usize..span.end as usize]
+                            .contains("987654")
+                    });
 
                 assert_eq!(present, retained, "{members}");
                 assert!(coverage.unknowns.is_some());
@@ -96,18 +104,76 @@ fn computed_methods_require_a_structurally_surviving_definition() {
     }
 
     with_surface("declare const key:string; class Base { selected(){void 987654;} } export class API extends Base {[key]=0;}",|_,coverage| {
-        assert!(coverage.functions.is_empty());
+        assert_eq!(coverage.functions.len(),1);
+        assert!(matches!(coverage.functions[0].function,FunctionNode::Construction(_)));
         assert!(coverage.unknowns.is_some());
     });
 
-    for (base, method, retained) in [
-        ("[key]=0;", "selected(){}", false),
-        ("selected=0;", "selected(){}", false),
-        ("static [key]=0;", "static selected(){}", true),
-        ("[key]=0;", "static selected(){}", true),
+    for (base, method, expected) in [
+        ("[key]=0;", "selected(){}", 1),
+        ("selected=0;", "selected(){}", 1),
+        ("static [key]=0;", "static selected(){}", 1),
+        ("[key]=0;", "static selected(){}", 2),
     ] {
         with_surface(&format!("declare const key:string; class Base {{{base}}} export class API extends Base {{{method}}}"),|_,coverage| {
-            assert_eq!(coverage.functions.len(),usize::from(retained),"{base} {method}");
+            assert_eq!(coverage.functions.len(),expected,"{base} {method}");
+        });
+    }
+}
+
+#[test]
+fn implicit_construction_is_a_named_surface_only_where_it_initializes() {
+    for (source, expected) in [
+        (
+            "export class HeavyField { rows: number[] = []; }",
+            vec!["new HeavyField()"],
+        ),
+        (
+            "export class HeavyField { rows: number[] = []; constructor(){} }",
+            vec!["HeavyField.constructor"],
+        ),
+        (
+            "class Base { constructor(){} } export class Derived extends Base {}",
+            vec!["Base.constructor"],
+        ),
+        (
+            "class Base { rows: number[] = []; } export class Derived extends Base {}",
+            vec!["new Derived()"],
+        ),
+        ("export class Empty {}", vec![]),
+        (
+            "export class Uninitialized { count: number = 0; }",
+            vec!["new Uninitialized()"],
+        ),
+        ("export class Statics { static total = 1; }", vec![]),
+        ("export declare class Ambient { size: number; }", vec![]),
+        ("export abstract class Shape { size = 1; }", vec![]),
+        (
+            "abstract class Shape { size = 1; } export class Concrete extends Shape {}",
+            vec!["new Concrete()"],
+        ),
+        (
+            "export const Named = class { size = 1; };",
+            vec!["new Named()"],
+        ),
+        (
+            "export default class { size = 1; }",
+            vec!["new <default>()"],
+        ),
+        ("export class Hidden { #size = 1; }", vec!["new Hidden()"]),
+        (
+            "export class Accessors { accessor size = 1; }",
+            vec!["new Accessors()"],
+        ),
+    ] {
+        with_surface(source, |analysis, coverage| {
+            let names: Vec<String> = coverage
+                .functions
+                .iter()
+                .map(|public| analysis.name_of(public.file, public.function))
+                .collect();
+
+            assert_eq!(names, expected, "{source}");
         });
     }
 }
@@ -420,11 +486,14 @@ fn model_includes_namespace_and_class_expression_implementations() {
         ("src/budgets.ts", 62),
         ("src/budgets.ts", 123),
         ("src/budgets.ts", 140),
+        ("src/classes.ts", 64),
+        ("src/classes.ts", 75),
         ("src/classes.ts", 88),
         ("src/classes.ts", 118),
+        ("src/classes.ts", 140),
     ] {
         assert!(sites.contains(&expected), "{expected:?}");
     }
 
-    assert_eq!(coverage.functions.len(), 132);
+    assert_eq!(coverage.functions.len(), 135);
 }

@@ -140,6 +140,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let is_expression = match function {
             FunctionNode::Arrow(_) => true,
             FunctionNode::Function(inner) => inner.is_expression(),
+            FunctionNode::Construction(class) => class.is_expression(),
         };
 
         if is_expression
