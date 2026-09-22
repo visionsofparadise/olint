@@ -1,7 +1,8 @@
 use olint::analysis::Analysis;
 use olint::budgets::{Budget, Direction, Potential, Spend, StepMagnitude};
 use olint::declarations::Binding;
-use olint::project::FileId;
+use olint::project::{FileId, Project};
+use olint::syntax::is_iteration_kind;
 use oxc_ast::AstKind;
 
 mod support;
@@ -303,6 +304,8 @@ fn a_step_of_unproven_magnitude_never_cancels_the_budget() {
     });
 }
 
+type SpendShape = Option<(StepMagnitude, bool)>;
+
 type SpendRow<'r> = (&'r str, String, StepMagnitude, bool);
 
 fn budget_source(body: &str) -> String {
@@ -323,15 +326,17 @@ fn trailing_budget_source(outer: &str) -> String {
     ))
 }
 
-fn spend_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, Option<(StepMagnitude, bool)>)> {
+fn shapes_of(
+    rows: &[(&str, &str)],
+    spend: &dyn Fn(&mut Analysis<'_, '_>, FileId) -> Option<Spend>,
+) -> Vec<(String, SpendShape)> {
     let mut found = Vec::new();
 
-    for (label, source, _, _) in rows {
+    for (label, source) in rows {
         let mut shape = None;
 
         run_with_source(source, |analysis, file| {
-            shape = spend_of_single_loop(analysis, file)
-                .map(|spend| (spend.magnitude, spend.share.is_some()));
+            shape = spend(analysis, file).map(|spend| (spend.magnitude, spend.share.is_some()));
         });
 
         found.push(((*label).to_string(), shape));
@@ -340,7 +345,20 @@ fn spend_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, Option<(StepMagnitude,
     found
 }
 
-fn expected_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, Option<(StepMagnitude, bool)>)> {
+fn labelled_sources_of<'r, T>(
+    rows: &'r [T],
+    of: impl Fn(&'r T) -> (&'r str, &'r str),
+) -> Vec<(&'r str, &'r str)> {
+    rows.iter().map(of).collect()
+}
+
+fn spend_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, SpendShape)> {
+    let sources = labelled_sources_of(rows, |(label, source, _, _)| (*label, source.as_str()));
+
+    shapes_of(&sources, &spend_of_single_loop)
+}
+
+fn expected_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, SpendShape)> {
     rows.iter()
         .map(|(label, _, magnitude, share)| ((*label).to_string(), Some((*magnitude, *share))))
         .collect()
@@ -417,4 +435,153 @@ fn a_refilled_budget_keeps_the_loop_factor_it_cannot_cancel() {
 
         assert_eq!((cost, complete), (expected, true), "{outer}");
     }
+}
+
+type GuardRow<'r> = (&'r str, String, SpendShape);
+
+fn guarded_source(body: &str) -> String {
+    format!(
+        "export function f(n: number, g: number, xs: number[], flag: boolean) {{ let i = 0, total = 0; {body} return total; }}"
+    )
+}
+
+fn last_loop_of<'a>(project: &Project<'a>, file: FileId) -> AstKind<'a> {
+    project
+        .file(file)
+        .semantic
+        .nodes()
+        .iter()
+        .filter(|node| is_iteration_kind(&node.kind()))
+        .map(|node| node.kind())
+        .last()
+        .expect("the source declares a loop")
+}
+
+fn spend_of_last_loop(analysis: &mut Analysis<'_, '_>, file: FileId) -> Option<Spend> {
+    let project = analysis.project;
+    let function = function_of_name(project, file, "f");
+    let context = analysis.collect_budgets(file, function);
+    let loop_kind = last_loop_of(project, file);
+
+    analysis.budget_context = Some(context);
+
+    analysis.spent_budget(file, loop_kind)
+}
+
+fn guard_shapes_of(rows: &[GuardRow<'_>]) -> Vec<(String, SpendShape)> {
+    let sources = labelled_sources_of(rows, |(label, source, _)| (*label, source.as_str()));
+
+    shapes_of(&sources, &spend_of_last_loop)
+}
+
+fn expected_guard_shapes_of(rows: &[GuardRow<'_>]) -> Vec<(String, SpendShape)> {
+    rows.iter()
+        .map(|(label, _, shape)| ((*label).to_string(), *shape))
+        .collect()
+}
+
+#[test]
+fn a_budget_cancels_only_a_loop_its_own_condition_guards() {
+    let cancels = Some((StepMagnitude::Constant, false));
+    let rows: [GuardRow<'_>; 8] = [
+        (
+            "a sibling for-of the condition never reaches",
+            guarded_source(
+                "while (i < n) { i++; } for (let j = 0; j < n; j++) { for (const y of xs) { i++; total += y; } }",
+            ),
+            None,
+        ),
+        (
+            "a for-of nested in the loop the condition guards",
+            guarded_source("while (i < n) { for (const y of xs) { i++; total += y; } }"),
+            None,
+        ),
+        (
+            "a while continued by a flag",
+            guarded_source(
+                "while (i < n) { i++; } for (let j = 0; j < n; j++) { while (flag) { i++; total++; } }",
+            ),
+            None,
+        ),
+        (
+            "a for with no test",
+            guarded_source(
+                "while (i < n) { i++; } for (let j = 0; j < n; j++) { for (;;) { i++; total++; } }",
+            ),
+            None,
+        ),
+        (
+            "a for whose update spends a counter its test ignores",
+            guarded_source("while (i < n) { i++; } for (let j = 0; j < n; i++) { total++; }"),
+            None,
+        ),
+        (
+            "the two-pointer inner while",
+            guarded_source("for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } }"),
+            cancels,
+        ),
+        (
+            "a second while carrying the same guard",
+            guarded_source(
+                "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } while (i < n) { i++; total++; } }",
+            ),
+            cancels,
+        ),
+        (
+            "a guarded while spending a share",
+            guarded_source("for (let j = 0; j < n; j++) { while (i < n) { i += g; total++; } }"),
+            Some((StepMagnitude::Stable, true)),
+        ),
+    ];
+
+    assert_eq!(guard_shapes_of(&rows), expected_guard_shapes_of(&rows));
+}
+
+#[test]
+fn an_unguarded_loop_keeps_the_factor_no_budget_cancels() {
+    let rows = [
+        (
+            "a sibling for-of the condition never reaches",
+            "while (i < n) { i++; } for (let j = 0; j < n; j++) { for (const y of xs) { i++; total += y; } }",
+            "O(N^2)",
+        ),
+        (
+            "a for-of nested in the loop the condition guards",
+            "while (i < n) { for (const y of xs) { i++; total += y; } }",
+            "O(N^2)",
+        ),
+        (
+            "a while continued by a flag",
+            "while (i < n) { i++; } for (let j = 0; j < n; j++) { while (flag) { i++; total++; } }",
+            "O(N^2)",
+        ),
+        (
+            "the two-pointer inner while",
+            "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } }",
+            "O(N)",
+        ),
+        (
+            "a second while carrying the same guard",
+            "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } while (i < n) { i++; total++; } }",
+            "O(N)",
+        ),
+    ];
+    let found: Vec<(&str, String, bool)> = rows
+        .iter()
+        .map(|(label, body, _)| {
+            let (cost, complete, _) = support::legacy_result_of(&guarded_source(body), "f");
+
+            (*label, cost.text(), complete)
+        })
+        .collect();
+    let expected: Vec<(&str, String, bool)> = rows
+        .iter()
+        .map(|(label, _, expected)| {
+            let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
+
+            (*label, cost.text(), true)
+        })
+        .collect();
+
+    assert_eq!(found, expected);
 }

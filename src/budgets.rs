@@ -65,6 +65,7 @@ pub struct Budget {
     pub text: String,
     pub scope: Option<NodeId>,
     pub potential: Potential,
+    pub guards: Vec<NodeId>,
 }
 
 pub struct BudgetContext {
@@ -295,7 +296,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
 
             if let Some(condition) = condition {
-                self.consider_condition(file, function, condition, &writes, &mut budgets);
+                self.consider_condition(
+                    file,
+                    function,
+                    kind.node_id(),
+                    condition,
+                    &writes,
+                    &mut budgets,
+                );
             }
         }
 
@@ -313,6 +321,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         function: FunctionNode<'a>,
+        node: NodeId,
         condition: &'a Expression<'a>,
         writes: &HashMap<Binding, Vec<WriteKind>>,
         budgets: &mut HashMap<Binding, Budget>,
@@ -330,10 +339,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     continue;
                 };
 
-                if budgets.contains_key(&binding) {
-                    continue;
-                }
-
                 let Some(origin) = self.counter_origin_of(binding, function) else {
                     continue;
                 };
@@ -343,6 +348,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
 
                 if !self.is_invariant(file, bound, writes) {
+                    continue;
+                }
+
+                if let Some(found) = budgets.get_mut(&binding) {
+                    found.guards.push(node);
+
                     continue;
                 }
 
@@ -358,6 +369,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         text: collapsed_text_of(self.text_of(file, conjunct.span())),
                         scope: origin.scope,
                         potential,
+                        guards: vec![node],
                     },
                 );
             }
@@ -781,9 +793,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        let node = loop_kind.node_id();
+
         if let AstKind::ForStatement(statement) = loop_kind {
             if let Some(update) = &statement.update {
-                if let Some(spend) = self.spend_of(file, update) {
+                if let Some(spend) = self.spend_of(file, node, update) {
                     return Some(spend);
                 }
             }
@@ -802,7 +816,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for statement in statements {
             if let Statement::ExpressionStatement(expression) = statement {
-                if let Some(spend) = self.spend_of(file, &expression.expression) {
+                if let Some(spend) = self.spend_of(file, node, &expression.expression) {
                     return Some(spend);
                 }
             }
@@ -811,12 +825,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         None
     }
 
-    fn spend_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<Spend> {
+    fn spend_of(&mut self, file: FileId, node: NodeId, e: &'a Expression<'a>) -> Option<Spend> {
         let advance = self.advance_of(file, e)?;
         let context = self.budget_context.as_ref()?;
         let budget = context.budgets.get(&advance.binding)?;
 
         if budget.direction != advance.direction {
+            return None;
+        }
+
+        if !budget.guards.contains(&node) {
             return None;
         }
 
