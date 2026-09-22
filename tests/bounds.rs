@@ -465,6 +465,36 @@ fn an_additive_step_of_unknown_magnitude_leaves_the_bound_unresolved() {
 }
 
 #[test]
+fn a_counter_whose_unconditional_writes_cancel_leaves_the_bound_unresolved() {
+    for (body, expected) in [
+        (
+            "for (let i = 0; i < 10; i++) { i--; sum++; }",
+            "iteration bound",
+        ),
+        (
+            "let i = 0; while (i < 10) { i = i + 1; i = i - 1; sum++; }",
+            "iteration bound",
+        ),
+        (
+            "for (let i = 0; i < n; i++) { i -= 2; sum++; }",
+            "iteration bound",
+        ),
+        (
+            "let i = 0; while (i < 10) { i -= 1; for (const x of xs) { i += 1; sum++; } }",
+            "N",
+        ),
+        ("for (let i = 0; i < 10; i++) { i += 2; i--; sum++; }", "N"),
+        ("for (let i = 0; i < 10; i++) sum++;", "constant bound"),
+    ] {
+        let source = format!(
+            "export function f(n: number, xs: number[]) {{ let sum = 0; {body} return sum; }}"
+        );
+
+        assert_eq!(first_reason_of(&source), expected, "{body}");
+    }
+}
+
+#[test]
 fn a_body_that_can_repeat_loses_the_single_iteration_proof() {
     for (body, expected) in [
         ("for (const x of xs) { return x; }", "single iteration"),

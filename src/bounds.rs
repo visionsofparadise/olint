@@ -791,10 +791,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             })
             .try_fold(0.0, |total, advance| advance.map(|advance| total + advance));
 
-        if advances
-            .iter()
-            .all(|advance| advance.is_some_and(|advance| advance <= 0.0))
-            && guaranteed.is_some_and(|guaranteed| guaranteed <= 0.0)
+        let sums_every_write = progression.unconditional.len() == progression.writes.len();
+
+        if guaranteed.is_some_and(|guaranteed| guaranteed <= 0.0)
+            && (sums_every_write
+                || advances
+                    .iter()
+                    .all(|advance| advance.is_some_and(|advance| advance <= 0.0)))
         {
             return Some(unresolved_bound_of());
         }
