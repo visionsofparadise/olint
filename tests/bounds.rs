@@ -208,6 +208,18 @@ fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
             "let limit = 10; for (let i = 0; i < limit; i++) limit = n;",
             "N",
         ),
+        (
+            "let sum = 0; let i = 0; while (i < 10) { step: { if (n > 0) break step; i++; } sum++; }",
+            "N",
+        ),
+        (
+            "let sum = 0; let i = 0; while (i < 10) { step: { i++; if (n > 0) break step; } sum++; }",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; let i = 0; while (i < 10) { step: { if (n > 0) break step; } i++; sum++; }",
+            "constant bound",
+        ),
     ] {
         let source = format!("export function f(n: number) {{ {body} }}");
 
@@ -309,6 +321,22 @@ fn contraction_must_hold_on_every_repeating_path() {
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; lo = mid; sum++; }",
             "N",
+        ),
+        (
+            "let i = xs.length; while (i > 1) { step: { if (sum > 2) break step; i /= 2; } sum++; }",
+            "N",
+        ),
+        (
+            "let i = xs.length; while (i > 1) { step: { i /= 2; if (sum > 2) break step; } sum++; }",
+            "halving",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { step: { if (sum > 2) break step; const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; } sum++; }",
+            "N",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { step: { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; if (sum > 2) break step; } sum++; }",
+            "halving",
         ),
     ] {
         let source =

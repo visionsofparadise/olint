@@ -1315,10 +1315,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         match statement {
-            Statement::BlockStatement(block) => block
-                .body
-                .iter()
-                .any(|statement| self.covers_statement(file, node, statement, sites)),
+            Statement::BlockStatement(block) => {
+                self.covers_sequence(file, node, &block.body, sites)
+            }
             Statement::ExpressionStatement(statement) => {
                 covers_expression(&statement.expression, sites)
             }
@@ -1334,6 +1333,55 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
             _ => false,
         }
+    }
+
+    fn covers_sequence(
+        &self,
+        file: FileId,
+        node: NodeId,
+        body: &'a [Statement<'a>],
+        sites: &[NodeId],
+    ) -> bool {
+        let Some((last, leading)) = body.split_last() else {
+            return false;
+        };
+
+        for statement in leading {
+            if self.covers_statement(file, node, statement, sites) {
+                return true;
+            }
+
+            if self.skips_remainder(file, node, statement) {
+                return false;
+            }
+        }
+
+        self.covers_statement(file, node, last, sites)
+    }
+
+    fn skips_remainder(&self, file: FileId, node: NodeId, statement: &'a Statement<'a>) -> bool {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let root = statement.node_id();
+
+        Subtree::of(Root::Statement(statement), true, false)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                AstKind::BreakStatement(jump) => Some(jump.node_id()),
+                AstKind::ContinueStatement(jump) => Some(jump.node_id()),
+                _ => None,
+            })
+            .any(|jump| match completion_of(semantic, jump) {
+                Some(completion) => match completion {
+                    Completion::Break(target) | Completion::Continue(target) => {
+                        !leaves_iteration(nodes, completion, node)
+                            && !is_within(nodes, target, root)
+                    }
+                    _ => false,
+                },
+                None => true,
+            })
     }
 }
 
