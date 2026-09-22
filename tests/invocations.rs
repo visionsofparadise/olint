@@ -305,3 +305,58 @@ fn unresolved_iteration_protocols_leave_multiplicity_unproven() {
 
     assert_selected(&controls);
 }
+
+#[test]
+fn instance_checks_invoke_their_known_has_instance_implementations() {
+    let marker = "class Marker { static [Symbol.hasInstance](value: unknown) { return quadratic(xs) > 0; } }";
+    let literal =
+        "const marker = { [Symbol.hasInstance](value: unknown) { return quadratic(xs) > 0; } };";
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], value: unknown) {{ {marker} return value instanceof Marker; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], value: unknown) {{ {literal} return value instanceof (marker as any); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], value: unknown) {{ class Marker {{}} Object.defineProperty(Marker, Symbol.hasInstance, {{ value: () => quadratic(xs) > 0 }}); return value instanceof Marker; }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {marker} let total = 0; for (const x of xs) if (x instanceof Marker) total += x; return total; }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\n{marker}\nexport function selected(value: unknown, constructor: Function) {{ return value instanceof constructor; }}")), "O(1)", true),
+    ];
+
+    assert_selected(&cases);
+
+    let controls = [
+        (index_of(format!("{QUADRATIC}\n{marker}\nexport function selected(value: unknown) {{ class Plain {{ v = 1; }} return value instanceof Plain; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{marker}\nexport function selected(xs: number[], value: unknown) {{ class Plain {{ v = 1; }} let total = 0; for (const x of xs) if (value instanceof Plain) total += x; return total; }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(value: unknown) {{ class Plain {{ v = 1; }} return value instanceof Plain; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(value: unknown, constructor: Function) {{ return value instanceof constructor; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(value: unknown) {{ return value instanceof Error; }}")), "O(1)", false),
+    ];
+
+    assert_selected(&controls);
+}
+
+#[test]
+fn awaits_invoke_their_known_then_implementations() {
+    let thenable =
+        "const thenable = { then(resolve: (value: number) => void) { quadratic(xs); } };";
+    let class_thenable =
+        "class Thenable { then(resolve: (value: number) => void) { quadratic(xs); } }";
+    let cases = [
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {thenable} return await (thenable as unknown as Promise<number>); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {class_thenable} return await (new Thenable() as unknown as Promise<number>); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ const box = {{ get then() {{ quadratic(xs); return undefined; }} }}; return await (box as any); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {thenable} let total = 0; for (const x of xs) total += await (thenable as unknown as Promise<number>); return total; }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", true),
+    ];
+
+    assert_selected(&cases);
+
+    let controls = [
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected() {{ return await producer(); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(source: Promise<number>) {{ return await source; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected() {{ return await Promise.resolve(1); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected(xs: number[]) {{ let total = 0; for (const x of xs) total += await producer(); return total; }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(value: number) {{ return await value; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(rows: AsyncIterable<number>) {{ let total = 0; for await (const row of rows) total += row; return total; }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", false),
+    ];
+
+    assert_selected(&controls);
+}

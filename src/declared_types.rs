@@ -1031,6 +1031,109 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    pub(crate) fn is_declared_promise(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        self.is_declared_promise_at(file, expression, 0)
+    }
+
+    fn is_declared_promise_at(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match self.promise_typing_of(file, expression) {
+            Some(Typing::Annotation(target, annotation)) => {
+                self.is_promise_type(target, annotation, depth + 1)
+            }
+            Some(Typing::Initializer(target, value)) => {
+                self.is_declared_promise_at(target, value, depth + 1)
+            }
+            None => false,
+        }
+    }
+
+    fn promise_typing_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Option<Typing<'a>> {
+        match expression {
+            Expression::ParenthesizedExpression(inner) => {
+                Some(Typing::Initializer(file, &inner.expression))
+            }
+            Expression::TSNonNullExpression(inner) => {
+                Some(Typing::Initializer(file, &inner.expression))
+            }
+            Expression::TSAsExpression(cast) => {
+                Some(Typing::Annotation(file, &cast.type_annotation))
+            }
+            Expression::TSTypeAssertion(cast) => {
+                Some(Typing::Annotation(file, &cast.type_annotation))
+            }
+            Expression::TSSatisfiesExpression(cast) => {
+                Some(Typing::Annotation(file, &cast.type_annotation))
+            }
+            Expression::Identifier(reference) => {
+                let declaration = self
+                    .declarations
+                    .of_reference(self.project, file, reference)?;
+                let (target, annotation, _) = binding_parts_of(&declaration)?;
+
+                Some(Typing::Annotation(target, annotation?))
+            }
+            Expression::CallExpression(call) => {
+                let Expression::Identifier(callee) = unwrap(&call.callee) else {
+                    return None;
+                };
+                let declaration = self.declarations.of_reference(self.project, file, callee);
+                let (target, returned) = return_type_of_callee(declaration)?;
+
+                Some(Typing::Annotation(target, returned))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_promise_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match ty {
+            TSType::TSParenthesizedType(parenthesized) => {
+                self.is_promise_type(file, &parenthesized.type_annotation, depth + 1)
+            }
+            TSType::TSUnionType(union) => union.types.iter().all(|part| {
+                self.is_promise_type(file, part, depth + 1)
+                    || self.is_primitive_type(file, part, depth + 1)
+            }),
+            TSType::TSTypeReference(reference) => {
+                if type_name_text_of(&reference.type_name) == "Promise" {
+                    return true;
+                }
+
+                match self.declaration_of_type_name(file, &reference.type_name) {
+                    Some(Declaration::TypeAlias {
+                        file: target,
+                        declaration,
+                    }) if declaration.type_parameters.is_none() => {
+                        self.is_promise_type(target, &declaration.type_annotation, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_primitive_value(
         &mut self,
         file: FileId,

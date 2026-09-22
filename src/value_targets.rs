@@ -1172,11 +1172,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let coercing = keys
             .iter()
             .any(|key| matches!(key, MemberKey::WellKnown(name) if name == "toPrimitive"));
+        let awaiting = keys
+            .iter()
+            .any(|key| matches!(key, MemberKey::Name(name) if name == "then"));
         let kind = match coercing {
             true => self.proven_kind_of(file, expression, 0),
             false => self.declared_kind_of(file, expression),
         };
-        let unresolved = (receiver.origins.is_empty() || receiver.constrained) && !is_builtin(kind);
+        let intrinsic =
+            is_builtin(kind) || (awaiting && self.is_intrinsic_promise(file, expression));
+        let unresolved = (receiver.origins.is_empty() || receiver.constrained) && !intrinsic;
         let mut found = closed_targets_of();
 
         for key in keys {
@@ -1296,6 +1301,65 @@ impl<'p, 'a> Analysis<'p, 'a> {
             && !targets.known.is_empty()
             && targets.known.iter().all(|target| {
                 matches!(self.kind_of_node(target.file, target.node), AstKind::Function(function) if function.generator)
+            })
+    }
+
+    fn is_intrinsic_promise(&mut self, file: FileId, expression: &'a Expression<'a>) -> bool {
+        self.is_intrinsic_promise_at(file, expression, 0)
+    }
+
+    fn is_intrinsic_promise_at(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAXIMUM_ALIAS_DEPTH {
+            return false;
+        }
+
+        if self.is_declared_promise(file, expression) {
+            return true;
+        }
+
+        match unwrap(expression) {
+            Expression::NewExpression(new) => self.is_global_promise(file, &new.callee),
+            Expression::CallExpression(call) => match member_expression_of(unwrap(&call.callee)) {
+                Some(member) if self.is_global_promise(file, member.object()) => true,
+                _ => self.is_asynchronous_call(file, call),
+            },
+            Expression::Identifier(reference) => match self.local_values_of(file, reference) {
+                Some(values) if !values.is_empty() => values
+                    .into_iter()
+                    .all(|(source, value)| self.is_intrinsic_promise_at(source, value, depth + 1)),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn is_global_promise(&mut self, file: FileId, expression: &'a Expression<'a>) -> bool {
+        let Expression::Identifier(reference) = unwrap(expression) else {
+            return false;
+        };
+
+        reference.name == "Promise"
+            && is_unbound(self.project.file(file).semantic.scoping(), reference)
+            && !self.values.targets.replaced_every_global
+            && !self.values.targets.replaced_globals.contains("Promise")
+    }
+
+    fn is_asynchronous_call(&mut self, file: FileId, call: &'a CallExpression<'a>) -> bool {
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        !targets.open
+            && !targets.known.is_empty()
+            && targets.known.iter().all(|target| {
+                match self.kind_of_node(target.file, target.node) {
+                    AstKind::Function(function) => function.r#async && !function.generator,
+                    AstKind::ArrowFunctionExpression(arrow) => arrow.r#async,
+                    _ => false,
+                }
             })
     }
 

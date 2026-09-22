@@ -22,6 +22,8 @@ use crate::values::{outermost_of, protocol_key_of, Iteration, MemberKey, ValueId
 use std::rc::Rc;
 
 const COERCION_KEYS: [&str; 3] = ["@@toPrimitive", "valueOf", "toString"];
+const HAS_INSTANCE_KEYS: [&str; 1] = ["@@hasInstance"];
+const AWAITED_KEYS: [&str; 1] = ["then"];
 const MAXIMUM_RETURN_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +161,20 @@ fn coercion_keys() -> Vec<MemberKey> {
         .collect()
 }
 
+fn has_instance_keys() -> Vec<MemberKey> {
+    HAS_INSTANCE_KEYS
+        .iter()
+        .map(|name| protocol_key_of(name))
+        .collect()
+}
+
+fn awaited_keys() -> Vec<MemberKey> {
+    AWAITED_KEYS
+        .iter()
+        .map(|name| protocol_key_of(name))
+        .collect()
+}
+
 fn iteration_keys() -> Vec<MemberKey> {
     ["@@iterator", "@@asyncIterator", "next", "return"]
         .iter()
@@ -278,6 +294,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for operand in self.coerced_operands_of(file, kind) {
             targets.push(self.coercion_targets_of(file, operand));
+        }
+
+        if let Some(constructor) = checked_constructor_of(kind) {
+            targets.push(self.has_instance_targets_of(file, constructor));
+        }
+
+        if let Some(operand) = awaited_operand_of(kind) {
+            targets.push(self.awaited_targets_of(file, operand));
         }
 
         targets
@@ -503,6 +527,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             parts.push(self.target_coercion_part_of(file, target, kind.span()));
         }
 
+        if let Some(constructor) = checked_constructor_of(kind) {
+            let targets = self.has_instance_targets_of(file, constructor);
+
+            parts.push(self.implicit_part_of(
+                (file, kind.span()),
+                &targets,
+                "instanceof",
+                &[constructor],
+            ));
+        }
+
+        if let Some(operand) = awaited_operand_of(kind) {
+            let targets = self.awaited_targets_of(file, operand);
+
+            parts.push(self.implicit_part_of((file, kind.span()), &targets, "await", &[operand]));
+        }
+
         if matches!(
             kind,
             AstKind::ObjectPattern(_)
@@ -694,6 +735,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn coercion_targets_of(&mut self, file: FileId, operand: &'a Expression<'a>) -> TargetSet {
         self.protocol_targets_of(file, operand, &coercion_keys())
+    }
+
+    fn has_instance_targets_of(
+        &mut self,
+        file: FileId,
+        constructor: &'a Expression<'a>,
+    ) -> TargetSet {
+        self.protocol_targets_of(file, constructor, &has_instance_keys())
+    }
+
+    fn awaited_targets_of(&mut self, file: FileId, operand: &'a Expression<'a>) -> TargetSet {
+        if self.is_primitive_operand(file, operand) {
+            return TargetSet {
+                known: Vec::new(),
+                open: false,
+            };
+        }
+
+        self.protocol_targets_of(file, operand, &awaited_keys())
     }
 
     fn target_coercion_part_of(
@@ -1416,6 +1476,22 @@ fn is_inert(iteration: &Iteration) -> bool {
     [&iteration.acquire, &iteration.next, &iteration.close]
         .iter()
         .all(|targets| !targets.open && targets.known.is_empty())
+}
+
+fn checked_constructor_of<'a>(kind: AstKind<'a>) -> Option<&'a Expression<'a>> {
+    match kind {
+        AstKind::BinaryExpression(binary) if binary.operator == BinaryOperator::Instanceof => {
+            Some(&binary.right)
+        }
+        _ => None,
+    }
+}
+
+fn awaited_operand_of<'a>(kind: AstKind<'a>) -> Option<&'a Expression<'a>> {
+    match kind {
+        AstKind::AwaitExpression(awaited) => Some(&awaited.argument),
+        _ => None,
+    }
 }
 
 fn accessed_object_of<'a>(kind: AstKind<'a>) -> Option<&'a Expression<'a>> {
