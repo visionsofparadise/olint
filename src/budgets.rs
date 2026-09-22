@@ -41,6 +41,12 @@ pub enum Direction {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Strictness {
+    Strict,
+    Inclusive,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Potential {
     Constant(f64),
@@ -160,7 +166,12 @@ pub(crate) fn is_less(operator: BinaryOperator) -> bool {
     )
 }
 
-pub(crate) type ComparisonPair<'a> = (&'a Expression<'a>, &'a Expression<'a>, Direction);
+pub(crate) type ComparisonPair<'a> = (
+    &'a Expression<'a>,
+    &'a Expression<'a>,
+    Direction,
+    Strictness,
+);
 
 pub(crate) fn comparison_pairs_of<'a>(
     conjunct: &'a Expression<'a>,
@@ -170,13 +181,19 @@ pub(crate) fn comparison_pairs_of<'a>(
     };
     let left = unwrap(&binary.left);
     let right = unwrap(&binary.right);
+    let strictness = strictness_of(binary.operator);
 
     if is_less(binary.operator) {
-        return Some([(left, right, Direction::Up), (right, left, Direction::Down)]);
+        return Some([
+            (left, right, Direction::Up, strictness),
+            (right, left, Direction::Down, strictness),
+        ]);
     }
 
-    is_greater(binary.operator)
-        .then_some([(left, right, Direction::Down), (right, left, Direction::Up)])
+    is_greater(binary.operator).then_some([
+        (left, right, Direction::Down, strictness),
+        (right, left, Direction::Up, strictness),
+    ])
 }
 
 fn is_greater(operator: BinaryOperator) -> bool {
@@ -184,6 +201,13 @@ fn is_greater(operator: BinaryOperator) -> bool {
         operator,
         BinaryOperator::GreaterThan | BinaryOperator::GreaterEqualThan
     )
+}
+
+fn strictness_of(operator: BinaryOperator) -> Strictness {
+    match operator {
+        BinaryOperator::LessThan | BinaryOperator::GreaterThan => Strictness::Strict,
+        _ => Strictness::Inclusive,
+    }
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -298,7 +322,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             };
 
-            for (counter, bound, direction) in pairs {
+            for (counter, bound, direction, _) in pairs {
                 let Some(counter) = identifier_of(counter) else {
                     continue;
                 };

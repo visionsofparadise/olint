@@ -378,6 +378,33 @@ fn contraction_must_hold_on_every_repeating_path() {
             "let lo = 0; let hi = xs.length; while (lo < hi) { step: { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; if (sum > 2) break step; } sum++; }",
             "halving",
         ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo <= hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; sum++; }",
+            "iteration bound",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (hi >= lo) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; sum++; }",
+            "iteration bound",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo <= hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid - 1; sum++; }",
+            "halving",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo <= hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid; else hi = mid - 1; sum++; }",
+            "iteration bound",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo <= hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid - xs.length; sum++; }",
+            "N",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid - xs.length; sum++; }",
+            "N",
+        ),
+        ("let i = xs.length; while (i >= 0) { i /= 2; sum++; }", "N"),
+        ("let i = xs.length; while (i > 0) { i /= 2; sum++; }", "halving"),
+        ("let i = xs.length; while (i >= 1) { i /= 2; sum++; }", "halving"),
     ] {
         let source =
             format!("export function f(xs: number[]) {{ let sum = 0; {body} return sum; }}");

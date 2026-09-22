@@ -9,7 +9,7 @@ use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UpdateOperator};
 
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
-use crate::budgets::{comparison_pairs_of, conjuncts_of, is_less, Direction, Subtree};
+use crate::budgets::{comparison_pairs_of, conjuncts_of, is_less, Direction, Strictness, Subtree};
 use crate::cost::Cost;
 use crate::declarations::{Binding, Declaration};
 use crate::directives::PerfTag;
@@ -149,6 +149,7 @@ struct Comparison<'a> {
     counter: Binding,
     endpoint: &'a Expression<'a>,
     direction: Direction,
+    strictness: Strictness,
 }
 
 struct Repetition<'a> {
@@ -331,7 +332,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             };
 
-            for (counter, endpoint, direction) in pairs {
+            for (counter, endpoint, direction, strictness) in pairs {
                 let Some(reference) = identifier_of(counter) else {
                     continue;
                 };
@@ -343,6 +344,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     counter,
                     endpoint,
                     direction,
+                    strictness,
                 });
             }
         }
@@ -741,8 +743,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     return None;
                 }
 
-                (self.numeric_value_of(file, comparison.endpoint)? >= 0.0)
-                    .then(|| logarithmic_bound_of(repetition.geometric_proof))
+                let endpoint = self.numeric_value_of(file, comparison.endpoint)?;
+                let clears_the_endpoint = match comparison.strictness {
+                    Strictness::Strict => endpoint >= 0.0,
+                    Strictness::Inclusive => endpoint > 0.0,
+                };
+
+                clears_the_endpoint.then(|| logarithmic_bound_of(repetition.geometric_proof))
             }
         }
     }
@@ -1014,7 +1021,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     return None;
                 }
 
-                if !self.is_bisecting_write(file, (lower, upper), rising, write.site, repetition) {
+                if !self.is_bisecting_write(
+                    file,
+                    (lower, upper),
+                    rising,
+                    write.site,
+                    repetition,
+                    comparison.strictness,
+                ) {
                     return None;
                 }
 
@@ -1037,6 +1051,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         rising: bool,
         site: NodeId,
         repetition: &Repetition<'a>,
+        strictness: Strictness,
     ) -> bool {
         let AstKind::AssignmentExpression(assignment) = self.kind_of_node(file, site) else {
             return false;
@@ -1067,11 +1082,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => (value, 0.0),
         };
 
+        let largest_falling_offset = match strictness {
+            Strictness::Strict => 0.0,
+            Strictness::Inclusive => -1.0,
+        };
+
         if rising && offset < 1.0 {
             return false;
         }
 
-        if !rising && offset > 0.0 {
+        if !rising && offset > largest_falling_offset {
             return false;
         }
 
