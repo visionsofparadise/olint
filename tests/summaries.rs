@@ -273,35 +273,93 @@ fn implicit_construction_charges_fields_and_base_construction() {
             None,
         ),
     ] {
-        run_in_project(
-            &[("tsconfig.json", "{}"), ("index.ts", source.as_str())],
-            |project, _| {
-                let mut analysis = Analysis::new(project, SYNTACTIC);
-                let found = analysis
-                    .reportable()
-                    .into_iter()
-                    .find(|(target, function)| {
-                        analysis.name_of(*target, *function) == name
-                    });
+        let reported = reported_result(&source, name);
 
-                let Some((target, function)) = found else {
-                    assert_eq!(expected, None, "{source}");
-
-                    return;
-                };
-                let part = analysis
-                    .summarize(target, function)
-                    .total(&mut analysis.unknowns, &mut analysis.traces);
-                let legacy = support::legacy_class_of(&mut analysis, target, function, &part.cost);
-
-                assert_eq!(
-                    Some(legacy),
-                    expected.map(|text| Cost::parse(text).unwrap()),
-                    "{source}"
-                );
-            },
+        assert_eq!(
+            reported.map(|(cost, _)| cost),
+            expected.map(|text| Cost::parse(text).unwrap()),
+            "{source}"
         );
     }
+}
+
+fn reported_result(
+    source: &str,
+    name: &str,
+) -> Option<(
+    Cost,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+)> {
+    let mut result = None;
+
+    run_in_project(
+        &[("tsconfig.json", "{}"), ("index.ts", source)],
+        |project, _| {
+            let mut analysis = Analysis::new(project, SYNTACTIC);
+            let found = analysis
+                .reportable()
+                .into_iter()
+                .find(|(target, function)| analysis.name_of(*target, *function) == name);
+            let Some((target, function)) = found else {
+                return;
+            };
+            let part = analysis
+                .summarize(target, function)
+                .total(&mut analysis.unknowns, &mut analysis.traces);
+
+            result = Some((
+                support::legacy_class_of(&mut analysis, target, function, &part.cost),
+                support::unknown_reasons(&analysis, part.unknowns),
+            ));
+        },
+    );
+
+    result
+}
+
+#[test]
+fn decorated_construction_surfaces_keep_their_unsupported_syntax() {
+    let decorator =
+        "function decorate(value: unknown, context: unknown): undefined { return undefined; }";
+
+    let mut partials = Vec::new();
+
+    for (source, name, unsupported) in [
+        (
+            format!("{decorator} export class Decorated {{ @decorate value = 1; }}"),
+            "new Decorated()",
+            true,
+        ),
+        (
+            format!("{decorator} @decorate export class Decorated {{ value = 1; }}"),
+            "new Decorated()",
+            true,
+        ),
+        (
+            format!("{decorator} class Base {{ @decorate value = 1; }} export class Derived extends Base {{}}"),
+            "new Derived()",
+            true,
+        ),
+        (
+            format!("{decorator} export class Plain {{ value = 1; }}"),
+            "new Plain()",
+            false,
+        ),
+    ] {
+        let Some((cost, reasons)) = reported_result(&source, name) else {
+            panic!("{source}: the construction surface is reported");
+        };
+
+        assert_eq!(cost, Cost::parse("O(1)").unwrap(), "{source}");
+
+        if !unsupported {
+            assert!(reasons.is_empty(), "{source}: {reasons:?}");
+        }
+
+        partials.push(reasons.contains(&olint::unknowns::UnknownReason::UnsupportedSyntax));
+    }
+
+    assert_eq!(partials, vec![true, true, true, false]);
 }
 
 fn selected_result(

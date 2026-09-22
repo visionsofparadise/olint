@@ -1340,6 +1340,113 @@ fn parameter_decorators_are_unsupported_class_definition_syntax() {
     }
 }
 
+#[test]
+fn decorated_classes_keep_unsupported_syntax_at_every_construction() {
+    let decorator =
+        "function decorate(value: unknown, context: unknown): undefined { return undefined; }";
+    let construct = "export function selected() { return new Decorated(); }";
+    let cases = [
+        (
+            index_of(format!(
+                "{decorator}\nclass Decorated {{ @decorate value = 1; }}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            vec![
+                (
+                    "index.ts",
+                    format!("import {{ Decorated }} from './other';\n{construct}"),
+                ),
+                (
+                    "other.ts",
+                    format!("{decorator}\nexport class Decorated {{ @decorate value = 1; }}"),
+                ),
+            ],
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Base {{ @decorate value = 1; }}\nclass Decorated extends Base {{}}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Base {{ @decorate value = 1; }}\nclass Decorated extends Base {{ constructor() {{ super(); }} }}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\n@decorate\nclass Decorated {{ value = 1; }}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Decorated {{ value = 1;\n@decorate\nmethod(): void {{}} }}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Decorated {{ value = 1;\nmethod(@decorate v: number): void {{ void v; }} }}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Decorated {{ @decorate accessor value = 1; }}\n{construct}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nexport function selected() {{ class Decorated {{ @decorate value = 1; }} return new Decorated(); }}"
+            )),
+            true,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Decorated {{ value = 1; }}\n{construct}"
+            )),
+            false,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Base {{ value = 1; }}\nclass Decorated extends Base {{ other = 2; }}\n{construct}"
+            )),
+            false,
+        ),
+        (
+            index_of(format!(
+                "{decorator}\nclass Base {{ constructor() {{ void 0; }} }}\nclass Decorated extends Base {{ other = 2; }}\n{construct}"
+            )),
+            false,
+        ),
+    ];
+
+    let mut found = Vec::new();
+
+    for (sources, unsupported) in &cases {
+        let (cost, reasons) =
+            support::selected_case_of(sources, olint::analysis::TypeMode::Syntactic);
+
+        assert_eq!(cost, Cost::parse("O(1)").unwrap(), "{sources:?}");
+
+        if !unsupported {
+            assert!(reasons.is_empty(), "{sources:?}: {reasons:?}");
+        }
+
+        found.push(reasons.contains(&olint::unknowns::UnknownReason::UnsupportedSyntax));
+    }
+
+    let expected: Vec<bool> = cases.iter().map(|(_, unsupported)| *unsupported).collect();
+
+    assert_eq!(found, expected);
+}
+
 const LOOP_QUADRATIC: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\treturn total;\n}\n";
 const LOOP_SCAN: &str = "function scan(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) total += x;\n\treturn total;\n}\n";
 const LOOP_TAPPED_VALUES: &str = "function tappedValues(xs: number[]) {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\tvoid total;\n\treturn xs;\n}\n";

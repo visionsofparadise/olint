@@ -343,17 +343,25 @@ pub fn selected_result_in(
 
 pub type SelectedCase<'s> = (Vec<(&'s str, String)>, &'s str, bool);
 
+pub fn selected_case_of(
+    sources: &[(&str, String)],
+    types: olint::analysis::TypeMode,
+) -> SelectedResult {
+    let sources: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(name, source)| (*name, source.as_str()))
+        .collect();
+
+    selected_result_in(&sources, types)
+}
+
 pub fn assert_selected(cases: &[SelectedCase<'_>]) {
     for types in [
         olint::analysis::TypeMode::Syntactic,
         olint::analysis::TypeMode::Tsc,
     ] {
         for (sources, expected, partial) in cases {
-            let sources: Vec<(&str, &str)> = sources
-                .iter()
-                .map(|(name, source)| (*name, source.as_str()))
-                .collect();
-            let (cost, reasons) = selected_result_in(&sources, types);
+            let (cost, reasons) = selected_case_of(sources, types);
 
             assert_eq!(
                 cost,

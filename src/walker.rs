@@ -1723,17 +1723,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    fn decorated_part_of(&mut self, file: FileId, decorated: Option<NodeId>) -> Option<Part> {
+        let node = decorated?;
+        let span = self.kind_of_node(file, node).span();
+
+        Some(self.unknown_part(file, span, UnknownReason::UnsupportedSyntax))
+    }
+
     fn cost_of_class_definition(&mut self, file: FileId, class: &'a Class<'a>) -> Reading {
         if class.declare {
             return Reading::empty();
         }
 
         let phases = class_phases_of(class);
-        let reading = match phases.decorated {
-            Some(node) => {
-                let span = self.kind_of_node(file, node).span();
+        let reading = match self.decorated_part_of(file, phases.decorated) {
+            Some(part) => {
+                self.current_effects.unknown_global = true;
 
-                self.unknown_reading(file, span, UnknownReason::UnsupportedSyntax)
+                Reading::of_part(part)
             }
             None => Reading::empty(),
         };
@@ -1788,12 +1795,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Reading::empty();
         }
 
-        let elements = class_phases_of(class)
-            .instances
-            .into_iter()
-            .map(|(element, _)| element);
+        let phases = class_phases_of(class);
+        let decorated = self.decorated_part_of(file, phases.decorated);
+        let reading = decorated.map_or_else(Reading::empty, Reading::of_part);
+        let elements = phases.instances.into_iter().map(|(element, _)| element);
 
-        self.merged_costs_of(file, Reading::empty(), elements, true)
+        self.merged_costs_of(file, reading, elements, true)
     }
 
     pub(crate) fn constructed_class_of(
