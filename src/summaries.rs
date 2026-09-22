@@ -20,7 +20,7 @@ use crate::effects::Effects;
 use crate::flow::Completion;
 use crate::project::{FileId, Site};
 use crate::recurrences::{
-    solution_of, weaker_relation_of, ArgumentRelation, CallStep, RecurrenceEdge,
+    solution_of, weaker_relation_of, ArgumentBounds, ArgumentRelation, CallStep, RecurrenceEdge,
     RecurrenceEquation, RecurrenceSolution, MAXIMUM_RECURRENCE_MEMBERS,
 };
 use crate::syntax::unwrap;
@@ -110,6 +110,7 @@ struct RecurrenceMarkers {
     solved: Option<Vec<Cost>>,
     unresolved: bool,
     steps: HashMap<(TaskId, TaskId, crate::unknowns::SourceSpan), Vec<CallStep>>,
+    bounds: HashMap<(TaskId, TaskId, crate::unknowns::SourceSpan), ArgumentBounds>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1605,9 +1606,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             (caller_function.file, caller_node),
             (call_file, arguments),
         );
+        let bounds = self.argument_bounds_of(
+            function,
+            (caller_function.file, caller_node),
+            (call_file, arguments),
+            &steps,
+        );
 
         if let Some(markers) = self.scheduler.recurrence_markers.as_mut() {
             markers.steps.insert((caller, callee, site), steps);
+            markers.bounds.insert((caller, callee, site), bounds);
         }
     }
 
@@ -1666,6 +1674,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 solved: None,
                 unresolved: false,
                 steps: HashMap::new(),
+                bounds: HashMap::new(),
             });
 
             let Some(round) = self.evaluate_marked_members(members) else {
@@ -1728,6 +1737,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             solved: Some(totals),
             unresolved: false,
             steps: HashMap::new(),
+            bounds: HashMap::new(),
         });
 
         let explained = self.evaluate_marked_members(members);
@@ -1802,7 +1812,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     continue;
                 };
 
-                if sites == 0 {
+                if sites == 0
+                    || !arguments_bounded_of(
+                        (members[index], members[callee]),
+                        slots[callee],
+                        markers,
+                    )
+                {
                     return None;
                 }
 
@@ -3862,6 +3878,20 @@ fn site_count_of((caller, callee): (TaskId, TaskId), markers: &RecurrenceMarkers
         .keys()
         .filter(|(site_caller, site_callee, _)| *site_caller == caller && *site_callee == callee)
         .count() as u64
+}
+
+fn arguments_bounded_of(
+    (caller, callee): (TaskId, TaskId),
+    measure: usize,
+    markers: &RecurrenceMarkers,
+) -> bool {
+    markers
+        .bounds
+        .iter()
+        .filter(|((site_caller, site_callee, _), _)| {
+            *site_caller == caller && *site_callee == callee
+        })
+        .all(|(_, bounds)| bounds.admits(measure))
 }
 
 fn recurrence_relation_of(

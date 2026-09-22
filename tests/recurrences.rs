@@ -263,3 +263,198 @@ fn a_directive_cost_still_overrides_a_solvable_recurrence() {
 
     assert_class(source, "f", "O(1)", true);
 }
+
+type RecurrenceRow<'r> = (&'r str, &'r str, &'r str);
+
+fn recurrence_results_of(rows: &[RecurrenceRow<'_>]) -> Vec<(String, String, bool, bool)> {
+    rows.iter()
+        .map(|(label, name, source)| {
+            let mut found = None;
+
+            run_with_source(source, |analysis, file| {
+                let part = summary_of(analysis, file, name);
+                let reasons = unknown_reasons(analysis, part.unknowns);
+
+                found = Some((
+                    label.to_string(),
+                    text_of(analysis, &part.cost),
+                    part.is_complete(),
+                    reasons.contains(&UnknownReason::Recurrence),
+                ));
+            });
+
+            found.expect("the source declares the named function")
+        })
+        .collect()
+}
+
+#[test]
+fn an_argument_that_can_grow_across_depth_keeps_its_recursion_unresolved() {
+    let rows = [
+        (
+            "an array doubled by spread",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; const doubled = [...xs, ...xs]; let t = 0; for (const x of doubled) t += x; return t + f(n - 1, doubled); }",
+        ),
+        (
+            "an array doubled by concat",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; const doubled = xs.concat(xs); let t = 0; for (const x of doubled) t += x; return t + f(n - 1, doubled); }",
+        ),
+        (
+            "a string doubled by concatenation",
+            "f",
+            "export function f(n: number, s: string): number { if (n <= 0) return 0; const bigger = s + s; let t = 0; for (const c of bigger) t += c.length; return t + f(n - 1, bigger); }",
+        ),
+        (
+            "a record rebuilt around a doubled field",
+            "f",
+            "export function f(n: number, box: { items: number[] }): number { if (n <= 0) return 0; let t = 0; for (const x of box.items) t += x; return t + f(n - 1, { items: box.items.concat(box.items) }); }",
+        ),
+        (
+            "a second array doubled beside an unchanged one",
+            "f",
+            "export function f(n: number, xs: number[], ys: number[]): number { if (n <= 0) return 0; let t = 0; for (const y of ys) t += y; return t + f(n - 1, xs, ys.concat(ys)); }",
+        ),
+        (
+            "an array of rows doubled by concat",
+            "f",
+            "export function f(n: number, rows: number[][]): number { if (n <= 0) return 0; let t = 0; for (const r of rows) t += r.length; return t + f(n - 1, rows.concat(rows)); }",
+        ),
+        (
+            "a second number doubled",
+            "f",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m * 2); }",
+        ),
+        (
+            "a second number incremented",
+            "f",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m + 1); }",
+        ),
+        (
+            "a second number decremented below every bound",
+            "f",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m - 1); }",
+        ),
+        (
+            "an accumulator extended by one element",
+            "f",
+            "export function f(n: number, acc: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of acc) t += x; return t + f(n - 1, [...acc, n]); }",
+        ),
+        (
+            "a doubled array under a halving measure",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 1) return 0; let t = 0; for (const x of xs) t += x; return t + f(n >> 1, xs.concat(xs)); }",
+        ),
+        (
+            "a doubled array under two recursive calls",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs.concat(xs)) + f(n - 1, xs.concat(xs)); }",
+        ),
+        (
+            "a doubled array under measure-many calls",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 1; let total = 0; for (let i = 0; i < n; i++) total += f(n - 1, xs.concat(xs)); for (const x of xs) total += x; return total; }",
+        ),
+        (
+            "a doubled array through a mutual cycle",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + g(n - 1, xs.concat(xs)); }\nexport function g(n: number, xs: number[]): number { return f(n, xs); }",
+        ),
+        (
+            "a rest parameter spread twice",
+            "f",
+            "export function f(n: number, ...xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ...xs, ...xs); }",
+        ),
+    ];
+    let expected: Vec<(String, bool, bool)> = rows
+        .iter()
+        .map(|(label, _, _)| (label.to_string(), false, true))
+        .collect();
+    let found: Vec<(String, bool, bool)> = recurrence_results_of(&rows)
+        .into_iter()
+        .map(|(label, _, complete, recurrence)| (label, complete, recurrence))
+        .collect();
+
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
+    let rows = [
+        (
+            "an array passed through",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
+            "O(max(n, xs, (n * max(1, n, xs))))",
+        ),
+        (
+            "two arrays swapped between parameters",
+            "f",
+            "export function f(n: number, xs: number[], ys: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ys, xs); }",
+            "O(max(n, xs, ys, (n * max(1, n, xs, ys))))",
+        ),
+        (
+            "a constant number",
+            "f",
+            "export function f(n: number, xs: number[], k: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; for (let i = 0; i < k; i++) t += i; return t + f(n - 1, xs, 3); }",
+            "O(max(n, xs, k, (n * max(1, n, xs, k))))",
+        ),
+        (
+            "a constant string",
+            "f",
+            "export function f(n: number, s: string): number { if (n <= 0) return 0; let t = 0; for (const c of s) t += c.length; return t + f(n - 1, \"ab\"); }",
+            "O(max(n, s, (n * max(1, n, s))))",
+        ),
+        (
+            "an omitted optional argument",
+            "f",
+            "export function f(n: number, xs: number[], k?: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
+            "O(max(n, xs, k, (n * max(1, n, xs, k))))",
+        ),
+        (
+            "a constant alias of a parameter",
+            "f",
+            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; const same = xs; let t = 0; for (const x of same) t += x; return t + f(n - 1, same); }",
+            "O(max(n, xs, (n * max(1, n, xs))))",
+        ),
+        (
+            "a rest parameter spread through",
+            "f",
+            "export function f(n: number, ...xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ...xs); }",
+            "O(max(n, (n * max(1, n))))",
+        ),
+        (
+            "a module function passed as its callback",
+            "run",
+            "function inc(x: number): number { return x + 1; }\nfunction f(n: number, xs: number[], g: (x: number) => number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += g(x); return t + f(n - 1, xs, inc); }\nexport function run(n: number, xs: number[]): number { return f(n, xs, inc); }",
+            "O(max(n, xs, (n * max(1, n, xs))))",
+        ),
+        (
+            "a second number decremented under its guard",
+            "f",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; if (m <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m - 1); }",
+            "O(max(n, m, (n * max(1, n, m))))",
+        ),
+        (
+            "a second number halved",
+            "f",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m >> 1); }",
+            "O(max(n, m, (n * max(1, n, m))))",
+        ),
+    ];
+    let sources: Vec<RecurrenceRow<'_>> = rows
+        .iter()
+        .map(|(label, name, source, _)| (*label, *name, *source))
+        .collect();
+    let expected: Vec<(String, String, bool)> = rows
+        .iter()
+        .map(|(label, _, _, cost)| (label.to_string(), cost.to_string(), true))
+        .collect();
+    let found: Vec<(String, String, bool)> = recurrence_results_of(&sources)
+        .into_iter()
+        .map(|(label, cost, complete, _)| (label, cost, complete))
+        .collect();
+
+    assert_eq!(found, expected);
+}

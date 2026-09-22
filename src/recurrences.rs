@@ -2,12 +2,12 @@ use oxc_ast::ast::{Argument, BindingPattern, Expression, Statement, TSType};
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::operator::{BinaryOperator, LogicalOperator};
+use oxc_syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
 
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::cost::Cost;
-use crate::declarations::{parameters_of, Binding, FunctionNode};
+use crate::declarations::{parameters_of, Binding, Declaration, FunctionNode};
 use crate::project::FileId;
 use crate::summaries::Substitutions;
 use crate::syntax::unwrap;
@@ -28,6 +28,23 @@ pub struct CallStep {
     pub caller_position: usize,
     pub relation: ArgumentRelation,
     pub lower_bound: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArgumentBounds {
+    pub positions: Vec<bool>,
+    pub rest: bool,
+}
+
+impl ArgumentBounds {
+    pub fn admits(&self, measure: usize) -> bool {
+        self.rest
+            && self
+                .positions
+                .iter()
+                .enumerate()
+                .all(|(position, bounded)| *bounded || position == measure)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,20 +103,25 @@ pub fn weaker_relation_of(left: ArgumentRelation, right: ArgumentRelation) -> Ar
 }
 
 fn guard_admits(relation: ArgumentRelation, lower_bound: Option<f64>) -> bool {
+    let floor = match relation {
+        ArgumentRelation::Division {
+            truncating: true, ..
+        } => Some(0.0),
+        ArgumentRelation::Division {
+            truncating: false, ..
+        } => Some(1.0),
+        _ => None,
+    };
+
+    shrinks(relation, lower_bound)
+        && floor.is_none_or(|floor| lower_bound.is_some_and(|bound| bound >= floor))
+}
+
+fn shrinks(relation: ArgumentRelation, lower_bound: Option<f64>) -> bool {
     match relation {
         ArgumentRelation::Unchanged => true,
         ArgumentRelation::Decrement { amount } => amount >= 1 && lower_bound.is_some(),
-        ArgumentRelation::Division {
-            divisor,
-            truncating,
-        } => {
-            let floor = match truncating {
-                true => 0.0,
-                false => 1.0,
-            };
-
-            divisor >= 2 && lower_bound.is_some_and(|bound| bound >= floor)
-        }
+        ArgumentRelation::Division { divisor, .. } => divisor >= 2,
     }
 }
 
@@ -456,6 +478,120 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         steps
+    }
+
+    pub(crate) fn argument_bounds_of(
+        &mut self,
+        callee: FunctionNode<'a>,
+        (caller_file, caller): (FileId, FunctionNode<'a>),
+        (call_file, arguments): (FileId, &'a [Argument<'a>]),
+        steps: &[CallStep],
+    ) -> ArgumentBounds {
+        let count = parameters_of(callee).map_or(0, |parameters| parameters.items.len());
+        let spread_at = arguments
+            .iter()
+            .position(|argument| matches!(argument, Argument::SpreadElement(_)));
+        let mut positions = Vec::with_capacity(count);
+
+        for position in 0..count {
+            if spread_at.is_some_and(|spread| position >= spread) {
+                positions.push(false);
+
+                continue;
+            }
+
+            let Some(argument) = arguments.get(position).and_then(Argument::as_expression) else {
+                positions.push(true);
+
+                continue;
+            };
+            let preserved = self.is_preserved_argument(call_file, argument, 0);
+            let shrunk = steps
+                .iter()
+                .filter(|step| {
+                    step.callee_position == position && shrinks(step.relation, step.lower_bound)
+                })
+                .map(|step| step.caller_position)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .any(|source| {
+                    self.numeric_parameter_binding_of(caller_file, caller, source)
+                        .is_some_and(|binding| self.is_parameter_unwritten(binding))
+                });
+
+            positions.push(preserved || shrunk);
+        }
+
+        let rest = match arguments.get(count..).unwrap_or_default() {
+            [Argument::SpreadElement(spread)] => {
+                self.is_preserved_argument(call_file, &spread.argument, 0)
+            }
+            surplus => surplus.iter().all(|argument| {
+                argument
+                    .as_expression()
+                    .is_some_and(|argument| self.is_preserved_argument(call_file, argument, 0))
+            }),
+        };
+
+        ArgumentBounds { positions, rest }
+    }
+
+    fn is_preserved_argument(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAXIMUM_RECURRENCE_DEPTH {
+            return false;
+        }
+
+        match unwrap(value) {
+            Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::BigIntLiteral(_) => true,
+            Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+            Expression::UnaryExpression(unary) => match unary.operator {
+                UnaryOperator::Void => true,
+                UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus => {
+                    matches!(unwrap(&unary.argument), Expression::NumericLiteral(_))
+                }
+                _ => false,
+            },
+            Expression::Identifier(reference) => {
+                let Some(binding) = self.binding_of_identifier(file, reference) else {
+                    return reference.name == "undefined";
+                };
+
+                match self.declarations.of_binding(self.project, binding) {
+                    Some(Declaration::Parameter { .. }) => self.is_parameter_unwritten(binding),
+                    Some(Declaration::Variable {
+                        file,
+                        declarator,
+                        constant,
+                    }) => {
+                        let (BindingPattern::BindingIdentifier(_), Some(initializer)) =
+                            (&declarator.id, &declarator.init)
+                        else {
+                            return false;
+                        };
+
+                        (constant || self.declarations.is_write_free(self.project, binding))
+                            && self.is_preserved_argument(file, initializer, depth + 1)
+                    }
+                    Some(Declaration::Function { file, function }) => {
+                        self.declarations.is_write_free(self.project, binding)
+                            && self
+                                .enclosing_function_of(file, function.node_id())
+                                .is_none()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn caller_position_of(
