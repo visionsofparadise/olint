@@ -2,7 +2,7 @@ public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
 O(1)               34
-O(1) [partial]     16
+O(1) [partial]     17
 O(xs)              13
 O(rows^2)           9
 O(xs) [partial]     7
@@ -31,7 +31,6 @@ O(max(xs, mode))    1
 O(max(xs, channels))    1
 O(max(xs, target))    1
 O((max(rows, width))^(2))    1
-O(max(n, g, xs)) [partial]    1
 O((max(xs, n, next))^(2)) [partial]    1
 O((max(xs, n))^(2))    1
 O(max(xs, n)) [partial]    1

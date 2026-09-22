@@ -771,6 +771,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if advances.iter().any(Option::is_none) {
+            return Some(unresolved_bound_of());
+        }
+
         let guaranteed: Option<f64> = progression
             .unconditional
             .iter()

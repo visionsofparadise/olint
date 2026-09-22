@@ -170,7 +170,7 @@ fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
         ("let sum = 0; for (let i = n; i > 0; i--) sum++;", "N"),
         (
             "let sum = 0; for (let i = 0; i < 1; i += 1 / n) sum++;",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; for (let i = 0; i < 1; i += 0.25) sum++;",
@@ -352,7 +352,7 @@ fn contraction_must_hold_on_every_repeating_path() {
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (hi - hi) / 2 + lo + 1; lo = mid; sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; sum++; }",
@@ -360,7 +360,7 @@ fn contraction_must_hold_on_every_repeating_path() {
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; lo = mid; sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let i = xs.length; while (i > 1) { step: { if (sum > 2) break step; i /= 2; } sum++; }",
@@ -372,7 +372,7 @@ fn contraction_must_hold_on_every_repeating_path() {
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { step: { if (sum > 2) break step; const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; } sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { step: { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; if (sum > 2) break step; } sum++; }",
@@ -399,6 +399,41 @@ fn a_counter_reset_to_an_unbounded_value_leaves_the_bound_unresolved() {
         let source = format!("export function f(n: number, xs: number[]) {{ {body} return n; }}");
 
         assert_eq!(first_reason_of(&source), "iteration bound", "{body}");
+    }
+}
+
+#[test]
+fn an_additive_step_of_unknown_magnitude_leaves_the_bound_unresolved() {
+    for (body, expected) in [
+        (
+            "const gap = 1 / (n * n); for (let i = 0; i < n; i += gap) sum++;",
+            "iteration bound",
+        ),
+        (
+            "for (let i = 0; i < n; i += step) sum++;",
+            "iteration bound",
+        ),
+        (
+            "const gap = 1 / n; for (let i = 0; i < 10; i += gap) sum++;",
+            "iteration bound",
+        ),
+        (
+            "for (let i = 0; i < 10; i++) { if (n > 0) i += step; sum++; }",
+            "iteration bound",
+        ),
+        ("for (let i = 0; i < 10; i++) sum++;", "constant bound"),
+        ("for (let i = 0; i < 10; i += 3) sum++;", "constant bound"),
+        (
+            "const gap = 1 / 4; for (let i = 0; i < 10; i += gap) sum++;",
+            "constant bound",
+        ),
+        ("for (let i = 0; i < n; i++) sum++;", "N"),
+    ] {
+        let source = format!(
+            "export function f(n: number, step: number) {{ let sum = 0; {body} return sum; }}"
+        );
+
+        assert_eq!(first_reason_of(&source), expected, "{body}");
     }
 }
 
@@ -478,7 +513,7 @@ fn nested_budget_source(step: &str) -> String {
 fn a_budget_spent_in_steps_of_unproven_magnitude_keeps_its_nested_work() {
     assert_eq!(
         legacy_cost_of(&nested_budget_source("1 / n"), "f"),
-        (cost("O(N^2)"), true)
+        (cost("O(N)"), false)
     );
     assert_eq!(
         legacy_cost_of(&nested_budget_source("1"), "f"),

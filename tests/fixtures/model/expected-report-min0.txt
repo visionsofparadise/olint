@@ -2,7 +2,7 @@ public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
 O(1)               34
-O(1) [partial]     16
+O(1) [partial]     17
 O(xs)              13
 O(rows^2)           9
 O(xs) [partial]     7
@@ -31,7 +31,6 @@ O(max(xs, mode))    1
 O(max(xs, channels))    1
 O(max(xs, target))    1
 O((max(rows, width))^(2))    1
-O(max(n, g, xs)) [partial]    1
 O((max(xs, n, next))^(2)) [partial]    1
 O((max(xs, n))^(2))    1
 O(max(xs, n)) [partial]    1
@@ -239,9 +238,6 @@ O(max(xs, n))  swapPattern  src/budgets.ts:97 [partial]
 
 O(max(n, xs))  ordinaryForLoopCounterExcluded  src/budgets.ts:41
     in loop for                                              src/budgets.ts:43  x N
-
-O(max(n, g, xs)) shareOfBudget  src/budgets.ts:26 [partial]
-    in loop while [budget: i < n, by g]                      src/budgets.ts:29  x N
 
 O(max(n, xs))  drainedBudget  src/budgets.ts:1
     in loop while [budget: i < n]                            src/budgets.ts:5  x N
@@ -497,6 +493,8 @@ O(1)           hotHelper  src/branches.ts:197
 O(1)           callsHotFunctionBesideQuadratic  src/branches.ts:201
 
 O(1)           count  src/branches.ts:209
+
+O(1)           shareOfBudget  src/budgets.ts:26 [partial]
 
 O(1)           callBound  src/budgets.ts:86 [partial]
 
