@@ -808,6 +808,44 @@ fn retained_provenance_survives_rank_selection_and_wraps_with_its_part() {
     }
 }
 
+#[test]
+fn a_provenance_only_main_channel_never_becomes_a_constant_sibling() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let origin = SourceSpan {
+        file: FileId(0),
+        start: 4,
+        end: 9,
+    };
+    let quadratic = Cost::parse("O(N^2)").unwrap();
+    let target = unknowns.origin(origin, UnknownReason::Target);
+    let cold = part_of(&mut traces, quadratic.clone(), "cold").preferred(Preference::Cold);
+    let provenance = Part::none().retaining(Some(target), &mut unknowns);
+    let held = Reading::of_part(provenance.clone()).sibling();
+
+    assert!(held.main().is_absent());
+    assert!(held.main().holds_only_provenance());
+    assert_eq!(
+        held.main()
+            .max(cold.clone(), &mut unknowns, &mut traces)
+            .cost,
+        quadratic
+    );
+
+    let exhaustion = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
+    let mut owned = provenance;
+    owned.unknowns = unknowns.join(owned.unknowns, Some(exhaustion));
+
+    let promoted = Reading::of_part(owned).sibling();
+
+    assert!(!promoted.main().holds_only_provenance());
+    assert_eq!(promoted.main().preference, Preference::Unmarked);
+    assert_eq!(
+        promoted.main().max(cold, &mut unknowns, &mut traces).cost,
+        Cost::ONE
+    );
+}
+
 fn escape_channel_of(target: u32) -> Completion {
     Completion::Break(oxc_semantic::NodeId::from_usize(target as usize))
 }

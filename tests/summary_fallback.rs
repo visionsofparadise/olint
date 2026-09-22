@@ -435,7 +435,7 @@ deferred();
 
 #[test]
 fn cold_rejected_site() {
-    fallback_case(COLD_REJECTED_SITE, "O(N^3)", false, false, false, false);
+    fallback_case(COLD_REJECTED_SITE, "O(N^3)", true, false, false, false);
 }
 
 const HOT_REJECTED_SITE: &str = r#"function deferred() {}
@@ -463,14 +463,7 @@ deferred();
 
 #[test]
 fn cold_rejected_hot_known() {
-    fallback_case(
-        COLD_REJECTED_HOT_KNOWN,
-        "O(N^3)",
-        false,
-        false,
-        false,
-        false,
-    );
+    fallback_case(COLD_REJECTED_HOT_KNOWN, "O(N^3)", true, false, false, false);
 }
 
 fn ordinary_wide_source(statements: usize) -> String {

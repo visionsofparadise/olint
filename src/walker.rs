@@ -111,10 +111,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let origin = self.source_span(file, span);
         let unknown = self.unknowns.origin(origin, reason);
 
-        Part {
-            unknowns: Some(unknown),
-            ..Part::unmarked(Cost::ONE, None)
-        }
+        Part::none().retaining(Some(unknown), &mut self.unknowns)
     }
 
     pub(crate) fn unknown_reading(

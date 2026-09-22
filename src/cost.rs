@@ -1567,6 +1567,10 @@ impl Part {
         self.cost.is_one() && self.unknowns == self.retained
     }
 
+    pub fn holds_only_provenance(&self) -> bool {
+        self.retained.is_some() && self.holds_no_work()
+    }
+
     fn rank(&self) -> u8 {
         if self.is_absent() {
             return 0;
@@ -1810,7 +1814,10 @@ impl Reading {
     }
 
     pub fn sibling(self) -> Reading {
-        if !self.main().is_absent() || self.retains_exit_work() {
+        if !self.main().is_absent()
+            || self.main().holds_only_provenance()
+            || self.retains_exit_work()
+        {
             return self;
         }
 

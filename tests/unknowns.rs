@@ -218,18 +218,22 @@ fn unknown_effects_remove_dependent_iteration_proofs() {
 
 #[test]
 fn selected_cost_preferences_control_unknown_diagnostics() {
-    for annotation in ["ignore", "cold"] {
+    for (annotation, code) in [("ignore", 0), ("cold", 1)] {
         let source = format!("/** @perf O(N) */ function known() {{}}\nexport function f(callback: () => void) {{\n/** @perf {annotation} */\ncallback();\nknown();\n}}");
         let output = cli(&source, Some("error"), false);
 
         assert_eq!(
             output.status.code(),
-            Some(0),
+            Some(code),
             "{annotation}: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("unknown call target"));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown call target"),
+            code == 1,
+            "{annotation}"
+        );
     }
 
     let hot = cli(

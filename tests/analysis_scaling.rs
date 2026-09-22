@@ -558,7 +558,7 @@ fn visit_and_prepass_limits_include_reserved_fallback_work() {
 fn fallback_preserves_completed_loops_and_source_selection() {
     for (mark, expected, partial) in [
         ("", "O(N^3)", true),
-        ("/** @perf cold */", "O(N^3)", false),
+        ("/** @perf cold */", "O(N^3)", true),
         ("/** @perf hot */", "O(1)", true),
     ] {
         let source=format!("function deferred(){{}} export function root(xs:number[]){{\nfor(const a of xs)for(const b of xs)for(const c of xs)void c;\n{mark}\ndeferred();\n}}");
@@ -636,7 +636,7 @@ fn recurrence_contexts_preserve_selection_and_independent_loop_assumptions() {
         (
             "/** @perf hot @perf O(1) */\nvoid 0; b();",
             "O(1)",
-            false,
+            true,
             false,
         ),
         ("for(const item of xs)b();", "O(N^3)", true, true),
@@ -814,19 +814,22 @@ fn failed_discovery_wave_reuses_source_invocations_without_capture_rescans() {
 
 #[test]
 fn context_exhaustion_keeps_resource_at_the_selected_invocation() {
-    for limit in [0, 1, 64] {
+    for (limit, reason) in [
+        (0, UnknownReason::ResourceExhaustion),
+        (1, UnknownReason::Recurrence),
+        (64, UnknownReason::Recurrence),
+    ] {
         run_with_source(
             "export function root(){\n/** @perf hot */\nvoid 0;\nroot();\n}",
             |analysis, file| {
                 limit_work(analysis, Event::RecurrenceContext, limit);
 
                 let part = summary_of(analysis, file, "root");
+                let found = reasons(analysis, part.unknowns);
 
                 assert_eq!(part.cost, Cost::ONE);
                 assert_eq!(part.preference, olint::cost::Preference::Hot);
-                assert!(reasons(analysis, part.unknowns)
-                    .iter()
-                    .all(|reason| *reason == UnknownReason::ResourceExhaustion));
+                assert_eq!(found, BTreeSet::from([reason]), "{limit}");
                 assert_terminal(analysis.scheduler_stats());
             },
         );

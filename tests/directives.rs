@@ -260,7 +260,7 @@ fn an_open_target_marks_a_known_cold_contribution_without_cancelling_it() {
     }
 }
 
-const OPEN_BASE: &str = "declare const OpenBase: new () => object;\ndeclare function opaque(): number;\nfunction quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nfunction coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nclass Empty {}\nclass ClosedChild extends Empty {}\nclass OpenChild extends OpenBase {}\nclass ExplicitChild extends OpenBase {\n\tconstructor() {\n\t\tsuper();\n\t}\n}\nclass MixedOpenChild extends OpenBase {\n\tv = opaque();\n}\nclass MixedClosedChild extends Empty {\n\tv = opaque();\n}\n";
+const OPEN_BASE: &str = "declare const OpenBase: new () => object;\ndeclare function opaque(): number;\nfunction quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nfunction coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nclass Empty {}\nclass ClosedChild extends Empty {}\nclass OpenChild extends OpenBase {}\nclass ExplicitChild extends OpenBase {\n\tconstructor() {\n\t\tsuper();\n\t}\n}\nclass MixedOpenChild extends OpenBase {\n\tv = opaque();\n}\nclass MixedClosedChild extends Empty {\n\tv = opaque();\n}\ndeclare const data: number[];\nfunction knownLinear() {\n\tlet total = 0;\n\tfor (const item of data) total += item;\n\treturn total;\n}\nclass KnownClosedChild extends Empty {\n\tv = knownLinear();\n}\n";
 
 #[test]
 fn an_unresolved_construction_never_manufactures_a_competing_statement() {
@@ -284,13 +284,18 @@ fn an_unresolved_construction_never_manufactures_a_competing_statement() {
         ),
         (
             "(xs: number[]) {\n\treturn [coldQuadratic(xs), new MixedOpenChild()];\n}",
-            "O(1)",
+            "O(N^2)",
             true,
         ),
         (
             "(xs: number[]) {\n\treturn [coldQuadratic(xs), new MixedClosedChild()];\n}",
-            "O(1)",
+            "O(N^2)",
             true,
+        ),
+        (
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new KnownClosedChild()];\n}",
+            "O(N)",
+            false,
         ),
     ] {
         let (cost, reasons) = selected_result_with(OPEN_BASE, body);
@@ -342,5 +347,40 @@ fn nested_loops_around_an_executed_body_still_charge_their_iterations() {
             olint::cost::Cost::parse(expected).unwrap(),
             "{body}"
         );
+    }
+}
+
+const COLD_CUBE: &str = "/** @perf cold */\nfunction coldCube(xs: number[]) {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) for (const c of xs) total += a + b + c;\n\treturn total;\n}\nfunction knownConstant(xs: number[]) {\n\treturn xs.length > 0 ? 1 : 0;\n}\n";
+
+#[test]
+fn an_unresolved_target_retains_a_proved_cold_cost_as_a_partial_result() {
+    use olint::unknowns::UnknownReason;
+
+    for (body, expected, unknown) in [
+        ("(xs: number[]) {\n\treturn coldCube(xs);\n}", "O(N^3)", None),
+        (
+            "(xs: number[]) {\n\treturn coldCube(xs) + knownConstant(xs);\n}",
+            "O(N^3)",
+            None,
+        ),
+        (
+            "(xs: number[], cb: (v: number[]) => number) {\n\treturn coldCube(xs) + cb(xs);\n}",
+            "O(N^3)",
+            Some(UnknownReason::Target),
+        ),
+        (
+            "(xs: number[], o: unknown) {\n\treturn coldCube(xs) + (o as { f(v: number[]): number }).f(xs);\n}",
+            "O(N^3)",
+            Some(UnknownReason::UnsupportedModel),
+        ),
+    ] {
+        let (cost, reasons) = selected_result_with(COLD_CUBE, body);
+
+        assert_eq!(
+            cost,
+            olint::cost::Cost::parse(expected).unwrap(),
+            "{body} {reasons:?}"
+        );
+        assert_eq!(reasons, unknown.into_iter().collect(), "{body}");
     }
 }
