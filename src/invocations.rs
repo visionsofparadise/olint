@@ -465,6 +465,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if unresolved {
             let bound = self.unknowns.origin(origin, UnknownReason::Bound);
 
+            self.note_unresolved_multiplicity(&next);
+
             return next
                 .scaled(None, &mut self.unknowns)
                 .retaining(Some(bound), &mut self.unknowns);

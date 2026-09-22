@@ -1555,10 +1555,7 @@ fn break_targets_decide_whether_a_branch_leaves_its_loop() {
     assert_eq!(switched_labels, vec!["for-of", "call scan()"]);
     assert_eq!(blocked, quadratic);
     assert_eq!(blocked_labels, vec!["for-of", "call scan()"]);
-    assert_eq!(
-        labelled_break.text(),
-        "O(max(1, size_0, size_1, (max(size_0, size_1))^(2)))"
-    );
+    assert_eq!(labelled_break, quadratic);
     assert_eq!(
         labelled_break_labels,
         vec![

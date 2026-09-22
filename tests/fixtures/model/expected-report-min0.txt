@@ -2,7 +2,7 @@ public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
 O(1)               34
-O(1) [partial]     23
+O(1) [partial]     16
 O(xs)              13
 O(rows^2)           9
 O(xs) [partial]     7
@@ -11,6 +11,8 @@ O((xs * log(xs)))    5
 O(N)                5
 O(o)                4
 O(N) [partial]      4
+O(n)                4
+O(n) [partial]      4
 O((xs * xs^2))      3
 O(xs^2)             3
 O(x)                3
@@ -44,7 +46,6 @@ O(max(s, cb)) [partial]    1
 O(max(m, cb)) [partial]    1
 O(max(strings, needle)) [partial]    1
 O(max(re, needles)) [partial]    1
-O(n)                1
 O(text)             1
 O(parts)            1
 O(items^2)          1
@@ -396,6 +397,37 @@ O(N)           spreadRestKeys  src/methods.ts:90
 O(o)           forInIndexSig  src/types.ts:6
     in loop for-in                                           src/types.ts:8  x N
 
+O(n)           callsCycleMemberDirectly  src/recursion.ts:38 [partial]
+    calls CycleHolder.step()                               src/recursion.ts:40  = O(n)
+    calls cycleContinue()                                  src/recursion.ts:25  = O(n)
+    calls cycleStart()                                     src/recursion.ts:30  = O(n)
+
+O(n)           threeCycleEntry  src/recursion.ts:32 [partial]
+    calls cycleStart()                                     src/recursion.ts:34  = O(n)
+    calls CycleHolder.step()                               src/recursion.ts:20  = O(n)
+    calls cycleContinue()                                  src/recursion.ts:25  = O(n)
+
+O(n)           cycleContinue  src/recursion.ts:28 [partial]
+    calls cycleStart()                                     src/recursion.ts:30  = O(n)
+    calls CycleHolder.step()                               src/recursion.ts:20  = O(n)
+
+O(n)           CycleHolder.step  src/recursion.ts:23
+    calls cycleContinue()                                  src/recursion.ts:25  = O(n)
+    calls cycleStart()                                     src/recursion.ts:30  = O(n)
+
+O(n)           cycleStart  src/recursion.ts:18 [partial]
+    calls CycleHolder.step()                               src/recursion.ts:20  = O(n)
+    calls cycleContinue()                                  src/recursion.ts:25  = O(n)
+
+O(n)           directRecursion  src/recursion.ts:4
+    calls factorialLike()                                  src/recursion.ts:5  = O(n)
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+
+O(n)           factorialLike  src/recursion.ts:1
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+
 O(xs)          RoundEngine.run  src/methods.ts:103
     does xs.indexOf()                                     src/methods.ts:104  x N
 
@@ -518,25 +550,11 @@ O(1)           makeDoubled  src/methods.ts:76
 
 O(1)           makeRoundEngine  src/methods.ts:108
 
-O(1)           factorialLike  src/recursion.ts:1 [partial]
-
-O(1)           directRecursion  src/recursion.ts:4 [partial]
-
 O(1)           isEvenRec  src/recursion.ts:8 [partial]
 
 O(1)           isOddRec  src/recursion.ts:11 [partial]
 
 O(1)           mutualRecursionCaller  src/recursion.ts:14 [partial]
-
-O(1)           cycleStart  src/recursion.ts:18 [partial]
-
-O(1)           CycleHolder.step  src/recursion.ts:23 [partial]
-
-O(1)           cycleContinue  src/recursion.ts:28 [partial]
-
-O(1)           threeCycleEntry  src/recursion.ts:32 [partial]
-
-O(1)           callsCycleMemberDirectly  src/recursion.ts:38 [partial]
 
 O(1)           pkgWrapped  src/modules/external.ts:3 [partial]
 

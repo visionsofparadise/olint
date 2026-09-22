@@ -19,16 +19,22 @@ use crate::directives::{cost_tag_of, PerfTag};
 use crate::effects::Effects;
 use crate::flow::Completion;
 use crate::project::{FileId, Site};
+use crate::recurrences::{
+    solution_of, weaker_relation_of, ArgumentRelation, CallStep, RecurrenceEdge,
+    RecurrenceEquation, RecurrenceSolution, MAXIMUM_RECURRENCE_MEMBERS,
+};
 use crate::syntax::unwrap;
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
 use crate::unknowns::UnknownReason;
 use crate::values::{
     ArgumentFacts, ConstructionPlan, Definedness, SizeQuantity, ValueFacts, ValueId,
+    RECURRENCE_BASE,
 };
 use crate::walker::tagged_reading_of;
 
 const MAXIMUM_PATTERN_ALIASES: usize = 8;
+const MAXIMUM_RECURRENCE_ROUNDS: usize = 4;
 
 #[cfg(test)]
 #[path = "summaries.test.rs"]
@@ -96,6 +102,14 @@ struct RecurrenceFrame {
     key: RecurrenceKey,
     children: Vec<RecurrenceKey>,
     next: usize,
+}
+
+struct RecurrenceMarkers {
+    members: Vec<TaskId>,
+    effects: Effects,
+    solved: Option<Vec<Cost>>,
+    unresolved: bool,
+    steps: HashMap<(TaskId, TaskId, crate::unknowns::SourceSpan), Vec<CallStep>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +193,7 @@ pub(crate) struct Scheduler {
     recurrence_records: HashMap<RecurrenceKey, (Reading, Effects)>,
     recurrence_missing: HashSet<RecurrenceKey>,
     recurrence_fallbacks: HashMap<TaskId, (Reading, Effects)>,
+    recurrence_markers: Option<RecurrenceMarkers>,
     runtime: HashSet<(FunctionId, FunctionId)>,
     sites: HashSet<(FunctionId, crate::unknowns::SourceSpan, FunctionId)>,
     function_counts: HashMap<(FunctionId, bool, Vec<Cost>), usize>,
@@ -222,6 +237,7 @@ impl Scheduler {
             recurrence_records: HashMap::new(),
             recurrence_missing: HashSet::new(),
             recurrence_fallbacks: HashMap::new(),
+            recurrence_markers: None,
             runtime: HashSet::new(),
             sites: HashSet::new(),
             function_counts: HashMap::new(),
@@ -929,6 +945,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if self.scheduler.component.contains(&id) {
+            if let Some(part) = self.marker_part_of(id) {
+                return (Reading::of_part(part), true);
+            }
+
             self.current_effects.unknown_global = true;
 
             return (self.recurrence_reading(id), true);
@@ -1387,6 +1407,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .insert(*id, (reading, effects));
             }
 
+            if let Some(solved) = self.solve_component_recurrence(&members) {
+                self.scheduler.component.clear();
+
+                let mut effects = Effects::unknown();
+
+                for id in &members {
+                    let local = self
+                        .scheduler
+                        .local_records
+                        .get(id)
+                        .map(|record| record.effects.clone());
+
+                    if let Some(local) = local {
+                        effects.join(&local);
+                    }
+                }
+
+                for (id, reading) in solved {
+                    self.publish_task(id, reading, effects.clone());
+                }
+
+                continue;
+            }
+
             let mut completed = Vec::new();
 
             for id in &members {
@@ -1472,6 +1516,340 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading = Reading::of_part(part);
 
         reading
+    }
+
+    pub(crate) fn forget_recurrence_multiplicity(&mut self) {
+        if let Some(markers) = self.scheduler.recurrence_markers.as_mut() {
+            markers.unresolved = true;
+        }
+    }
+
+    fn marker_of(&self, id: TaskId) -> Option<Cost> {
+        let markers = self.scheduler.recurrence_markers.as_ref()?;
+        let index = markers.members.iter().position(|member| *member == id)?;
+
+        match &markers.solved {
+            Some(solved) => solved.get(index).cloned(),
+            None => Some(marker_cost_of(index)),
+        }
+    }
+
+    fn marker_part_of(&mut self, id: TaskId) -> Option<Part> {
+        let cost = self.marker_of(id)?;
+        let effects = self
+            .scheduler
+            .recurrence_markers
+            .as_ref()
+            .map(|markers| markers.effects.clone())?;
+
+        self.current_effects.join(&effects);
+
+        Some(Part::unmarked(cost, None))
+    }
+
+    fn cyclic_effects_of(&mut self, key: &SummaryKey) -> Effects {
+        let Some(id) = self.scheduler.keys.get(key).copied() else {
+            return Effects::unknown();
+        };
+
+        match self
+            .scheduler
+            .recurrence_markers
+            .as_ref()
+            .filter(|markers| markers.members.contains(&id))
+        {
+            Some(markers) => markers.effects.clone(),
+            None => Effects::unknown(),
+        }
+    }
+
+    fn record_recurrence_steps(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        (call_file, arguments, span): (FileId, &'a [Argument<'a>], oxc_span::Span),
+        key: &SummaryKey,
+    ) {
+        let Some(callee) = self.scheduler.keys.get(key).copied() else {
+            return;
+        };
+        let Some(caller) = self.scheduler.active else {
+            return;
+        };
+
+        if self
+            .scheduler
+            .recurrence_markers
+            .as_ref()
+            .is_none_or(|markers| !markers.members.contains(&callee))
+        {
+            return;
+        }
+
+        let site = self.source_span(call_file, span);
+
+        if self
+            .scheduler
+            .recurrence_markers
+            .as_ref()
+            .is_some_and(|markers| markers.steps.contains_key(&(caller, callee, site)))
+        {
+            return;
+        }
+
+        let caller_function = self.scheduler.tasks[caller.0].key.function;
+        let caller_node = self.function_at(caller_function);
+        let steps = self.call_steps_of(
+            (file, function),
+            (caller_function.file, caller_node),
+            (call_file, arguments),
+        );
+
+        if let Some(markers) = self.scheduler.recurrence_markers.as_mut() {
+            markers.steps.insert((caller, callee, site), steps);
+        }
+    }
+
+    fn evaluate_marked_members(&mut self, members: &[TaskId]) -> Option<Vec<(Reading, Effects)>> {
+        let mut results = Vec::new();
+
+        for id in members {
+            let (reading, effects, missing, exhausted) = self.evaluate_task(*id);
+
+            if !missing.is_empty() || exhausted || self.scheduler.tasks[id.0].fallback {
+                return None;
+            }
+
+            results.push((reading, effects));
+        }
+
+        Some(results)
+    }
+
+    fn activation_effects_of(&mut self, members: &[TaskId], mut shared: Effects) -> Effects {
+        let functions: Vec<FunctionId> = members
+            .iter()
+            .map(|id| self.scheduler.tasks[id.0].key.function)
+            .collect();
+        let mut retained = Vec::new();
+
+        for binding in std::mem::take(&mut shared.binding_writes) {
+            let activation = functions.iter().any(|function| {
+                self.is_isolated_binding(function.file, Some(function.node), binding)
+            });
+
+            if !activation {
+                retained.push(binding);
+            }
+        }
+
+        shared.binding_writes = retained;
+
+        shared
+    }
+
+    fn solve_component_recurrence(&mut self, members: &[TaskId]) -> Option<Vec<(TaskId, Reading)>> {
+        if members.len() > MAXIMUM_RECURRENCE_MEMBERS
+            || !self.charge_work(Event::RecurrenceStep, members.len() as u64)
+        {
+            return None;
+        }
+
+        let mut shared = Effects::default();
+        let mut settled = None;
+
+        for _ in 0..MAXIMUM_RECURRENCE_ROUNDS {
+            self.scheduler.recurrence_markers = Some(RecurrenceMarkers {
+                members: members.to_vec(),
+                effects: shared.clone(),
+                solved: None,
+                unresolved: false,
+                steps: HashMap::new(),
+            });
+
+            let Some(round) = self.evaluate_marked_members(members) else {
+                self.scheduler.recurrence_markers = None;
+
+                return None;
+            };
+            let mut observed = Effects::default();
+
+            for (_, effects) in &round {
+                observed.join(effects);
+            }
+
+            let observed = self.activation_effects_of(members, observed);
+            let mut widened = shared.clone();
+
+            widened.join(&observed);
+
+            if widened == shared {
+                settled = Some(round);
+
+                break;
+            }
+
+            shared = widened;
+        }
+
+        let Some(results) = settled else {
+            self.scheduler.recurrence_markers = None;
+
+            return None;
+        };
+        let markers = self.scheduler.recurrence_markers.take()?;
+
+        if markers.unresolved {
+            return None;
+        }
+
+        let readings: Vec<Reading> = results.into_iter().map(|(reading, _)| reading).collect();
+        let equations = self.recurrence_equations_of(members, &readings, &markers)?;
+        let RecurrenceSolution::Solved { factors, proof } = solution_of(&equations) else {
+            return None;
+        };
+        let local = Cost::maximum(
+            equations
+                .iter()
+                .map(|equation| equation.local.clone())
+                .collect(),
+        )
+        .ok()?;
+        let mut totals = Vec::new();
+
+        for factor in &factors {
+            totals.push(factor.multiply(&local).ok()?);
+        }
+
+        self.scheduler.recurrence_markers = Some(RecurrenceMarkers {
+            members: members.to_vec(),
+            effects: markers.effects.clone(),
+            solved: Some(totals),
+            unresolved: false,
+            steps: HashMap::new(),
+        });
+
+        let explained = self.evaluate_marked_members(members);
+
+        self.scheduler.recurrence_markers = None;
+
+        let explained = explained?;
+        let mut solved = Vec::new();
+
+        for (index, id) in members.iter().enumerate() {
+            let mut reading = explained[index].0.clone();
+
+            for (phase, completion, part) in &mut reading.completions {
+                if part.holds_no_work() {
+                    continue;
+                }
+
+                let main = *phase == crate::cost::ExecutionPhase::Immediate
+                    && *completion == Completion::Normal;
+                let source = readings[index].part_of(*phase, *completion);
+                let (channel, _) = stripped_cost_of(&source.cost, members.len())?;
+                let channel = match main {
+                    true => Cost::maximum(vec![channel, local.clone()]).ok()?,
+                    false => channel,
+                };
+
+                part.cost = factors[index].multiply(&channel).ok()?;
+            }
+
+            solved.push((*id, reading));
+        }
+
+        self.stats.count(&format!("recurrence solved: {proof}"));
+
+        Some(solved)
+    }
+
+    fn recurrence_equations_of(
+        &mut self,
+        members: &[TaskId],
+        readings: &[Reading],
+        markers: &RecurrenceMarkers,
+    ) -> Option<Vec<RecurrenceEquation>> {
+        let mut locals = Vec::new();
+        let mut multiplicities = Vec::new();
+
+        for reading in readings {
+            let total = reading.total(&mut self.unknowns, &mut self.traces);
+            let (local, factors) = stripped_cost_of(&total.cost, members.len())?;
+
+            locals.push(local);
+            multiplicities.push(factors);
+        }
+
+        let slots = self.recurrence_slots_of(members, &multiplicities, markers)?;
+        let mut equations = Vec::new();
+
+        for (index, id) in members.iter().enumerate() {
+            let function = self.scheduler.tasks[id.0].key.function;
+            let inputs = self.scheduler.tasks[id.0].inputs.clone();
+            let node = self.function_at(function);
+            let measure = self.recurrence_measure_of(function.file, node, slots[index], &inputs)?;
+            let mut edges = Vec::new();
+
+            for (callee, multiplicity) in multiplicities[index].iter().enumerate() {
+                let sites = site_count_of((members[index], members[callee]), markers);
+                let Some(multiplicity) = multiplicity else {
+                    if sites > 0 {
+                        return None;
+                    }
+
+                    continue;
+                };
+
+                if sites == 0 {
+                    return None;
+                }
+
+                let multiplicity = multiplicity.multiply(&Cost::constant(sites)).ok()?;
+                let (relation, lower_bound) = recurrence_relation_of(
+                    (members[index], members[callee]),
+                    (slots[index], slots[callee]),
+                    markers,
+                )?;
+
+                edges.push(RecurrenceEdge {
+                    callee,
+                    multiplicity,
+                    relation,
+                    lower_bound,
+                });
+            }
+
+            equations.push(RecurrenceEquation {
+                local: locals[index].clone(),
+                measure,
+                edges,
+            });
+        }
+
+        Some(equations)
+    }
+
+    fn recurrence_slots_of(
+        &mut self,
+        members: &[TaskId],
+        multiplicities: &[Vec<Option<Cost>>],
+        markers: &RecurrenceMarkers,
+    ) -> Option<Vec<usize>> {
+        let function = self.scheduler.tasks[members[0].0].key.function;
+        let node = self.function_at(function);
+        let positions = parameters_of(node).map_or(0, |parameters| parameters.items.len());
+
+        for candidate in 0..positions {
+            if !self.charge_work(Event::RecurrenceStep, 1) {
+                return None;
+            }
+
+            if let Some(slots) = slots_from(members, multiplicities, markers, candidate) {
+                return Some(slots);
+            }
+        }
+
+        None
     }
 
     fn recurrence_reading(&mut self, id: TaskId) -> Reading {
@@ -2623,11 +3001,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.observe_invocation(&key, call_file, span);
 
-        let mut effects = self
-            .summaries
-            .get(&key)
-            .map(|id| self.summaries_arena[id.0 as usize].effects.clone())
-            .unwrap_or_else(Effects::unknown);
+        if cyclic {
+            self.record_recurrence_steps((file, function), (call_file, arguments, span), &key);
+        }
+
+        let mut effects = match self.summaries.get(&key) {
+            Some(id) => self.summaries_arena[id.0 as usize].effects.clone(),
+            None => self.cyclic_effects_of(&key),
+        };
 
         self.substitute_parameter_values(file, function, call_file, arguments, &mut effects);
         self.current_effects.join(&effects);
@@ -2694,6 +3075,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     definedness: Definedness::Unknown,
                 },
             };
+
+            let mut facts = facts;
+
+            if facts.value.size.is_none() && positional && !undefined {
+                if let Some(argument) = arguments.get(index).and_then(Argument::as_expression) {
+                    facts.value.size = self.reduced_measure_size_of(call_file, argument);
+                }
+            }
 
             if let Some(symbol) = identifier.symbol_id.get() {
                 substitutions.insert(Binding::Symbol { file, symbol }, facts);
@@ -3444,4 +3833,118 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         Ok(rounds)
     }
+}
+
+fn marker_cost_of(index: usize) -> Cost {
+    Cost::dimension(RECURRENCE_BASE - index as u64, crate::cost::Domain::Size)
+}
+
+fn stripped_cost_of(cost: &Cost, members: usize) -> Option<(Cost, Vec<Option<Cost>>)> {
+    let mut residue = cost.clone();
+    let mut factors = Vec::new();
+
+    for index in 0..members {
+        let (local, factor) = residue.split_dimension(RECURRENCE_BASE - index as u64)?;
+
+        residue = local;
+
+        factors.push(factor);
+    }
+
+    Some((residue, factors))
+}
+
+fn site_count_of((caller, callee): (TaskId, TaskId), markers: &RecurrenceMarkers) -> u64 {
+    markers
+        .steps
+        .keys()
+        .filter(|(site_caller, site_callee, _)| *site_caller == caller && *site_callee == callee)
+        .count() as u64
+}
+
+fn recurrence_relation_of(
+    (caller, callee): (TaskId, TaskId),
+    (caller_position, callee_position): (usize, usize),
+    markers: &RecurrenceMarkers,
+) -> Option<(ArgumentRelation, Option<f64>)> {
+    let mut relation: Option<ArgumentRelation> = None;
+    let mut lower_bound: Option<f64> = None;
+    let mut seen = false;
+
+    for ((site_caller, site_callee, _), steps) in &markers.steps {
+        if *site_caller != caller || *site_callee != callee {
+            continue;
+        }
+
+        let step = steps.iter().find(|step| {
+            step.caller_position == caller_position && step.callee_position == callee_position
+        })?;
+
+        relation = Some(match relation {
+            None => step.relation,
+            Some(found) => weaker_relation_of(found, step.relation),
+        });
+        lower_bound = match (seen, lower_bound, step.lower_bound) {
+            (false, _, bound) => bound,
+            (true, Some(found), Some(bound)) => Some(f64::min(found, bound)),
+            _ => None,
+        };
+        seen = true;
+    }
+
+    relation.map(|relation| (relation, lower_bound))
+}
+
+fn slots_from(
+    members: &[TaskId],
+    multiplicities: &[Vec<Option<Cost>>],
+    markers: &RecurrenceMarkers,
+    candidate: usize,
+) -> Option<Vec<usize>> {
+    let mut slots: Vec<Option<usize>> = vec![None; members.len()];
+    let mut pending = vec![0usize];
+
+    slots[0] = Some(candidate);
+
+    while let Some(index) = pending.pop() {
+        let caller_position = slots[index]?;
+
+        for (callee, multiplicity) in multiplicities[index].iter().enumerate() {
+            if multiplicity.is_none() {
+                continue;
+            }
+
+            let mut position = None;
+
+            for ((site_caller, site_callee, _), steps) in &markers.steps {
+                if *site_caller != members[index] || *site_callee != members[callee] {
+                    continue;
+                }
+
+                let step = steps
+                    .iter()
+                    .find(|step| step.caller_position == caller_position)?;
+
+                if position.is_some_and(|found| found != step.callee_position) {
+                    return None;
+                }
+
+                position = Some(step.callee_position);
+            }
+
+            let position = position?;
+
+            match slots[callee] {
+                Some(found) if found != position => return None,
+                Some(_) => {}
+                None => {
+                    slots[callee] = Some(position);
+
+                    pending.push(callee);
+                }
+            }
+        }
+    }
+
+    slots.into_iter().collect()
 }

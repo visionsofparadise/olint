@@ -79,6 +79,10 @@ pub struct ArgumentFacts {
     pub definedness: Definedness,
 }
 
+pub const RECURRENCE_BASE: u64 = u64::MAX - 1;
+pub const RECURRENCE_FLOOR: u64 =
+    RECURRENCE_BASE - (crate::recurrences::MAXIMUM_RECURRENCE_MEMBERS as u64);
+
 #[derive(Default)]
 pub struct Values {
     origins: HashMap<SourceSpan, ValueId>,
@@ -174,6 +178,10 @@ impl Values {
             return "N".into();
         }
 
+        if id >= RECURRENCE_FLOOR {
+            return "recursion".into();
+        }
+
         self.labels
             .get(id as usize)
             .cloned()
@@ -183,6 +191,10 @@ impl Values {
     pub fn write_label(&self, id: u64, out: &mut dyn std::fmt::Write) -> std::fmt::Result {
         if id == u64::MAX {
             return out.write_str("N");
+        }
+
+        if id >= RECURRENCE_FLOOR {
+            return out.write_str("recursion");
         }
 
         match self.labels.get(id as usize) {

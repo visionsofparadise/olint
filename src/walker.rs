@@ -1206,6 +1206,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             let unresolved = self.unknowns.scale(unknown, None);
+
+            self.note_unresolved_multiplicity(&body_main);
+
             let body_main = body_main
                 .scaled(None, &mut self.unknowns)
                 .retaining(unresolved, &mut self.unknowns);

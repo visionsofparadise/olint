@@ -2311,3 +2311,58 @@ fn repeating_path_scans_resolve_once_per_loop() {
         );
     }
 }
+
+fn conjunct_guard_source(depth: usize) -> String {
+    let conjuncts: String = (0..depth)
+        .map(|_| " && flag".to_string())
+        .collect::<Vec<_>>()
+        .join("");
+
+    format!(
+        "export function selected(n: number, xs: number[], flag: boolean): number {{ let total = 0; for (const x of xs) total += x; if (n > 0{conjuncts}) return total + selected(n - 1, xs, flag); return total; }}"
+    )
+}
+
+fn conjunct_guard_steps_of(depth: usize, solved: bool) -> u64 {
+    let source = conjunct_guard_source(depth);
+    let mut steps = 0;
+
+    run_with_source(&source, |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert_eq!(part.is_complete(), solved, "{depth}");
+        assert_eq!(
+            reasons(analysis, part.unknowns).contains(&UnknownReason::Recurrence),
+            !solved,
+            "{depth}"
+        );
+
+        steps = stats.work.consumed(Event::RecurrenceStep);
+    });
+
+    steps
+}
+
+#[test]
+fn a_guard_within_the_recurrence_depth_cap_solves_its_recursion() {
+    for depth in [4_u64, 8, 16, 31] {
+        assert_eq!(
+            conjunct_guard_steps_of(depth as usize, true),
+            4 * depth + 50,
+            "{depth}"
+        );
+    }
+}
+
+#[test]
+fn a_guard_past_the_recurrence_depth_cap_degrades_to_a_recurrence_result() {
+    for depth in [32_u64, 34, 40, 46] {
+        assert_eq!(
+            conjunct_guard_steps_of(depth as usize, false),
+            97,
+            "{depth}"
+        );
+    }
+}

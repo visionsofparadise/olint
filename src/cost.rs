@@ -186,6 +186,23 @@ impl Cost {
         self.0.structural_key()
     }
 
+    pub(crate) fn constant_of(&self) -> Option<u64> {
+        match self.0 {
+            Expression::Constant(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn mentions_dimension_from(&self, floor: u64) -> bool {
+        self.0.mentions_dimension_from(floor)
+    }
+
+    pub(crate) fn split_dimension(&self, id: u64) -> Option<(Self, Option<Self>)> {
+        let (local, factor) = self.0.split_dimension(id, 0)?;
+
+        Some((Self(local), factor.map(Self)))
+    }
+
     pub(crate) fn names(&self) -> Vec<String> {
         let mut names = std::collections::BTreeSet::new();
         let mut pending = vec![&self.0];
@@ -454,6 +471,108 @@ impl Expression {
         result.check_budget()?;
 
         Ok(result)
+    }
+
+    fn mentions_dimension_where(&self, accept: &impl Fn(u64) -> bool) -> bool {
+        let mut pending = vec![self];
+        let mut visited = 0usize;
+
+        while let Some(value) = pending.pop() {
+            visited += 1;
+
+            if visited > MAX_NODES {
+                return true;
+            }
+
+            if matches!(value, Self::Dimension { id, .. } if accept(*id)) {
+                return true;
+            }
+
+            pending.extend(value.children());
+        }
+
+        false
+    }
+
+    fn mentions_dimension(&self, id: u64) -> bool {
+        self.mentions_dimension_where(&|found| found == id)
+    }
+
+    fn mentions_dimension_from(&self, floor: u64) -> bool {
+        self.mentions_dimension_where(&|found| found >= floor)
+    }
+
+    fn split_dimension(&self, id: u64, depth: usize) -> Option<(Self, Option<Self>)> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+
+        if !self.mentions_dimension(id) {
+            return Some((self.clone(), None));
+        }
+
+        match self {
+            Self::Dimension { .. } => Some((Self::ONE, Some(Self::ONE))),
+            Self::Sum(children) | Self::Maximum(children) => {
+                let additive = matches!(self, Self::Sum(_));
+                let mut locals = Vec::new();
+                let mut factors = Vec::new();
+
+                for child in children.iter() {
+                    let (local, factor) = child.split_dimension(id, depth + 1)?;
+
+                    locals.push(local);
+
+                    if let Some(factor) = factor {
+                        factors.push(factor);
+                    }
+                }
+
+                let combine = |values| match additive {
+                    true => Self::sum(values),
+                    false => Self::maximum(values),
+                };
+                let local = combine(locals).ok()?;
+                let factor = match factors.is_empty() {
+                    true => None,
+                    false => Some(combine(factors).ok()?),
+                };
+
+                Some((local, factor))
+            }
+            Self::Product(children) => {
+                let mut constant = Vec::new();
+                let mut carrying = None;
+
+                for child in children.iter() {
+                    if !child.mentions_dimension(id) {
+                        constant.push(child.clone());
+
+                        continue;
+                    }
+
+                    if carrying.is_some() {
+                        return None;
+                    }
+
+                    carrying = Some(child.split_dimension(id, depth + 1)?);
+                }
+
+                let (local, factor) = carrying?;
+                let factor = factor?;
+                let mut local_values = constant.clone();
+                let mut factor_values = constant;
+
+                local_values.push(local);
+                factor_values.push(factor);
+
+                Some((
+                    Self::product(local_values).ok()?,
+                    Some(Self::product(factor_values).ok()?),
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn integer(&self) -> bool {
@@ -1087,6 +1206,16 @@ fn within(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
         return true;
     }
 
+    if dominates_its_monomials(b, a) {
+        return true;
+    }
+
+    if let Expression::Product(values) = b {
+        if values.iter().all(at_least_one) && values.iter().any(|value| within(a, value, budget)) {
+            return true;
+        }
+    }
+
     match (a, b) {
         (Expression::Sum(values) | Expression::Maximum(values), _)
             if values.iter().all(|value| within(value, b, budget)) =>
@@ -1141,6 +1270,20 @@ fn within(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
         _ => {}
     }
 
+    if let Expression::Power(base, exponent) = b {
+        if let Expression::Maximum(values) = base.as_ref() {
+            for value in values.iter() {
+                let Ok(branch) = Expression::power(value.clone(), exponent.as_ref().clone()) else {
+                    continue;
+                };
+
+                if within(a, &branch, budget) {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
 }
 fn strictly_larger(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
@@ -1150,6 +1293,24 @@ fn strictly_larger(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
 
     if let Some((left, right)) = shared_envelope_growth(a, b) {
         if left > right {
+            return true;
+        }
+    }
+
+    if dominates_its_monomials(a, b) {
+        return true;
+    }
+
+    if let Expression::Maximum(values) = a {
+        if values.iter().any(|value| strictly_larger(value, b, budget)) {
+            return true;
+        }
+    }
+
+    if let Expression::Product(values) = a {
+        if values.iter().all(at_least_one)
+            && values.iter().any(|value| strictly_larger(value, b, budget))
+        {
             return true;
         }
     }
@@ -1219,6 +1380,25 @@ fn strictly_larger(a: &Expression, b: &Expression, budget: &mut usize) -> bool {
         _ => false,
     }
 }
+fn dominates_its_monomials(value: &Expression, other: &Expression) -> bool {
+    let argument = match value {
+        Expression::Power(base, exponent) if matches!(base.as_ref(), Expression::Constant(number) if *number > 1) => {
+            exponent.as_ref()
+        }
+        Expression::Factorial(argument) => argument.as_ref(),
+        _ => return false,
+    };
+    let Expression::Dimension {
+        id,
+        domain: Domain::Size,
+    } = argument
+    else {
+        return false;
+    };
+
+    monomial(other).is_some_and(|powers| powers.keys().all(|key| key == id))
+}
+
 fn exponential_order(a: &Expression, b: &Expression) -> Option<std::cmp::Ordering> {
     let (Expression::Power(base, exponent), Expression::Power(other, next)) = (a, b) else {
         return None;

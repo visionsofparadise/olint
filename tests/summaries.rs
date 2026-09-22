@@ -1,6 +1,6 @@
 use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::read_config;
-use olint::cost::Cost;
+use olint::cost::{Cost, CostComparison};
 use olint::public::public_functions;
 use std::path::Path;
 
@@ -408,7 +408,7 @@ fn labels_of(
 }
 
 #[test]
-fn self_recursion_retains_known_work_and_reports_recurrence() {
+fn self_recursion_charges_its_body_at_every_guarded_level() {
     run_with_source(
         "export function walk(n: number): number {\n\treturn n > 0 ? walk(n - 1) : 0;\n}",
         |analysis, file| {
@@ -419,10 +419,9 @@ fn self_recursion_retains_known_work_and_reports_recurrence() {
 
             assert_eq!(
                 support::legacy_class_of(analysis, file, walk, &part.cost),
-                Cost::ONE
+                Cost::N
             );
-            assert!(part.trace.is_none());
-            assert_recurrence(analysis, &part);
+            assert!(part.is_complete());
         },
     );
 }
@@ -437,10 +436,10 @@ fn separate_cycle_roots_keep_their_own_summary_context() {
             let root = analysis.summarize(file, ping).total(&mut analysis.unknowns, &mut analysis.traces);
             let member = analysis.summarize(file, pong).total(&mut analysis.unknowns, &mut analysis.traces);
 
-            assert_eq!(support::legacy_class_of(analysis, file, ping, &root.cost), Cost::ONE);
-            assert_eq!(support::legacy_class_of(analysis, file, pong, &member.cost), Cost::ONE);
-            assert_recurrence(analysis, &root);
-            assert_recurrence(analysis, &member);
+            assert_eq!(support::legacy_class_of(analysis, file, ping, &root.cost), Cost::N);
+            assert_eq!(support::legacy_class_of(analysis, file, pong, &member.cost), Cost::N);
+            assert!(root.is_complete());
+            assert!(member.is_complete());
         },
     );
 }
@@ -648,34 +647,58 @@ fn a_cold_callback_parameter_call_yields_inside_its_caller() {
     );
 }
 
+const GUARDED_CYCLE: &str = "export function ping(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
+const SKIPPING_CYCLE: &str = "export function ping(xs: number[], n: number): number {\n\tif (n === 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
+
+fn assert_solved_depth(analysis: &mut Analysis<'_, '_>, file: olint::project::FileId, name: &str) {
+    let function = function_of_name(analysis.project, file, name);
+    let part = support::summary_of(analysis, file, name);
+    let envelope = analysis
+        .bind_function_cost(file, function, &Cost::N)
+        .expect("the envelope binds to the declared inputs");
+
+    assert_eq!(
+        part.cost.compare(&envelope),
+        CostComparison::Within,
+        "{name}"
+    );
+    assert_ne!(
+        part.cost.compare(&Cost::ONE),
+        CostComparison::Within,
+        "{name}"
+    );
+    assert!(part.is_complete(), "{name}");
+}
+
 #[test]
-fn a_cold_recursive_function_keeps_its_recurrence_uncertainty() {
+fn a_cold_recursive_function_keeps_its_solved_depth() {
     let source = "/** @perf cold */\nexport function walk(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + walk(xs, n - 1);\n}\n";
 
     run_with_source(source, |analysis, file| {
-        let part = support::summary_of(analysis, file, "walk");
-
-        assert_eq!(part.cost, Cost::ONE);
-        assert_recurrence(analysis, &part);
+        assert_solved_depth(analysis, file, "walk");
     });
 }
 
 #[test]
-fn a_cold_cycle_member_keeps_the_cycle_uncertainty() {
-    let source = "export function ping(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
+fn a_cold_cycle_member_keeps_the_cycle_depth() {
+    run_with_source(GUARDED_CYCLE, |analysis, file| {
+        for name in ["ping", "pong"] {
+            assert_solved_depth(analysis, file, name);
+        }
+    });
+}
 
-    run_with_source(source, |analysis, file| {
-        let ping = function_of_name(analysis.project, file, "ping");
-        let pong = function_of_name(analysis.project, file, "pong");
-
-        for function in [ping, pong] {
-            let part = analysis
-                .summarize(file, function)
-                .total(&mut analysis.unknowns, &mut analysis.traces);
+#[test]
+fn an_unguarded_cycle_member_keeps_the_cycle_uncertainty() {
+    run_with_source(SKIPPING_CYCLE, |analysis, file| {
+        for name in ["ping", "pong"] {
+            let function = function_of_name(analysis.project, file, name);
+            let part = support::summary_of(analysis, file, name);
 
             assert_eq!(
                 support::legacy_class_of(analysis, file, function, &part.cost),
-                Cost::ONE
+                Cost::ONE,
+                "{name}"
             );
             assert_recurrence(analysis, &part);
         }
