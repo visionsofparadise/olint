@@ -142,6 +142,7 @@ struct CounterWrite {
     step: Step,
     deferred: bool,
     updating: bool,
+    within_update: bool,
 }
 
 struct Comparison<'a> {
@@ -153,7 +154,7 @@ struct Comparison<'a> {
 struct Repetition<'a> {
     node: NodeId,
     body: &'a Statement<'a>,
-    update: Option<NodeId>,
+    update: Option<&'a Expression<'a>>,
     initial: Option<(Binding, &'a Expression<'a>)>,
     returns_to_head: bool,
     geometric_proof: &'static str,
@@ -168,7 +169,7 @@ impl Progression {
     fn is_driven(&self) -> bool {
         self.writes
             .iter()
-            .any(|write| write.updating || !is_replacing(write))
+            .any(|write| write.within_update || !is_replacing(write))
     }
 }
 
@@ -269,10 +270,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let repetition = Repetition {
             node: statement.node_id(),
             body,
-            update: statement
-                .update
-                .as_ref()
-                .map(|update| unwrap(update).node_id()),
+            update: statement.update.as_ref().map(unwrap),
             initial: variable,
             returns_to_head: self.returns_to_head(file, statement.node_id(), body),
             geometric_proof: "geometric step",
@@ -444,9 +442,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
                 )
             });
-        let updating = repetition
+        let within_update = repetition
             .update
-            .is_some_and(|update| site == update || is_within(nodes, site, update));
+            .is_some_and(|update| is_within(nodes, site, update.node_id()));
         let (site, step) = match nodes.parent_kind(site) {
             AstKind::UpdateExpression(update) => (
                 parent,
@@ -462,11 +460,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => (site, Step::Replacing),
         };
 
+        let updating = repetition
+            .update
+            .is_some_and(|update| covers_expression(update, &[site]));
+
         CounterWrite {
             site,
             step,
             deferred,
             updating,
+            within_update,
         }
     }
 

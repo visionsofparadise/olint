@@ -220,6 +220,30 @@ fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
             "let sum = 0; let i = 0; while (i < 10) { step: { if (n > 0) break step; } i++; sum++; }",
             "constant bound",
         ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; n > 0 ? i++ : 0) sum++;",
+            "N",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; n > 0 && i++) sum++;",
+            "N",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; n > 0 || i++) sum++;",
+            "N",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; (() => i++)()) sum++;",
+            "N",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; (i++)) sum++;",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; i++, sum--) sum++;",
+            "constant bound",
+        ),
     ] {
         let source = format!("export function f(n: number) {{ {body} }}");
 
@@ -277,6 +301,22 @@ fn geometric_progress_needs_a_positive_start_and_no_competing_write() {
             "N",
         ),
         ("for (let i = 1; i < xs.length; i *= 1.5) sum += i;", "N"),
+        (
+            "for (let i = 1; i < xs.length; sum > 0 ? (i *= 2) : 0) sum += i;",
+            "N",
+        ),
+        (
+            "for (let i = 1; i < xs.length; sum > 0 && (i *= 2)) sum += i;",
+            "N",
+        ),
+        (
+            "for (let i = 1; i < xs.length; (i *= 2)) sum += i;",
+            "geometric step",
+        ),
+        (
+            "for (let i = 1; i < xs.length; i *= 2, sum--) sum += i;",
+            "geometric step",
+        ),
     ] {
         let source =
             format!("export function f(xs: number[]) {{ let sum = 0; {body} return sum; }}");
