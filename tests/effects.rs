@@ -2,7 +2,6 @@ use olint::cost::Cost;
 use olint::unknowns::UnknownReason;
 
 mod support;
-use support::{function_of_name, run_with_source};
 
 const DECLARED: &str =
     "declare function opaque(value: unknown): void;\ndeclare function poke(): void;\n";
@@ -14,19 +13,9 @@ fn result_of(source: &str, name: &str) -> (Cost, bool) {
 }
 
 fn reasoned_result_of(source: &str, name: &str) -> (Cost, bool, bool) {
-    let mut found = None;
+    let (cost, complete, reasons) = support::legacy_result_of(&format!("{DECLARED}{source}"), name);
 
-    run_with_source(&format!("{DECLARED}{source}"), |analysis, file| {
-        let function = function_of_name(analysis.project, file, name);
-        let part = support::summary_of(analysis, file, name);
-        let cost = support::legacy_class_of(analysis, file, function, &part.cost);
-        let bound =
-            support::unknown_reasons(analysis, part.unknowns).contains(&UnknownReason::Bound);
-
-        found = Some((cost, part.is_complete(), bound));
-    });
-
-    found.expect("summary result")
+    (cost, complete, reasons.contains(&UnknownReason::Bound))
 }
 
 fn cost(text: &str) -> Cost {

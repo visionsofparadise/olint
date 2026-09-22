@@ -389,3 +389,51 @@ fn a_fresh_local_allocation_cannot_be_reached_through_a_parameter() {
         assert_eq!(bound_is_unknown(source, "f"), unknown, "{source}");
     }
 }
+
+fn legacy_cost_of(source: &str, name: &str) -> (olint::cost::Cost, bool) {
+    let (cost, complete, _) = support::legacy_result_of(source, name);
+
+    (cost, complete)
+}
+
+fn cost(text: &str) -> olint::cost::Cost {
+    olint::cost::Cost::parse(text).expect("a legacy cost parses")
+}
+
+fn nested_budget_source(step: &str) -> String {
+    format!(
+        "export function f(n: number) {{ const step = {step}; let i = 0, total = 0; for (let j = 0; j < n; j++) {{ while (i < n) {{ i += step; total++; }} }} return total; }}"
+    )
+}
+
+#[test]
+fn a_budget_spent_in_steps_of_unproven_magnitude_keeps_its_nested_work() {
+    assert_eq!(
+        legacy_cost_of(&nested_budget_source("1 / n"), "f"),
+        (cost("O(N^2)"), true)
+    );
+    assert_eq!(
+        legacy_cost_of(&nested_budget_source("1"), "f"),
+        (cost("O(N)"), true)
+    );
+    assert_eq!(
+        legacy_cost_of(&nested_budget_source("1 / 4"), "f"),
+        (cost("O(N)"), true)
+    );
+}
+
+#[test]
+fn a_unit_step_two_pointer_budget_still_collapses() {
+    let source = "export function f(xs: number[]) { let i = 0, total = 0; for (let j = 0; j < xs.length; j++) { while (i < xs.length) { i++; total++; } } return total; }";
+
+    assert_eq!(legacy_cost_of(source, "f"), (cost("O(N)"), true));
+}
+
+#[test]
+fn a_replenished_budget_separates_from_an_unrelated_counter() {
+    let unrelated = "export function f(n: number, m: number) { let i = 0, k = 0, total = 0; const bump = () => { k = 0; }; for (let j = 0; j < n; j++) { bump(); while (i < n) { i++; total++; } } while (k < m) { k++; total++; } return total; }";
+    let escaped = "export function f(n: number, use: (fn: () => void) => void) { let i = 0, total = 0; const reset = () => { i = 0; }; for (let j = 0; j < n; j++) { use(reset); while (i < n) { i++; total++; } } return total; }";
+
+    assert_eq!(legacy_cost_of(unrelated, "f"), (cost("O(N)"), true));
+    assert_eq!(legacy_cost_of(escaped, "f"), (cost("O(N^2)"), false));
+}

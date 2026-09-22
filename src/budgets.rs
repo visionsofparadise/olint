@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentTarget, DoWhileStatement, Expression, ForInStatement,
-    ForOfStatement, ForStatement, ForStatementInit, Function, IdentifierReference,
-    SimpleAssignmentTarget, Statement, VariableDeclarationKind, WhileStatement,
+    ForOfStatement, ForStatement, ForStatementInit, ForStatementLeft, Function,
+    IdentifierReference, SimpleAssignmentTarget, Statement, VariableDeclarationKind,
+    WhileStatement,
 };
 use oxc_ast::AstKind;
 use oxc_ast_visit::Visit;
@@ -40,11 +41,24 @@ pub enum Direction {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Potential {
+    Constant(f64),
+    Enveloped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepMagnitude {
+    Constant,
+    Stable,
+}
+
 #[derive(Clone, Debug)]
 pub struct Budget {
     pub direction: Direction,
     pub text: String,
     pub scope: Option<NodeId>,
+    pub potential: Potential,
 }
 
 pub struct BudgetContext {
@@ -58,6 +72,13 @@ pub struct Spend {
     pub text: String,
     pub share: Option<Binding>,
     pub scope: Option<NodeId>,
+    pub magnitude: StepMagnitude,
+}
+
+impl Spend {
+    pub fn cancels(&self) -> bool {
+        self.magnitude == StepMagnitude::Constant
+    }
 }
 
 pub(crate) struct Subtree<'a> {
@@ -289,7 +310,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     continue;
                 }
 
-                let Some(scope) = self.budget_scope_of(binding, function) else {
+                let Some(origin) = self.counter_origin_of(binding, function) else {
                     continue;
                 };
 
@@ -301,80 +322,82 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     continue;
                 }
 
+                let potential = match self.numeric_value_of(file, bound) {
+                    Some(endpoint) => Potential::Constant((endpoint - origin.initial).abs()),
+                    None => Potential::Enveloped,
+                };
+
                 budgets.insert(
                     binding,
                     Budget {
                         direction,
                         text: collapsed_text_of(self.text_of(file, conjunct.span())),
-                        scope,
+                        scope: origin.scope,
+                        potential,
                     },
                 );
             }
         }
     }
 
-    fn budget_scope_of(
-        &self,
+    fn counter_origin_of(
+        &mut self,
         binding: Binding,
         function: FunctionNode<'a>,
-    ) -> Option<Option<NodeId>> {
-        match self.declarations.of_binding(self.project, binding)? {
-            Declaration::Parameter {
-                parameter,
-                function: owner,
-                ..
-            } => {
-                let identifier = match parameter {
-                    ParameterNode::Formal(formal) => is_identifier_pattern(&formal.pattern),
-                    ParameterNode::Rest(rest) => is_identifier_pattern(&rest.rest.argument),
-                };
+    ) -> Option<CounterOrigin> {
+        let Declaration::Variable {
+            file, declarator, ..
+        } = self.declarations.of_binding(self.project, binding)?
+        else {
+            return None;
+        };
 
-                (identifier && owner == function).then_some(None)
-            }
-            Declaration::Variable {
-                file, declarator, ..
-            } => {
-                if !is_identifier_pattern(&declarator.id) {
-                    return None;
-                }
-
-                if self.enclosing_function_of(file, declarator.node_id())
-                    != Some(function.node_id())
-                {
-                    return None;
-                }
-
-                let nodes = self.project.file(file).semantic.nodes();
-                let declaration_node = nodes.parent_id(declarator.node_id());
-                let AstKind::VariableDeclaration(declaration) = nodes.kind(declaration_node) else {
-                    return None;
-                };
-
-                if matches!(declaration.kind, VariableDeclarationKind::Var) {
-                    return None;
-                }
-
-                if let AstKind::ForStatement(statement) = nodes.parent_kind(declaration_node) {
-                    if matches!(&statement.init, Some(ForStatementInit::VariableDeclaration(init)) if std::ptr::eq(&**init, declaration))
-                    {
-                        return Some(Some(statement.node_id()));
-                    }
-                }
-
-                for ancestor in nodes.ancestors(declaration_node) {
-                    if ancestor.id() == function.node_id() {
-                        break;
-                    }
-
-                    if is_iteration_kind(&ancestor.kind()) {
-                        return Some(Some(ancestor.id()));
-                    }
-                }
-
-                Some(None)
-            }
-            _ => None,
+        if !is_identifier_pattern(&declarator.id) {
+            return None;
         }
+
+        if self.enclosing_function_of(file, declarator.node_id()) != Some(function.node_id()) {
+            return None;
+        }
+
+        let initial = self.numeric_value_of(file, declarator.init.as_ref()?)?;
+        let nodes = self.project.file(file).semantic.nodes();
+        let declaration_node = nodes.parent_id(declarator.node_id());
+        let AstKind::VariableDeclaration(declaration) = nodes.kind(declaration_node) else {
+            return None;
+        };
+
+        if matches!(declaration.kind, VariableDeclarationKind::Var) {
+            return None;
+        }
+
+        if let AstKind::ForStatement(statement) = nodes.parent_kind(declaration_node) {
+            if matches!(&statement.init, Some(ForStatementInit::VariableDeclaration(init)) if std::ptr::eq(&**init, declaration))
+            {
+                return Some(CounterOrigin {
+                    scope: Some(statement.node_id()),
+                    initial,
+                });
+            }
+        }
+
+        for ancestor in nodes.ancestors(declaration_node) {
+            if ancestor.id() == function.node_id() {
+                break;
+            }
+
+            if is_iteration_kind(&ancestor.kind()) {
+                return Some(CounterOrigin {
+                    scope: Some(ancestor.id()),
+                    initial,
+                });
+            }
+        }
+
+        Some(CounterOrigin {
+            scope: None,
+            initial,
+        })
     }
 
     fn is_invariant(
@@ -436,7 +459,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     AssignmentOperator::Addition | AssignmentOperator::Subtraction => {
                         let increment = assignment.operator == AssignmentOperator::Addition;
                         let right = unwrap(&assignment.right);
-                        let write = if self.is_numeric_constant(file, right) {
+                        let signed = self
+                            .numeric_value_of(file, right)
+                            .map(|step| signed_direction_of(step, increment));
+                        let write = if let Some(direction) = signed {
+                            match direction {
+                                Some(Direction::Up) => WriteKind::IncrementConstant,
+                                Some(Direction::Down) => WriteKind::DecrementConstant,
+                                None => WriteKind::Other,
+                            }
+                        } else if self.is_numeric_constant(file, right) {
                             if increment {
                                 WriteKind::IncrementConstant
                             } else {
@@ -507,11 +539,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         writes.entry(binding).or_default().push(WriteKind::Other);
                     }
                 }
+                AstKind::ForOfStatement(statement) => {
+                    self.add_left_write(file, &statement.left, &mut writes)
+                }
+                AstKind::ForInStatement(statement) => {
+                    self.add_left_write(file, &statement.left, &mut writes)
+                }
                 _ => {}
             }
         }
 
         writes
+    }
+
+    fn add_left_write(
+        &mut self,
+        file: FileId,
+        left: &'a ForStatementLeft<'a>,
+        writes: &mut HashMap<Binding, Vec<WriteKind>>,
+    ) {
+        let Some(target) = left.as_assignment_target() else {
+            return;
+        };
+
+        if let Some(simple) = target.as_simple_assignment_target() {
+            if let Some(binding) = self.simple_target_binding_of(file, simple) {
+                writes.entry(binding).or_default().push(WriteKind::Other);
+            }
+
+            return;
+        }
+
+        for binding in self.referenced_bindings_of(file, target.node_id(), true) {
+            writes.entry(binding).or_default().push(WriteKind::Other);
+        }
     }
 
     fn add_target_write(
@@ -740,6 +801,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 text: budget.text.clone(),
                 share: None,
                 scope: budget.scope,
+                magnitude: StepMagnitude::Constant,
             });
         };
         let text = format!("{}, by {}", budget.text, identifier);
@@ -767,10 +829,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         });
 
+        if !stable {
+            return None;
+        }
+
         Some(Spend {
             text,
-            share: if stable { identifier_binding } else { None },
+            share: identifier_binding,
             scope,
+            magnitude: StepMagnitude::Stable,
         })
     }
 
@@ -796,9 +863,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 })
             }
             Expression::AssignmentExpression(assignment) => {
-                let direction = match assignment.operator {
-                    AssignmentOperator::Addition => Direction::Up,
-                    AssignmentOperator::Subtraction => Direction::Down,
+                let added = match assignment.operator {
+                    AssignmentOperator::Addition => true,
+                    AssignmentOperator::Subtraction => false,
                     _ => return None,
                 };
                 let AssignmentTarget::AssignmentTargetIdentifier(reference) = &assignment.left
@@ -808,14 +875,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let binding = self.binding_of_identifier(file, reference)?;
                 let right = unwrap(&assignment.right);
 
-                if self.is_numeric_constant(file, right) {
-                    return Some(Advance {
+                if let Some(step) = self.numeric_value_of(file, right) {
+                    return signed_direction_of(step, added).map(|direction| Advance {
                         binding,
                         direction,
                         identifier: None,
                     });
                 }
 
+                let direction = match added {
+                    true => Direction::Up,
+                    false => Direction::Down,
+                };
                 let identifier = identifier_of(right)?;
 
                 Some(Advance {
@@ -830,6 +901,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => None,
         }
     }
+}
+
+struct CounterOrigin {
+    scope: Option<NodeId>,
+    initial: f64,
 }
 
 struct Advance {
@@ -871,6 +947,19 @@ pub(crate) fn conjuncts_of<'a>(e: &'a Expression<'a>) -> Vec<&'a Expression<'a>>
         }
         _ => vec![e],
     }
+}
+
+fn signed_direction_of(step: f64, added: bool) -> Option<Direction> {
+    let signed = match added {
+        true => step,
+        false => -step,
+    };
+
+    if signed > 0.0 {
+        return Some(Direction::Up);
+    }
+
+    (signed < 0.0).then_some(Direction::Down)
 }
 
 fn is_zero(e: &Expression<'_>) -> bool {

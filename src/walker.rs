@@ -1233,14 +1233,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(budget) = &budget {
             self.stats.count(&format!(
-                "loop {}: budget{}{}",
+                "loop {}: budget{}{}{}",
                 loop_label(kind),
                 if budget.share.is_some() {
                     " by share"
                 } else {
                     ""
                 },
-                if scope.is_some() { " (scoped)" } else { "" }
+                if scope.is_some() { " (scoped)" } else { "" },
+                if budget.cancels() {
+                    ""
+                } else {
+                    " (spent per visit)"
+                }
             ));
         }
 
@@ -1281,7 +1286,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .max(absorbed, &mut self.unknowns, &mut self.traces);
         let mut result = self.loop_result(sibling, escaping, main);
 
-        if let (Some(_), Some(scope)) = (&budget, scope) {
+        let cancels = budget.as_ref().is_some_and(|budget| budget.cancels());
+
+        if let (true, Some(scope)) = (cancels, scope) {
             let pending = self
                 .pending_scoped
                 .remove(&(file, scope))
@@ -1289,7 +1296,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .max(looped, &mut self.unknowns, &mut self.traces);
 
             self.pending_scoped.insert((file, scope), pending);
-        } else if budget.is_some() && self.inside_loop(file, node) {
+        } else if cancels && self.inside_loop(file, node) {
             result.join(
                 crate::cost::ExecutionPhase::Immediate,
                 Completion::Return,

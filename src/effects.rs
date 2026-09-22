@@ -47,6 +47,12 @@ pub(crate) struct Invalidation {
 }
 
 #[derive(Clone, Debug, Default)]
+pub(crate) struct BudgetStorage {
+    loops: Vec<(NodeId, Storage)>,
+    exhausted: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Storage {
     bindings: Vec<Binding>,
     values: Vec<(ValueId, Option<Binding>)>,
@@ -967,7 +973,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .map_or(loop_kind.node_id(), |ancestor| ancestor.id());
         let header = self.header_storage_of(file, loop_kind);
         let bound = self.affects(file, function, effects, &header, Some(repeated));
-        let budget = match self.budget_storage_of() {
+        let budget = match self.budget_storage_of(file, loop_kind.node_id()) {
             Some(storage) => self.affects(file, function, effects, &storage, None),
             None => false,
         };
@@ -1115,7 +1121,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn budget_storage_of(&mut self) -> Option<Storage> {
+    fn budget_storage_of(&mut self, file: FileId, loop_node: NodeId) -> Option<Storage> {
         let context = self.budget_context.as_ref()?;
 
         if context.budgets.is_empty() && self.share_bindings.is_empty() {
@@ -1124,16 +1130,44 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let function = context.function;
         let counters: Vec<Binding> = context.budgets.keys().copied().collect();
-        let mut storage = match self.budget_storage.get(&function) {
-            Some(storage) => storage.clone(),
+        let budgeted = match self.budget_storage.get(&function) {
+            Some(budgeted) => budgeted.clone(),
             None => {
-                let storage = self.budgeted_loop_storage_of(function, &counters);
+                let budgeted = self.budgeted_loop_storage_of(function, &counters);
 
-                self.budget_storage.insert(function, storage.clone());
+                self.budget_storage.insert(function, budgeted.clone());
 
-                storage
+                budgeted
             }
         };
+        let mut storage = Storage {
+            unresolved: budgeted.exhausted,
+            ..Storage::default()
+        };
+
+        let reachable: Vec<Storage> = match function.file == file {
+            true => {
+                let nodes = self.project.file(file).semantic.nodes();
+
+                budgeted
+                    .loops
+                    .iter()
+                    .filter(|(node, _)| {
+                        *node == loop_node || nodes.ancestor_ids(*node).any(|id| id == loop_node)
+                    })
+                    .map(|(_, found)| found.clone())
+                    .collect()
+            }
+            false => budgeted
+                .loops
+                .iter()
+                .map(|(_, found)| found.clone())
+                .collect(),
+        };
+
+        for found in reachable {
+            storage.merge(found);
+        }
 
         for binding in &self.share_bindings {
             if !storage.bindings.contains(binding) {
@@ -1144,27 +1178,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Some(storage)
     }
 
-    fn budgeted_loop_storage_of(&mut self, function: FunctionId, counters: &[Binding]) -> Storage {
+    fn budgeted_loop_storage_of(
+        &mut self,
+        function: FunctionId,
+        counters: &[Binding],
+    ) -> BudgetStorage {
         let file = function.file;
-        let mut storage = Storage::default();
+        let mut budgeted = BudgetStorage::default();
         let Some(body) = body_root_of(self.function_at(function)) else {
-            return storage;
+            return budgeted;
         };
 
         for kind in self.counted_subtree(file, body, Event::EffectPrepassNode) {
-            let (tests, body): (Vec<&'a Expression<'a>>, &'a Statement<'a>) = match kind {
-                AstKind::WhileStatement(statement) => (vec![&statement.test], &statement.body),
-                AstKind::DoWhileStatement(statement) => (vec![&statement.test], &statement.body),
-                AstKind::ForStatement(statement) => (
-                    statement
-                        .test
-                        .iter()
-                        .chain(statement.update.iter())
-                        .collect(),
-                    &statement.body,
-                ),
-                _ => continue,
-            };
+            let (node, tests, body): (NodeId, Vec<&'a Expression<'a>>, &'a Statement<'a>) =
+                match kind {
+                    AstKind::WhileStatement(statement) => {
+                        (statement.node_id(), vec![&statement.test], &statement.body)
+                    }
+                    AstKind::DoWhileStatement(statement) => {
+                        (statement.node_id(), vec![&statement.test], &statement.body)
+                    }
+                    AstKind::ForStatement(statement) => (
+                        statement.node_id(),
+                        statement
+                            .test
+                            .iter()
+                            .chain(statement.update.iter())
+                            .collect(),
+                        &statement.body,
+                    ),
+                    _ => continue,
+                };
             let mut found = Storage::default();
 
             for test in tests {
@@ -1188,14 +1232,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             }
 
-            storage.merge(found);
+            budgeted.loops.push((node, found));
         }
 
-        if self.work_exhausted() {
-            storage.unresolved = true;
-        }
+        budgeted.exhausted = self.work_exhausted();
 
-        storage
+        budgeted
     }
 
     fn spent_binding_of(&self, file: FileId, statement: &'a Statement<'a>) -> Option<Binding> {

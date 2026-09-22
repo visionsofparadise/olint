@@ -654,7 +654,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .any(|reference| self.binding_of_identifier(file, reference) == Some(counter))
     }
 
-    fn numeric_value_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Option<f64> {
+    pub(crate) fn numeric_value_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+    ) -> Option<f64> {
         match self.known_value(file, value).value.as_deref() {
             Ok(Primitive::Number(found)) if found.is_finite() => Some(*found),
             _ => None,

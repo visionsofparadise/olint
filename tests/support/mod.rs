@@ -207,6 +207,28 @@ pub fn summary_of(analysis: &mut Analysis<'_, '_>, file: FileId, name: &str) -> 
         .total(&mut analysis.unknowns, &mut analysis.traces)
 }
 
+pub fn legacy_result_of(
+    source: &str,
+    name: &str,
+) -> (
+    olint::cost::Cost,
+    bool,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+) {
+    let mut found = None;
+
+    run_with_source(source, |analysis, file| {
+        let function = function_of_name(analysis.project, file, name);
+        let part = summary_of(analysis, file, name);
+        let cost = legacy_class_of(analysis, file, function, &part.cost);
+        let reasons = unknown_reasons(analysis, part.unknowns);
+
+        found = Some((cost, part.is_complete(), reasons));
+    });
+
+    found.expect("the source declares the named function")
+}
+
 pub fn legacy_class_of<'a>(
     analysis: &mut Analysis<'_, 'a>,
     file: FileId,

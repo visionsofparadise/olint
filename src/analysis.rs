@@ -7,7 +7,7 @@ use crate::budgets::BudgetContext;
 use crate::cost::Part;
 use crate::declarations::{Binding, Declarations, FunctionId};
 use crate::directives::PerfTag;
-use crate::effects::{Effects, Storage};
+use crate::effects::{BudgetStorage, Effects};
 use crate::flow::Completion;
 use crate::project::{FileId, Project};
 use crate::summaries::{Scheduler, Substitutions, SummaryId, SummaryKey, SummaryRecord};
@@ -86,7 +86,7 @@ pub struct Analysis<'p, 'a> {
         HashMap<(FileId, NodeId, Completion, NodeId), Option<Completion>>,
     pub(crate) escape_depth_exhausted: bool,
     pub(crate) isolated_bindings: HashMap<(Binding, NodeId), bool>,
-    pub(crate) budget_storage: HashMap<FunctionId, Storage>,
+    pub(crate) budget_storage: HashMap<FunctionId, BudgetStorage>,
     pub(crate) dynamic_scopes: HashMap<(FileId, NodeId), (bool, bool)>,
     pub(crate) unclassified_writes: HashMap<(Binding, Option<NodeId>), bool>,
     pub(crate) prototype_members: crate::values::PrototypeMembers<'a>,
