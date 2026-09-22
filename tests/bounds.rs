@@ -686,6 +686,77 @@ fn a_share_collapses_only_where_the_consuming_loop_advances_a_whole_unit() {
     assert_eq!(found, expected);
 }
 
+type LegacyRow<'r> = (&'r str, String, &'r str, bool);
+
+fn assert_legacy_rows(rows: &[LegacyRow<'_>]) {
+    let found: Vec<(&str, (olint::cost::Cost, bool))> = rows
+        .iter()
+        .map(|(label, source, _, _)| (*label, legacy_cost_of(source, "f")))
+        .collect();
+    let expected: Vec<(&str, (olint::cost::Cost, bool))> = rows
+        .iter()
+        .map(|(label, _, text, complete)| (*label, (cost(text), *complete)))
+        .collect();
+
+    assert_eq!(found, expected);
+}
+
+fn halving_window_source(inner: &str) -> String {
+    format!(
+        "export function f(n: number, step: number, xs: Uint8Array) {{ let offset = 0, total = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} return total; }}"
+    )
+}
+
+fn reset_halving_window_source(inner: &str) -> String {
+    format!(
+        "export function f(n: number, step: number, xs: Uint8Array, ys: number[]) {{ let total = 0; for (const y of ys) {{ let offset = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} }} return total; }}"
+    )
+}
+
+fn reset_window_source(inner: &str) -> String {
+    format!(
+        "export function f(n: number, step: number, xs: Uint8Array, ys: number[]) {{ let total = 0; for (const y of ys) {{ let offset = 0; while (offset < n) {{ {inner} offset += step; }} }} return total; }}"
+    )
+}
+
+#[test]
+fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential() {
+    let rows = [
+        (
+            "a bare share endpoint under a halving budget loop",
+            halving_window_source("for (let k = 0; k < step; k += 1) total++;"),
+            "O(N * log(N))",
+            true,
+        ),
+        (
+            "a shared slice under a halving budget loop",
+            halving_window_source("for (const v of xs.subarray(0, step)) total += v;"),
+            "O(N * log(N))",
+            false,
+        ),
+        (
+            "a counter the enclosing loop resets",
+            reset_halving_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
+            "O(N^2 * log(N))",
+            true,
+        ),
+        (
+            "an offset share endpoint under an unresolved budget loop",
+            shared_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
+            "O(1)",
+            false,
+        ),
+        (
+            "a counter the enclosing unresolved loop resets",
+            reset_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
+            "O(N)",
+            false,
+        ),
+    ];
+
+    assert_legacy_rows(&rows);
+}
+
 #[test]
 fn a_subunit_share_consumer_keeps_the_factor_its_enclosing_loop_multiplies() {
     let rows = [
@@ -710,18 +781,10 @@ fn a_subunit_share_consumer_keeps_the_factor_its_enclosing_loop_multiplies() {
         (
             "a unit step under a halving budget loop",
             halving_share_source("for (let k = offset; k < offset + step; k++) total++;"),
-            "O(log(N))",
+            "O(N * log(N))",
             true,
         ),
     ];
-    let found: Vec<(&str, (olint::cost::Cost, bool))> = rows
-        .iter()
-        .map(|(label, source, _, _)| (*label, legacy_cost_of(source, "f")))
-        .collect();
-    let expected: Vec<(&str, (olint::cost::Cost, bool))> = rows
-        .iter()
-        .map(|(label, _, text, complete)| (*label, (cost(text), *complete)))
-        .collect();
 
-    assert_eq!(found, expected);
+    assert_legacy_rows(&rows);
 }

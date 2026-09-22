@@ -10,6 +10,7 @@ use oxc_span::{GetSpan, Span};
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
+use crate::budgets::{charge_covers, tests_after_body};
 use crate::cost::{Cost, Part, Preference, Reading};
 use crate::declarations::{
     function_of_initializer, parameters_of, Binding, Declaration, FunctionNode, ParameterNode,
@@ -1155,16 +1156,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.spent_budget(file, kind)
         };
         let budget = spend.filter(|spend| spend.scope != Some(node));
+        let visits = budget
+            .as_ref()
+            .and_then(|budget| self.visits_since(file, budget.scope));
+        let granted = match (&budget, &visits) {
+            (Some(budget), Some(visits)) => budget.share.filter(|_| {
+                visits
+                    .multiply(&factor)
+                    .is_ok_and(|charge| charge_covers(&charge, &budget.potential.cost()))
+            }),
+            _ => None,
+        };
 
-        if let Some(share) = budget.as_ref().and_then(|budget| budget.share) {
+        if let Some(share) = granted {
             self.share_bindings.push(share);
         }
+
+        self.enclosing_factors.push((file, node, factor.clone()));
 
         let body_raw =
             self.cost_of_statement(file, body)
                 .merge(visit, &mut self.unknowns, &mut self.traces);
 
-        if budget.as_ref().is_some_and(|budget| budget.share.is_some()) {
+        self.enclosing_factors.pop();
+
+        if granted.is_some() {
             self.share_bindings.pop();
         }
 
@@ -1234,21 +1250,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .and_then(|budget| budget.scope)
             .filter(|scope| self.is_ancestor(file, *scope, node));
 
+        let cancels = budget.as_ref().is_some_and(|budget| {
+            budget.cancels()
+                && charge_covers(&factor, &budget.potential.cost())
+                && match tests_after_body(kind) {
+                    true => visits
+                        .as_ref()
+                        .is_some_and(|visits| charge_covers(&factor, visits)),
+                    false => true,
+                }
+        });
+
         if let Some(budget) = &budget {
             self.stats.count(&format!(
                 "loop {}: budget{}{}{}",
                 loop_label(kind),
-                if budget.share.is_some() {
-                    " by share"
-                } else {
-                    ""
+                match (budget.share.is_some(), granted.is_some()) {
+                    (true, true) => " by share",
+                    (true, false) => " by withheld share",
+                    _ => "",
                 },
                 if scope.is_some() { " (scoped)" } else { "" },
-                if budget.cancels() {
-                    ""
-                } else {
-                    " (spent per visit)"
-                }
+                if cancels { "" } else { " (spent per visit)" }
             ));
         }
 
@@ -1289,8 +1312,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .max(absorbed, &mut self.unknowns, &mut self.traces);
         let mut result = self.loop_result(sibling, escaping, main);
 
-        let cancels = budget.as_ref().is_some_and(|budget| budget.cancels());
-
         if let (true, Some(scope)) = (cancels, scope) {
             let pending = self
                 .pending_scoped
@@ -1316,6 +1337,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         result
+    }
+
+    fn visits_since(&self, file: FileId, scope: Option<NodeId>) -> Option<Cost> {
+        let start = match scope {
+            Some(scope) => {
+                self.enclosing_factors
+                    .iter()
+                    .position(|(held, node, _)| *held == file && *node == scope)?
+                    + 1
+            }
+            None => 0,
+        };
+
+        self.enclosing_factors[start..]
+            .iter()
+            .try_fold(Cost::ONE, |visits, (_, _, factor)| {
+                visits.multiply(factor).ok()
+            })
     }
 
     fn is_ancestor(&self, file: FileId, ancestor: NodeId, node: NodeId) -> bool {

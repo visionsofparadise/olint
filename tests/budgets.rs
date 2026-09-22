@@ -537,6 +537,77 @@ fn a_budget_cancels_only_a_loop_its_own_condition_guards() {
     assert_eq!(guard_shapes_of(&rows), expected_guard_shapes_of(&rows));
 }
 
+type CostRow<'r> = (&'r str, &'r str, &'r str);
+
+fn assert_guarded_costs(rows: &[CostRow<'_>]) {
+    let found: Vec<(&str, String, bool)> = rows
+        .iter()
+        .map(|(label, body, _)| {
+            let (cost, complete, _) = support::legacy_result_of(&guarded_source(body), "f");
+
+            (*label, cost.text(), complete)
+        })
+        .collect();
+    let expected: Vec<(&str, String, bool)> = rows
+        .iter()
+        .map(|(label, _, expected)| {
+            let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
+
+            (*label, cost.text(), true)
+        })
+        .collect();
+
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn a_budget_cancels_only_where_its_charge_covers_the_potential_across_every_visit() {
+    let rows = [
+        (
+            "a do-while under two enclosing loops",
+            "for (let j = 0; j < n; j++) { for (const y of xs) { do { i++; total += y; } while (i < n); } }",
+            "O(N^3)",
+        ),
+        (
+            "a halving do-while under one enclosing loop",
+            "let size = n; for (let j = 0; j < n; j++) { do { i++; total++; size = size / 2; } while (size > 1 && i < n); }",
+            "O(N log N)",
+        ),
+        (
+            "a halving while under one enclosing loop",
+            "let size = n; for (let j = 0; j < n; j++) { while (size > 1 && i < n) { i++; total++; size = size / 2; } }",
+            "O(N log N)",
+        ),
+        (
+            "a do-while under one enclosing loop",
+            "for (let j = 0; j < n; j++) { do { i++; total++; } while (i < n); }",
+            "O(N)",
+        ),
+        (
+            "a while under two enclosing loops",
+            "for (let j = 0; j < n; j++) { for (const y of xs) { while (i < n) { i++; total += y; } } }",
+            "O(N)",
+        ),
+        (
+            "a do-while no loop encloses",
+            "do { i++; total++; } while (i < n);",
+            "O(N)",
+        ),
+        (
+            "the two-pointer inner while",
+            "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } }",
+            "O(N)",
+        ),
+        (
+            "a counter scoped to the enclosing loop",
+            "for (let j = 0; j < n; j++) { let k = 0; while (k < n) { k++; total++; } }",
+            "O(N^2)",
+        ),
+    ];
+
+    assert_guarded_costs(&rows);
+}
+
 #[test]
 fn an_unguarded_loop_keeps_the_factor_no_budget_cancels() {
     let rows = [
@@ -566,22 +637,6 @@ fn an_unguarded_loop_keeps_the_factor_no_budget_cancels() {
             "O(N)",
         ),
     ];
-    let found: Vec<(&str, String, bool)> = rows
-        .iter()
-        .map(|(label, body, _)| {
-            let (cost, complete, _) = support::legacy_result_of(&guarded_source(body), "f");
 
-            (*label, cost.text(), complete)
-        })
-        .collect();
-    let expected: Vec<(&str, String, bool)> = rows
-        .iter()
-        .map(|(label, _, expected)| {
-            let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
-
-            (*label, cost.text(), true)
-        })
-        .collect();
-
-    assert_eq!(found, expected);
+    assert_guarded_costs(&rows);
 }

@@ -243,6 +243,7 @@ pub fn legacy_class_of<'a>(
         "O(N)",
         "O(N log N)",
         "O(N^2)",
+        "O(N^2 log N)",
         "O(N^3)",
         "O(N^4)",
     ] {

@@ -17,6 +17,7 @@ use oxc_syntax::scope::ScopeFlags;
 
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
+use crate::cost::{Cost, CostComparison};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
 use crate::project::FileId;
 use crate::syntax::{
@@ -53,6 +54,15 @@ pub enum Potential {
     Enveloped,
 }
 
+impl Potential {
+    pub fn cost(&self) -> Cost {
+        match self {
+            Potential::Constant(_) => Cost::ONE,
+            Potential::Enveloped => Cost::N,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepMagnitude {
     Constant,
@@ -80,12 +90,21 @@ pub struct Spend {
     pub share: Option<Binding>,
     pub scope: Option<NodeId>,
     pub magnitude: StepMagnitude,
+    pub potential: Potential,
 }
 
 impl Spend {
     pub fn cancels(&self) -> bool {
         self.magnitude == StepMagnitude::Constant
     }
+}
+
+pub fn charge_covers(charge: &Cost, required: &Cost) -> bool {
+    required.compare_legacy(charge) == CostComparison::Within
+}
+
+pub fn tests_after_body(loop_kind: AstKind<'_>) -> bool {
+    matches!(loop_kind, AstKind::DoWhileStatement(_))
 }
 
 pub(crate) struct Subtree<'a> {
@@ -852,10 +871,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     true => StepMagnitude::Constant,
                     false => StepMagnitude::Stable,
                 },
+                potential: budget.potential,
             });
         };
         let text = format!("{}, by {}", budget.text, identifier);
         let scope = budget.scope;
+        let potential = budget.potential;
         let stable = identifier_binding.is_some_and(|binding| {
             match self.declarations.of_binding(self.project, binding) {
                 Some(Declaration::Variable {
@@ -888,6 +909,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             share: identifier_binding,
             scope,
             magnitude: StepMagnitude::Stable,
+            potential,
         })
     }
 

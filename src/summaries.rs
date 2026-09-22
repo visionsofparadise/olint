@@ -1101,6 +1101,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let saved_roots = self.root_sizes.replace(key.root_sizes.clone());
         let saved_budget = self.budget_context.take();
         let saved_shares = std::mem::take(&mut self.share_bindings);
+        let saved_factors = std::mem::take(&mut self.enclosing_factors);
         let saved_scoped = std::mem::take(&mut self.pending_scoped);
         let saved_bounds = std::mem::take(&mut self.bound_seen);
         let saved_warnings = std::mem::take(&mut self.warnings);
@@ -1138,6 +1139,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.root_sizes = saved_roots;
         self.budget_context = saved_budget;
         self.share_bindings = saved_shares;
+        self.enclosing_factors = saved_factors;
         self.pending_scoped = saved_scoped;
         self.bound_seen = saved_bounds;
         let pending = std::mem::take(&mut self.scheduler.missing);
