@@ -2800,7 +2800,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let argument = argument?;
         let facts = self.argument_facts_of(file, argument);
 
-        Some(self.invoke_argument_with(&facts, file, argument.span(), &[], true))
+        Some(self.invoke_argument_with(&facts, file, argument.span(), &[], (true, &[])))
+    }
+
+    pub(crate) fn invoke_callback(
+        &mut self,
+        facts: &ArgumentFacts,
+        file: FileId,
+        span: oxc_span::Span,
+        supplied: &[Part],
+    ) -> Part {
+        self.invoke_argument_with(facts, file, span, &[], (true, supplied))
     }
 
     pub(crate) fn apply_argument_effects(
@@ -2828,7 +2838,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         span: oxc_span::Span,
         arguments: &'a [Argument<'a>],
     ) -> Part {
-        self.invoke_argument_with(facts, file, span, arguments, false)
+        self.invoke_argument_with(facts, file, span, arguments, (false, &[]))
     }
 
     fn invoke_argument_with(
@@ -2837,7 +2847,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         span: oxc_span::Span,
         arguments: &'a [Argument<'a>],
-        implicit: bool,
+        (implicit, supplied): (bool, &[Part]),
     ) -> Part {
         if let Some(id) = self
             .scheduler
@@ -2858,12 +2868,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.fallback_invocation(target, file, span)
             } else {
                 let descriptor = descriptor.clone();
+                let captured = self.supplied_substitutions_of(
+                    (target.file, function),
+                    descriptor.captured,
+                    supplied,
+                );
 
                 self.call_with_captures(
                     (target.file, function),
                     (file, arguments, span),
                     implicit,
-                    descriptor.captured,
+                    captured,
                 )
             };
 
@@ -2882,6 +2897,38 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .callback
             .clone()
             .unwrap_or_else(|| self.unknown_part(file, span, UnknownReason::Target))
+    }
+
+    fn supplied_substitutions_of(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        mut substitutions: Substitutions,
+        supplied: &[Part],
+    ) -> Substitutions {
+        let Some(parameters) = parameters_of(function) else {
+            return substitutions;
+        };
+
+        for (parameter, part) in parameters.items.iter().zip(supplied) {
+            let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+
+            substitutions.insert(
+                Binding::Symbol { file, symbol },
+                ArgumentFacts {
+                    value: self.values.at(self.source_span(file, identifier.span)),
+                    callback: Some(part.clone()),
+                    preference: Preference::Absent,
+                    definedness: Definedness::Defined,
+                },
+            );
+        }
+
+        substitutions
     }
 
     pub(crate) fn called_part_of(
@@ -3088,6 +3135,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 continue;
             };
+            let supplied = identifier
+                .symbol_id
+                .get()
+                .filter(|_| implicit && arguments.get(index).is_none())
+                .is_some_and(|symbol| {
+                    substitutions.contains_key(&Binding::Symbol { file, symbol })
+                });
+
+            if supplied {
+                continue;
+            }
+
             let positional = spread_at.is_none_or(|spread| spread > index);
             let undefined = match arguments.get(index).and_then(Argument::as_expression) {
                 Some(expression) => {

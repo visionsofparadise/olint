@@ -1841,3 +1841,41 @@ fn a_caught_throw_is_charged_at_the_loop_its_handler_sits_outside() {
     assert_eq!(inside, Cost::parse("O(N^4)").unwrap());
     assert_eq!(inside_labels, vec!["for-of", "for-of", "call quadratic()"]);
 }
+
+#[test]
+fn standard_api_callbacks_run_inside_their_native_operation() {
+    for (source, expected, labels) in [
+        (
+            "export function f(s: string, xs: number[]) { return s.replaceAll(\"x\", () => `${quadratic(xs)}`); }",
+            "O(N^3)",
+            vec!["s.replaceAll() [string]", "call quadratic()"],
+        ),
+        (
+            "export function f(s: string, xs: number[]) { return s.replace(\"x\", () => `${quadratic(xs)}`); }",
+            "O(N^2)",
+            vec!["s.replace() [string]", "call quadratic()"],
+        ),
+        (
+            "export function f(xs: number[]) { return Object.groupBy(xs, () => quadratic(xs)); }",
+            "O(N^3)",
+            vec!["Object.groupBy(xs)", "call quadratic()"],
+        ),
+        (
+            "export function f(xs: number[]) { return JSON.stringify(xs, (_, value) => { quadratic(xs); return value; }); }",
+            "O(N^3)",
+            vec!["JSON.stringify(xs)", "call quadratic()"],
+        ),
+        (
+            "export function f(xs: number[]) { return new Promise<number>(resolve => resolve(quadratic(xs))); }",
+            "O(N^2)",
+            vec!["call quadratic()"],
+        ),
+    ] {
+        let (reading, found) = reading_of(&format!("{QUADRATIC}\n{source}"), "f");
+        let total = reading.total();
+
+        assert_eq!(total.cost, Cost::parse(expected).unwrap(), "{source}");
+        assert!(total.is_complete(), "{source}");
+        assert_eq!(found, labels, "{source}");
+    }
+}

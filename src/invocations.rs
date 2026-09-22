@@ -154,7 +154,7 @@ fn is_coercing_binary(operator: BinaryOperator) -> bool {
     )
 }
 
-fn coercion_keys() -> Vec<MemberKey> {
+pub(crate) fn coercion_keys() -> Vec<MemberKey> {
     COERCION_KEYS
         .iter()
         .map(|name| protocol_key_of(name))
@@ -175,7 +175,7 @@ fn awaited_keys() -> Vec<MemberKey> {
         .collect()
 }
 
-fn iteration_keys() -> Vec<MemberKey> {
+pub(crate) fn iteration_keys() -> Vec<MemberKey> {
     ["@@iterator", "@@asyncIterator", "next", "return"]
         .iter()
         .map(|name| protocol_key_of(name))
@@ -364,6 +364,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.delegated_part_of(file, spread.span, &spread.argument, false)
     }
 
+    pub(crate) fn inspected_part_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Part {
+        if self.is_primitive_operand(file, value) || self.has_primitive_elements(file, value) {
+            return Part::none();
+        }
+
+        self.implicit_plan_part_of((file, value.node_id()), |analysis, plan| {
+            let sources = Sources {
+                values: vec![(file, value)],
+                open: false,
+            };
+
+            analysis.plan_rest_reads_of((file, value.span()), &sources, &[], plan);
+        })
+    }
+
+    pub(crate) fn unknown_visits_part_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+    ) -> Part {
+        let receiver = self.storage_value_of(file, value);
+        let visited = self.unknown_implicit_part(file, value.span(), &[receiver]);
+
+        self.visits_of((file, value.span()), visited, false)
+    }
+
     fn copied_part_of(&mut self, file: FileId, spread: &'a SpreadElement<'a>) -> Option<Part> {
         Some(
             self.implicit_plan_part_of((file, spread.node_id()), |analysis, plan| {
@@ -410,7 +436,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         part
     }
 
-    fn delegated_part_of(
+    pub(crate) fn delegated_part_of(
         &mut self,
         file: FileId,
         span: Span,
@@ -672,7 +698,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         part
     }
 
-    fn is_primitive_operand(&mut self, file: FileId, operand: &'a Expression<'a>) -> bool {
+    pub(crate) fn is_primitive_operand(
+        &mut self,
+        file: FileId,
+        operand: &'a Expression<'a>,
+    ) -> bool {
         if self.is_declared_primitive(file, operand) {
             return true;
         }
@@ -715,13 +745,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         targets.known.into_iter().all(|target| {
-            let deferred = match self.function_at(target) {
-                FunctionNode::Function(function) => function.r#async || function.generator,
-                FunctionNode::Arrow(arrow) => arrow.r#async,
-                FunctionNode::Construction(_) => false,
-            };
-
-            !deferred
+            !self.is_deferred_function(target)
                 && self
                     .returned_expressions_of(target)
                     .into_iter()
@@ -733,6 +757,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             || self.returns_primitive(target.file, returned, depth + 1)
                     })
         })
+    }
+
+    pub(crate) fn returns_only_primitives(&mut self, target: FunctionId) -> bool {
+        !self.is_deferred_function(target)
+            && self
+                .returned_expressions_of(target)
+                .into_iter()
+                .all(|returned| self.is_primitive_operand(target.file, returned))
+    }
+
+    fn is_deferred_function(&self, target: FunctionId) -> bool {
+        match self.function_at(target) {
+            FunctionNode::Function(function) => function.r#async || function.generator,
+            FunctionNode::Arrow(arrow) => arrow.r#async,
+            FunctionNode::Construction(_) => false,
+        }
     }
 
     fn coercion_targets_of(&mut self, file: FileId, operand: &'a Expression<'a>) -> TargetSet {
@@ -837,7 +877,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.implicit_part_of((file, span), &targets, "coercion", &receivers)
     }
 
-    fn operand_coercion_part_of(&mut self, file: FileId, operand: &'a Expression<'a>) -> Part {
+    pub(crate) fn operand_coercion_part_of(
+        &mut self,
+        file: FileId,
+        operand: &'a Expression<'a>,
+    ) -> Part {
         if self.is_primitive_operand(file, operand) {
             return Part::none();
         }
@@ -1375,7 +1419,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         joined
     }
 
-    fn implicit_part_of(
+    pub(crate) fn implicit_part_of(
         &mut self,
         (file, span): (FileId, Span),
         targets: &TargetSet,

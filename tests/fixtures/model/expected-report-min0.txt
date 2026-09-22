@@ -43,11 +43,11 @@ O(max(xs, other)) [partial]    1
 O(max(xs, needle))    1
 O(max(s, cb)) [partial]    1
 O(max(m, cb)) [partial]    1
-O(max(strings, needle)) [partial]    1
+O((max(strings, needle))^(2))    1
 O(max(re, needles)) [partial]    1
 O(text)             1
 O(parts)            1
-O(items^2)          1
+O(items^2) [partial]    1
 O(rows) [partial]    1
 O(max(1, xs^2)) [partial]    1
 O((matrix * matrix^2))    1
@@ -128,6 +128,10 @@ O((max(o, matrix))^(2)) unionOfClosed  src/types.ts:18
     in loop for-of                                           src/types.ts:20  x N
         in loop for-of                                       src/types.ts:20  x N
 
+O((max(strings, needle))^(2)) stringLinearCall  src/methods.ts:17
+    in loop for-of                                           src/methods.ts:19  x N
+        does s.indexOf() [string]                         src/methods.ts:19  x N
+
 O(rows^2)      WithStaticMethod.compute  src/classes.ts:54
     in loop for-of                                           src/classes.ts:56  x N
         in loop for-of                                       src/classes.ts:56  x N
@@ -196,7 +200,7 @@ O(xs^2)        a  src/modules/star.ts:1
     in loop for-of                                           src/modules/star.ts:3  x N
         in loop for-of                                       src/modules/star.ts:3  x N
 
-O(items^2)     structuredCloneCall  src/methods.ts:51
+O(items^2)     structuredCloneCall  src/methods.ts:51 [partial]
     does items.map()                                      src/methods.ts:52  x N
         does structuredClone()                            src/methods.ts:52  x N
 
@@ -259,9 +263,6 @@ O(max(xs, fast)) hotIfBranch  src/branches.ts:1
 
 O(max(re, needles)) regexpVarCall  src/methods.ts:27 [partial]
     does re.test() [regexp]                               src/methods.ts:29  x N
-
-O(max(strings, needle)) stringLinearCall  src/methods.ts:17 [partial]
-    does s.indexOf() [string]                             src/methods.ts:19  x N
 
 O(max(m, cb))  mapLinearCall  src/methods.ts:13 [partial]
     does m.forEach()                                      src/methods.ts:14  x N

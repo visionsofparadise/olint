@@ -76,15 +76,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub fn kind_of(&mut self, file: FileId, e: &'a Expression<'a>, method: &str) -> Kind {
-        let mut kind = self.declared_type_of_expression(file, e).kind;
+        let kind = self.receiver_kind_of(file, e, method);
+
+        self.stats.count(&format!("kind: {}", kind_label_of(kind)));
+
+        kind
+    }
+
+    pub(crate) fn receiver_kind_of(
+        &mut self,
+        file: FileId,
+        e: &'a Expression<'a>,
+        method: &str,
+    ) -> Kind {
+        let kind = self.declared_type_of_expression(file, e).kind;
 
         if kind == Kind::Unknown && method_matters(method) {
             if let Some(answer) = self.type_answer_of(file, unwrap(e).span()) {
-                kind = answer.kind;
+                return answer.kind;
             }
         }
-
-        self.stats.count(&format!("kind: {}", kind_label_of(kind)));
 
         kind
     }

@@ -22,14 +22,15 @@ use crate::flow::{
     class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, loop_phases_of,
     Completion, Resumption,
 };
+use crate::native::Native;
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
     member_expression_of, unwrap, Root,
 };
 use crate::tables::{
-    ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, GLOBAL_FUNCTIONS_LINEAR, GLOBAL_LINEAR,
-    LINEAR_CONSTRUCTORS, MAP_LINEAR, OBJECT_KEYED, REGEXP_LINEAR, SET_LINEAR, STRING_LINEAR,
+    ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, LINEAR_CONSTRUCTORS, MAP_LINEAR, REGEXP_LINEAR,
+    SET_LINEAR,
 };
 use crate::types::ResolvedCallee;
 use crate::unknowns::{SourceSpan, UnknownId, UnknownReason};
@@ -1665,6 +1666,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return reading;
         }
 
+        if let Some(model) = self.construction_model_of(file, new) {
+            let native = self.construction_site_of(file, new);
+
+            if self.intrinsic_replaced_of(file, &new.callee) {
+                let unknown =
+                    self.unknown_invocation(file, new.span, &new.arguments, UnknownReason::Target);
+
+                reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+            }
+
+            return self.native_reading_of(&native, model, reading, true);
+        }
+
         self.record_unknown_reach(file, Some(&new.callee), &new.arguments, new.span);
 
         let constructor = match &new.callee {
@@ -1754,7 +1768,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn named_call_of(
+    pub(crate) fn named_call_of(
         &mut self,
         (target, function): (FileId, FunctionNode<'a>),
         called: Part,
@@ -2035,10 +2049,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let member = member_expression_of(callee).filter(|member| {
-            !matches!(member, MemberExpression::ComputedMemberExpression(_))
-                || self.static_member_name_of(file, member).is_some()
-        });
+        let member = self.callee_member_of(file, call);
 
         let ResolvedCallee {
             declaration,
@@ -2153,24 +2164,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if !targets.known.is_empty() {
-            if self.intrinsic_replaced_of(file, callee)
-                && self.has_intrinsic_model(file, call, member)
-            {
-                let intrinsic =
-                    self.intrinsic_reading_of(file, call, member, Reading::empty(), site);
+            if self.intrinsic_replaced_of(file, callee) {
+                let native = self.native_of(file, call, member, true);
 
-                reading = reading.merge(intrinsic, &mut self.unknowns, &mut self.traces);
+                if is_modelled(native) {
+                    let intrinsic =
+                        self.intrinsic_reading_of(file, call, member, native, Reading::empty());
+
+                    reading = reading.merge(intrinsic, &mut self.unknowns, &mut self.traces);
+                }
             }
 
             return reading;
         }
 
-        self.record_unknown_reach(file, Some(&call.callee), &call.arguments, call.span);
-
         if exhausted {
+            self.record_unknown_reach(file, Some(&call.callee), &call.arguments, call.span);
+
             let unknown = self.unknown_invocation(file, call.span, &call.arguments, reason);
 
             return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        let native = self.native_of(file, call, member, true);
+
+        if !matches!(native, Native::Modelled(_)) {
+            self.record_unknown_reach(file, Some(&call.callee), &call.arguments, call.span);
         }
 
         if self.intrinsic_replaced_of(file, callee) {
@@ -2179,7 +2198,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
         }
 
-        self.intrinsic_reading_of(file, call, member, reading, site)
+        self.intrinsic_reading_of(file, call, member, native, reading)
     }
 
     fn cost_of_returned_call(
@@ -2227,149 +2246,49 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading
     }
 
-    fn has_intrinsic_model(
-        &mut self,
-        file: FileId,
-        call: &'a CallExpression<'a>,
-        member: Option<&'a MemberExpression<'a>>,
-    ) -> bool {
-        let Some(member) = member else {
-            return identifier_of(unwrap(&call.callee)).is_some_and(|reference| {
-                is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str())
-            });
-        };
-        let method = self.method_name_of(file, member);
-        let receiver = member.object();
-
-        if identifier_of(receiver).is_some_and(|global| {
-            GLOBAL_LINEAR.iter().any(|(name, methods)| {
-                *name == global.name.as_str() && methods.contains(&method.as_str())
-            })
-        }) {
-            return true;
-        }
-
-        matches!(
-            self.kind_of(file, receiver, &method),
-            Kind::Array | Kind::Set | Kind::Map | Kind::String | Kind::RegExp
-        )
-    }
-
     fn intrinsic_reading_of(
         &mut self,
         file: FileId,
         call: &'a CallExpression<'a>,
         member: Option<&'a MemberExpression<'a>>,
+        native: Native,
         reading: Reading,
-        site: Site,
     ) -> Reading {
-        let callee = unwrap(&call.callee);
+        match (native, member) {
+            (Native::Modelled(model), _) => {
+                let site = self.call_site_of(file, call, member);
 
-        if let Some(member) = member {
-            return self.cost_of_method_call(file, call, member, reading, site);
-        }
+                self.native_reading_of(&site, model, reading, true)
+            }
+            (Native::Receiver(kind), Some(member)) => {
+                let site = self.site_of_node(file, call.node_id());
 
-        if let Some(reference) = identifier_of(callee) {
-            if is_listed(GLOBAL_FUNCTIONS_LINEAR, reference.name.as_str()) {
-                return self.append_linear_operation(
-                    reading,
-                    format!("{}()", reference.name),
-                    site,
-                    (file, call.span),
+                self.cost_of_method_call(file, call, (member, kind), reading, site)
+            }
+            _ => {
+                let unknown = self.unknown_invocation(
+                    file,
+                    call.span,
+                    &call.arguments,
+                    UnknownReason::Target,
                 );
+
+                reading.merge(unknown, &mut self.unknowns, &mut self.traces)
             }
         }
-
-        let unknown =
-            self.unknown_invocation(file, call.span, &call.arguments, UnknownReason::Target);
-
-        reading.merge(unknown, &mut self.unknowns, &mut self.traces)
-    }
-
-    fn is_bounded_global_argument(
-        &mut self,
-        file: FileId,
-        global_name: &str,
-        method: &str,
-        argument: &'a Argument<'a>,
-    ) -> bool {
-        self.is_constant_sized_argument(file, argument)
-            || (global_name == "Object"
-                && is_listed(OBJECT_KEYED, method)
-                && (argument
-                    .as_expression()
-                    .is_some_and(|expression| self.is_enum_object(file, expression))
-                    || self.is_closed_argument(file, argument)))
     }
 
     fn cost_of_method_call(
         &mut self,
         file: FileId,
         call: &'a CallExpression<'a>,
-        member: &'a MemberExpression<'a>,
+        (member, kind): (&'a MemberExpression<'a>, Kind),
         reading: Reading,
         site: Site,
     ) -> Reading {
         let method = self.method_name_of(file, member);
         let receiver = member.object();
         let first = call.arguments.first();
-
-        if let Some(global) = identifier_of(receiver) {
-            let global_name = global.name.as_str();
-            let listed = GLOBAL_LINEAR
-                .iter()
-                .any(|(name, methods)| *name == global_name && methods.contains(&method.as_str()));
-
-            if listed {
-                let copies_every_argument = global_name == "Object" && method == "assign";
-                let bounded = match (first, copies_every_argument) {
-                    (Some(_), true) => call.arguments.iter().all(|argument| {
-                        self.is_bounded_global_argument(file, global_name, &method, argument)
-                    }),
-                    (Some(argument), false) => {
-                        self.is_bounded_global_argument(file, global_name, &method, argument)
-                    }
-                    (None, _) => false,
-                };
-                let callback = if method == "from" {
-                    self.callback_part_of(file, call.arguments.get(1))
-                } else {
-                    Part::none()
-                };
-
-                self.stats.count(&format!(
-                    "{global_name}.{method}: {}",
-                    if bounded { "bounded" } else { "N" }
-                ));
-
-                if bounded {
-                    return reading.merge(
-                        Reading::of_part(callback),
-                        &mut self.unknowns,
-                        &mut self.traces,
-                    );
-                }
-
-                let argument_text = match first {
-                    Some(argument) => short(self.text_of(file, argument.span())),
-                    None => String::new(),
-                };
-
-                return reading.merge(
-                    Reading::of_part(self.nest_part(
-                        format!("{global_name}.{method}({argument_text})"),
-                        site,
-                        self.source_span(file, call.span),
-                        Cost::N,
-                        callback.executed(),
-                    )),
-                    &mut self.unknowns,
-                    &mut self.traces,
-                );
-            }
-        }
-
-        let kind = self.kind_of(file, receiver, &method);
 
         if kind == Kind::Unknown {
             let unknown = self.unknown_invocation(
@@ -2398,13 +2317,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if array_like && (is_listed(ARRAY_N_LOG_N, &method) || is_listed(ARRAY_LINEAR, &method)) {
             self.stats.count(&format!(
                 "array method: {}",
-                if bounded { "bounded" } else { "N" }
-            ));
-        }
-
-        if kind == Kind::String && is_listed(STRING_LINEAR, &method) {
-            self.stats.count(&format!(
-                "string method: {}",
                 if bounded { "bounded" } else { "N" }
             ));
         }
@@ -2471,15 +2383,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         }
 
-        if kind == Kind::String && is_listed(STRING_LINEAR, &method) && !bounded {
-            return self.append_linear_operation(
-                reading,
-                label(" [string]"),
-                site,
-                (file, call.span),
-            );
-        }
-
         if kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method) {
             if let Some(argument) = first {
                 if !self.is_constant_sized_argument(file, argument) {
@@ -2495,10 +2398,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return reading;
         }
 
-        if kind == Kind::String && is_listed(STRING_LINEAR, &method) && bounded {
-            return reading;
-        }
-
         let unknown = self.unknown_invocation(
             file,
             call.span,
@@ -2507,6 +2406,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         );
 
         reading.merge(unknown, &mut self.unknowns, &mut self.traces)
+    }
+}
+
+fn is_modelled(native: Native) -> bool {
+    match native {
+        Native::Modelled(_) => true,
+        Native::Receiver(kind) => matches!(
+            kind,
+            Kind::Array | Kind::Set | Kind::Map | Kind::String | Kind::RegExp
+        ),
+        Native::Unmodelled => false,
     }
 }
 

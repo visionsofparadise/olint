@@ -893,6 +893,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.is_declared_primitive_at(file, expression, 0)
     }
 
+    pub(crate) fn has_primitive_elements(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        match self.element_type_of(file, expression, 0) {
+            Some((source, element)) => self.is_primitive_type(source, element, 1),
+            None => false,
+        }
+    }
+
     fn is_declared_primitive_at(
         &mut self,
         file: FileId,

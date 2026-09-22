@@ -884,7 +884,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             self.call_user(target.file, function, file, &call.arguments, call.span);
                         }
 
-                        if targets.open {
+                        let native =
+                            targets.known.is_empty() && self.records_native_effects(file, call);
+
+                        if targets.open && !native {
                             self.record_unknown_reach(
                                 file,
                                 Some(&call.callee),
@@ -908,9 +911,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         self.construction_part_of((file, &new.arguments, new.span), *implicit);
                     }
 
-                    if (targets.known.is_empty() && construction.implicit.is_empty())
-                        || targets.open
-                    {
+                    let unresolved = targets.known.is_empty() && construction.implicit.is_empty();
+                    let native = unresolved && self.records_construction_effects(file, new);
+
+                    if (unresolved || targets.open) && !native {
                         self.record_unknown_reach(
                             file,
                             Some(&new.callee),

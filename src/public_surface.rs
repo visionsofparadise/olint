@@ -792,6 +792,17 @@ impl<'a> Walk<'_, '_, 'a> {
         escaping: bool,
         pending: &mut Vec<(Binding, bool)>,
     ) {
+        if let AstKind::CallExpression(expression) =
+            self.analysis.project.file(file).semantic.nodes().kind(call)
+        {
+            if self
+                .analysis
+                .is_contained_native_argument(file, expression, index)
+            {
+                return;
+            }
+        }
+
         let (targets, arguments) =
             match self.analysis.project.file(file).semantic.nodes().kind(call) {
                 AstKind::CallExpression(expression) => (

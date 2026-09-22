@@ -97,31 +97,7 @@ pub static STRING_LINEAR: &[&str] = &[
 
 pub static REGEXP_LINEAR: &[&str] = &["test", "exec"];
 
-pub static GLOBAL_LINEAR: &[(&str, &[&str])] = &[
-    ("Array", &["from", "of"]),
-    (
-        "Object",
-        &[
-            "keys",
-            "values",
-            "entries",
-            "assign",
-            "fromEntries",
-            "freeze",
-            "groupBy",
-        ],
-    ),
-    ("JSON", &["parse", "stringify"]),
-    (
-        "Buffer",
-        &["from", "concat", "alloc", "allocUnsafe", "compare"],
-    ),
-    ("Map", &["groupBy"]),
-];
-
 pub static OBJECT_KEYED: &[&str] = &["keys", "values", "entries", "freeze", "assign"];
-
-pub static GLOBAL_FUNCTIONS_LINEAR: &[&str] = &["structuredClone"];
 
 pub static LINEAR_CONSTRUCTORS: &[&str] = &[
     "Set",
