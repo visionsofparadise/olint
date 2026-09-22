@@ -172,6 +172,26 @@ impl Progression {
             .iter()
             .any(|write| write.within_update || !is_replacing(write))
     }
+
+    fn advances(&self, toward: f64) -> Option<Vec<Option<f64>>> {
+        self.writes
+            .iter()
+            .map(|write| match write.step {
+                Step::Additive(delta) => Some(delta.map(|delta| delta * toward)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn guaranteed_advance(&self, toward: f64) -> Option<f64> {
+        self.unconditional
+            .iter()
+            .map(|write| match write.step {
+                Step::Additive(delta) => delta.map(|delta| delta * toward),
+                _ => None,
+            })
+            .try_fold(0.0, |total, advance| advance.map(|advance| total + advance))
+    }
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -263,11 +283,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return linear_bound_of();
         };
         let variable = self.loop_variable_of(file, statement);
-
-        if let Some(bound) = self.share_bound_of(file, test, variable.as_ref()) {
-            return bound;
-        }
-
         let repetition = Repetition {
             node: statement.node_id(),
             body,
@@ -276,6 +291,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             returns_to_head: self.returns_to_head(file, statement.node_id(), body),
             geometric_proof: "geometric step",
         };
+
+        if let Some(bound) = self.share_bound_of(file, test, &repetition) {
+            return bound;
+        }
 
         self.bound_of_repetition(file, test, &repetition)
     }
@@ -769,28 +788,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Direction::Up => 1.0,
             Direction::Down => -1.0,
         };
-        let mut advances = Vec::new();
-
-        for write in &progression.writes {
-            match write.step {
-                Step::Additive(delta) => advances.push(delta.map(|delta| delta * toward)),
-                _ => return None,
-            }
-        }
+        let advances = progression.advances(toward)?;
 
         if advances.iter().any(Option::is_none) {
             return Some(unresolved_bound_of());
         }
 
-        let guaranteed: Option<f64> = progression
-            .unconditional
-            .iter()
-            .map(|write| match write.step {
-                Step::Additive(delta) => delta.map(|delta| delta * toward),
-                _ => None,
-            })
-            .try_fold(0.0, |total, advance| advance.map(|advance| total + advance));
-
+        let guaranteed = progression.guaranteed_advance(toward);
         let sums_every_write = progression.unconditional.len() == progression.writes.len();
 
         if guaranteed.is_some_and(|guaranteed| guaranteed <= 0.0)
@@ -1209,7 +1213,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         test: &'a Expression<'a>,
-        variable: Option<&(Binding, &'a Expression<'a>)>,
+        repetition: &Repetition<'a>,
     ) -> Option<Bound> {
         let Expression::BinaryExpression(binary) = unwrap(test) else {
             return None;
@@ -1221,27 +1225,59 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let counter = identifier_of(unwrap(&binary.left))?;
         let counter = self.binding_of_identifier(file, counter)?;
-        let (_, initial) = variable.filter(|(binding, _)| *binding == counter)?;
+        let (_, initial) = repetition
+            .initial
+            .filter(|(binding, _)| *binding == counter)?;
         let endpoint = unwrap(&binary.right);
+        let shared =
+            self.is_share_sized(file, endpoint) || self.is_share_offset_of(file, initial, endpoint);
 
-        if self.is_share_sized(file, endpoint) {
-            return Some(constant_bound_of("share of budget"));
-        }
+        (shared && self.consumes_a_unit(file, counter, repetition))
+            .then(|| constant_bound_of("share of budget"))
+    }
 
+    fn is_share_offset_of(
+        &mut self,
+        file: FileId,
+        initial: &'a Expression<'a>,
+        endpoint: &'a Expression<'a>,
+    ) -> bool {
         let Expression::BinaryExpression(sum) = endpoint else {
-            return None;
+            return false;
         };
 
         if sum.operator != BinaryOperator::Addition {
-            return None;
+            return false;
         }
 
-        let shared = (self.is_same_reading(file, initial, &sum.left)
-            && self.is_share_sized(file, &sum.right))
+        (self.is_same_reading(file, initial, &sum.left) && self.is_share_sized(file, &sum.right))
             || (self.is_same_reading(file, initial, &sum.right)
-                && self.is_share_sized(file, &sum.left));
+                && self.is_share_sized(file, &sum.left))
+    }
 
-        shared.then(|| constant_bound_of("share of budget"))
+    fn consumes_a_unit(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        repetition: &Repetition<'a>,
+    ) -> bool {
+        let Some(progression) = self.progression_of(file, counter, repetition) else {
+            return false;
+        };
+        let Some(advances) = progression.advances(1.0) else {
+            return false;
+        };
+
+        if !advances
+            .iter()
+            .all(|advance| advance.is_some_and(|advance| advance >= 0.0))
+        {
+            return false;
+        }
+
+        progression
+            .guaranteed_advance(1.0)
+            .is_some_and(|guaranteed| guaranteed >= 1.0)
     }
 
     fn loop_variable_of(

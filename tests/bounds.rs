@@ -597,3 +597,131 @@ fn a_replenished_budget_separates_from_an_unrelated_counter() {
     assert_eq!(legacy_cost_of(unrelated, "f"), (cost("O(N)"), true));
     assert_eq!(legacy_cost_of(escaped, "f"), (cost("O(N^2)"), false));
 }
+
+fn shared_window_source(inner: &str) -> String {
+    format!(
+        "export function f(n: number, step: number, q: number, xs: Uint8Array) {{ let offset = 0, total = 0; const fine = 1 / n; while (offset < n) {{ {inner} offset += step; }} return total; }}"
+    )
+}
+
+fn halving_share_source(inner: &str) -> String {
+    format!(
+        "export function f(n: number, step: number) {{ let offset = 0, total = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} return total; }}"
+    )
+}
+
+fn shared_inner_reason_of(source: &str) -> String {
+    let mut found = String::new();
+
+    run_with_source(source, |analysis, file| {
+        let project = analysis.project;
+        let function = support::function_of_name(project, file, "f");
+        let context = analysis.collect_budgets(file, function);
+        let outer = support::first_node_of(project, file, |kind| {
+            matches!(kind, AstKind::WhileStatement(_)).then_some(kind)
+        });
+
+        analysis.budget_context = Some(context);
+
+        let spend = analysis
+            .spent_budget(file, outer)
+            .expect("the outer loop spends its budget");
+        let share = spend.share.expect("a stable identifier step is a share");
+
+        analysis.share_bindings.push(share);
+
+        let inner = support::first_node_of(project, file, |kind| {
+            matches!(kind, AstKind::ForStatement(_) | AstKind::ForOfStatement(_)).then_some(kind)
+        });
+
+        found = analysis.bound_of(file, inner).label().to_string();
+    });
+
+    found
+}
+
+const SHARE_CONSUMER_ROWS: [(&str, &str); 11] = [
+    ("a unit update", "share of budget"),
+    ("a unit addition", "share of budget"),
+    ("a step of two", "share of budget"),
+    (
+        "a bare share endpoint under a unit update",
+        "share of budget",
+    ),
+    ("a for-of over a shared slice", "share of budget"),
+    ("a step of one over the envelope", "iteration bound"),
+    ("a step of an unproven identifier", "iteration bound"),
+    ("a proven quarter step", "N"),
+    ("a bare share endpoint under a quarter step", "N"),
+    ("a unit step the body can skip", "N"),
+    ("a unit update a conditional write undoes", "N"),
+];
+
+const SHARE_CONSUMER_BODIES: [&str; 11] = [
+    "for (let k = offset; k < offset + step; k++) total++;",
+    "for (let k = offset; k < offset + step; k += 1) total++;",
+    "for (let k = offset; k < offset + step; k += 2) total++;",
+    "for (let k = 0; k < step; k++) total++;",
+    "for (const y of xs.subarray(0, step)) total += y;",
+    "for (let k = offset; k < offset + step; k += fine) total++;",
+    "for (let k = offset; k < offset + step; k += q) total++;",
+    "for (let k = offset; k < offset + step; k += 1 / 4) total++;",
+    "for (let k = 0; k < step; k += 1 / 4) total++;",
+    "for (let k = offset; k < offset + step; ) { if (total > 0) k++; total++; }",
+    "for (let k = offset; k < offset + step; k++) { if (total > 0) k--; total++; }",
+];
+
+#[test]
+fn a_share_collapses_only_where_the_consuming_loop_advances_a_whole_unit() {
+    let found: Vec<(&str, String)> = SHARE_CONSUMER_ROWS
+        .iter()
+        .zip(SHARE_CONSUMER_BODIES.iter())
+        .map(|((label, _), body)| (*label, shared_inner_reason_of(&shared_window_source(body))))
+        .collect();
+    let expected: Vec<(&str, String)> = SHARE_CONSUMER_ROWS
+        .iter()
+        .map(|(label, reason)| (*label, (*reason).to_string()))
+        .collect();
+
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn a_subunit_share_consumer_keeps_the_factor_its_enclosing_loop_multiplies() {
+    let rows = [
+        (
+            "a quarter step under an unresolved budget loop",
+            shared_window_source("for (let k = offset; k < offset + step; k += 1 / 4) total++;"),
+            "O(N)",
+            false,
+        ),
+        (
+            "a unit step under an unresolved budget loop",
+            shared_window_source("for (let k = offset; k < offset + step; k++) total++;"),
+            "O(1)",
+            false,
+        ),
+        (
+            "a quarter step under a halving budget loop",
+            halving_share_source("for (let k = offset; k < offset + step; k += 1 / 4) total++;"),
+            "O(N * log(N))",
+            true,
+        ),
+        (
+            "a unit step under a halving budget loop",
+            halving_share_source("for (let k = offset; k < offset + step; k++) total++;"),
+            "O(log(N))",
+            true,
+        ),
+    ];
+    let found: Vec<(&str, (olint::cost::Cost, bool))> = rows
+        .iter()
+        .map(|(label, source, _, _)| (*label, legacy_cost_of(source, "f")))
+        .collect();
+    let expected: Vec<(&str, (olint::cost::Cost, bool))> = rows
+        .iter()
+        .map(|(label, _, text, complete)| (*label, (cost(text), *complete)))
+        .collect();
+
+    assert_eq!(found, expected);
+}
