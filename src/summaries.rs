@@ -108,6 +108,7 @@ struct RecurrenceMarkers {
     members: Vec<TaskId>,
     effects: Effects,
     solved: Option<Vec<Cost>>,
+    provenance: Vec<Option<crate::unknowns::UnknownId>>,
     unresolved: bool,
     steps: HashMap<(TaskId, TaskId, crate::unknowns::SourceSpan), Vec<CallStep>>,
     bounds: HashMap<(TaskId, TaskId, crate::unknowns::SourceSpan), ArgumentBounds>,
@@ -1539,15 +1540,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn marker_part_of(&mut self, id: TaskId) -> Option<Part> {
         let cost = self.marker_of(id)?;
-        let effects = self
-            .scheduler
-            .recurrence_markers
-            .as_ref()
-            .map(|markers| markers.effects.clone())?;
+        let (effects, members, owned) =
+            self.scheduler.recurrence_markers.as_ref().map(|markers| {
+                (
+                    markers.effects.clone(),
+                    markers.members.clone(),
+                    markers.provenance.clone(),
+                )
+            })?;
+        let caller = self.scheduler.active;
+        let mut provenance = None;
+
+        for (member, unknowns) in members.iter().zip(owned) {
+            if caller != Some(*member) {
+                provenance = self.unknowns.join(provenance, unknowns);
+            }
+        }
 
         self.current_effects.join(&effects);
 
-        Some(Part::unmarked(cost, None))
+        Some(Part::unmarked(cost, None).retaining(provenance, &mut self.unknowns))
     }
 
     fn cyclic_effects_of(&mut self, key: &SummaryKey) -> Effects {
@@ -1672,6 +1684,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 members: members.to_vec(),
                 effects: shared.clone(),
                 solved: None,
+                provenance: Vec::new(),
                 unresolved: false,
                 steps: HashMap::new(),
                 bounds: HashMap::new(),
@@ -1714,7 +1727,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let readings: Vec<Reading> = results.into_iter().map(|(reading, _)| reading).collect();
-        let equations = self.recurrence_equations_of(members, &readings, &markers)?;
+        let member_totals: Vec<Part> = readings
+            .iter()
+            .map(|reading| reading.total(&mut self.unknowns, &mut self.traces))
+            .collect();
+        let equations = self.recurrence_equations_of(members, &member_totals, &markers)?;
         let RecurrenceSolution::Solved { factors, proof } = solution_of(&equations) else {
             return None;
         };
@@ -1725,6 +1742,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .collect(),
         )
         .ok()?;
+        let provenance = member_totals.iter().map(|total| total.unknowns).collect();
         let mut totals = Vec::new();
 
         for factor in &factors {
@@ -1735,6 +1753,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             members: members.to_vec(),
             effects: markers.effects.clone(),
             solved: Some(totals),
+            provenance,
             unresolved: false,
             steps: HashMap::new(),
             bounds: HashMap::new(),
@@ -1778,14 +1797,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
     fn recurrence_equations_of(
         &mut self,
         members: &[TaskId],
-        readings: &[Reading],
+        totals: &[Part],
         markers: &RecurrenceMarkers,
     ) -> Option<Vec<RecurrenceEquation>> {
         let mut locals = Vec::new();
         let mut multiplicities = Vec::new();
 
-        for reading in readings {
-            let total = reading.total(&mut self.unknowns, &mut self.traces);
+        for total in totals {
             let (local, factors) = stripped_cost_of(&total.cost, members.len())?;
 
             locals.push(local);

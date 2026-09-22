@@ -458,3 +458,101 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
 
     assert_eq!(found, expected);
 }
+
+const CYCLE_WITH_HIDDEN_WORK: &str = "export function cycleStart(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\tlet t = 0;\n\tfor (const x of xs) for (const y of xs) t += x + y;\n\treturn t + new CycleHolder().step(n - 1, xs);\n}\nexport class CycleHolder {\n\tstep(n: number, xs: number[]): number {\n\t\tif (n <= 0) return 0;\n\t\treturn cycleContinue(n - 1, xs) + xs.length;\n\t}\n}\nexport function cycleContinue(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\treturn cycleStart(n - 1, xs);\n}\n";
+
+const CLEAN_CYCLE: &str = "export function cycleStart(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\tlet t = 0;\n\tfor (const x of xs) for (const y of xs) t += x + y;\n\treturn t + step(n - 1, xs);\n}\nexport function step(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\treturn cycleContinue(n - 1, xs) + xs.length;\n}\nexport function cycleContinue(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\treturn cycleStart(n - 1, xs);\n}\n";
+
+fn member_of<'a>(
+    project: &olint::project::Project<'a>,
+    file: FileId,
+    name: &str,
+) -> olint::declarations::FunctionNode<'a> {
+    support::first_node_of(project, file, |kind| match kind {
+        oxc_ast::AstKind::Function(function)
+            if function.id.as_ref().is_some_and(|id| id.name == name) =>
+        {
+            Some(olint::declarations::FunctionNode::Function(function))
+        }
+        oxc_ast::AstKind::MethodDefinition(method)
+            if method.key.static_name().as_deref() == Some(name) =>
+        {
+            Some(olint::declarations::FunctionNode::Function(&method.value))
+        }
+        _ => None,
+    })
+}
+
+fn orders_of<'m>(members: &[&'m str]) -> Vec<Vec<&'m str>> {
+    if members.len() <= 1 {
+        return vec![members.to_vec()];
+    }
+
+    let mut orders = Vec::new();
+
+    for (index, first) in members.iter().enumerate() {
+        let mut rest = members.to_vec();
+
+        rest.remove(index);
+
+        for mut order in orders_of(&rest) {
+            order.insert(0, first);
+            orders.push(order);
+        }
+    }
+
+    orders
+}
+
+fn component_results_of(source: &str, members: &[&str]) -> Vec<(String, String, bool, bool)> {
+    let mut found = Vec::new();
+
+    for order in orders_of(members) {
+        let label = order.join(" then ");
+
+        run_with_source(source, |analysis, file| {
+            for name in &order {
+                let function = member_of(analysis.project, file, name);
+                let part = analysis
+                    .summarize(file, function)
+                    .total(&mut analysis.unknowns, &mut analysis.traces);
+                let reasons = unknown_reasons(analysis, part.unknowns);
+
+                found.push((
+                    label.clone(),
+                    name.to_string(),
+                    part.is_complete(),
+                    reasons.contains(&UnknownReason::Target),
+                ));
+            }
+        });
+    }
+
+    found
+}
+
+#[test]
+fn every_member_of_a_solved_component_is_partial_when_any_member_is() {
+    let members = ["cycleStart", "step", "cycleContinue"];
+    let found = component_results_of(CYCLE_WITH_HIDDEN_WORK, &members);
+    let expected: Vec<(String, String, bool, bool)> = found
+        .iter()
+        .map(|(order, name, _, _)| (order.clone(), name.clone(), false, true))
+        .collect();
+
+    assert_eq!(found.len(), 18);
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn every_member_of_a_clean_solved_component_stays_complete() {
+    let members = ["cycleStart", "step", "cycleContinue"];
+    let found = component_results_of(CLEAN_CYCLE, &members);
+    let expected: Vec<(String, String, bool, bool)> = found
+        .iter()
+        .map(|(order, name, _, _)| (order.clone(), name.clone(), true, false))
+        .collect();
+
+    assert_eq!(found.len(), 18);
+    assert_eq!(found, expected);
+}

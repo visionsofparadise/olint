@@ -9,13 +9,13 @@ O(xs) [partial]     7
 O(rows^2) [partial]    7
 O((xs * log(xs)))    5
 O(N)                5
+O(n) [partial]      5
 O(o)                4
 O(N) [partial]      4
-O(n)                4
-O(n) [partial]      4
 O((xs * xs^2))      3
 O(xs^2)             3
 O(x)                3
+O(n)                3
 O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
@@ -407,7 +407,7 @@ O(n)           cycleContinue  src/recursion.ts:28 [partial]
     calls cycleStart()                                     src/recursion.ts:30  = O(n)
     calls CycleHolder.step()                               src/recursion.ts:20  = O(n)
 
-O(n)           CycleHolder.step  src/recursion.ts:23
+O(n)           CycleHolder.step  src/recursion.ts:23 [partial]
     calls cycleContinue()                                  src/recursion.ts:25  = O(n)
     calls cycleStart()                                     src/recursion.ts:30  = O(n)
 
