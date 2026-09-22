@@ -11,6 +11,7 @@ const MAX_PARSE_DEPTH: usize = MAX_DEPTH * 8;
 const MAX_NODES: usize = 4096;
 const MAX_PARSE_NODES: usize = MAX_NODES * 4;
 const MAX_TEXT: usize = 65536;
+const MAX_REDUCED_TERMS: usize = MAX_DEPTH;
 const PROOF_CREDITS_PER_NODE: usize = MAX_NODES * MAX_DEPTH * 32;
 const COMPARISON_CREDITS: usize = PROOF_CREDITS_PER_NODE * 256;
 
@@ -337,6 +338,8 @@ impl Expression {
 
         if kind == 2 {
             output.dedup();
+
+            output = undominated_of(output);
         }
 
         let result = if kind == 1
@@ -883,6 +886,37 @@ fn monomial_within(a: &Monomial, b: &Monomial) -> bool {
     a.keys()
         .chain(b.keys())
         .all(|id| a.get(id).copied().unwrap_or_default() <= b.get(id).copied().unwrap_or_default())
+}
+fn dominance_of(value: &Expression) -> Option<Monomial> {
+    if matches!(value, Expression::Constant(_)) {
+        return None;
+    }
+
+    let mut powers = monomial(value)?;
+
+    powers.retain(|_, growth| *growth != (0, 0));
+
+    Some(powers)
+}
+fn undominated_of(values: Vec<Expression>) -> Vec<Expression> {
+    if values.len() > MAX_REDUCED_TERMS {
+        return values;
+    }
+
+    let powers: Vec<Option<Monomial>> = values.iter().map(dominance_of).collect();
+
+    values
+        .into_iter()
+        .zip(powers.iter())
+        .filter(|(_, dominated)| {
+            dominated.as_ref().is_none_or(|dominated| {
+                !powers.iter().flatten().any(|dominating| {
+                    dominating != dominated && monomial_within(dominated, dominating)
+                })
+            })
+        })
+        .map(|(value, _)| value)
+        .collect()
 }
 fn scaled_dimension(value: &Expression) -> Option<(u64, u128)> {
     match value {

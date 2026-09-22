@@ -319,6 +319,52 @@ fn independent_dimensions_and_monomials() {
     );
 }
 #[test]
+fn a_maximum_keeps_every_term_no_sibling_provably_dominates() {
+    assert_eq!(bound("O(max(n, n^2))"), bound("O(n^2)"));
+    assert_eq!(bound("O(max(n*log(n), n^2))"), bound("O(n^2)"));
+    assert_eq!(bound("O(max(n/m, n))"), bound("O(n)"));
+    assert_eq!(bound("O(max(1, n, n^2))"), bound("O(max(1, n^2))"));
+
+    assert_eq!(bound("O(max(n, m))"), bound("O(max(m, n))"));
+    assert_ne!(bound("O(max(n, m))"), bound("O(n)"));
+    assert_ne!(bound("O(max(n, m))"), bound("O(m)"));
+    assert_ne!(bound("O(max(1, n))"), bound("O(n)"));
+    assert_ne!(bound("O(max(2*n, 3*n))"), bound("O(n)"));
+    assert_ne!(bound("O(max(n^2, n*m))"), bound("O(n^2)"));
+    assert_ne!(bound("O(max(n^2, 2^n))"), bound("O(2^n)"));
+
+    let powers = |count: u64| {
+        Expression::maximum(
+            (1..=count)
+                .map(|exponent| Expression::power(size(1), Expression::Constant(exponent)).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    };
+    let capped = MAX_REDUCED_TERMS as u64;
+
+    assert_eq!(
+        powers(capped),
+        Expression::power(size(1), Expression::Constant(capped)).unwrap()
+    );
+    assert_eq!(powers(capped + 1).children().count(), MAX_REDUCED_TERMS + 1);
+}
+#[test]
+fn a_reduced_maximum_inside_a_product_compares_against_its_limit() {
+    assert_eq!(
+        bound("O(n*max(n, n^2))").compare(&bound("O(n^2)")),
+        CostComparison::Exceeds
+    );
+    assert_eq!(
+        bound("O(max(1, n*max(n, n^2)))").compare(&bound("O(n^3)")),
+        CostComparison::Within
+    );
+    assert_eq!(
+        bound("O(n*max(n, m))").compare(&bound("O(n^2)")),
+        CostComparison::Inconclusive
+    );
+}
+#[test]
 fn aggregate_and_envelope_bounds() {
     assert_eq!(
         bound("O(n+m)").compare(&bound("O(max(n,m))")),
@@ -678,7 +724,6 @@ fn report_logarithmic_exception_uses_net_envelope_exponents() {
             ("O(N^3 + log(N))", false),
             ("O(max(N^3, log(N)))", false),
             ("O(N * log(N) + N)", false),
-            ("O(max(N * log(N), N))", false),
         ] {
             let cost = Cost::parse(text).unwrap().bind(&|_| None, &roots).unwrap();
 
@@ -688,6 +733,20 @@ fn report_logarithmic_exception_uses_net_envelope_exponents() {
                 "{text}"
             );
         }
+
+        let cost = Cost::parse("O(max(N * log(N), N))")
+            .unwrap()
+            .bind(&|_| None, &roots)
+            .unwrap();
+
+        assert_eq!(
+            cost.has_polynomial_log_growth(&envelope),
+            cost == Cost::parse("O(N log N)")
+                .unwrap()
+                .bind(&|_| None, &roots)
+                .unwrap()
+        );
+        assert_eq!(cost.has_polynomial_log_growth(&envelope), roots.len() == 1);
     }
 }
 
