@@ -132,43 +132,30 @@ impl<'a> Visit<'a> for Subtree<'a> {
     }
 }
 
-pub(crate) struct Sides<'a> {
-    pub left: Option<&'a Expression<'a>>,
-    pub right: &'a Expression<'a>,
-}
-
-pub(crate) fn sides_of<'a>(e: &'a Expression<'a>) -> Option<Sides<'a>> {
-    match e {
-        Expression::BinaryExpression(binary) => Some(Sides {
-            left: Some(&binary.left),
-            right: &binary.right,
-        }),
-        Expression::LogicalExpression(logical) => Some(Sides {
-            left: Some(&logical.left),
-            right: &logical.right,
-        }),
-        Expression::AssignmentExpression(assignment) => Some(Sides {
-            left: None,
-            right: &assignment.right,
-        }),
-        Expression::SequenceExpression(sequence) => {
-            let right = sequence.expressions.last()?;
-            let left = match sequence.expressions.len() {
-                2 => sequence.expressions.first(),
-                _ => None,
-            };
-
-            Some(Sides { left, right })
-        }
-        _ => None,
-    }
-}
-
 pub(crate) fn is_less(operator: BinaryOperator) -> bool {
     matches!(
         operator,
         BinaryOperator::LessThan | BinaryOperator::LessEqualThan
     )
+}
+
+pub(crate) type ComparisonPair<'a> = (&'a Expression<'a>, &'a Expression<'a>, Direction);
+
+pub(crate) fn comparison_pairs_of<'a>(
+    conjunct: &'a Expression<'a>,
+) -> Option<[ComparisonPair<'a>; 2]> {
+    let Expression::BinaryExpression(binary) = conjunct else {
+        return None;
+    };
+    let left = unwrap(&binary.left);
+    let right = unwrap(&binary.right);
+
+    if is_less(binary.operator) {
+        return Some([(left, right, Direction::Up), (right, left, Direction::Down)]);
+    }
+
+    is_greater(binary.operator)
+        .then_some([(left, right, Direction::Down), (right, left, Direction::Up)])
 }
 
 fn is_greater(operator: BinaryOperator) -> bool {
@@ -286,16 +273,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         budgets: &mut HashMap<Binding, Budget>,
     ) {
         for conjunct in conjuncts_of(condition) {
-            let Expression::BinaryExpression(binary) = conjunct else {
-                continue;
-            };
-            let left = unwrap(&binary.left);
-            let right = unwrap(&binary.right);
-            let pairs = if is_less(binary.operator) {
-                [(left, right, Direction::Up), (right, left, Direction::Down)]
-            } else if is_greater(binary.operator) {
-                [(left, right, Direction::Down), (right, left, Direction::Up)]
-            } else {
+            let Some(pairs) = comparison_pairs_of(conjunct) else {
                 continue;
             };
 
@@ -880,7 +858,7 @@ impl<'a> Subtree<'a> {
     }
 }
 
-fn conjuncts_of<'a>(e: &'a Expression<'a>) -> Vec<&'a Expression<'a>> {
+pub(crate) fn conjuncts_of<'a>(e: &'a Expression<'a>) -> Vec<&'a Expression<'a>> {
     let e = unwrap(e);
 
     match e {

@@ -1,42 +1,87 @@
 use oxc_ast::ast::{
-    AssignmentTarget, BindingPattern, Expression, ForStatement, ForStatementInit, Statement,
-    StaticMemberExpression,
+    AssignmentExpression, AssignmentTarget, BindingPattern, Expression, ForStatement,
+    ForStatementInit, Statement,
 };
 use oxc_ast::AstKind;
-use oxc_ast_visit::Visit;
-use oxc_semantic::NodeId;
+use oxc_semantic::{AstNodes, NodeId, SymbolId};
 use oxc_span::GetSpan;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UpdateOperator};
 
+use crate::analysis::work::Event;
 use crate::analysis::Analysis;
-use crate::budgets::{is_less, sides_of, Subtree};
+use crate::budgets::{comparison_pairs_of, conjuncts_of, is_less, Direction, Subtree};
 use crate::cost::Cost;
+use crate::declarations::{Binding, Declaration};
 use crate::directives::PerfTag;
+use crate::flow::{completion_of, control_target_of, Completion};
 use crate::project::FileId;
 use crate::syntax::{
-    call_of, collapsed_text_of, compact_text_of, identifier_of, is_iteration_kind, loop_body_of,
-    unwrap, Root,
+    collapsed_text_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
+    member_expression_of, unwrap, Root,
 };
+use crate::unknowns::UnknownReason;
+use crate::values::Primitive;
+
+const MAXIMUM_VALUE_DEPTH: usize = 4;
+
+const SMALLEST_GROWTH_RATIO: f64 = 2.0;
+
+const LARGEST_CONTRACTION_RATIO: f64 = 0.5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bound {
-    pub factor: Cost,
-    pub why: Option<&'static str>,
+pub enum Bound {
+    Proven {
+        factor: Cost,
+        proof: Option<&'static str>,
+    },
+    Unresolved {
+        reason: UnknownReason,
+    },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Exit {
-    Return,
-    Throw,
-    Break,
-}
-
-impl Exit {
-    pub fn text(self) -> &'static str {
+impl Bound {
+    pub fn factor(&self) -> Option<&Cost> {
         match self {
-            Exit::Return => "return",
-            Exit::Throw => "throw",
-            Exit::Break => "break",
+            Bound::Proven { factor, .. } => Some(factor),
+            Bound::Unresolved { .. } => None,
+        }
+    }
+
+    pub fn proof(&self) -> Option<&'static str> {
+        match self {
+            Bound::Proven { proof, .. } => *proof,
+            Bound::Unresolved { .. } => None,
+        }
+    }
+
+    pub fn reason(&self) -> Option<UnknownReason> {
+        match self {
+            Bound::Proven { .. } => None,
+            Bound::Unresolved { reason } => Some(*reason),
+        }
+    }
+
+    pub fn is_unresolved(&self) -> bool {
+        matches!(self, Bound::Unresolved { .. })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Bound::Unresolved { reason } => reason.text(),
+            Bound::Proven {
+                proof: Some(proof), ..
+            } => proof,
+            Bound::Proven { factor, .. } if *factor == Cost::LOG => "log",
+            Bound::Proven { .. } => "N",
+        }
+    }
+
+    fn strength(&self) -> u8 {
+        match self {
+            Bound::Proven { factor, .. } if factor.is_one() => 0,
+            Bound::Proven { factor, .. } if *factor == Cost::LOG => 1,
+            Bound::Proven { .. } => 2,
+            Bound::Unresolved { .. } => 3,
         }
     }
 }
@@ -84,75 +129,50 @@ pub(crate) fn utf16_length_of(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
-fn is_multiplicative_operator(operator: BinaryOperator) -> bool {
-    matches!(
-        operator,
-        BinaryOperator::Multiplication
-            | BinaryOperator::Division
-            | BinaryOperator::ShiftLeft
-            | BinaryOperator::ShiftRight
-            | BinaryOperator::ShiftRightZeroFill
-    )
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    Additive(Option<f64>),
+    Geometric(Option<f64>),
+    Replacing,
 }
 
-fn is_multiplicative_assignment(operator: AssignmentOperator) -> bool {
-    matches!(
-        operator,
-        AssignmentOperator::Multiplication
-            | AssignmentOperator::Division
-            | AssignmentOperator::ShiftLeft
-            | AssignmentOperator::ShiftRight
-            | AssignmentOperator::ShiftRightZeroFill
-    )
+#[derive(Clone, Copy, Debug)]
+struct CounterWrite {
+    site: NodeId,
+    step: Step,
+    deferred: bool,
+    updating: bool,
 }
 
-enum AssignmentWrite<'a> {
-    Geometric,
-    Assign(&'a Expression<'a>),
-    Other,
+struct Comparison<'a> {
+    counter: Binding,
+    endpoint: &'a Expression<'a>,
+    direction: Direction,
 }
 
-struct LoopVariable<'a> {
-    name: &'a str,
-    init: &'a Expression<'a>,
+struct Repetition<'a> {
+    node: NodeId,
+    body: &'a Statement<'a>,
+    update: Option<NodeId>,
+    initial: Option<(Binding, &'a Expression<'a>)>,
+    returns_to_head: bool,
+    geometric_proof: &'static str,
 }
 
-#[derive(Default)]
-struct Names {
-    names: Vec<String>,
+struct Progression {
+    writes: Vec<CounterWrite>,
+    unconditional: Vec<CounterWrite>,
 }
 
-impl<'a> Visit<'a> for Names {
-    fn visit_identifier_reference(&mut self, reference: &oxc_ast::ast::IdentifierReference<'a>) {
-        self.add(reference.name.as_str());
-    }
-
-    fn visit_binding_identifier(&mut self, identifier: &oxc_ast::ast::BindingIdentifier<'a>) {
-        self.add(identifier.name.as_str());
-    }
-
-    fn visit_identifier_name(&mut self, identifier: &oxc_ast::ast::IdentifierName<'a>) {
-        self.add(identifier.name.as_str());
-    }
-
-    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        self.visit_expression(&member.object);
-    }
-}
-
-impl Names {
-    fn add(&mut self, name: &str) {
-        if !self.names.iter().any(|known| known == name) {
-            self.names.push(name.to_string());
-        }
+impl Progression {
+    fn is_driven(&self) -> bool {
+        self.writes
+            .iter()
+            .any(|write| write.updating || !is_replacing(write))
     }
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
-    pub fn ends_in(&self, _file: FileId, statement: &'a Statement<'a>) -> Option<Exit> {
-        exit_of(statement)
-    }
-
     pub fn inside_loop(&self, file: FileId, node: NodeId) -> bool {
         let nodes = self.project.file(file).semantic.nodes();
 
@@ -178,14 +198,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let bound = self.inner_bound_of(file, loop_kind);
 
         if self.bound_seen.insert((file, loop_kind.node_id())) {
-            let reason = match bound.why {
-                Some(why) => why,
-                None if bound.factor == Cost::LOG => "log",
-                None => "N",
-            };
-
-            self.stats
-                .count(&format!("loop {}: {}", loop_label(loop_kind), reason));
+            self.stats.count(&format!(
+                "loop {}: {}",
+                loop_label(loop_kind),
+                bound.label()
+            ));
         }
 
         bound
@@ -200,7 +217,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return linear_bound_of();
         };
 
-        if self.ends_in(file, body).is_some() {
+        if self.runs_at_most_once(file, loop_kind.node_id(), body) {
             return constant_bound_of("single iteration");
         }
 
@@ -223,417 +240,1172 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     linear_bound_of()
                 }
             }
-            AstKind::ForStatement(statement) => self.bound_of_for(file, statement),
+            AstKind::ForStatement(statement) => self.bound_of_for(file, statement, body),
             AstKind::WhileStatement(statement) => {
-                self.bound_of_while(file, &statement.test, &statement.body)
+                self.bound_of_while(file, loop_kind.node_id(), &statement.test, body)
             }
             AstKind::DoWhileStatement(statement) => {
-                self.bound_of_while(file, &statement.test, &statement.body)
+                self.bound_of_while(file, loop_kind.node_id(), &statement.test, body)
             }
             _ => linear_bound_of(),
         }
     }
 
-    fn is_same_text(&self, file: FileId, left: &Expression<'_>, right: &Expression<'_>) -> bool {
-        compact_text_of(self.text_of(file, left.span()))
-            == compact_text_of(self.text_of(file, right.span()))
-    }
-
-    fn bound_of_for(&mut self, file: FileId, statement: &'a ForStatement<'a>) -> Bound {
-        let variable = loop_variable_of(statement);
-
-        if let Some(variable) = &variable {
-            if self.is_multiplicative_update(file, statement.update.as_ref(), variable.name) {
-                return Bound {
-                    factor: Cost::LOG,
-                    why: Some("geometric step"),
-                };
-            }
-        }
-
-        let condition = statement.test.as_ref().map(unwrap);
-
-        if let (Some(variable), Some(Expression::BinaryExpression(binary))) = (&variable, condition)
-        {
-            let counter = identifier_of(unwrap(&binary.left));
-
-            if is_less(binary.operator)
-                && counter.is_some_and(|counter| counter.name == variable.name)
-            {
-                let bound = unwrap(&binary.right);
-
-                if self.is_share_sized(file, bound) {
-                    return constant_bound_of("share of budget");
-                }
-
-                if let Expression::BinaryExpression(sum) = bound {
-                    if sum.operator == BinaryOperator::Addition
-                        && ((self.is_same_text(file, &sum.left, variable.init)
-                            && self.is_share_sized(file, &sum.right))
-                            || (self.is_same_text(file, &sum.right, variable.init)
-                                && self.is_share_sized(file, &sum.left)))
-                    {
-                        return constant_bound_of("share of budget");
-                    }
-                }
-            }
-        }
-
-        if let Some(sides) = condition.and_then(sides_of) {
-            let unwrapped = [sides.left.map(unwrap), Some(unwrap(sides.right))];
-
-            for side in unwrapped.into_iter().flatten() {
-                if self.is_numeric_constant(file, side) {
-                    return constant_bound_of("constant bound");
-                }
-            }
-
-            if let Some(variable) = &variable {
-                let bound = unwrapped.into_iter().find(|side| {
-                    !side
-                        .and_then(identifier_of)
-                        .is_some_and(|identifier| identifier.name == variable.name)
-                });
-
-                if let Some(Some(Expression::BinaryExpression(offset))) = bound {
-                    if matches!(
-                        offset.operator,
-                        BinaryOperator::Addition | BinaryOperator::Subtraction
-                    ) {
-                        let left = unwrap(&offset.left);
-                        let right = unwrap(&offset.right);
-
-                        if (self.is_same_text(file, left, variable.init)
-                            && self.is_numeric_constant(file, right))
-                            || (self.is_same_text(file, right, variable.init)
-                                && self.is_numeric_constant(file, left))
-                        {
-                            return constant_bound_of("constant offset from start");
-                        }
-                    }
-                }
-            }
-        }
-
-        linear_bound_of()
-    }
-
-    fn is_geometric(&mut self, file: FileId, value: &'a Expression<'a>, name: &str) -> bool {
-        let value = unwrap(value);
-
-        if let Expression::BinaryExpression(binary) = value {
-            if is_multiplicative_operator(binary.operator) {
-                return identifier_of(unwrap(&binary.left))
-                    .is_some_and(|identifier| identifier.name == name)
-                    && self.is_numeric_constant(file, &binary.right);
-            }
-        }
-
-        if let Some(call) = call_of(value) {
-            let callee = compact_text_of(self.text_of(file, call.callee.span()));
-
-            if matches!(callee.as_str(), "Math.floor" | "Math.ceil" | "Math.trunc") {
-                if let Some(argument) = call
-                    .arguments
-                    .first()
-                    .and_then(|argument| argument.as_expression())
-                {
-                    return self.is_geometric(file, argument, name);
-                }
-            }
-        }
-
-        false
-    }
-
-    fn is_multiplicative_update(
+    fn bound_of_for(
         &mut self,
         file: FileId,
-        e: Option<&'a Expression<'a>>,
-        name: &str,
-    ) -> bool {
-        let Some(e) = e else {
-            return false;
-        };
-        let Expression::AssignmentExpression(assignment) = unwrap(e) else {
-            return false;
-        };
-        let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left else {
-            return false;
-        };
-
-        if target.name != name {
-            return false;
-        }
-
-        if is_multiplicative_assignment(assignment.operator) {
-            return self.is_numeric_constant(file, &assignment.right);
-        }
-
-        if assignment.operator == AssignmentOperator::Assign {
-            return self.is_geometric(file, &assignment.right, name);
-        }
-
-        false
-    }
-
-    fn assignments_of(
-        &mut self,
-        file: FileId,
+        statement: &'a ForStatement<'a>,
         body: &'a Statement<'a>,
-        names: &[String],
-    ) -> Vec<AssignmentWrite<'a>> {
+    ) -> Bound {
+        let Some(test) = statement.test.as_ref() else {
+            return linear_bound_of();
+        };
+        let variable = self.loop_variable_of(file, statement);
+
+        if let Some(bound) = self.share_bound_of(file, test, variable.as_ref()) {
+            return bound;
+        }
+
+        let repetition = Repetition {
+            node: statement.node_id(),
+            body,
+            update: statement
+                .update
+                .as_ref()
+                .map(|update| unwrap(update).node_id()),
+            initial: variable,
+            returns_to_head: self.returns_to_head(file, statement.node_id(), body),
+            geometric_proof: "geometric step",
+        };
+
+        self.bound_of_repetition(file, test, &repetition)
+    }
+
+    fn bound_of_while(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        test: &'a Expression<'a>,
+        body: &'a Statement<'a>,
+    ) -> Bound {
+        let repetition = Repetition {
+            node,
+            body,
+            update: None,
+            initial: None,
+            returns_to_head: self.returns_to_head(file, node, body),
+            geometric_proof: "halving",
+        };
+
+        self.bound_of_repetition(file, test, &repetition)
+    }
+
+    fn bound_of_repetition(
+        &mut self,
+        file: FileId,
+        test: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Bound {
+        let comparisons = self.comparisons_of(file, test);
+        let mut best: Option<Bound> = None;
+
+        for comparison in comparisons {
+            let Some(bound) = self.verdict_of(file, &comparison, repetition) else {
+                continue;
+            };
+
+            if best
+                .as_ref()
+                .is_none_or(|found| bound.strength() < found.strength())
+            {
+                best = Some(bound);
+            }
+        }
+
+        best.unwrap_or_else(linear_bound_of)
+    }
+
+    fn comparisons_of(&mut self, file: FileId, test: &'a Expression<'a>) -> Vec<Comparison<'a>> {
         let mut found = Vec::new();
 
-        for kind in Subtree::of(Root::Statement(body), true, false) {
-            match kind {
-                AstKind::AssignmentExpression(assignment) => {
-                    let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left
-                    else {
-                        continue;
-                    };
-                    let name = target.name.as_str();
+        for conjunct in conjuncts_of(test) {
+            let Some(pairs) = comparison_pairs_of(conjunct) else {
+                continue;
+            };
 
-                    if !names.iter().any(|known| known == name) {
-                        continue;
-                    }
+            for (counter, endpoint, direction) in pairs {
+                let Some(reference) = identifier_of(counter) else {
+                    continue;
+                };
+                let Some(counter) = self.binding_of_identifier(file, reference) else {
+                    continue;
+                };
 
-                    let is_multiplicative = if is_multiplicative_assignment(assignment.operator) {
-                        self.is_numeric_constant(file, &assignment.right)
-                    } else if assignment.operator == AssignmentOperator::Assign {
-                        self.is_geometric(file, &assignment.right, name)
-                    } else {
-                        false
-                    };
-
-                    if is_multiplicative {
-                        found.push(AssignmentWrite::Geometric);
-                    } else if assignment.operator == AssignmentOperator::Assign {
-                        found.push(AssignmentWrite::Assign(&assignment.right));
-                    } else {
-                        found.push(AssignmentWrite::Other);
-                    }
-                }
-                AstKind::UpdateExpression(update) => {
-                    if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(
-                        target,
-                    ) = &update.argument
-                    {
-                        if names.iter().any(|known| known == target.name.as_str()) {
-                            found.push(AssignmentWrite::Other);
-                        }
-                    }
-                }
-                _ => {}
+                found.push(Comparison {
+                    counter,
+                    endpoint,
+                    direction,
+                });
             }
         }
 
         found
     }
 
-    fn midpoint_names_of(
-        &self,
+    fn verdict_of(
+        &mut self,
         file: FileId,
-        body: &'a Statement<'a>,
-        names: &[String],
-    ) -> Vec<String> {
-        let mut midpoints = Vec::new();
+        comparison: &Comparison<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Option<Bound> {
+        let progression = self.progression_of(file, comparison.counter, repetition)?;
 
-        for kind in Subtree::of(Root::Statement(body), true, false) {
-            let AstKind::VariableDeclarator(declarator) = kind else {
-                continue;
-            };
-            let (BindingPattern::BindingIdentifier(identifier), Some(initializer)) =
-                (&declarator.id, &declarator.init)
-            else {
-                continue;
-            };
-            let text = compact_text_of(self.text_of(file, initializer.span()));
-            let mentions = names
-                .iter()
-                .filter(|name| contains_word(&text, name))
-                .count();
+        if let Some(bound) = self.bisection_bound_of(file, comparison, repetition) {
+            return Some(bound);
+        }
 
-            if mentions >= 2 && (has_halving_shift(&text) || has_halving_division(&text)) {
-                midpoints.push(identifier.name.to_string());
+        if progression.is_driven() && progression.writes.iter().any(is_replacing) {
+            return Some(unresolved_bound_of());
+        }
+
+        if let Some(bound) = self.geometric_bound_of(file, comparison, &progression, repetition) {
+            return Some(bound);
+        }
+
+        self.additive_bound_of(file, comparison, &progression, repetition)
+    }
+
+    fn progression_of(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        repetition: &Repetition<'a>,
+    ) -> Option<Progression> {
+        let sites = self.write_sites_of(file, counter, repetition.node)?;
+        let mut writes = Vec::new();
+
+        for site in sites {
+            writes.push(self.write_of(file, counter, site, repetition));
+        }
+
+        let mut unconditional = Vec::new();
+
+        for write in &writes {
+            let reached = write.updating
+                || (!write.deferred
+                    && !repetition.returns_to_head
+                    && self.covers_every_path(file, repetition, &[write.site]));
+
+            if reached {
+                unconditional.push(*write);
             }
         }
 
-        midpoints
+        Some(Progression {
+            writes,
+            unconditional,
+        })
     }
 
-    fn bound_of_while(
+    fn write_sites_of(&self, file: FileId, counter: Binding, node: NodeId) -> Option<Vec<NodeId>> {
+        let symbol = local_symbol_of(file, counter)?;
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+
+        Some(
+            semantic
+                .scoping()
+                .get_resolved_references(symbol)
+                .filter(|reference| reference.is_write())
+                .map(|reference| reference.node_id())
+                .filter(|site| is_within(nodes, *site, node))
+                .collect(),
+        )
+    }
+
+    fn write_of(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        site: NodeId,
+        repetition: &Repetition<'a>,
+    ) -> CounterWrite {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let span = nodes.kind(site).span();
+        let parent = nodes.parent_id(site);
+        let deferred = nodes
+            .ancestor_ids(site)
+            .take_while(|ancestor| *ancestor != repetition.node)
+            .any(|ancestor| {
+                matches!(
+                    nodes.kind(ancestor),
+                    AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+                )
+            });
+        let updating = repetition
+            .update
+            .is_some_and(|update| site == update || is_within(nodes, site, update));
+        let (site, step) = match nodes.parent_kind(site) {
+            AstKind::UpdateExpression(update) => (
+                parent,
+                Step::Additive(Some(match update.operator {
+                    UpdateOperator::Increment => 1.0,
+                    UpdateOperator::Decrement => -1.0,
+                })),
+            ),
+            AstKind::AssignmentExpression(assignment) if assignment.left.span() == span => (
+                parent,
+                self.step_of_assignment(file, counter, assignment, repetition),
+            ),
+            _ => (site, Step::Replacing),
+        };
+
+        CounterWrite {
+            site,
+            step,
+            deferred,
+            updating,
+        }
+    }
+
+    fn step_of_assignment(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        assignment: &'a AssignmentExpression<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Step {
+        let right = &assignment.right;
+
+        match assignment.operator {
+            AssignmentOperator::Addition => Step::Additive(self.numeric_value_of(file, right)),
+            AssignmentOperator::Subtraction => {
+                Step::Additive(self.numeric_value_of(file, right).map(|value| -value))
+            }
+            AssignmentOperator::Multiplication => {
+                Step::Geometric(self.numeric_value_of(file, right))
+            }
+            AssignmentOperator::Division => Step::Geometric(self.inverse_value_of(file, right)),
+            AssignmentOperator::ShiftLeft => {
+                Step::Geometric(self.shift_ratio_of(file, right, true))
+            }
+            AssignmentOperator::ShiftRight | AssignmentOperator::ShiftRightZeroFill => {
+                Step::Geometric(self.shift_ratio_of(file, right, false))
+            }
+            AssignmentOperator::Assign => self.step_of_value(file, counter, right, repetition, 0),
+            _ => Step::Replacing,
+        }
+    }
+
+    fn step_of_value(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        value: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+        depth: usize,
+    ) -> Step {
+        let value = unwrap(value);
+
+        if depth < MAXIMUM_VALUE_DEPTH {
+            if let Some(aliased) = self.repetition_constant_of(file, value, repetition) {
+                return self.step_of_value(file, counter, aliased, repetition, depth + 1);
+            }
+        }
+
+        if let Expression::BinaryExpression(binary) = value {
+            let left = unwrap(&binary.left);
+            let right = unwrap(&binary.right);
+            let counted_left = self.is_counter_reference(file, counter, left);
+            let counted_right = self.is_counter_reference(file, counter, right);
+
+            match binary.operator {
+                BinaryOperator::Addition if counted_left => {
+                    return Step::Additive(self.numeric_value_of(file, right))
+                }
+                BinaryOperator::Addition if counted_right => {
+                    return Step::Additive(self.numeric_value_of(file, left))
+                }
+                BinaryOperator::Subtraction if counted_left => {
+                    return Step::Additive(self.numeric_value_of(file, right).map(|value| -value))
+                }
+                BinaryOperator::Multiplication if counted_left => {
+                    return Step::Geometric(self.numeric_value_of(file, right))
+                }
+                BinaryOperator::Multiplication if counted_right => {
+                    return Step::Geometric(self.numeric_value_of(file, left))
+                }
+                BinaryOperator::Division if counted_left => {
+                    return Step::Geometric(self.inverse_value_of(file, right))
+                }
+                BinaryOperator::ShiftLeft if counted_left => {
+                    return Step::Geometric(self.shift_ratio_of(file, right, true))
+                }
+                BinaryOperator::ShiftRight | BinaryOperator::ShiftRightZeroFill if counted_left => {
+                    return Step::Geometric(self.shift_ratio_of(file, right, false))
+                }
+                _ => {}
+            }
+        }
+
+        if depth < MAXIMUM_VALUE_DEPTH {
+            if let Some(argument) = self.truncated_argument_of(file, value) {
+                return match self.step_of_value(file, counter, argument, repetition, depth + 1) {
+                    Step::Geometric(ratio) => Step::Geometric(ratio),
+                    Step::Additive(_) => Step::Additive(None),
+                    Step::Replacing => Step::Replacing,
+                };
+            }
+        }
+
+        match self.mentions_counter(file, counter, value) {
+            true => Step::Additive(None),
+            false => Step::Replacing,
+        }
+    }
+
+    fn repetition_constant_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Option<&'a Expression<'a>> {
+        let reference = identifier_of(value)?;
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+        let Declaration::Variable {
+            file: owner,
+            declarator,
+            constant: true,
+        } = declaration
+        else {
+            return None;
+        };
+
+        if owner != file || !is_identifier_pattern(&declarator.id) {
+            return None;
+        }
+
+        let nodes = self.project.file(file).semantic.nodes();
+
+        is_within(nodes, declarator.node_id(), repetition.node)
+            .then_some(declarator.init.as_ref())
+            .flatten()
+    }
+
+    fn truncated_argument_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+    ) -> Option<&'a Expression<'a>> {
+        let Expression::CallExpression(call) = value else {
+            return None;
+        };
+        let member = member_expression_of(&call.callee)?;
+        let object = identifier_of(unwrap(member.object()))?;
+
+        if object.name != "Math" || self.binding_of_identifier(file, object).is_some() {
+            return None;
+        }
+
+        let name = member.static_property_name()?;
+
+        if !matches!(name, "floor" | "trunc") {
+            return None;
+        }
+
+        call.arguments
+            .first()
+            .and_then(|argument| argument.as_expression())
+            .map(unwrap)
+    }
+
+    fn is_counter_reference(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        value: &'a Expression<'a>,
+    ) -> bool {
+        identifier_of(value)
+            .and_then(|reference| self.binding_of_identifier(file, reference))
+            .is_some_and(|binding| binding == counter)
+    }
+
+    fn mentions_counter(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        value: &'a Expression<'a>,
+    ) -> bool {
+        let references: Vec<&'a oxc_ast::ast::IdentifierReference<'a>> =
+            Subtree::of(Root::Expression(value), false, false)
+                .into_iter()
+                .filter_map(|kind| match kind {
+                    AstKind::IdentifierReference(reference) => Some(reference),
+                    _ => None,
+                })
+                .collect();
+
+        references
+            .into_iter()
+            .any(|reference| self.binding_of_identifier(file, reference) == Some(counter))
+    }
+
+    fn numeric_value_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Option<f64> {
+        match self.known_value(file, value).value.as_deref() {
+            Ok(Primitive::Number(found)) if found.is_finite() => Some(*found),
+            _ => None,
+        }
+    }
+
+    fn inverse_value_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Option<f64> {
+        self.numeric_value_of(file, value)
+            .map(|found| 1.0 / found)
+            .filter(|ratio| ratio.is_finite())
+    }
+
+    fn shift_ratio_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        leftward: bool,
+    ) -> Option<f64> {
+        let places = self.numeric_value_of(file, value)? as i64 & 31;
+        let ratio = (2.0_f64).powi(places as i32);
+
+        match leftward {
+            true => Some(ratio),
+            false => Some(1.0 / ratio),
+        }
+    }
+
+    fn geometric_bound_of(
+        &mut self,
+        file: FileId,
+        comparison: &Comparison<'a>,
+        progression: &Progression,
+        repetition: &Repetition<'a>,
+    ) -> Option<Bound> {
+        if progression.writes.is_empty() {
+            return None;
+        }
+
+        let mut ratios = Vec::new();
+
+        for write in &progression.writes {
+            match write.step {
+                Step::Geometric(Some(ratio)) if write.updating || !write.deferred => {
+                    ratios.push(ratio)
+                }
+                _ => return None,
+            }
+        }
+
+        if progression.unconditional.is_empty() {
+            return None;
+        }
+
+        if !self.is_stable_endpoint(file, comparison.endpoint, repetition) {
+            return None;
+        }
+
+        match comparison.direction {
+            Direction::Up => {
+                if !ratios.iter().all(|ratio| *ratio >= SMALLEST_GROWTH_RATIO) {
+                    return None;
+                }
+
+                let (_, initial) = repetition
+                    .initial
+                    .filter(|(binding, _)| *binding == comparison.counter)
+                    .or_else(|| self.entry_value_of(file, comparison.counter, repetition))?;
+
+                (self.numeric_value_of(file, initial)? >= 1.0)
+                    .then(|| logarithmic_bound_of(repetition.geometric_proof))
+            }
+            Direction::Down => {
+                if !ratios
+                    .iter()
+                    .all(|ratio| ratio.abs() <= LARGEST_CONTRACTION_RATIO)
+                {
+                    return None;
+                }
+
+                (self.numeric_value_of(file, comparison.endpoint)? >= 0.0)
+                    .then(|| logarithmic_bound_of(repetition.geometric_proof))
+            }
+        }
+    }
+
+    fn additive_bound_of(
+        &mut self,
+        file: FileId,
+        comparison: &Comparison<'a>,
+        progression: &Progression,
+        repetition: &Repetition<'a>,
+    ) -> Option<Bound> {
+        if progression.writes.is_empty() {
+            return None;
+        }
+
+        let toward = match comparison.direction {
+            Direction::Up => 1.0,
+            Direction::Down => -1.0,
+        };
+        let mut advances = Vec::new();
+
+        for write in &progression.writes {
+            match write.step {
+                Step::Additive(delta) => advances.push(delta.map(|delta| delta * toward)),
+                _ => return None,
+            }
+        }
+
+        let guaranteed: Option<f64> = progression
+            .unconditional
+            .iter()
+            .map(|write| match write.step {
+                Step::Additive(delta) => delta.map(|delta| delta * toward),
+                _ => None,
+            })
+            .try_fold(0.0, |total, advance| advance.map(|advance| total + advance));
+
+        if advances
+            .iter()
+            .all(|advance| advance.is_some_and(|advance| advance <= 0.0))
+            && guaranteed.is_some_and(|guaranteed| guaranteed <= 0.0)
+        {
+            return Some(unresolved_bound_of());
+        }
+
+        let guaranteed = guaranteed.filter(|guaranteed| *guaranteed > 0.0)?;
+
+        if !advances
+            .iter()
+            .all(|advance| advance.is_some_and(|advance| advance >= 0.0))
+        {
+            return None;
+        }
+
+        if !self.is_stable_endpoint(file, comparison.endpoint, repetition) {
+            return None;
+        }
+
+        let (distance, proof) = self.distance_of(file, comparison, repetition)?;
+        let repetitions = (distance / guaranteed).floor() + 1.0;
+
+        repetitions.is_finite().then(|| constant_bound_of(proof))
+    }
+
+    fn distance_of(
+        &mut self,
+        file: FileId,
+        comparison: &Comparison<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Option<(f64, &'static str)> {
+        let (_, initial) = repetition
+            .initial
+            .filter(|(binding, _)| *binding == comparison.counter)
+            .or_else(|| self.entry_value_of(file, comparison.counter, repetition))?;
+        let toward = match comparison.direction {
+            Direction::Up => 1.0,
+            Direction::Down => -1.0,
+        };
+
+        if let (Some(start), Some(end)) = (
+            self.numeric_value_of(file, initial),
+            self.numeric_value_of(file, comparison.endpoint),
+        ) {
+            return Some((((end - start) * toward).max(0.0), "constant bound"));
+        }
+
+        let offset = self.offset_of(file, initial, comparison.endpoint)? * toward;
+
+        (offset >= 0.0).then_some((offset, "constant offset from start"))
+    }
+
+    fn offset_of(
+        &mut self,
+        file: FileId,
+        initial: &'a Expression<'a>,
+        endpoint: &'a Expression<'a>,
+    ) -> Option<f64> {
+        let Expression::BinaryExpression(binary) = unwrap(endpoint) else {
+            return None;
+        };
+        let left = unwrap(&binary.left);
+        let right = unwrap(&binary.right);
+
+        match binary.operator {
+            BinaryOperator::Addition => {
+                if self.is_same_reading(file, initial, left) {
+                    return self.numeric_value_of(file, right);
+                }
+
+                self.is_same_reading(file, initial, right)
+                    .then(|| self.numeric_value_of(file, left))
+                    .flatten()
+            }
+            BinaryOperator::Subtraction => self
+                .is_same_reading(file, initial, left)
+                .then(|| self.numeric_value_of(file, right).map(|value| -value))
+                .flatten(),
+            _ => None,
+        }
+    }
+
+    fn is_same_reading(
+        &mut self,
+        file: FileId,
+        left: &'a Expression<'a>,
+        right: &'a Expression<'a>,
+    ) -> bool {
+        let left = unwrap(left);
+        let right = unwrap(right);
+
+        if let (Some(left), Some(right)) = (identifier_of(left), identifier_of(right)) {
+            let left = self.binding_of_identifier(file, left);
+
+            return left.is_some() && left == self.binding_of_identifier(file, right);
+        }
+
+        let (Some(left), Some(right)) = (member_expression_of(left), member_expression_of(right))
+        else {
+            return false;
+        };
+        let (Some(left_name), Some(right_name)) =
+            (left.static_property_name(), right.static_property_name())
+        else {
+            return false;
+        };
+
+        left_name == right_name
+            && self.is_same_reading(file, unwrap(left.object()), unwrap(right.object()))
+    }
+
+    fn entry_value_of(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        repetition: &Repetition<'a>,
+    ) -> Option<(Binding, &'a Expression<'a>)> {
+        let symbol = local_symbol_of(file, counter)?;
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let declaration = semantic.scoping().symbol_declaration(symbol);
+
+        if is_within(nodes, declaration, repetition.node) {
+            return None;
+        }
+
+        let settled = semantic
+            .scoping()
+            .get_resolved_references(symbol)
+            .filter(|reference| reference.is_write())
+            .all(|reference| is_within(nodes, reference.node_id(), repetition.node));
+
+        if !settled {
+            return None;
+        }
+
+        if self.enclosing_function_of(file, declaration)
+            != self.enclosing_function_of(file, repetition.node)
+        {
+            return None;
+        }
+
+        let AstKind::VariableDeclarator(declarator) = self.kind_of_node(file, declaration) else {
+            return None;
+        };
+
+        if !is_identifier_pattern(&declarator.id) {
+            return None;
+        }
+
+        declarator
+            .init
+            .as_ref()
+            .map(|initial| (counter, unwrap(initial)))
+    }
+
+    fn is_stable_endpoint(
+        &mut self,
+        file: FileId,
+        endpoint: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+    ) -> bool {
+        if self.numeric_value_of(file, endpoint).is_some() {
+            return true;
+        }
+
+        let kinds = Subtree::of(Root::Expression(endpoint), false, false);
+        let mut references = Vec::new();
+
+        for kind in kinds {
+            match kind {
+                AstKind::CallExpression(_)
+                | AstKind::NewExpression(_)
+                | AstKind::TaggedTemplateExpression(_)
+                | AstKind::AwaitExpression(_)
+                | AstKind::YieldExpression(_)
+                | AstKind::AssignmentExpression(_)
+                | AstKind::UpdateExpression(_)
+                | AstKind::Function(_)
+                | AstKind::ArrowFunctionExpression(_) => return false,
+                AstKind::IdentifierReference(reference) => references.push(reference),
+                _ => {}
+            }
+        }
+
+        for reference in references {
+            let Some(binding) = self.binding_of_identifier(file, reference) else {
+                return false;
+            };
+
+            match self.write_sites_of(file, binding, repetition.node) {
+                Some(sites) if sites.is_empty() => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
+    fn bisection_bound_of(
+        &mut self,
+        file: FileId,
+        comparison: &Comparison<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Option<Bound> {
+        if comparison.direction != Direction::Up {
+            return None;
+        }
+
+        let reference = identifier_of(unwrap(comparison.endpoint))?;
+        let upper = self.binding_of_identifier(file, reference)?;
+        let lower = comparison.counter;
+
+        if upper == lower || repetition.returns_to_head {
+            return None;
+        }
+
+        let mut sites = Vec::new();
+
+        for (binding, rising) in [(lower, true), (upper, false)] {
+            for site in self.write_sites_of(file, binding, repetition.node)? {
+                let write = self.write_of(file, binding, site, repetition);
+
+                if write.deferred || write.updating {
+                    return None;
+                }
+
+                if !self.is_bisecting_write(file, (lower, upper), rising, write.site, repetition) {
+                    return None;
+                }
+
+                sites.push(write.site);
+            }
+        }
+
+        if sites.is_empty() {
+            return None;
+        }
+
+        self.covers_every_path(file, repetition, &sites)
+            .then(|| logarithmic_bound_of("halving"))
+    }
+
+    fn is_bisecting_write(
+        &mut self,
+        file: FileId,
+        interval: (Binding, Binding),
+        rising: bool,
+        site: NodeId,
+        repetition: &Repetition<'a>,
+    ) -> bool {
+        let AstKind::AssignmentExpression(assignment) = self.kind_of_node(file, site) else {
+            return false;
+        };
+
+        if assignment.operator != AssignmentOperator::Assign {
+            return false;
+        }
+
+        let value = unwrap(&assignment.right);
+        let (middle, offset) = match value {
+            Expression::BinaryExpression(binary)
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::Addition | BinaryOperator::Subtraction
+                ) =>
+            {
+                let Some(offset) = self.numeric_value_of(file, &binary.right) else {
+                    return false;
+                };
+                let signed = match binary.operator {
+                    BinaryOperator::Subtraction => -offset,
+                    _ => offset,
+                };
+
+                (unwrap(&binary.left), signed)
+            }
+            _ => (value, 0.0),
+        };
+
+        if rising && offset < 1.0 {
+            return false;
+        }
+
+        if !rising && offset > 0.0 {
+            return false;
+        }
+
+        self.is_midpoint_of(file, interval, middle, repetition, 0)
+    }
+
+    fn is_midpoint_of(
+        &mut self,
+        file: FileId,
+        interval: (Binding, Binding),
+        value: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+        depth: usize,
+    ) -> bool {
+        let value = unwrap(value);
+
+        if depth < MAXIMUM_VALUE_DEPTH {
+            if let Some(aliased) = self.repetition_constant_of(file, value, repetition) {
+                return self.is_midpoint_of(file, interval, aliased, repetition, depth + 1);
+            }
+        }
+
+        let value = self.truncated_argument_of(file, value).unwrap_or(value);
+        let Expression::BinaryExpression(binary) = value else {
+            return false;
+        };
+        let left = unwrap(&binary.left);
+        let right = unwrap(&binary.right);
+
+        match binary.operator {
+            BinaryOperator::Division
+            | BinaryOperator::ShiftRight
+            | BinaryOperator::ShiftRightZeroFill => {
+                self.is_halving_divisor(file, binary.operator, right)
+                    && self.is_interval_sum(file, interval, left)
+            }
+            BinaryOperator::Addition => {
+                (self.is_counter_reference(file, interval.0, left)
+                    && self.is_half_width(file, interval, right))
+                    || (self.is_counter_reference(file, interval.0, right)
+                        && self.is_half_width(file, interval, left))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_halving_divisor(
+        &mut self,
+        file: FileId,
+        operator: BinaryOperator,
+        divisor: &'a Expression<'a>,
+    ) -> bool {
+        let expected = match operator {
+            BinaryOperator::Division => 2.0,
+            BinaryOperator::ShiftRight | BinaryOperator::ShiftRightZeroFill => 1.0,
+            _ => return false,
+        };
+
+        self.numeric_value_of(file, divisor) == Some(expected)
+    }
+
+    fn is_interval_sum(
+        &mut self,
+        file: FileId,
+        interval: (Binding, Binding),
+        value: &'a Expression<'a>,
+    ) -> bool {
+        let Expression::BinaryExpression(binary) = unwrap(value) else {
+            return false;
+        };
+
+        if binary.operator != BinaryOperator::Addition {
+            return false;
+        }
+
+        let left = unwrap(&binary.left);
+        let right = unwrap(&binary.right);
+
+        (self.is_counter_reference(file, interval.0, left)
+            && self.is_counter_reference(file, interval.1, right))
+            || (self.is_counter_reference(file, interval.1, left)
+                && self.is_counter_reference(file, interval.0, right))
+    }
+
+    fn is_half_width(
+        &mut self,
+        file: FileId,
+        interval: (Binding, Binding),
+        value: &'a Expression<'a>,
+    ) -> bool {
+        let value = unwrap(value);
+        let value = self.truncated_argument_of(file, value).unwrap_or(value);
+        let Expression::BinaryExpression(binary) = value else {
+            return false;
+        };
+        let halving = self.is_halving_divisor(file, binary.operator, &binary.right);
+
+        if !halving {
+            return false;
+        }
+
+        let Expression::BinaryExpression(width) = unwrap(&binary.left) else {
+            return false;
+        };
+
+        width.operator == BinaryOperator::Subtraction
+            && self.is_counter_reference(file, interval.1, unwrap(&width.left))
+            && self.is_counter_reference(file, interval.0, unwrap(&width.right))
+    }
+
+    fn share_bound_of(
         &mut self,
         file: FileId,
         test: &'a Expression<'a>,
-        body: &'a Statement<'a>,
-    ) -> Bound {
-        let condition = unwrap(test);
-        let mut names = Names::default();
+        variable: Option<&(Binding, &'a Expression<'a>)>,
+    ) -> Option<Bound> {
+        let Expression::BinaryExpression(binary) = unwrap(test) else {
+            return None;
+        };
 
-        names.visit_expression(condition);
-
-        if names.names.is_empty() {
-            return linear_bound_of();
+        if !is_less(binary.operator) {
+            return None;
         }
 
-        let writes = self.assignments_of(file, body, &names.names);
+        let counter = identifier_of(unwrap(&binary.left))?;
+        let counter = self.binding_of_identifier(file, counter)?;
+        let (_, initial) = variable.filter(|(binding, _)| *binding == counter)?;
+        let endpoint = unwrap(&binary.right);
 
-        if writes.is_empty() {
-            return linear_bound_of();
+        if self.is_share_sized(file, endpoint) {
+            return Some(constant_bound_of("share of budget"));
         }
 
-        let midpoints = self.midpoint_names_of(file, body, &names.names);
-        let is_midpoint = |name: &str| midpoints.iter().any(|known| known == name);
-        let mut halving = true;
+        let Expression::BinaryExpression(sum) = endpoint else {
+            return None;
+        };
 
-        for write in writes {
-            let holds = match write {
-                AssignmentWrite::Geometric => true,
-                AssignmentWrite::Other => false,
-                AssignmentWrite::Assign(value) => {
-                    let value = unwrap(value);
+        if sum.operator != BinaryOperator::Addition {
+            return None;
+        }
 
-                    if identifier_of(value).is_some_and(|identifier| is_midpoint(&identifier.name))
-                    {
-                        true
-                    } else if let Some(sides) = sides_of(value) {
-                        sides
-                            .left
-                            .map(unwrap)
-                            .and_then(identifier_of)
-                            .is_some_and(|identifier| is_midpoint(&identifier.name))
-                            && self.is_numeric_constant(file, sides.right)
-                    } else {
-                        false
-                    }
+        let shared = (self.is_same_reading(file, initial, &sum.left)
+            && self.is_share_sized(file, &sum.right))
+            || (self.is_same_reading(file, initial, &sum.right)
+                && self.is_share_sized(file, &sum.left));
+
+        shared.then(|| constant_bound_of("share of budget"))
+    }
+
+    fn loop_variable_of(
+        &mut self,
+        file: FileId,
+        statement: &'a ForStatement<'a>,
+    ) -> Option<(Binding, &'a Expression<'a>)> {
+        match statement.init.as_ref()? {
+            ForStatementInit::VariableDeclaration(declaration) => {
+                let [declarator] = declaration.declarations.as_slice() else {
+                    return None;
+                };
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    return None;
+                };
+                let symbol = identifier.symbol_id.get()?;
+                let initial = declarator.init.as_ref()?;
+
+                Some((Binding::Symbol { file, symbol }, unwrap(initial)))
+            }
+            init => {
+                let Expression::AssignmentExpression(assignment) = init.as_expression()? else {
+                    return None;
+                };
+                let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left else {
+                    return None;
+                };
+
+                if assignment.operator != AssignmentOperator::Assign {
+                    return None;
                 }
-            };
 
-            if !holds {
-                halving = false;
+                let binding = self.binding_of_identifier(file, target)?;
 
-                break;
+                Some((binding, unwrap(&assignment.right)))
+            }
+        }
+    }
+
+    fn runs_at_most_once(&mut self, file: FileId, node: NodeId, body: &'a Statement<'a>) -> bool {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let Some(completion) = completion_of(semantic, body.node_id()) else {
+            return false;
+        };
+
+        if !leaves_iteration(semantic.nodes(), completion, node) {
+            return false;
+        }
+
+        !self.returns_to_head(file, node, body)
+    }
+
+    fn returns_to_head(&mut self, file: FileId, node: NodeId, body: &'a Statement<'a>) -> bool {
+        if let Some(found) = self.repeating_bodies.get(&(file, node)) {
+            return *found;
+        }
+
+        let kinds = self.counted_subtree(file, Root::Statement(body), Event::BudgetPrepassNode);
+        let exhausted = self.work_exhausted();
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let found = exhausted
+            || kinds.into_iter().any(|kind| match kind {
+                AstKind::ContinueStatement(statement) => {
+                    let label = statement.label.as_ref().map(|label| label.name.as_str());
+
+                    control_target_of(semantic, statement.node_id(), label, true) == Some(node)
+                }
+                _ => false,
+            });
+
+        self.repeating_bodies.insert((file, node), found);
+
+        found
+    }
+
+    fn covers_every_path(
+        &self,
+        file: FileId,
+        repetition: &Repetition<'a>,
+        sites: &[NodeId],
+    ) -> bool {
+        self.covers_statement(file, repetition.node, repetition.body, sites)
+    }
+
+    fn covers_statement(
+        &self,
+        file: FileId,
+        node: NodeId,
+        statement: &'a Statement<'a>,
+        sites: &[NodeId],
+    ) -> bool {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+
+        if let Some(completion) = completion_of(semantic, statement.node_id()) {
+            if leaves_iteration(semantic.nodes(), completion, node) {
+                return true;
             }
         }
 
-        if halving {
-            Bound {
-                factor: Cost::LOG,
-                why: Some("halving"),
+        match statement {
+            Statement::BlockStatement(block) => block
+                .body
+                .iter()
+                .any(|statement| self.covers_statement(file, node, statement, sites)),
+            Statement::ExpressionStatement(statement) => {
+                covers_expression(&statement.expression, sites)
             }
-        } else {
-            linear_bound_of()
+            Statement::LabeledStatement(statement) => {
+                self.covers_statement(file, node, &statement.body, sites)
+            }
+            Statement::IfStatement(statement) => match &statement.alternate {
+                Some(alternate) => {
+                    self.covers_statement(file, node, &statement.consequent, sites)
+                        && self.covers_statement(file, node, alternate, sites)
+                }
+                None => false,
+            },
+            _ => false,
         }
     }
 }
 
-fn exit_of(statement: &Statement<'_>) -> Option<Exit> {
-    match statement {
-        Statement::ReturnStatement(_) => Some(Exit::Return),
-        Statement::ThrowStatement(_) => Some(Exit::Throw),
-        Statement::BreakStatement(_) => Some(Exit::Break),
-        Statement::BlockStatement(block) => block.body.last().and_then(exit_of),
-        Statement::IfStatement(statement) => {
-            let consequent = exit_of(&statement.consequent);
-            let alternate = statement.alternate.as_ref().and_then(exit_of);
+fn local_symbol_of(file: FileId, counter: Binding) -> Option<SymbolId> {
+    let Binding::Symbol {
+        file: owner,
+        symbol,
+    } = counter;
 
-            match (consequent, alternate) {
-                (Some(first), Some(second)) if first == second => Some(first),
-                (Some(_), Some(_)) => Some(Exit::Return),
-                _ => None,
-            }
+    (owner == file).then_some(symbol)
+}
+
+fn is_replacing(write: &CounterWrite) -> bool {
+    write.step == Step::Replacing
+}
+
+fn covers_expression(value: &Expression<'_>, sites: &[NodeId]) -> bool {
+    match value {
+        Expression::ParenthesizedExpression(inner) => covers_expression(&inner.expression, sites),
+        Expression::TSAsExpression(inner) => covers_expression(&inner.expression, sites),
+        Expression::TSSatisfiesExpression(inner) => covers_expression(&inner.expression, sites),
+        Expression::TSNonNullExpression(inner) => covers_expression(&inner.expression, sites),
+        Expression::TSTypeAssertion(inner) => covers_expression(&inner.expression, sites),
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .iter()
+            .any(|value| covers_expression(value, sites)),
+        Expression::ConditionalExpression(conditional) => {
+            covers_expression(&conditional.consequent, sites)
+                && covers_expression(&conditional.alternate, sites)
         }
-        _ => None,
+        Expression::AssignmentExpression(_) | Expression::UpdateExpression(_) => {
+            sites.contains(&value.node_id())
+        }
+        _ => false,
     }
 }
 
-fn loop_variable_of<'a>(statement: &'a ForStatement<'a>) -> Option<LoopVariable<'a>> {
-    match statement.init.as_ref()? {
-        ForStatementInit::VariableDeclaration(declaration) => {
-            let [declarator] = declaration.declarations.as_slice() else {
-                return None;
-            };
-            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                return None;
-            };
-
-            Some(LoopVariable {
-                name: identifier.name.as_str(),
-                init: declarator.init.as_ref()?,
-            })
-        }
-        init => {
-            let Expression::AssignmentExpression(assignment) = init.as_expression()? else {
-                return None;
-            };
-            let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left else {
-                return None;
-            };
-
-            (assignment.operator == AssignmentOperator::Assign).then_some(LoopVariable {
-                name: target.name.as_str(),
-                init: &assignment.right,
-            })
-        }
+fn leaves_iteration(nodes: &AstNodes<'_>, completion: Completion, node: NodeId) -> bool {
+    match completion {
+        Completion::Return | Completion::Throw => true,
+        Completion::Break(target) => target == node || !is_within(nodes, target, node),
+        Completion::Continue(target) => target != node,
+        Completion::Normal => false,
     }
 }
 
-fn constant_bound_of(why: &'static str) -> Bound {
-    Bound {
+fn is_within(nodes: &AstNodes<'_>, node: NodeId, ancestor: NodeId) -> bool {
+    node == ancestor || nodes.ancestor_ids(node).any(|found| found == ancestor)
+}
+
+fn constant_bound_of(proof: &'static str) -> Bound {
+    Bound::Proven {
         factor: Cost::ONE,
-        why: Some(why),
+        proof: Some(proof),
+    }
+}
+
+fn logarithmic_bound_of(proof: &'static str) -> Bound {
+    Bound::Proven {
+        factor: Cost::LOG,
+        proof: Some(proof),
     }
 }
 
 fn linear_bound_of() -> Bound {
-    Bound {
+    Bound::Proven {
         factor: Cost::N,
-        why: None,
+        proof: None,
     }
 }
 
-fn is_word_character(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn is_boundary(text: &[u8], position: usize) -> bool {
-    let left = position.checked_sub(1).map(|index| text[index]);
-    let right = text.get(position).copied();
-    let left_word = left.is_some_and(is_word_character);
-    let right_word = right.is_some_and(is_word_character);
-
-    left_word != right_word
-}
-
-fn contains_word(text: &str, word: &str) -> bool {
-    if word.is_empty() {
-        return false;
+fn unresolved_bound_of() -> Bound {
+    Bound::Unresolved {
+        reason: UnknownReason::Bound,
     }
-
-    let bytes = text.as_bytes();
-
-    text.match_indices(word)
-        .any(|(start, _)| is_boundary(bytes, start) && is_boundary(bytes, start + word.len()))
-}
-
-fn has_halving_shift(text: &str) -> bool {
-    let bytes = text.as_bytes();
-
-    [">>>1", ">>1"].iter().any(|pattern| {
-        text.match_indices(pattern).any(|(start, _)| {
-            let end = start + pattern.len();
-
-            !bytes.get(end).copied().is_some_and(is_word_character)
-        })
-    })
-}
-
-fn has_halving_division(text: &str) -> bool {
-    let bytes = text.as_bytes();
-
-    text.match_indices("/2")
-        .any(|(start, _)| !bytes.get(start + 2).copied().is_some_and(is_word_character))
 }
 
 #[cfg(test)]

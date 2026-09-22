@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use oxc_allocator::GetAddress;
-use oxc_ast::ast::{Expression, MemberExpression};
+use oxc_ast::ast::{Class, ClassElement, Expression, MemberExpression, SimpleAssignmentTarget};
 use oxc_ast::AstKind;
 use oxc_semantic::{NodeId, Semantic};
 use oxc_syntax::operator::{LogicalOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
+use crate::budgets::Subtree;
 use crate::constants::{constant_initializer_of, evaluate_enum};
 use crate::declarations::Declaration;
 use crate::project::FileId;
-use crate::syntax::{member_expression_of, unwrap};
+use crate::syntax::{member_expression_of, unwrap, Root};
 use crate::unknowns::UnknownReason;
 
 #[path = "primitive_values.rs"]
@@ -296,6 +297,23 @@ impl Values {
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn stable_initializer_of(
+        &mut self,
+        declaration: Declaration<'a>,
+    ) -> Option<(FileId, &'a Expression<'a>)> {
+        let (file, initializer) = constant_initializer_of(declaration)?;
+
+        let Declaration::Member { class, element, .. } = declaration else {
+            return Some((file, initializer));
+        };
+        let ClassElement::PropertyDefinition(property) = element else {
+            return Some((file, initializer));
+        };
+        let key = property.key.static_name()?;
+
+        (!reassigns_key(class, key.as_ref())).then_some((file, initializer))
+    }
+
     pub(crate) fn definedness_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Definedness {
         self.definedness_at(file, e, 0)
     }
@@ -338,7 +356,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     return Definedness::Defined;
                 }
 
-                match constant_initializer_of(declaration) {
+                match self.stable_initializer_of(declaration) {
                     Some((target, initializer)) => {
                         self.definedness_at(target, initializer, depth + 1)
                     }
@@ -692,7 +710,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .declarations
                 .of_reference(self.project, file, reference)
             {
-                if let Some((target, initializer)) = constant_initializer_of(declaration) {
+                if let Some((target, initializer)) = self.stable_initializer_of(declaration) {
                     if self.declaration_has_exact_size(declaration) {
                         return self.primitive_length(target, initializer, depth + 1);
                     }
@@ -761,10 +779,55 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .unwrap_or(Err(Failure::UncertifiedReference));
         }
 
-        let (file, initializer) =
-            constant_initializer_of(declaration).ok_or(Failure::UncertifiedReference)?;
+        let (file, initializer) = self
+            .stable_initializer_of(declaration)
+            .ok_or(Failure::UncertifiedReference)?;
 
         self.known_value_at(file, initializer, depth).value
+    }
+}
+
+fn reassigns_key(class: &Class<'_>, key: &str) -> bool {
+    class.body.body.iter().any(|element| {
+        let kinds = match element {
+            ClassElement::MethodDefinition(method) => match &method.value.body {
+                Some(body) => Subtree::of(Root::Body(body), false, false),
+                None => Vec::new(),
+            },
+            ClassElement::PropertyDefinition(property) => match &property.value {
+                Some(value) => Subtree::of(Root::Expression(value), false, false),
+                None => Vec::new(),
+            },
+            ClassElement::StaticBlock(block) => block
+                .body
+                .iter()
+                .flat_map(|statement| Subtree::of(Root::Statement(statement), false, false))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        kinds.into_iter().any(|kind| writes_key(kind, key))
+    })
+}
+
+fn writes_key(kind: AstKind<'_>, key: &str) -> bool {
+    let target = match kind {
+        AstKind::AssignmentExpression(assignment) => assignment.left.as_simple_assignment_target(),
+        AstKind::UpdateExpression(update) => Some(&update.argument),
+        AstKind::UnaryExpression(unary) if unary.operator == UnaryOperator::Delete => {
+            return member_expression_of(unwrap(&unary.argument))
+                .is_some_and(|member| member.static_property_name().is_none_or(|name| name == key))
+        }
+        _ => return false,
+    };
+
+    match target {
+        Some(SimpleAssignmentTarget::ComputedMemberExpression(member)) => {
+            member.static_property_name().is_none_or(|name| name == key)
+        }
+        Some(SimpleAssignmentTarget::StaticMemberExpression(member)) => member.property.name == key,
+        Some(SimpleAssignmentTarget::PrivateFieldExpression(member)) => member.field.name == key,
+        _ => false,
     }
 }
 

@@ -79,6 +79,7 @@ pub struct Analysis<'p, 'a> {
     pub share_bindings: Vec<Binding>,
     pub(crate) pending_scoped: HashMap<(FileId, NodeId), Part>,
     pub(crate) bound_seen: HashSet<(FileId, NodeId)>,
+    pub(crate) repeating_bodies: HashMap<(FileId, NodeId), bool>,
     pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
     pub(crate) finalizer_replacements: FinalizerReplacements,
     pub(crate) completion_escapes:
@@ -118,6 +119,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             share_bindings: Vec::new(),
             pending_scoped: HashMap::new(),
             bound_seen: HashSet::new(),
+            repeating_bodies: HashMap::new(),
             children: HashMap::new(),
             finalizer_replacements: FinalizerReplacements::new(),
             completion_escapes: HashMap::new(),

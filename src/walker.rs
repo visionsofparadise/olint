@@ -1145,7 +1145,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .budget
             .then(|| std::mem::take(&mut self.share_bindings));
         let bound = self.bound_of(file, kind);
-        let spend = if bound.factor.is_one() {
+        let factor = bound.factor().cloned().unwrap_or(Cost::N);
+
+        invalidation.bound |= bound.is_unresolved();
+
+        let spend = if factor.is_one() {
             None
         } else {
             self.spent_budget(file, kind)
@@ -1191,7 +1195,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if invalidation.bound && !assumed_bound {
             let origin = self.source_span(file, kind.span());
-            let mut unknown = Some(self.unknowns.origin(origin, UnknownReason::Bound));
+            let reason = bound.reason().unwrap_or(UnknownReason::Bound);
+            let mut unknown = Some(self.unknowns.origin(origin, reason));
 
             if self.fallback_active() {
                 let resource = self
@@ -1212,7 +1217,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return self.loop_result(sibling, escaping, main);
         }
 
-        if bound.factor.is_one() {
+        if factor.is_one() {
             let main = sibling
                 .main()
                 .max(body_main, &mut self.unknowns, &mut self.traces)
@@ -1241,8 +1246,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let mut label = loop_label(kind).to_string();
 
-        if let Some(why) = bound.why {
-            label.push_str(&format!(" [{why}]"));
+        if let Some(proof) = bound.proof() {
+            label.push_str(&format!(" [{proof}]"));
         }
 
         if let Some(budget) = &budget {
@@ -1263,7 +1268,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             label,
             site,
             self.source_span(file, kind.span()),
-            bound.factor,
+            factor,
             body_main,
         );
         let looped = match escaped {

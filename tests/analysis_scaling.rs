@@ -1994,16 +1994,20 @@ fn spread_copies_and_destructured_elements_scan_source_keys_once() {
     }
 }
 
+fn scanning_loop_source(statements: String) -> String {
+    format!(
+        "function scan(xs: number[]) {{ let found = 0; for (const x of xs) found += x; return found; }}
+export function selected(xs: number[]) {{ let total = 0; {statements}return total; }}"
+    )
+}
+
 fn loop_phase_walks_of(loops: usize) -> u64 {
     let statements: String = (0..loops)
         .map(|index| {
             format!("for (let i{index} = 0; i{index} < scan(xs); i{index}++) total += i{index}; ")
         })
         .collect();
-    let source = format!(
-        "function scan(xs: number[]) {{ let found = 0; for (const x of xs) found += x; return found; }}
-export function selected(xs: number[]) {{ let total = 0; {statements}return total; }}"
-    );
+    let source = scanning_loop_source(statements);
 
     quadratic_work_of(source, Event::WalkerNode)
 }
@@ -2282,6 +2286,28 @@ fn construction_lineage_visits_each_class_once_across_its_chain() {
             construction_lineage_visits_of(depth),
             (depth + 1, depth + 1),
             "{depth}"
+        );
+    }
+}
+
+fn repeating_body_scans_of(loops: usize) -> u64 {
+    let statements: String = (0..loops)
+        .map(|index| {
+            format!("for (let i{index} = 0; i{index} < scan(xs); i{index}++) {{ if (i{index} < 0) continue; total += i{index}; }} ")
+        })
+        .collect();
+    let source = scanning_loop_source(statements);
+
+    quadratic_work_of(source, Event::BudgetPrepassNode)
+}
+
+#[test]
+fn repeating_path_scans_resolve_once_per_loop() {
+    for loops in [16_u64, 32, 48] {
+        assert_eq!(
+            repeating_body_scans_of(loops as usize),
+            130 * loops + 97,
+            "{loops}"
         );
     }
 }

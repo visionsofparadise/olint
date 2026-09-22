@@ -70,6 +70,14 @@ const CONSTANT_GLOBALS: [&str; 3] = ["undefined", "NaN", "Infinity"];
 const FRESH_CONSTRUCTORS: [&str; 5] = ["Date", "Error", "RegExp", "Promise", "ArrayBuffer"];
 const MAXIMUM_ALIAS_DEPTH: usize = 8;
 
+fn is_contained_flow(nodes: &AstNodes<'_>, flow: ValueFlow) -> bool {
+    match flow {
+        ValueFlow::Read | ValueFlow::Member => true,
+        ValueFlow::Alias(node) => matches!(nodes.kind(node), AstKind::ForOfStatement(_)),
+        _ => false,
+    }
+}
+
 pub fn value_flow_of(nodes: &AstNodes<'_>, node: NodeId) -> ValueFlow {
     let mut current = node;
     let mut contained = false;
@@ -1004,15 +1012,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         for (value, holder) in &storage.values {
-            if effects
-                .member_writes
-                .iter()
-                .any(|written| self.values.may_alias(*written, *value))
-            {
-                return true;
-            }
+            let isolated = self.is_isolated_value(file, function, *value, *holder);
+            let written = match isolated {
+                true => effects.member_writes.contains(value),
+                false => effects
+                    .member_writes
+                    .iter()
+                    .any(|written| self.values.may_alias(*written, *value)),
+            };
 
-            if reached && !self.is_isolated_value(file, function, *value, *holder) {
+            if written || (reached && !isolated) {
                 return true;
             }
         }
@@ -1304,10 +1313,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .get_resolved_references(symbol)
                 .all(|reference| {
                     self.enclosing_function_of(file, reference.node_id()) == Some(function)
-                        && matches!(
-                            value_flow_of(nodes, reference.node_id()),
-                            ValueFlow::Read | ValueFlow::Member
-                        )
+                        && is_contained_flow(nodes, value_flow_of(nodes, reference.node_id()))
                 })
     }
 

@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use olint::analysis::Analysis;
-use olint::cost::Cost;
 use olint::declarations::FunctionNode;
 use olint::project::Project;
 use olint::syntax::is_iteration_kind;
@@ -10,6 +9,7 @@ use oxc_ast::AstKind;
 
 mod support;
 
+use olint::unknowns::UnknownReason;
 use support::{run_with_source, SYNTACTIC};
 
 fn loop_reasons_of(
@@ -34,12 +34,7 @@ fn loop_reasons_of(
                 _ => None,
             })
             .expect("every fixture loop sits in a function");
-        let bound = analysis.bound_of(file, kind);
-        let reason = match bound.why {
-            Some(why) => why.to_string(),
-            None if bound.factor == Cost::LOG => "log".to_string(),
-            None => "N".to_string(),
-        };
+        let reason = analysis.bound_of(file, kind).label().to_string();
 
         reasons.push((analysis.name_of(file, function), reason));
     }
@@ -141,5 +136,256 @@ fn unary_reads_preserve_bounds_while_updates_invalidate_them() {
                 "{expression}"
             );
         });
+    }
+}
+
+fn first_reason_of(source: &str) -> String {
+    let mut found = String::new();
+
+    run_with_source(source, |analysis, file| {
+        found = loop_reasons_of(analysis, file)
+            .first()
+            .map(|(_, reason)| reason.clone())
+            .expect("the source declares a loop");
+    });
+
+    found
+}
+
+fn bound_is_unknown(source: &str, name: &str) -> bool {
+    let mut found = false;
+
+    run_with_source(source, |analysis, file| {
+        let part = support::summary_of(analysis, file, name);
+
+        found = support::unknown_reasons(analysis, part.unknowns).contains(&UnknownReason::Bound);
+    });
+
+    found
+}
+
+#[test]
+fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
+    for (body, expected) in [
+        ("let sum = 0; for (let i = n; i > 0; i--) sum++;", "N"),
+        (
+            "let sum = 0; for (let i = 0; i < 1; i += 1 / n) sum++;",
+            "N",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 1; i += 0.25) sum++;",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; i++) sum++;",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10 && n > 0; i++) sum++;",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; let i = 0; while (i < 4) { i += 2; sum++; }",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; i += 0) sum++;",
+            "iteration bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; i--) sum++;",
+            "iteration bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; i++) { if (n > 0) i++; sum++; }",
+            "constant bound",
+        ),
+        (
+            "let sum = 0; for (let i = 0; i < 10; i++) { if (n > 0) i--; sum++; }",
+            "N",
+        ),
+        (
+            "let limit = 10; for (let i = 0; i < limit; i++) limit = n;",
+            "N",
+        ),
+    ] {
+        let source = format!("export function f(n: number) {{ {body} }}");
+
+        assert_eq!(first_reason_of(&source), expected, "{body}");
+    }
+}
+
+#[test]
+fn a_stable_base_and_a_constant_offset_keep_a_fixed_window() {
+    for (initial, test, update, expected) in [
+        (
+            "start",
+            "i < start + 5",
+            "i++",
+            "constant offset from start",
+        ),
+        (
+            "xs.length",
+            "i < xs.length + 5",
+            "i++",
+            "constant offset from start",
+        ),
+        (
+            "start",
+            "i > start - 5",
+            "i--",
+            "constant offset from start",
+        ),
+        ("start", "i < xs.length + 5", "i++", "N"),
+        ("start", "i < start + n", "i++", "N"),
+        ("start", "i > start + 5", "i--", "N"),
+    ] {
+        let source = format!(
+            "export function f(xs: number[], start: number, n: number) {{ let sum = 0; for (let i = {initial}; {test}; {update}) sum += xs[i] ?? 0; return sum; }}"
+        );
+
+        assert_eq!(first_reason_of(&source), expected, "{test}");
+    }
+}
+
+#[test]
+fn geometric_progress_needs_a_positive_start_and_no_competing_write() {
+    for (body, expected) in [
+        (
+            "for (let i = 1; i < xs.length; i *= 2) sum += i;",
+            "geometric step",
+        ),
+        (
+            "for (let i = 1; i < xs.length; i <<= 1) sum += i;",
+            "geometric step",
+        ),
+        ("for (let i = 0; i < xs.length; i *= 2) sum += i;", "N"),
+        (
+            "for (let i = 1; i < xs.length; i *= 2) { i = Math.floor(i / 2) + 1; sum++; }",
+            "N",
+        ),
+        ("for (let i = 1; i < xs.length; i *= 1.5) sum += i;", "N"),
+    ] {
+        let source =
+            format!("export function f(xs: number[]) {{ let sum = 0; {body} return sum; }}");
+
+        assert_eq!(first_reason_of(&source), expected, "{body}");
+    }
+}
+
+#[test]
+fn contraction_must_hold_on_every_repeating_path() {
+    for (body, expected) in [
+        (
+            "let i = xs.length; while (i > 1) { i = i >> 1; sum++; }",
+            "halving",
+        ),
+        ("let i = xs.length; while (i > 1) { i /= 2; sum++; }", "halving"),
+        (
+            "let i = xs.length; while (i > 1) { if (sum > 2) i /= 2; sum++; }",
+            "N",
+        ),
+        ("let i = xs.length; while (i > 1) { i = i - 1; sum++; }", "N"),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid; sum++; }",
+            "halving",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = Math.floor((lo + hi) / 2); lo = mid + 1; sum++; }",
+            "halving",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = lo + ((hi - lo) >> 1); hi = mid; sum++; }",
+            "halving",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (hi - hi) / 2 + lo + 1; lo = mid; sum++; }",
+            "N",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; sum++; }",
+            "N",
+        ),
+        (
+            "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; lo = mid; sum++; }",
+            "N",
+        ),
+    ] {
+        let source =
+            format!("export function f(xs: number[]) {{ let sum = 0; {body} return sum; }}");
+
+        assert_eq!(first_reason_of(&source), expected, "{body}");
+    }
+}
+
+#[test]
+fn a_counter_reset_to_an_unbounded_value_leaves_the_bound_unresolved() {
+    for body in [
+        "for (let k = 0; k < n; k++) { k = xs[0]; }",
+        "for (let i = 0; i < n; i++) { for (i of xs) void i; }",
+        "for (let i = 0; i < n; i++) { for (i of [0]) void i; }",
+        "for (let i = 0; i < n; i++) { let j = 0; j = i; i = xs[j]; }",
+        "for (let i = 0; i < n; i = xs.length) { void i; }",
+        "for (let i = 0; i < n; i++) { const reset = () => { i = 0; }; reset(); }",
+    ] {
+        let source = format!("export function f(n: number, xs: number[]) {{ {body} return n; }}");
+
+        assert_eq!(first_reason_of(&source), "iteration bound", "{body}");
+    }
+}
+
+#[test]
+fn a_body_that_can_repeat_loses_the_single_iteration_proof() {
+    for (body, expected) in [
+        ("for (const x of xs) { return x; }", "single iteration"),
+        ("for (const x of xs) { if (n > 0) continue; break; }", "N"),
+        (
+            "for (const x of xs) { if (n > 0) { sum += x; continue; } return sum; }",
+            "N",
+        ),
+        (
+            "outer: for (const x of xs) { for (const y of xs) { void y; continue outer; } }",
+            "N",
+        ),
+    ] {
+        let source = format!(
+            "export function f(xs: number[], n: number) {{ let sum = 0; {body} return sum; }}"
+        );
+
+        assert_eq!(first_reason_of(&source), expected, "{body}");
+    }
+}
+
+#[test]
+fn a_readonly_field_a_constructor_can_reassign_is_not_a_constant_endpoint() {
+    for (declared, expected) in [
+        ("", "constant bound"),
+        ("constructor(n: number) { this.limit = n; }", "N"),
+    ] {
+        let source = format!(
+            "export class K {{ readonly limit: number = 4; {declared} run(): number {{ let total = 0; for (let i = 0; i < this.limit; i++) total++; return total; }} }}"
+        );
+
+        assert_eq!(first_reason_of(&source), expected, "{declared}");
+    }
+}
+
+#[test]
+fn a_fresh_local_allocation_cannot_be_reached_through_a_parameter() {
+    for (source, unknown) in [
+        (
+            "export function f(xs: number[]) { const copy = [1, 2, 3]; let total = 0; for (const value of copy) { xs[0] = value; total += value; } return total; }",
+            false,
+        ),
+        (
+            "export function f(xs: number[]) { const copy = [1, 2, 3]; let total = 0; for (const value of copy) { copy[0] = value; total += value; } return total; }",
+            true,
+        ),
+        (
+            "export function f(xs: number[], keep: (values: number[]) => void) { const copy = [1, 2, 3]; let total = 0; keep(copy); for (const value of copy) { xs[0] = value; total += value; } return total; }",
+            true,
+        ),
+    ] {
+        assert_eq!(bound_is_unknown(source, "f"), unknown, "{source}");
     }
 }
