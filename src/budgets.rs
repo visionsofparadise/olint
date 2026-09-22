@@ -821,11 +821,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let Some((identifier, identifier_binding)) = advance.identifier else {
+            let proven = context
+                .writes
+                .get(&advance.binding)
+                .is_some_and(|found| found.iter().all(is_proven_constant));
+
             return Some(Spend {
                 text: budget.text.clone(),
                 share: None,
                 scope: budget.scope,
-                magnitude: StepMagnitude::Constant,
+                magnitude: match proven {
+                    true => StepMagnitude::Constant,
+                    false => StepMagnitude::Stable,
+                },
             });
         };
         let text = format!("{}, by {}", budget.text, identifier);
@@ -971,6 +979,13 @@ pub(crate) fn conjuncts_of<'a>(e: &'a Expression<'a>) -> Vec<&'a Expression<'a>>
         }
         _ => vec![e],
     }
+}
+
+fn is_proven_constant(write: &WriteKind) -> bool {
+    matches!(
+        write,
+        WriteKind::IncrementConstant | WriteKind::DecrementConstant
+    )
 }
 
 fn signed_direction_of(step: f64, added: bool) -> Option<Direction> {

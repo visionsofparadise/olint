@@ -302,3 +302,119 @@ fn a_step_of_unproven_magnitude_never_cancels_the_budget() {
         );
     });
 }
+
+type SpendRow<'r> = (&'r str, String, StepMagnitude, bool);
+
+fn budget_source(body: &str) -> String {
+    format!(
+        "export function f(n: number, g: number) {{ let i = 0, total = 0; {body} return total; }}"
+    )
+}
+
+fn nested_budget_source(outer: &str) -> String {
+    budget_source(&format!(
+        "for (let j = 0; j < n; j++) {{ {outer} while (i < n) {{ i++; total++; }} }}"
+    ))
+}
+
+fn trailing_budget_source(outer: &str) -> String {
+    budget_source(&format!(
+        "for (let j = 0; j < n; j++) {{ while (i < n) {{ i++; total++; }} {outer} }}"
+    ))
+}
+
+fn spend_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, Option<(StepMagnitude, bool)>)> {
+    let mut found = Vec::new();
+
+    for (label, source, _, _) in rows {
+        let mut shape = None;
+
+        run_with_source(source, |analysis, file| {
+            shape = spend_of_single_loop(analysis, file)
+                .map(|spend| (spend.magnitude, spend.share.is_some()));
+        });
+
+        found.push(((*label).to_string(), shape));
+    }
+
+    found
+}
+
+fn expected_shapes_of(rows: &[SpendRow<'_>]) -> Vec<(String, Option<(StepMagnitude, bool)>)> {
+    rows.iter()
+        .map(|(label, _, magnitude, share)| ((*label).to_string(), Some((*magnitude, *share))))
+        .collect()
+}
+
+#[test]
+fn a_budget_cancels_only_where_every_write_to_its_counter_is_a_proven_constant() {
+    let rows: [SpendRow<'_>; 9] = [
+        (
+            "a constant step before an identifier step",
+            budget_source("while (i < n) { i++; i += g; total++; }"),
+            StepMagnitude::Stable,
+            false,
+        ),
+        (
+            "an identifier step before a constant step",
+            budget_source("while (i < n) { i += g; i++; total++; }"),
+            StepMagnitude::Stable,
+            true,
+        ),
+        (
+            "a constant step refilled before the loop",
+            nested_budget_source("i += g;"),
+            StepMagnitude::Stable,
+            false,
+        ),
+        (
+            "a constant step refilled after the loop",
+            trailing_budget_source("i += g;"),
+            StepMagnitude::Stable,
+            false,
+        ),
+        (
+            "two proven constant steps",
+            budget_source("while (i < n) { i++; i += 1; total++; }"),
+            StepMagnitude::Constant,
+            false,
+        ),
+        (
+            "a proven fractional pair",
+            budget_source("while (i < n) { i++; i += 1 / 4; total++; }"),
+            StepMagnitude::Constant,
+            false,
+        ),
+        (
+            "a proven constant refill",
+            nested_budget_source("i += 2;"),
+            StepMagnitude::Constant,
+            false,
+        ),
+        (
+            "a lone constant step",
+            budget_source("while (i < n) { i++; total++; }"),
+            StepMagnitude::Constant,
+            false,
+        ),
+        (
+            "a lone identifier step",
+            budget_source("while (i < n) { i += g; total++; }"),
+            StepMagnitude::Stable,
+            true,
+        ),
+    ];
+
+    assert_eq!(spend_shapes_of(&rows), expected_shapes_of(&rows));
+}
+
+#[test]
+fn a_refilled_budget_keeps_the_loop_factor_it_cannot_cancel() {
+    for (outer, expected) in [("i += g;", "O(N^2)"), ("i += 2;", "O(N)")] {
+        let source = nested_budget_source(outer);
+        let (cost, complete, _) = support::legacy_result_of(&source, "f");
+        let expected = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
+
+        assert_eq!((cost, complete), (expected, true), "{outer}");
+    }
+}
