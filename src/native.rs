@@ -16,7 +16,7 @@ use crate::project::FileId;
 use crate::syntax::{identifier_of, member_expression_of, unwrap};
 use crate::tables::STRING_LINEAR;
 use crate::unknowns::UnknownReason;
-use crate::values::{protocol_key_of, MemberKey};
+use crate::values::{protocol_key_of, MemberKey, Size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Identity {
@@ -35,6 +35,10 @@ pub enum Operand {
     EveryKeys,
     Arity,
     Graph,
+    Each,
+    Every,
+    Elements,
+    Nested,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +72,18 @@ pub enum Role {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    Unrelated,
+    Copied,
+    Concatenated,
+    Flattened,
+    Produced,
+    Repeated,
+    Padded,
+    Joined,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeModel {
     pub identity: Identity,
     pub names: &'static [&'static str],
@@ -76,6 +92,13 @@ pub struct NativeModel {
     pub arguments: &'static [Role],
     pub rest: Role,
     pub phase: ExecutionPhase,
+    pub output: Output,
+}
+
+impl Output {
+    pub fn materializes(self) -> bool {
+        matches!(self, Output::Repeated | Output::Padded)
+    }
 }
 
 impl Role {
@@ -115,20 +138,28 @@ const fn model_of(
         arguments,
         rest,
         phase: ExecutionPhase::Immediate,
+        output: Output::Unrelated,
     }
 }
 
+const fn producing(model: NativeModel, output: Output) -> NativeModel {
+    NativeModel { output, ..model }
+}
+
 pub static MODELS: &[NativeModel] = &[
-    model_of(
-        Identity::Namespace("Array"),
-        &["from"],
-        Work::Linear(Operand::First),
-        &[
-            Role::Iterated,
-            Role::Callback(Count::PerElement),
-            Role::Forwarded,
-        ],
-        Role::Read,
+    producing(
+        model_of(
+            Identity::Namespace("Array"),
+            &["from"],
+            Work::Linear(Operand::First),
+            &[
+                Role::Iterated,
+                Role::Callback(Count::PerElement),
+                Role::Forwarded,
+            ],
+            Role::Read,
+        ),
+        Output::Copied,
     ),
     model_of(
         Identity::Namespace("Array"),
@@ -204,12 +235,15 @@ pub static MODELS: &[NativeModel] = &[
         &[Role::Opaque],
         Role::Coerced,
     ),
-    model_of(
-        Identity::Namespace("Buffer"),
-        &["concat"],
-        Work::Linear(Operand::First),
-        &[Role::Read],
-        Role::Coerced,
+    producing(
+        model_of(
+            Identity::Namespace("Buffer"),
+            &["concat"],
+            Work::Linear(Operand::Elements),
+            &[Role::Read],
+            Role::Coerced,
+        ),
+        Output::Joined,
     ),
     model_of(
         Identity::Namespace("Buffer"),
@@ -238,6 +272,66 @@ pub static MODELS: &[NativeModel] = &[
         Work::Constant,
         &[Role::Executor],
         Role::Read,
+    ),
+    producing(
+        model_of(
+            Identity::Receiver(Kind::Array),
+            &["concat"],
+            Work::Linear(Operand::Every),
+            &[],
+            Role::Read,
+        ),
+        Output::Concatenated,
+    ),
+    producing(
+        model_of(
+            Identity::Receiver(Kind::Array),
+            &["flat"],
+            Work::Linear(Operand::Nested),
+            &[Role::Coerced],
+            Role::Read,
+        ),
+        Output::Flattened,
+    ),
+    producing(
+        model_of(
+            Identity::Receiver(Kind::Array),
+            &["flatMap"],
+            Work::Linear(Operand::Each),
+            &[Role::Callback(Count::PerElement), Role::Read],
+            Role::Read,
+        ),
+        Output::Produced,
+    ),
+    producing(
+        model_of(
+            Identity::Receiver(Kind::String),
+            &["concat"],
+            Work::Linear(Operand::Every),
+            &[],
+            Role::Coerced,
+        ),
+        Output::Concatenated,
+    ),
+    producing(
+        model_of(
+            Identity::Receiver(Kind::String),
+            &["repeat"],
+            Work::Linear(Operand::Receiver),
+            &[Role::Coerced],
+            Role::Read,
+        ),
+        Output::Repeated,
+    ),
+    producing(
+        model_of(
+            Identity::Receiver(Kind::String),
+            &["padStart", "padEnd"],
+            Work::Linear(Operand::Receiver),
+            &[Role::Coerced, Role::Coerced],
+            Role::Read,
+        ),
+        Output::Padded,
     ),
     model_of(
         Identity::Receiver(Kind::String),
@@ -306,6 +400,7 @@ pub static MODELS: &[NativeModel] = &[
         arguments: &[],
         rest: Role::Forwarded,
         phase: ExecutionPhase::Immediate,
+        output: Output::Unrelated,
     },
 ];
 
@@ -546,7 +641,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Reading {
         let file = site.file;
         let origin = self.source_span(file, site.span);
-        let bounded = self.is_native_bounded(site, model.work);
+        let charge = self.native_charge_of(site, model);
+        let bounded = charge.length.is_one();
         let mut inner = Part::none();
         let mut beside = match model.receiver {
             Role::Callee => self.forwarded_part_of(site),
@@ -561,6 +657,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Count::Once => beside = beside.max(part, &mut self.unknowns, &mut self.traces),
                 _ => inner = inner.max(part, &mut self.unknowns, &mut self.traces),
             }
+        }
+
+        if model.output == Output::Produced {
+            let result = self.result_size_of(file, site.arguments.first(), &charge.element, 0);
+            let copied = Part::unmarked(result.length.clone(), None);
+
+            inner = inner.max(copied, &mut self.unknowns, &mut self.traces);
+
+            if !result.length_resolved {
+                let unresolved = self.unknown_part(file, site.span, UnknownReason::SizeRelation);
+
+                beside = beside.max(unresolved, &mut self.unknowns, &mut self.traces);
+            }
+        }
+
+        if !charge.length_resolved {
+            let unresolved = self.unknown_part(file, site.span, UnknownReason::SizeRelation);
+
+            beside = beside.max(unresolved, &mut self.unknowns, &mut self.traces);
+        }
+
+        if model.output.materializes() && !self.is_counted_argument(site) {
+            let materialized = self.unknown_part(file, site.span, UnknownReason::UnsupportedModel);
+
+            beside = beside.max(materialized, &mut self.unknowns, &mut self.traces);
         }
 
         if site.hides_invocation(model) {
@@ -585,7 +706,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     label,
                     site_of,
                     origin,
-                    Cost::N,
+                    charge.length,
                     inner.executed(),
                     &mut self.unknowns,
                     &mut self.traces,
@@ -625,6 +746,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Some(format!("{owner}.{}({argument})", site.name))
             }
             Identity::Function => Some(format!("{}()", site.name)),
+            Identity::Receiver(Kind::Array) => {
+                let receiver = site
+                    .receiver
+                    .map(|receiver| short(self.text_of(file, receiver.span())))
+                    .unwrap_or_default();
+
+                Some(format!("{receiver}.{}()", site.name))
+            }
             Identity::Receiver(Kind::String) => {
                 let receiver = site
                     .receiver
@@ -650,8 +779,52 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match model.identity {
             Identity::Namespace(owner) => Some(format!("{owner}.{}: {measure}", site.name)),
+            Identity::Receiver(Kind::Array) => Some(format!("array method: {measure}")),
             Identity::Receiver(Kind::String) => Some(format!("string method: {measure}")),
             _ => None,
+        }
+    }
+
+    fn native_charge_of(&mut self, site: &NativeSite<'a>, model: &NativeModel) -> Size {
+        let file = site.file;
+
+        match model.work {
+            Work::Linear(Operand::Each) => match site.receiver {
+                Some(receiver) if !self.is_share_sized(file, receiver) => {
+                    self.collection_size_of(file, receiver)
+                }
+                _ => Size::constant(),
+            },
+            Work::Linear(Operand::Every | Operand::Elements | Operand::Nested) => self
+                .output_size_of(site, model, 0)
+                .unwrap_or_else(Size::unresolved),
+            Work::Linear(operand @ (Operand::Receiver | Operand::First))
+                if !self.is_native_bounded(site, model.work) =>
+            {
+                let measured = match operand {
+                    Operand::Receiver => site.receiver,
+                    _ => site.expression_at(0),
+                };
+                let produced = measured.and_then(|measured| self.produced_size_of(file, measured));
+
+                match produced {
+                    Some(size) if size.exceeds || !size.length_resolved => size,
+                    _ => Size::sized(Cost::N),
+                }
+            }
+            work => match self.is_native_bounded(site, work) {
+                true => Size::constant(),
+                false => Size::sized(Cost::N),
+            },
+        }
+    }
+
+    fn is_counted_argument(&mut self, site: &NativeSite<'a>) -> bool {
+        match site.arguments.first() {
+            Some(argument) => argument
+                .as_expression()
+                .is_some_and(|expression| self.is_numeric_constant(site.file, expression)),
+            None => true,
         }
     }
 
@@ -661,7 +834,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match work {
             Work::Constant | Work::Linear(Operand::Arity) => true,
-            Work::Linear(Operand::Graph) => false,
+            Work::Linear(
+                Operand::Graph
+                | Operand::Each
+                | Operand::Every
+                | Operand::Elements
+                | Operand::Nested,
+            ) => false,
             Work::Linear(Operand::First) => {
                 first.is_some_and(|argument| self.is_constant_sized_argument(file, argument))
             }
@@ -1058,6 +1237,149 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.native_reading_of(&site, model, Reading::empty(), false);
 
         true
+    }
+
+    pub(crate) fn call_size_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        depth: usize,
+    ) -> Option<Size> {
+        if self.is_call_exhausted(file, call.node_id())
+            || self.intrinsic_replaced_of(file, &call.callee)
+        {
+            return None;
+        }
+
+        let member = self.callee_member_of(file, call);
+
+        if member.is_some() && !self.is_intrinsic_member(file, call) {
+            return None;
+        }
+
+        match self.native_of(file, call, member, false) {
+            Native::Modelled(model) => {
+                let site = self.call_site_of(file, call, member);
+
+                self.output_size_of(&site, model, depth)
+            }
+            Native::Receiver(Kind::Array) => {
+                let member = member?;
+                let method = self.static_member_name_of(file, member)?;
+
+                self.array_method_size_of(file, call, member.object(), &method, depth)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn output_size_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+        depth: usize,
+    ) -> Option<Size> {
+        let file = site.file;
+        let next = depth + 1;
+        let receiver = match site.receiver {
+            Some(receiver) => self.collection_size_at(file, receiver, next),
+            None => Size::constant(),
+        };
+
+        match model.output {
+            Output::Unrelated => None,
+            Output::Copied => {
+                let source = match site.expression_at(0) {
+                    Some(source) => self.collection_size_at(file, source, next),
+                    None => Size::unresolved(),
+                };
+
+                match site.arguments.get(1) {
+                    Some(callback) => {
+                        let result =
+                            self.result_size_of(file, Some(callback), &source.element, next);
+
+                        Some(source.containing(&result))
+                    }
+                    None => Some(source),
+                }
+            }
+            Output::Concatenated => {
+                let array = model.identity == Identity::Receiver(Kind::Array);
+                let mut size = receiver;
+
+                for argument in site.arguments {
+                    let operand = match argument {
+                        Argument::SpreadElement(spread) => self
+                            .collection_size_at(file, &spread.argument, next)
+                            .flattened(),
+                        _ => match argument.as_expression() {
+                            Some(operand) if array && self.is_primitive_operand(file, operand) => {
+                                Size::constant()
+                            }
+                            Some(operand) => self.collection_size_at(file, operand, next),
+                            None => Size::unresolved(),
+                        },
+                    };
+
+                    size = size.combined(&operand);
+                }
+
+                Some(size)
+            }
+            Output::Flattened => {
+                let depth = match site.expression_at(0) {
+                    Some(depth) => match self.known_value(file, depth).value.as_deref() {
+                        Ok(crate::values::Primitive::Number(depth)) => Some(*depth),
+                        _ => None,
+                    },
+                    None => Some(1.0),
+                };
+
+                Some(match depth {
+                    Some(depth) if depth < 1.0 => receiver,
+                    Some(depth) if depth < 2.0 => receiver.flattened(),
+                    _ => receiver.flattened().unresolved_length(),
+                })
+            }
+            Output::Produced => {
+                let result =
+                    self.result_size_of(file, site.arguments.first(), &receiver.element, next);
+
+                Some(receiver.producing(&result))
+            }
+            Output::Repeated => Some(match self.count_argument_of(site, 0) {
+                Some(count) => receiver.repeated(&Size::sized(count)),
+                None => receiver.unresolved_length(),
+            }),
+            Output::Padded => Some(match self.count_argument_of(site, 0) {
+                Some(count) => receiver.combined(&Size::sized(count)),
+                None => receiver.unresolved_length(),
+            }),
+            Output::Joined => {
+                let list = match site.expression_at(0) {
+                    Some(list) => self.collection_size_at(file, list, next).flattened(),
+                    None => Size::unresolved(),
+                };
+
+                Some(match site.arguments.get(1) {
+                    None => list,
+                    Some(_) => match self.count_argument_of(site, 1) {
+                        Some(total) => list.combined(&Size::sized(total)),
+                        None => list.unresolved_length(),
+                    },
+                })
+            }
+        }
+    }
+
+    fn count_argument_of(&mut self, site: &NativeSite<'a>, index: usize) -> Option<Cost> {
+        let Some(argument) = site.arguments.get(index) else {
+            return Some(Cost::ONE);
+        };
+        let argument = argument.as_expression()?;
+
+        self.count_of(site.file, argument)
     }
 
     pub(crate) fn is_contained_native_argument(

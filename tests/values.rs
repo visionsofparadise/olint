@@ -452,3 +452,75 @@ fn rest_copies_compose_getter_and_custom_iterator_work() {
     assert_eq!(legacy_cost_of(iterated, "f"), cost("O(N^2)"));
     assert_eq!(result_of(inert, "f"), (cost("O(1)"), true));
 }
+
+fn reasons_of(
+    source: &str,
+    name: &str,
+) -> std::collections::BTreeSet<olint::unknowns::UnknownReason> {
+    support::legacy_result_of(source, name).2
+}
+
+#[test]
+fn produced_sizes_reach_the_operations_that_visit_them() {
+    for source in [
+        "export function f(xs: number[]) { const m = xs.flatMap(() => xs); let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
+        "export function f(xs: number[]) { const m = xs.map(() => xs).flat(); let t = 0; for (const a of xs) t += [...m].length + a; return t; }",
+        "export function f(xs: number[]) { const m = xs.flatMap(() => xs); let t = 0; for (const a of xs) t += Array.from(m).length + a; return t; }",
+        "export function f(xs: number[]) { let t = 0; xs.flatMap(() => xs).forEach(() => { for (const y of xs) t += y; }); return t; }",
+        "export function f(xs: number[]) { const m = xs.flatMap(() => xs).filter((v) => v > 0); let t = 0; for (let i = 0; i < xs.length; i++) for (const v of m) t += v; return t; }",
+    ] {
+        assert_eq!(result_of(source, "f"), (cost("O(N^3)"), true), "{source}");
+    }
+
+    for source in [
+        "export function f(xs: number[]) { const m = xs.slice(); if (xs.length > 5) m.length = 0; let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
+        "export function f(xs: number[]) { const m = xs.map(() => 1); let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
+        "export function f(xs: number[]) { const m = xs.filter((x) => x > 0).slice(1); let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
+        "export function f(xs: number[]) { const m = [...xs, ...xs]; let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
+    ] {
+        assert_eq!(result_of(source, "f"), (cost("O(N^2)"), true), "{source}");
+    }
+}
+
+#[test]
+fn repeated_string_lengths_reach_later_scans() {
+    let source = r#"export function f(s: string) { const t = s.repeat(s.length); let c = 0; for (let i = 0; i < s.length; i++) if (t.includes("a")) c++; return c; }"#;
+    let fixed = r#"export function f(s: string) { const t = s.repeat(2); let c = 0; for (let i = 0; i < s.length; i++) if (t.includes("a")) c++; return c; }"#;
+
+    assert_eq!(result_of(source, "f"), (cost("O(N^3)"), false));
+    assert_eq!(result_of(fixed, "f"), (cost("O(N^2)"), true));
+}
+
+#[test]
+fn pushes_grow_their_holder_by_every_visit() {
+    let nested = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) out.push(j); let c = 0; for (let i = 0; i < n; i++) if (out.includes(i)) c++; return c; }";
+    let spread = "export function f(n: number) { const out: number[] = []; const row = [1, 2, 3]; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) out.push(...row); let c = 0; for (let i = 0; i < n; i++) c += out.indexOf(i); return c; }";
+    let shifted = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n; i++) out.unshift(i); let c = 0; for (let i = 0; i < n; i++) c += out.indexOf(i); return c; }";
+    let scoped = "export function f(n: number) { let c = 0; for (let i = 0; i < n; i++) { const out: number[] = []; for (let j = 0; j < n; j++) out.push(j); for (let k = 0; k < n; k++) c += out.indexOf(k); } return c; }";
+    let once = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n; i++) out.push(i); return out.slice(); }";
+    let produced = "export function f(xs: number[]) { const m = xs.flatMap(() => xs); const out: number[] = []; for (const v of m) out.push(v); const k = xs.length; let c = 0; for (let i = 0; i < k; i++) c += out.indexOf(i); return c; }";
+
+    assert_eq!(legacy_cost_of(nested, "f"), cost("O(N^3)"));
+    assert_eq!(legacy_cost_of(spread, "f"), cost("O(N^3)"));
+    assert_eq!(legacy_cost_of(scoped, "f"), cost("O(N^3)"));
+    assert_eq!(result_of(shifted, "f"), (cost("O(N^2)"), true));
+    assert_eq!(legacy_cost_of(once, "f"), cost("O(N)"));
+    assert_eq!(legacy_cost_of(produced, "f"), cost("O(N^3)"));
+}
+
+#[test]
+fn growth_the_analysis_cannot_count_stays_unresolved() {
+    for source in [
+        "export function f(n: number) { const out: number[] = []; const alias = out; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) alias.push(j); out.push(1); let c = 0; for (let i = 0; i < n; i++) if (out.includes(i)) c++; return c; }",
+        "export function f(n: number, xs: number[]) { const out: number[] = []; out.push(1); xs.forEach((x) => out.push(x)); let c = 0; for (let i = 0; i < n; i++) if (out.includes(i)) c++; return c; }",
+    ] {
+        let (found, complete) = result_of(source, "f");
+
+        assert_eq!(found, cost("O(N^2)"), "{source}");
+        assert!(!complete, "{source}");
+        assert!(
+            reasons_of(source, "f").contains(&olint::unknowns::UnknownReason::SizeRelation),
+            "{source}"
+        );
+    }
+}

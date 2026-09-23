@@ -2,17 +2,20 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use oxc_allocator::GetAddress;
-use oxc_ast::ast::{Class, ClassElement, Expression, MemberExpression, SimpleAssignmentTarget};
+use oxc_ast::ast::{
+    Argument, ArrayExpression, ArrayExpressionElement, BindingPattern, CallExpression, Class,
+    ClassElement, Expression, IdentifierReference, MemberExpression, SimpleAssignmentTarget,
+};
 use oxc_ast::AstKind;
 use oxc_semantic::{NodeId, Semantic};
 use oxc_syntax::operator::{LogicalOperator, UnaryOperator};
 
-use crate::analysis::Analysis;
+use crate::analysis::{work::Event, Analysis};
 use crate::budgets::Subtree;
 use crate::constants::{constant_initializer_of, evaluate_enum};
-use crate::declarations::Declaration;
+use crate::declarations::{Declaration, FunctionNode};
 use crate::project::FileId;
-use crate::syntax::{member_expression_of, unwrap, Root};
+use crate::syntax::{is_iteration_kind, member_expression_of, unwrap, Root};
 use crate::unknowns::UnknownReason;
 
 #[path = "primitive_values.rs"]
@@ -77,6 +80,147 @@ pub struct ArgumentFacts {
     pub callback: Option<Part>,
     pub preference: Preference,
     pub definedness: Definedness,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Size {
+    pub length: Cost,
+    pub element: Cost,
+    pub exceeds: bool,
+    pub length_resolved: bool,
+    pub element_resolved: bool,
+}
+
+const MAXIMUM_PRODUCED_DEPTH: usize = 16;
+
+const PRESERVING_METHODS: [&str; 10] = [
+    "filter",
+    "slice",
+    "sort",
+    "toSorted",
+    "reverse",
+    "toReversed",
+    "fill",
+    "copyWithin",
+    "with",
+    "splice",
+];
+
+fn size_sum_of(sizes: [&Cost; 2]) -> Result<Cost, CostError> {
+    let mut terms: Vec<Cost> = sizes
+        .into_iter()
+        .filter(|size| size.constant_of().is_none())
+        .cloned()
+        .collect();
+
+    terms.dedup();
+
+    match terms.len() {
+        0 => Ok(Cost::ONE),
+        1 => Ok(terms.remove(0)),
+        _ => Cost::maximum(terms),
+    }
+}
+
+fn size_product_of(left: &Cost, right: &Cost) -> Result<(Cost, bool), CostError> {
+    match (left.constant_of(), right.constant_of()) {
+        (Some(_), Some(_)) => Ok((Cost::ONE, false)),
+        (Some(_), None) => Ok((right.clone(), false)),
+        (None, Some(_)) => Ok((left.clone(), false)),
+        (None, None) => Ok((left.multiply(right)?, true)),
+    }
+}
+
+impl Size {
+    pub fn constant() -> Size {
+        Size {
+            element: Cost::ONE,
+            ..Size::sized(Cost::ONE)
+        }
+    }
+
+    pub fn sized(length: Cost) -> Size {
+        Size {
+            length,
+            element: Cost::N,
+            exceeds: false,
+            length_resolved: true,
+            element_resolved: true,
+        }
+    }
+
+    pub fn unresolved() -> Size {
+        Size::sized(Cost::N).unresolved_length()
+    }
+
+    pub fn unresolved_length(self) -> Size {
+        Size {
+            length_resolved: false,
+            ..self
+        }
+    }
+
+    pub fn combined(self, other: &Size) -> Size {
+        match (
+            size_sum_of([&self.length, &other.length]),
+            size_sum_of([&self.element, &other.element]),
+        ) {
+            (Ok(length), Ok(element)) => Size {
+                length,
+                element,
+                exceeds: self.exceeds || other.exceeds,
+                length_resolved: self.length_resolved && other.length_resolved,
+                element_resolved: self.element_resolved && other.element_resolved,
+            },
+            _ => Size::unresolved(),
+        }
+    }
+
+    pub fn flattened(self) -> Size {
+        match size_product_of(&self.length, &self.element) {
+            Ok((length, product)) => Size {
+                length,
+                element: Cost::N,
+                exceeds: self.exceeds || product,
+                length_resolved: self.length_resolved && self.element_resolved,
+                element_resolved: true,
+            },
+            Err(_) => Size::unresolved(),
+        }
+    }
+
+    pub fn producing(self, result: &Size) -> Size {
+        match size_product_of(&self.length, &result.length) {
+            Ok((length, product)) => Size {
+                length,
+                element: result.element.clone(),
+                exceeds: self.exceeds || result.exceeds || product,
+                length_resolved: self.length_resolved && result.length_resolved,
+                element_resolved: result.element_resolved,
+            },
+            Err(_) => Size::unresolved(),
+        }
+    }
+
+    pub fn repeated(self, count: &Size) -> Size {
+        match size_product_of(&self.length, &count.length) {
+            Ok((length, product)) => Size {
+                length,
+                exceeds: self.exceeds || count.exceeds || product,
+                length_resolved: self.length_resolved && count.length_resolved,
+                ..self
+            },
+            Err(_) => Size::unresolved(),
+        }
+    }
+
+    pub fn containing(self, result: &Size) -> Size {
+        Size {
+            element: result.length.clone(),
+            element_resolved: result.length_resolved,
+            ..self
+        }
+    }
 }
 
 pub const RECURRENCE_BASE: u64 = u64::MAX - 1;
@@ -797,6 +941,388 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.known_value_at(file, initializer, depth).value
     }
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn collection_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Size {
+        self.collection_size_at(file, e, 0)
+    }
+
+    pub(crate) fn produced_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<Size> {
+        self.produced_size_at(file, e, 0)
+    }
+
+    pub(crate) fn collection_size_at(
+        &mut self,
+        file: FileId,
+        e: &'a Expression<'a>,
+        depth: usize,
+    ) -> Size {
+        match self.produced_size_at(file, e, depth) {
+            Some(size) => size,
+            None => self.input_size_of(file, e),
+        }
+    }
+
+    fn input_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Size {
+        let length = match self.is_constant_sized(file, e) {
+            true => Cost::ONE,
+            false => self.parameter_size_of(file, e).unwrap_or(Cost::N),
+        };
+        let element = match self.has_primitive_elements(file, e) {
+            true => Cost::ONE,
+            false => Cost::N,
+        };
+
+        Size {
+            element,
+            ..Size::sized(length)
+        }
+    }
+
+    fn produced_size_at(
+        &mut self,
+        file: FileId,
+        e: &'a Expression<'a>,
+        depth: usize,
+    ) -> Option<Size> {
+        if depth > MAXIMUM_PRODUCED_DEPTH || !self.charge_work(Event::SizeStep, 1) {
+            return Some(Size::unresolved());
+        }
+
+        match unwrap(e) {
+            Expression::ArrayExpression(array) => Some(self.literal_size_of(file, array, depth)),
+            Expression::ConditionalExpression(conditional) => {
+                let consequent = self.produced_size_at(file, &conditional.consequent, depth + 1);
+                let alternate = self.produced_size_at(file, &conditional.alternate, depth + 1);
+
+                if consequent.is_none() && alternate.is_none() {
+                    return None;
+                }
+
+                let consequent = match consequent {
+                    Some(size) => size,
+                    None => self.input_size_of(file, &conditional.consequent),
+                };
+                let alternate = match alternate {
+                    Some(size) => size,
+                    None => self.input_size_of(file, &conditional.alternate),
+                };
+
+                Some(consequent.combined(&alternate))
+            }
+            Expression::CallExpression(call) => self.call_size_of(file, call, depth),
+            Expression::Identifier(reference) => self.holder_size_of(file, reference, depth),
+            _ => None,
+        }
+    }
+
+    fn literal_size_of(
+        &mut self,
+        file: FileId,
+        array: &'a ArrayExpression<'a>,
+        depth: usize,
+    ) -> Size {
+        let mut size = Size::constant();
+
+        for element in &array.elements {
+            let part = match element {
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    self.collection_size_at(file, &spread.argument, depth + 1)
+                }
+                ArrayExpressionElement::Elision(_) => continue,
+                element => self.element_size_of(file, element.as_expression(), depth),
+            };
+
+            size = size.combined(&part);
+        }
+
+        size
+    }
+
+    fn element_size_of(
+        &mut self,
+        file: FileId,
+        element: Option<&'a Expression<'a>>,
+        depth: usize,
+    ) -> Size {
+        match element {
+            Some(element) => {
+                Size::constant().containing(&self.collection_size_at(file, element, depth + 1))
+            }
+            None => Size::unresolved(),
+        }
+    }
+
+    fn holder_size_of(
+        &mut self,
+        file: FileId,
+        reference: &'a IdentifierReference<'a>,
+        depth: usize,
+    ) -> Option<Size> {
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+
+        if !matches!(declaration, Declaration::Variable { .. }) {
+            return None;
+        }
+
+        let (target, initializer) = constant_initializer_of(declaration)?;
+        let held = initializer.node_id();
+        let produced = self.produced_size_at(target, initializer, depth + 1);
+        let primitive = produced.is_some() && self.is_primitive_operand(target, initializer);
+
+        match self.holder_growth_of(declaration, primitive) {
+            sizes::Growth::Stable => produced,
+            sizes::Growth::Unstable => None,
+            sizes::Growth::Sites { calls, open } => {
+                let mut size = match produced {
+                    Some(size) => size,
+                    None => self.input_size_of(target, initializer),
+                };
+
+                for call in calls {
+                    let grown = self.growth_size_of(target, call, held, depth);
+
+                    size = size.combined(&grown);
+                }
+
+                Some(match open {
+                    true => size.unresolved_length(),
+                    false => size,
+                })
+            }
+        }
+    }
+
+    fn growth_size_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        held: NodeId,
+        depth: usize,
+    ) -> Size {
+        let mut increment = Size::constant();
+
+        for argument in &call.arguments {
+            let part = match argument {
+                Argument::SpreadElement(spread) => {
+                    self.collection_size_at(file, &spread.argument, depth + 1)
+                }
+                argument => self.element_size_of(file, argument.as_expression(), depth),
+            };
+
+            increment = increment.combined(&part);
+        }
+
+        match self.growth_visits_of(file, call.node_id(), held, depth) {
+            Some(visits) => increment.repeated(&visits),
+            None => increment.unresolved_length(),
+        }
+    }
+
+    fn growth_visits_of(
+        &mut self,
+        file: FileId,
+        site: NodeId,
+        held: NodeId,
+        depth: usize,
+    ) -> Option<Size> {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let enclosing: std::collections::HashSet<NodeId> = nodes
+            .ancestors(held)
+            .map(|ancestor| ancestor.id())
+            .collect();
+        let mut visits = Size::constant();
+
+        for ancestor in nodes.ancestors(site) {
+            if enclosing.contains(&ancestor.id()) {
+                break;
+            }
+
+            if !is_iteration_kind(&ancestor.kind()) {
+                continue;
+            }
+
+            let factor = self.bound_of(file, ancestor.kind()).factor()?.clone();
+            let produced = match ancestor.kind() {
+                AstKind::ForOfStatement(statement) if factor == Cost::N => {
+                    self.produced_size_at(file, &statement.right, depth + 1)
+                }
+                _ => None,
+            };
+
+            visits = match produced {
+                Some(size) if !size.length_resolved => return None,
+                Some(size) if size.exceeds => visits.repeated(&size),
+                _ => visits.repeated(&Size::sized(factor)),
+            };
+        }
+
+        visits.length_resolved.then_some(visits)
+    }
+
+    pub(crate) fn count_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<Cost> {
+        if self.is_numeric_constant(file, e) {
+            return Some(Cost::ONE);
+        }
+
+        if let Some(size) = self.parameter_size_of(file, e) {
+            return Some(size);
+        }
+
+        match unwrap(e) {
+            Expression::StaticMemberExpression(member) if member.property.name == "length" => {
+                let size = self.collection_size_of(file, &member.object);
+
+                size.length_resolved.then_some(size.length)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn result_size_of(
+        &mut self,
+        file: FileId,
+        callback: Option<&'a Argument<'a>>,
+        element: &Cost,
+        depth: usize,
+    ) -> Size {
+        let Some(callback) = callback.and_then(Argument::as_expression) else {
+            return Size::unresolved();
+        };
+
+        if depth > MAXIMUM_PRODUCED_DEPTH {
+            return Size::unresolved();
+        }
+
+        let targets = self.callable_targets_of(file, callback);
+
+        if targets.open || targets.known.is_empty() {
+            return Size::unresolved();
+        }
+
+        let mut size: Option<Size> = None;
+
+        for target in targets.known {
+            let function = self.function_at(target);
+            let deferred = match function {
+                FunctionNode::Function(function) => function.r#async || function.generator,
+                FunctionNode::Arrow(arrow) => arrow.r#async,
+                FunctionNode::Construction(_) => false,
+            };
+            let returned = match deferred {
+                true => Vec::new(),
+                false => self.returned_expressions_of(target),
+            };
+            let mut found = Size::constant();
+
+            for expression in returned {
+                let part = if is_first_parameter(
+                    self.project.file(target.file).semantic.scoping(),
+                    function,
+                    expression,
+                ) {
+                    Size::sized(element.clone())
+                } else if self.is_primitive_operand(target.file, expression) {
+                    Size::constant()
+                } else {
+                    self.collection_size_at(target.file, expression, depth + 1)
+                };
+
+                found = found.combined(&part);
+            }
+
+            size = Some(match size {
+                Some(size) => size.combined(&found),
+                None => found,
+            });
+        }
+
+        size.unwrap_or_else(Size::unresolved)
+    }
+
+    fn parameter_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<Cost> {
+        let Expression::Identifier(reference) = unwrap(e) else {
+            return None;
+        };
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+        let binding = self.parameter_binding_of(declaration)?;
+
+        if !self.is_parameter_unwritten(binding) {
+            return None;
+        }
+
+        self.current_substitutions.get(&binding)?.value.size.clone()
+    }
+
+    pub(crate) fn array_method_size_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        receiver: &'a Expression<'a>,
+        method: &str,
+        depth: usize,
+    ) -> Option<Size> {
+        let source = self.collection_size_at(file, receiver, depth + 1);
+
+        match method {
+            "map" => {
+                let result =
+                    self.result_size_of(file, call.arguments.first(), &source.element, depth + 1);
+
+                Some(source.containing(&result))
+            }
+            "toSpliced" => {
+                let mut size = source;
+
+                for argument in call.arguments.iter().skip(2) {
+                    let part = match argument {
+                        Argument::SpreadElement(spread) => {
+                            self.collection_size_at(file, &spread.argument, depth + 1)
+                        }
+                        _ => Size::constant(),
+                    };
+
+                    size = size.combined(&part);
+                }
+
+                Some(size)
+            }
+            method if PRESERVING_METHODS.contains(&method) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn is_first_parameter(
+    scoping: &oxc_semantic::Scoping,
+    function: FunctionNode<'_>,
+    expression: &Expression<'_>,
+) -> bool {
+    let parameters = match function {
+        FunctionNode::Function(function) => &function.params,
+        FunctionNode::Arrow(arrow) => &arrow.params,
+        FunctionNode::Construction(_) => return false,
+    };
+    let Some(BindingPattern::BindingIdentifier(first)) =
+        parameters.items.first().map(|parameter| &parameter.pattern)
+    else {
+        return false;
+    };
+    let Expression::Identifier(reference) = unwrap(expression) else {
+        return false;
+    };
+
+    reference
+        .reference_id
+        .get()
+        .and_then(|id| scoping.get_reference(id).symbol_id())
+        .is_some_and(|symbol| first.symbol_id.get() == Some(symbol))
 }
 
 fn reassigns_key(class: &Class<'_>, key: &str) -> bool {

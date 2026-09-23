@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use olint::analysis::Analysis;
 use olint::config::read_config;
-use olint::cost::Cost;
+use olint::cost::{Cost, CostComparison};
 use olint::public::public_functions;
 use olint::unknowns::UnknownReason;
 
@@ -318,7 +318,7 @@ fn namespace_models_require_intrinsic_identity() {
     assert_selected(&[(
         "declare const Buffer: { concat(list: unknown[]): unknown };",
         "(parts: unknown[]) { return Buffer.concat(parts); }",
-        "O(N)",
+        "O(N^2)",
         true,
     )]);
 }
@@ -443,4 +443,221 @@ fn surfaced_objects_passed_to_reading_natives_keep_public_coverage() {
 
         assert_eq!(surface_is_complete(&source), complete, "{call}");
     }
+}
+
+fn bound_result_of(body: &str, expected: &str) -> (bool, bool) {
+    let source = format!("{HELPERS}\nexport function selected{body}");
+    let mut found = None;
+
+    support::run_with_source(&source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "selected");
+        let part = support::summary_of(analysis, file, "selected");
+        let bound = analysis
+            .bind_function_cost(file, function, &Cost::parse(expected).unwrap())
+            .unwrap();
+        let equal = part.cost.compare(&bound) == CostComparison::Within
+            && bound.compare(&part.cost) == CostComparison::Within;
+
+        found = Some((equal, part.is_complete()));
+    });
+
+    found.expect("the source declares the selected function")
+}
+
+#[test]
+fn concatenation_charges_every_operand() {
+    assert_selected(&[
+        (
+            "",
+            "(xs: number[]) { return ([] as number[]).concat(xs); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return [1, 2].concat(xs); }",
+            "O(N)",
+            true,
+        ),
+        ("", r#"(s: string) { return "".concat(s); }"#, "O(N)", true),
+        (
+            "",
+            "() { const xs = [1, 2, 3]; return xs.concat([4, 5]); }",
+            "O(1)",
+            true,
+        ),
+        ("", "(n: number) { return [1, 2].concat(n); }", "O(1)", true),
+    ]);
+
+    assert_eq!(
+        bound_result_of(
+            "(xs: number[], lists: number[][]) { return xs.concat(...lists); }",
+            "O(lists * max(xs, lists))"
+        ),
+        (true, true)
+    );
+}
+
+#[test]
+fn flattening_charges_the_elements_it_visits() {
+    assert_selected(&[
+        (
+            "",
+            "(xs: number[]) { return xs.map(() => xs).flat(); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return xs.flatMap(() => xs); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return [1, 2].flatMap(() => xs); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(rows: number[][]) { return rows.flat(); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(rows: number[][]) { return rows.flatMap((row) => row); }",
+            "O(N^2)",
+            true,
+        ),
+        ("", "(xs: number[]) { return xs.flat(); }", "O(N)", true),
+        (
+            "",
+            "(xs: number[]) { return xs.flatMap((x) => [x, x]); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return xs.flatMap((x) => x); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return xs.flatMap(() => quadratic(xs)); }",
+            "O(N^3)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn unknown_result_sizes_leave_flattening_partial() {
+    for (body, expected) in [
+        (
+            "(xs: number[], f: (x: number) => number[]) { return xs.flatMap(f); }",
+            "O(xs * max(xs, f))",
+        ),
+        (
+            "(rows: number[][], depth: number) { return rows.flat(depth); }",
+            "O(rows * max(rows, depth))",
+        ),
+    ] {
+        let (_, _, reasons) = selected_of("", body);
+
+        assert_eq!(bound_result_of(body, expected), (true, false), "{body}");
+        assert!(
+            reasons.contains(&UnknownReason::SizeRelation),
+            "{body}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn independent_inner_sizes_stay_explicit() {
+    for body in [
+        "(xs: number[], ys: number[]) { return xs.flatMap(() => ys); }",
+        "(xs: number[], ys: number[]) { return xs.map(() => ys).flat(); }",
+    ] {
+        assert_eq!(bound_result_of(body, "O(xs * ys)"), (true, true), "{body}");
+        assert_eq!(bound_result_of(body, "O(xs^2)"), (false, true), "{body}");
+    }
+
+    assert_eq!(
+        bound_result_of(
+            "(xs: number[], ys: number[]) { return xs.concat(ys); }",
+            "O(max(xs, ys))"
+        ),
+        (true, true)
+    );
+}
+
+#[test]
+fn buffer_concatenation_charges_every_part() {
+    let buffer = "declare const Buffer: { concat(list: unknown[], total?: number): unknown };";
+
+    assert_selected(&[
+        (
+            buffer,
+            "(a: Uint8Array, b: Uint8Array) { return Buffer.concat([a, b]); }",
+            "O(N)",
+            true,
+        ),
+        (
+            buffer,
+            "(parts: Uint8Array[]) { return Buffer.concat(parts); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            buffer,
+            "(a: Uint8Array, total: number) { return Buffer.concat([a], total); }",
+            "O(N)",
+            true,
+        ),
+        (
+            buffer,
+            "() { return Buffer.concat([new Uint8Array(2), new Uint8Array(3)]); }",
+            "O(1)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn repeated_strings_keep_materialization_unknown() {
+    for body in [
+        r#"(count: number) { return "x".repeat(count); }"#,
+        r#"(count: number) { return "x".padStart(count); }"#,
+        r#"(count: number) { return "x".padEnd(count, "y"); }"#,
+    ] {
+        let (cost, complete, reasons) = selected_of("", body);
+
+        assert_eq!(cost, Cost::ONE, "{body}");
+        assert!(!complete, "{body}");
+        assert!(
+            reasons.contains(&UnknownReason::UnsupportedModel),
+            "{body}: {reasons:?}"
+        );
+    }
+
+    assert_selected(&[
+        ("", "(s: string) { return s.repeat(3); }", "O(N)", true),
+        (
+            "",
+            r#"(s: string) { return s.padStart(8, "0"); }"#,
+            "O(N)",
+            true,
+        ),
+    ]);
+
+    assert_eq!(
+        bound_result_of(
+            r#"(s: string, n: number) { return s.repeat(n).split(""); }"#,
+            "O(s * n)"
+        ),
+        (true, false)
+    );
 }

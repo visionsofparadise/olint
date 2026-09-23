@@ -1147,9 +1147,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .budget
             .then(|| std::mem::take(&mut self.share_bindings));
         let bound = self.bound_of(file, kind);
-        let factor = bound.factor().cloned().unwrap_or(Cost::N);
+        let mut factor = bound.factor().cloned().unwrap_or(Cost::N);
 
         invalidation.bound |= bound.is_unresolved();
+
+        if let (AstKind::ForOfStatement(statement), true) = (kind, factor == Cost::N) {
+            if let Some(size) = self.produced_size_of(file, &statement.right) {
+                if size.exceeds {
+                    factor = size.length;
+                }
+
+                if !size.length_resolved {
+                    let unresolved = self.unknown_part(
+                        file,
+                        statement.right.span(),
+                        UnknownReason::SizeRelation,
+                    );
+
+                    sibling = sibling.merge(
+                        Reading::of_part(unresolved),
+                        &mut self.unknowns,
+                        &mut self.traces,
+                    );
+                }
+            }
+        }
 
         let spend = if factor.is_one() {
             None
@@ -1446,6 +1468,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return inner;
         }
 
+        let produced = self.produced_size_of(file, &spread.argument);
+        let factor = match &produced {
+            Some(size) if size.exceeds => size.length.clone(),
+            _ => Cost::N,
+        };
+        let inner = match produced.is_some_and(|size| !size.length_resolved) {
+            true => {
+                let unresolved = self.unknown_part(file, spread.span, UnknownReason::SizeRelation);
+
+                inner.merge(
+                    Reading::of_part(unresolved),
+                    &mut self.unknowns,
+                    &mut self.traces,
+                )
+            }
+            false => inner,
+        };
         let label = format!(
             "spread ...{}",
             short(self.text_of(file, spread.argument.span()))
@@ -1457,7 +1496,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 label,
                 site,
                 self.source_span(file, spread.span),
-                Cost::N,
+                factor,
                 Part::unmarked(Cost::ONE, None),
             )),
             &mut self.unknowns,
@@ -2321,44 +2360,62 @@ impl<'p, 'a> Analysis<'p, 'a> {
             ));
         }
 
-        if array_like {
-            if is_listed(ARRAY_N_LOG_N, &method) {
-                let callback = self.callback_part_of(file, first);
-                let part = if bounded {
-                    callback
-                } else {
-                    self.nest_part(
-                        label(" [n log n]"),
-                        site,
-                        self.source_span(file, call.span),
-                        Cost::N_LOG_N,
-                        callback.executed(),
-                    )
-                };
+        let sorting = match array_like {
+            true if is_listed(ARRAY_N_LOG_N, &method) => Some(true),
+            true if is_listed(ARRAY_LINEAR, &method) => Some(false),
+            _ => None,
+        };
 
-                return reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
-            }
+        if let Some(sorting) = sorting {
+            let produced = match bounded {
+                true => None,
+                false => self.produced_size_of(file, receiver),
+            };
+            let mut unresolved = match produced.as_ref().is_some_and(|size| !size.length_resolved) {
+                true => self.unknown_part(file, call.span, UnknownReason::SizeRelation),
+                false => Part::none(),
+            };
+            let length = produced.filter(|size| size.exceeds).map(|size| size.length);
+            let factor = match (sorting, length) {
+                (false, length) => length.unwrap_or(Cost::N),
+                (true, None) => Cost::N_LOG_N,
+                (true, Some(length)) => match Cost::logarithm(length.clone())
+                    .and_then(|logarithm| length.multiply(&logarithm))
+                {
+                    Ok(factor) => factor,
+                    Err(_) => {
+                        let exhausted =
+                            self.unknown_part(file, call.span, UnknownReason::ResourceExhaustion);
 
-            if is_listed(ARRAY_LINEAR, &method) {
-                let callback = if is_listed(CALLBACK_METHODS, &method) {
-                    self.callback_part_of(file, first)
-                } else {
-                    Part::none()
-                };
-                let part = if bounded {
-                    callback
-                } else {
-                    self.nest_part(
-                        label(""),
-                        site,
-                        self.source_span(file, call.span),
-                        Cost::N,
-                        callback.executed(),
-                    )
-                };
+                        unresolved =
+                            unresolved.max(exhausted, &mut self.unknowns, &mut self.traces);
 
-                return reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
-            }
+                        length
+                    }
+                },
+            };
+            let callback = match sorting || is_listed(CALLBACK_METHODS, &method) {
+                true => self.callback_part_of(file, first),
+                false => Part::none(),
+            };
+            let suffix = match sorting {
+                true => " [n log n]",
+                false => "",
+            };
+            let part = if bounded {
+                callback
+            } else {
+                self.nest_part(
+                    label(suffix),
+                    site,
+                    self.source_span(file, call.span),
+                    factor,
+                    callback.executed(),
+                )
+            };
+            let part = part.max(unresolved, &mut self.unknowns, &mut self.traces);
+
+            return reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
         }
 
         if (kind == Kind::Set && is_listed(SET_LINEAR, &method))

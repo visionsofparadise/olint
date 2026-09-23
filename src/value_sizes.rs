@@ -77,6 +77,7 @@ const COERCED_MEMBERS: [&str; 5] = [
 ];
 const ITERATED_MEMBERS: [&str; 5] = ["values", "next", "return", "@@iterator", "@@asyncIterator"];
 const AWAITED_MEMBERS: [&str; 1] = ["then"];
+const GROWING_METHODS: [&str; 2] = ["push", "unshift"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cardinality {
@@ -114,10 +115,27 @@ struct HolderSummary {
     function: Option<NodeId>,
 }
 
+pub(crate) enum Growth<'a> {
+    Stable,
+    Unstable,
+    Sites {
+        calls: Vec<&'a CallExpression<'a>>,
+        open: bool,
+    },
+}
+
+#[derive(Clone)]
+enum GrowthSummary {
+    Stable,
+    Unstable,
+    Sites { calls: Vec<NodeId>, open: bool },
+}
+
 #[derive(Default)]
 pub(crate) struct SizeMemory {
     declarations: HashMap<(FileId, NodeId), Option<Measure>>,
     holders: HashMap<(FileId, SymbolId, Shape, bool), HolderSummary>,
+    growths: HashMap<(FileId, SymbolId, Shape), GrowthSummary>,
     evaluating: HashMap<FileId, bool>,
     pub(crate) inherited: HashMap<Kind, bool>,
 }
@@ -199,6 +217,15 @@ fn symbol_of_declaration(declaration: &Declaration<'_>) -> Option<(FileId, Symbo
         )),
         _ => None,
     }
+}
+
+fn value_references_of(scoping: &oxc_semantic::Scoping, symbol: SymbolId) -> Vec<(NodeId, bool)> {
+    scoping
+        .get_resolved_references(symbol)
+        .filter(|reference| !reference.flags().is_type() && !reference.flags().is_value_as_type())
+        .filter(|reference| reference.is_read() || !reference.is_write())
+        .map(|reference| (reference.node_id(), reference.is_write()))
+        .collect()
 }
 
 fn is_unbound_named(
@@ -637,13 +664,150 @@ impl<'p, 'a> Analysis<'p, 'a> {
         ) || self.is_non_callable_expression(file, value)
     }
 
-    fn is_intrinsic_member(&mut self, file: FileId, call: &'a CallExpression<'a>) -> bool {
+    pub(crate) fn is_intrinsic_member(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> bool {
         let Some(member) = member_expression_of(unwrap(&call.callee)) else {
             return false;
         };
         let dispatch = self.member_dispatch_of(file, member);
 
         dispatch.known.is_empty() && !dispatch.replaced && !self.work_exhausted()
+    }
+
+    pub(crate) fn holder_growth_of(
+        &mut self,
+        declaration: Declaration<'a>,
+        primitive: bool,
+    ) -> Growth<'a> {
+        let Some((file, symbol, _)) = symbol_of_declaration(&declaration) else {
+            return Growth::Unstable;
+        };
+        let shape = match primitive {
+            true => Shape::Primitive,
+            false => Shape::Array,
+        };
+        let key = (file, symbol, shape);
+        let summary = match self.values.sizes.growths.get(&key) {
+            Some(summary) => summary.clone(),
+            None => {
+                let summary = self.growth_summary_of(file, symbol, shape);
+
+                self.values.sizes.growths.insert(key, summary.clone());
+
+                summary
+            }
+        };
+
+        match summary {
+            GrowthSummary::Stable => Growth::Stable,
+            GrowthSummary::Unstable => Growth::Unstable,
+            GrowthSummary::Sites { calls, open } => Growth::Sites {
+                calls: calls
+                    .into_iter()
+                    .filter_map(|node| match self.kind_of_node(file, node) {
+                        AstKind::CallExpression(call) => Some(call),
+                        _ => None,
+                    })
+                    .collect(),
+                open,
+            },
+        }
+    }
+
+    fn growth_summary_of(&mut self, file: FileId, symbol: SymbolId, shape: Shape) -> GrowthSummary {
+        if !shape.needs_history() || self.is_stable_symbol(file, symbol, shape, false) {
+            return GrowthSummary::Stable;
+        }
+
+        let project = self.project;
+        let scoping = project.file(file).semantic.scoping();
+        let function = self.enclosing_function_of(file, scoping.symbol_declaration(symbol));
+
+        if function.is_none() || self.evaluates_directly(file) {
+            return GrowthSummary::Unstable;
+        }
+
+        let references = value_references_of(scoping, symbol);
+        let holder = Holder {
+            function,
+            shape,
+            exact: false,
+        };
+        let mut calls = Vec::new();
+        let mut open = false;
+        let mut summary = HolderSummary {
+            stable: true,
+            returned: false,
+            local: true,
+            function,
+        };
+
+        for (node, written) in references {
+            if !self.charge_work(Event::SizeStep, 1) {
+                return GrowthSummary::Sites { calls, open: true };
+            }
+
+            let local = self.enclosing_function_of(file, node) == function;
+
+            summary.local &= local;
+
+            if written {
+                open = true;
+
+                continue;
+            }
+
+            if let Some(call) = self.growing_call_of(file, node) {
+                match local {
+                    true => calls.push(call.node_id()),
+                    false => open = true,
+                }
+
+                continue;
+            }
+
+            if !self.is_stable_use(file, node, holder, &mut summary, 0) {
+                open = true;
+            }
+        }
+
+        open |= summary.returned && !summary.local;
+
+        match calls.is_empty() {
+            true => GrowthSummary::Unstable,
+            false => GrowthSummary::Sites { calls, open },
+        }
+    }
+
+    fn growing_call_of(&mut self, file: FileId, node: NodeId) -> Option<&'a CallExpression<'a>> {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let current = outermost_of(nodes, node);
+        let span = nodes.kind(current).span();
+        let member = nodes.parent_id(current);
+        let AstKind::StaticMemberExpression(access) = nodes.kind(member) else {
+            return None;
+        };
+
+        if access.object.span() != span || !GROWING_METHODS.contains(&access.property.name.as_str())
+        {
+            return None;
+        }
+
+        let callee = outermost_of(nodes, member);
+        let AstKind::CallExpression(call) = nodes.parent_kind(callee) else {
+            return None;
+        };
+
+        if call.callee.span() != nodes.kind(callee).span() || !self.is_intrinsic_member(file, call)
+        {
+            return None;
+        }
+
+        Some(call)
     }
 
     fn evaluates_directly(&mut self, file: FileId) -> bool {
@@ -749,14 +913,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return HolderSummary::UNSTABLE;
         }
 
-        let references: Vec<(NodeId, bool)> = scoping
-            .get_resolved_references(symbol)
-            .filter(|reference| {
-                !reference.flags().is_type() && !reference.flags().is_value_as_type()
-            })
-            .filter(|reference| reference.is_read() || !reference.is_write())
-            .map(|reference| (reference.node_id(), reference.is_write()))
-            .collect();
+        let references = value_references_of(scoping, symbol);
         let mut summary = HolderSummary {
             stable: true,
             returned: false,

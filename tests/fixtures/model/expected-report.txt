@@ -46,7 +46,7 @@ O(max(m, cb)) [partial]    1
 O((max(strings, needle))^(2))    1
 O(max(re, needles)) [partial]    1
 O(text)             1
-O(parts)            1
+O(parts^2)          1
 O(items^2) [partial]    1
 O(rows) [partial]    1
 O(max(1, xs^2)) [partial]    1
@@ -203,6 +203,9 @@ O(xs^2)        a  src/modules/star.ts:1
 O(items^2)     structuredCloneCall  src/methods.ts:51 [partial]
     does items.map()                                      src/methods.ts:52  x N
         does structuredClone()                            src/methods.ts:52  x N
+
+O(parts^2)     bufferConcatCall  src/methods.ts:47
+    does Buffer.concat(parts)                             src/methods.ts:48  x (parts * N)
 
 O(matrix^2)    labeledLoop  src/bounds.ts:78
     in loop for-of                                           src/bounds.ts:80  x N
