@@ -9,7 +9,9 @@ use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UpdateOperator};
 
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
-use crate::budgets::{comparison_pairs_of, conjuncts_of, is_less, Direction, Strictness, Subtree};
+use crate::budgets::{
+    comparison_pairs_of, conjuncts_of, is_less, Direction, Strictness, Subtree, Visits,
+};
 use crate::cost::Cost;
 use crate::declarations::{Binding, Declaration};
 use crate::directives::PerfTag;
@@ -245,6 +247,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match loop_kind {
             AstKind::ForOfStatement(statement) => {
+                match self.live_iteration_of(file, statement) {
+                    Some(Visits::Budgeted(budget)) => {
+                        return match Cost::maximum(vec![Cost::N, budget.cost]) {
+                            Ok(factor) => Bound::Proven {
+                                factor,
+                                proof: Some("visit budget"),
+                            },
+                            Err(_) => unresolved_bound_of(),
+                        };
+                    }
+                    Some(Visits::Unresolved) => return unresolved_bound_of(),
+                    _ => {}
+                }
+
                 if self.is_constant_sized(file, &statement.right) {
                     constant_bound_of("constant collection")
                 } else if self.is_share_sized(file, &statement.right) {

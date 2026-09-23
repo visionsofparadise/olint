@@ -1,6 +1,6 @@
 use oxc_ast::ast::{
     Argument, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
-    CallExpression, ClassElement, Expression, ForStatementLeft, MemberExpression,
+    CallExpression, ClassElement, Expression, ForOfStatement, ForStatementLeft, MemberExpression,
     MethodDefinitionKind, NewExpression, SimpleAssignmentTarget, Statement,
 };
 use oxc_ast::AstKind;
@@ -10,8 +10,11 @@ use oxc_syntax::operator::UnaryOperator;
 
 use crate::analysis::work::Event;
 use crate::analysis::Analysis;
+use crate::budgets::{CollectionWrites, VisitBudget, Visits};
 use crate::constants::constant_initializer_of;
+use crate::cost::Cost;
 use crate::declarations::{Binding, Declaration, FunctionId};
+use crate::declared_types::Kind;
 use crate::project::FileId;
 use crate::syntax::{
     body_root_of, is_iteration_kind, loop_body_of, member_expression_of, unwrap, Root,
@@ -70,6 +73,7 @@ enum Writes {
 enum Prepass {
     Loop,
     Skipped,
+    Traversal,
 }
 
 const CONSTANT_GLOBALS: [&str; 3] = ["undefined", "NaN", "Infinity"];
@@ -758,11 +762,156 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         effects.join(&header);
 
-        let mut invalidation = self.invalidation_of(file, loop_kind, &effects);
+        let live = match loop_kind {
+            AstKind::ForOfStatement(statement) => self.live_iteration_of(file, statement),
+            _ => None,
+        };
+        let classified = matches!(
+            live,
+            Some(Visits::Stable { written: true } | Visits::Budgeted(_))
+        );
+        let mut invalidation = self.invalidation_of(file, loop_kind, &effects, classified);
 
         invalidation.bound |= header.unknown_global || !header.unknown_reachable.is_empty();
 
         invalidation
+    }
+
+    pub(crate) fn live_iteration_of(
+        &mut self,
+        file: FileId,
+        statement: &'a ForOfStatement<'a>,
+    ) -> Option<Visits> {
+        if statement.r#await || !matches!(unwrap(&statement.right), Expression::Identifier(_)) {
+            return None;
+        }
+
+        if !matches!(
+            self.receiver_kind_of(file, &statement.right, ""),
+            Kind::Set | Kind::Map
+        ) {
+            return None;
+        }
+
+        Some(self.live_visits_of(
+            file,
+            &statement.right,
+            &[(file, Root::Statement(&statement.body))],
+        ))
+    }
+
+    pub(crate) fn live_visits_of(
+        &mut self,
+        file: FileId,
+        collection: &'a Expression<'a>,
+        bodies: &[(FileId, Root<'a>)],
+    ) -> Visits {
+        let value = self.storage_value_of(file, collection);
+        let holder = match unwrap(collection) {
+            Expression::Identifier(reference) => self.binding_of_identifier(file, reference),
+            _ => None,
+        };
+        let function = self.enclosing_function_of(file, collection.node_id());
+        let storage = Storage {
+            values: vec![(value, holder)],
+            ..Storage::default()
+        };
+        let effects = self.traversal_effects_of(bodies, &[]);
+
+        if !self.affects(file, function, &effects, &storage, None) {
+            return Visits::Stable { written: false };
+        }
+
+        let mut writes = CollectionWrites::default();
+
+        for (body_file, body) in bodies {
+            self.collection_writes_in(*body_file, *body, value, &mut writes);
+        }
+
+        let remaining = self.traversal_effects_of(bodies, &writes.sites());
+
+        if self.work_exhausted() || self.affects(file, function, &remaining, &storage, None) {
+            return Visits::Unresolved;
+        }
+
+        if writes.additions.is_empty() {
+            return Visits::Stable { written: true };
+        }
+
+        if !writes.deletions.is_empty() {
+            return Visits::Unresolved;
+        }
+
+        let mut costs = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+
+        for addition in writes.additions {
+            let Some((endpoint, text)) = addition.guard else {
+                return Visits::Unresolved;
+            };
+            let mut endpoint_storage = Storage::default();
+
+            self.collect_storage(addition.file, endpoint.node_id(), &mut endpoint_storage);
+
+            let owner = self.enclosing_function_of(addition.file, endpoint.node_id());
+
+            if endpoint_storage.calls
+                || endpoint_storage.unresolved
+                || self.affects(addition.file, owner, &remaining, &endpoint_storage, None)
+            {
+                return Visits::Unresolved;
+            }
+
+            let Some(cost) = self.endpoint_cost_of(addition.file, endpoint) else {
+                return Visits::Unresolved;
+            };
+
+            costs.push(cost);
+
+            if !texts.contains(&text) {
+                texts.push(text);
+            }
+        }
+
+        match Cost::maximum(costs) {
+            Ok(cost) => Visits::Budgeted(VisitBudget {
+                cost,
+                text: texts.join(", "),
+            }),
+            Err(_) => Visits::Unresolved,
+        }
+    }
+
+    fn traversal_effects_of(
+        &mut self,
+        bodies: &[(FileId, Root<'a>)],
+        excluded: &[(FileId, NodeId)],
+    ) -> Effects {
+        let saved = std::mem::take(&mut self.current_effects);
+
+        for (file, body) in bodies {
+            if self.fallback_active() || self.work_exhausted() {
+                self.current_effects.unknown_global = true;
+
+                break;
+            }
+
+            let kinds: Vec<AstKind<'a>> = self
+                .counted_subtree(*file, *body, Event::EffectPrepassNode)
+                .into_iter()
+                .filter(|kind| !excluded.contains(&(*file, kind.node_id())))
+                .collect();
+
+            if self.work_exhausted() {
+                self.current_effects.unknown_global = true;
+
+                break;
+            }
+
+            self.prepass_effects_of(*file, kinds, Prepass::Traversal);
+        }
+
+        std::mem::replace(&mut self.current_effects, saved)
     }
 
     fn called_effects_in(&mut self, file: FileId, root: Root<'a>) -> Effects {
@@ -839,7 +988,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             match prepass {
-                Prepass::Skipped => self.record_writes(file, kind, Writes::All),
+                Prepass::Skipped | Prepass::Traversal => {
+                    self.record_writes(file, kind, Writes::All)
+                }
                 Prepass::Loop => self.record_writes(file, kind, Writes::Qualified),
             }
 
@@ -959,6 +1110,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         loop_kind: AstKind<'a>,
         effects: &Effects,
+        classified: bool,
     ) -> Invalidation {
         if effects.unknown_global {
             return Invalidation {
@@ -975,7 +1127,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .filter(|ancestor| is_iteration_kind(&ancestor.kind()))
             .last()
             .map_or(loop_kind.node_id(), |ancestor| ancestor.id());
-        let header = self.header_storage_of(file, loop_kind);
+        let header = self.header_storage_of(file, loop_kind, classified);
         let bound = self.affects(file, function, effects, &header, Some(repeated));
         let budget = match self.budget_storage_of(file, loop_kind.node_id()) {
             Some(storage) => self.affects(file, function, effects, &storage, None),
@@ -1039,23 +1191,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
         false
     }
 
-    fn header_storage_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Storage {
+    fn header_storage_of(
+        &mut self,
+        file: FileId,
+        loop_kind: AstKind<'a>,
+        classified: bool,
+    ) -> Storage {
         let body = loop_body_of(loop_kind).map(|body| body.node_id());
-        let mut storage = Storage::default();
-
-        for child in self.children_of(file, loop_kind.node_id()) {
-            if Some(child) != body {
-                self.collect_storage(file, child, &mut storage);
-            }
-        }
-
         let iterated = match loop_kind {
             AstKind::ForOfStatement(statement) => Some(&statement.right),
             AstKind::ForInStatement(statement) => Some(&statement.right),
             _ => None,
         };
+        let skipped = iterated
+            .filter(|_| classified)
+            .map(|iterated| iterated.node_id());
+        let mut storage = Storage::default();
 
-        if let Some(iterated) = iterated {
+        for child in self.children_of(file, loop_kind.node_id()) {
+            if Some(child) != body && Some(child) != skipped {
+                self.collect_storage(file, child, &mut storage);
+            }
+        }
+
+        if let Some(iterated) = iterated.filter(|_| !classified) {
             self.collect_value(file, iterated, &mut storage);
         }
 

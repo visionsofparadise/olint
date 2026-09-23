@@ -7,13 +7,14 @@ use oxc_span::{GetSpan, Span};
 
 use crate::analysis::Analysis;
 use crate::bounds::short;
+use crate::budgets::Visits;
 use crate::cost::{Cost, ExecutionPhase, Part, Reading};
 use crate::declarations::{Declaration, TargetSet};
 use crate::declared_types::Kind;
 use crate::flow::Completion;
 use crate::invocations::{coercion_keys, iteration_keys};
 use crate::project::FileId;
-use crate::syntax::{identifier_of, member_expression_of, unwrap};
+use crate::syntax::{body_root_of, identifier_of, member_expression_of, unwrap};
 use crate::tables::STRING_LINEAR;
 use crate::unknowns::UnknownReason;
 use crate::values::{protocol_key_of, MemberKey, Size};
@@ -52,6 +53,7 @@ pub enum Count {
     Once,
     PerElement,
     PerMatch,
+    PerVisit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +65,9 @@ pub enum Role {
     Inspected,
     Serialized,
     Written,
+    Grown,
+    Shrunk,
+    Stored,
     Opaque,
     Callback(Count),
     Grouping,
@@ -107,7 +112,10 @@ impl Role {
     }
 
     pub fn retains(self) -> bool {
-        matches!(self, Role::Written | Role::Opaque | Role::Forwarded)
+        matches!(
+            self,
+            Role::Written | Role::Stored | Role::Opaque | Role::Forwarded
+        )
     }
 
     pub fn exposes(self) -> bool {
@@ -144,6 +152,10 @@ const fn model_of(
 
 const fn producing(model: NativeModel, output: Output) -> NativeModel {
     NativeModel { output, ..model }
+}
+
+const fn writing(model: NativeModel, receiver: Role) -> NativeModel {
+    NativeModel { receiver, ..model }
 }
 
 pub static MODELS: &[NativeModel] = &[
@@ -391,6 +403,60 @@ pub static MODELS: &[NativeModel] = &[
         Work::Linear(Operand::Receiver),
         &[],
         Role::Coerced,
+    ),
+    writing(
+        model_of(
+            Identity::Receiver(Kind::Set),
+            &["add"],
+            Work::Constant,
+            &[Role::Stored],
+            Role::Read,
+        ),
+        Role::Grown,
+    ),
+    writing(
+        model_of(
+            Identity::Receiver(Kind::Map),
+            &["set"],
+            Work::Constant,
+            &[Role::Stored, Role::Stored],
+            Role::Read,
+        ),
+        Role::Grown,
+    ),
+    writing(
+        model_of(
+            Identity::Receiver(Kind::Set),
+            &["delete", "clear"],
+            Work::Constant,
+            &[Role::Read],
+            Role::Read,
+        ),
+        Role::Shrunk,
+    ),
+    writing(
+        model_of(
+            Identity::Receiver(Kind::Map),
+            &["delete", "clear"],
+            Work::Constant,
+            &[Role::Read],
+            Role::Read,
+        ),
+        Role::Shrunk,
+    ),
+    model_of(
+        Identity::Receiver(Kind::Set),
+        &["forEach"],
+        Work::Linear(Operand::Receiver),
+        &[Role::Callback(Count::PerVisit), Role::Read],
+        Role::Read,
+    ),
+    model_of(
+        Identity::Receiver(Kind::Map),
+        &["forEach"],
+        Work::Linear(Operand::Receiver),
+        &[Role::Callback(Count::PerVisit), Role::Read],
+        Role::Read,
     ),
     NativeModel {
         identity: Identity::Callable,
@@ -641,11 +707,33 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Reading {
         let file = site.file;
         let origin = self.source_span(file, site.span);
-        let charge = self.native_charge_of(site, model);
-        let bounded = charge.length.is_one();
+        let mut charge = self.native_charge_of(site, model);
+        let mut visits = match counted {
+            true => self.traversal_visits_of(site, model),
+            false => None,
+        };
+        let mut budget = None;
+
+        if let Some(Visits::Budgeted(found)) = &visits {
+            match Cost::maximum(vec![charge.length.clone(), found.cost.clone()]) {
+                Ok(length) => {
+                    charge.length = length;
+                    budget = Some(found.text.clone());
+                }
+                Err(_) => visits = Some(Visits::Unresolved),
+            }
+        }
+
+        let unresolved = visits == Some(Visits::Unresolved);
+        let bounded = charge.length.is_one() || unresolved;
         let mut inner = Part::none();
         let mut beside = match model.receiver {
             Role::Callee => self.forwarded_part_of(site),
+            Role::Written | Role::Grown | Role::Shrunk => {
+                self.record_receiver_write(site);
+
+                Part::none()
+            }
             _ => Part::none(),
         };
 
@@ -690,7 +778,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             beside = beside.max(hidden, &mut self.unknowns, &mut self.traces);
         }
 
-        let label = self.native_label_of(site, model);
+        if unresolved {
+            let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
+            let scaled = self.unknowns.scale(Some(unknown), None);
+
+            self.note_unresolved_multiplicity(&inner);
+
+            inner = inner
+                .scaled(None, &mut self.unknowns)
+                .retaining(scaled, &mut self.unknowns);
+        }
+
+        let label = self
+            .native_label_of(site, model)
+            .map(|label| match &budget {
+                Some(text) => format!("{label} [visit budget: {text}]"),
+                None => label,
+            });
 
         if counted {
             if let Some(statistic) = self.native_statistic_of(site, model, bounded) {
@@ -746,7 +850,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Some(format!("{owner}.{}({argument})", site.name))
             }
             Identity::Function => Some(format!("{}()", site.name)),
-            Identity::Receiver(Kind::Array) => {
+            Identity::Receiver(Kind::Array | Kind::Set | Kind::Map) => {
                 let receiver = site
                     .receiver
                     .map(|receiver| short(self.text_of(file, receiver.span())))
@@ -898,7 +1002,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             ),
             Role::Inspected => (self.inspected_part_of(file, expression), Count::Once),
             Role::Serialized => (self.serialized_part_of(file, expression), Count::Once),
-            Role::Written => (self.written_part_of(file, expression), Count::Once),
+            Role::Written | Role::Grown | Role::Shrunk => {
+                (self.written_part_of(file, expression), Count::Once)
+            }
+            Role::Stored => {
+                self.record_stored_value(file, expression);
+
+                (Part::none(), Count::Once)
+            }
             Role::Opaque => (self.opaque_part_of(file, expression), Count::Once),
             Role::Callback(count) => {
                 if self.is_non_callable_argument(file, expression) {
@@ -1001,6 +1112,63 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let targets = self.protocol_targets_of(file, pattern, &keys);
 
         self.implicit_part_of((file, pattern.span()), &targets, "pattern", &[pattern])
+    }
+
+    fn record_receiver_write(&mut self, site: &NativeSite<'a>) {
+        let Some(receiver) = site.receiver else {
+            return;
+        };
+        let value = self.storage_value_of(site.file, receiver);
+
+        if !self.current_effects.member_writes.contains(&value) {
+            self.current_effects.member_writes.push(value);
+        }
+    }
+
+    fn record_stored_value(&mut self, file: FileId, expression: &'a Expression<'a>) {
+        if self.is_primitive_operand(file, expression) {
+            return;
+        }
+
+        let value = self.storage_value_of(file, expression);
+
+        if !self.current_effects.escapes.contains(&value) {
+            self.current_effects.escapes.push(value);
+        }
+    }
+
+    fn traversal_visits_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+    ) -> Option<Visits> {
+        let file = site.file;
+        let index = (0..site.arguments.len())
+            .find(|index| site.role_of(model, *index) == Role::Callback(Count::PerVisit))?;
+        let receiver = site.receiver?;
+        let argument = &site.arguments[index];
+        let callback = argument.as_expression()?;
+
+        if self.is_non_callable_argument(file, callback) {
+            return None;
+        }
+
+        let targets = self.argument_facts_of(file, argument).value.targets;
+
+        if targets.open || targets.known.is_empty() {
+            return Some(Visits::Unresolved);
+        }
+
+        let mut bodies = Vec::new();
+
+        for target in targets.known {
+            match body_root_of(self.function_at(target)) {
+                Some(body) => bodies.push((target.file, body)),
+                None => return Some(Visits::Unresolved),
+            }
+        }
+
+        Some(self.live_visits_of(file, receiver, &bodies))
     }
 
     fn written_part_of(&mut self, file: FileId, target: &'a Expression<'a>) -> Part {
@@ -1186,7 +1354,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
-    fn modelled_call_of(
+    pub(crate) fn modelled_call_of(
         &mut self,
         file: FileId,
         call: &'a CallExpression<'a>,

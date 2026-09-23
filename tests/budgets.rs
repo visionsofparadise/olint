@@ -640,3 +640,228 @@ fn an_unguarded_loop_keeps_the_factor_no_budget_cancels() {
 
     assert_guarded_costs(&rows);
 }
+
+type VisitRow<'r> = (&'r str, &'r str, &'r str, &'r str, bool);
+
+fn assert_live_visits(rows: &[VisitRow<'_>]) {
+    let found: Vec<(&str, String, bool, bool)> = rows
+        .iter()
+        .map(|(label, parameters, body, _, _)| {
+            let (cost, complete, reasons) = support::legacy_result_of(
+                &format!(
+                    "export function f({parameters}) {{ let total = 0; {body} return total; }}"
+                ),
+                "f",
+            );
+
+            (
+                *label,
+                cost.text(),
+                complete,
+                reasons.contains(&olint::unknowns::UnknownReason::Bound),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, String, bool, bool)> = rows
+        .iter()
+        .map(|(label, _, _, expected, complete)| {
+            let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
+
+            (*label, cost.text(), *complete, !*complete)
+        })
+        .collect();
+
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn a_size_guarded_addition_budgets_live_collection_visits() {
+    let rows = [
+        (
+            "a singleton set grown to xs squared",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (values.size < xs.length * xs.length) values.add(value + 1); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "a singleton map grown to xs squared",
+            "xs: number[]",
+            "const table = new Map([[0, 0]]); for (const [key] of table) { if (table.size < xs.length * xs.length) table.set(key + 1, 0); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "a budgeted traversal multiplying its body",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (values.size < xs.length * xs.length) values.add(value + 1); for (const x of xs) total += x + value; }",
+            "O(N^3)",
+            true,
+        ),
+        (
+            "a guard admitting two additions",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (xs.length > values.size) { values.add(value + 1); values.add(value + 2); } }",
+            "O(N)",
+            true,
+        ),
+        (
+            "a constant guard keeping the initial size",
+            "s: Set<number>",
+            "for (const value of s) { if (s.size < 10) s.add(value + 1); total += value; }",
+            "O(N)",
+            true,
+        ),
+    ];
+
+    assert_live_visits(&rows);
+}
+
+#[test]
+fn deletions_keep_live_collection_visits_within_the_initial_size() {
+    let rows = [
+        (
+            "deleting each visited entry",
+            "s: Set<number>",
+            "for (const value of s) { s.delete(value); total += value; }",
+            "O(N)",
+            true,
+        ),
+        (
+            "deleting through a possible alias",
+            "s: Set<number>, t: Set<number>",
+            "for (const value of s) { t.delete(value); total += value; }",
+            "O(N)",
+            true,
+        ),
+        (
+            "a stable traversal adding to another fresh collection",
+            "xs: number[]",
+            "const values = new Set(xs); const seen = new Set<number>(); values.forEach(() => {}); for (const value of values) { seen.add(value); total += value; }",
+            "O(N)",
+            true,
+        ),
+        (
+            "a stable traversal",
+            "s: Set<number>",
+            "for (const value of s) { total += value; }",
+            "O(N)",
+            true,
+        ),
+    ];
+
+    assert_live_visits(&rows);
+}
+
+#[test]
+fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
+    let rows = [
+        (
+            "a deletion beside a size-guarded addition",
+            "xs: number[], s: Set<number>",
+            "for (const value of s) { if (s.size < xs.length) { s.delete(value); s.add(value); } }",
+            "O(1)",
+            false,
+        ),
+        (
+            "an unguarded addition",
+            "",
+            "const values = new Set([0]); for (const value of values) { values.add(value + 1); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "an addition in the alternate branch",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (values.size < xs.length) {} else values.add(value + 1); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a loop between the guard and the addition",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (values.size < xs.length) for (let i = 0; i < 2; i++) values.add(value + i); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "an endpoint the traversal raises",
+            "xs: number[]",
+            "const values = new Set([0]); let limit = xs.length; for (const value of values) { if (values.size < limit) { values.add(value + 1); limit++; } }",
+            "O(1)",
+            false,
+        ),
+        (
+            "an endpoint reading the grown collection",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (values.size < values.size + xs.length) values.add(value + 1); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a deletion through a possible alias beside a guarded addition",
+            "xs: number[], s: Set<number>, t: Set<number>",
+            "for (const value of s) { if (s.size < xs.length) s.add(value + 1); t.delete(value); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "an endpoint the traversal lengthens",
+            "",
+            "const values = new Set([0]); const limits = [0]; for (const value of values) { if (values.size < limits.length) { values.add(value + 1); limits.length = values.size + 1; } }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a guarded addition beside an unguarded one",
+            "xs: number[], s: Set<number>",
+            "for (const value of s) { if (s.size < xs.length) s.add(value + 1); s.add(value + 2); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a guarded addition beside one whose endpoint the traversal lengthens",
+            "xs: number[], s: Set<number>",
+            "const limits = [0]; for (const value of s) { if (s.size < xs.length) s.add(value + 1); if (s.size < limits.length) { s.add(value + 2); limits.length = s.size + 1; } }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a guarded addition beside one whose endpoint reads this",
+            "this: { items: number[] }, xs: number[], s: Set<number>",
+            "for (const value of s) { if (s.size < xs.length) s.add(value + 1); if (s.size < this.items.length) s.add(value + 2); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a guarded addition beside one whose endpoint has no size",
+            "xs: number[], s: Set<number>, o: { count: number }",
+            "for (const value of s) { if (s.size < xs.length) s.add(value + 1); if (s.size < o.count) s.add(value + 2); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "an endpoint evaluated through a call",
+            "xs: number[]",
+            "const values = new Set([0]); for (const value of values) { if (values.size < xs.concat(xs).length) values.add(value + 1); }",
+            "O(N)",
+            false,
+        ),
+        (
+            "a guard bounding the size from below",
+            "",
+            "const values = new Set([0]); for (const value of values) { if (values.size > 0) values.add(value + 1); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "a guard on another collection",
+            "xs: number[], t: Set<number>",
+            "const values = new Set([0]); for (const value of values) { if (t.size < xs.length) values.add(value + 1); }",
+            "O(1)",
+            false,
+        ),
+    ];
+
+    assert_live_visits(&rows);
+}

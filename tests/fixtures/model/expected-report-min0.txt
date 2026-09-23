@@ -2,14 +2,14 @@ public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
 O(1)               34
-O(1) [partial]     17
+O(1) [partial]     19
 O(xs)              13
 O(rows^2)           9
-O(xs) [partial]     7
+O(xs) [partial]     8
 O(rows^2) [partial]    7
+O(n) [partial]      6
 O((xs * log(xs)))    5
 O(N)                5
-O(n) [partial]      5
 O(o)                4
 O(N) [partial]      4
 O((xs * xs^2))      3
@@ -20,7 +20,6 @@ O((matrix * log(matrix)))    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
 O(max(n, xs))       2
-O(max(1, n^2))      2
 O(prefix)           2
 O((max(o, matrix))^(2))    2
 O((log(max(matrix, target)) * max(matrix, target)))    1
@@ -35,21 +34,19 @@ O((max(xs, n, next))^(2)) [partial]    1
 O((max(xs, n))^(2))    1
 O(max(xs, n)) [partial]    1
 O(max(n, cb)) [partial]    1
+O(max(1, n^2))      1
 O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
 O(obj) [partial]    1
 O(N^2)              1
 O(max(xs, other)) [partial]    1
 O(max(xs, needle))    1
-O(max(s, cb)) [partial]    1
-O(max(m, cb)) [partial]    1
 O((max(strings, needle))^(2))    1
 O(max(re, needles)) [partial]    1
 O(text)             1
 O(parts^2)          1
 O(items^2) [partial]    1
 O(rows) [partial]    1
-O(max(1, xs^2)) [partial]    1
 O((matrix * matrix^2))    1
 
 O((log(max(matrix, target)) * max(matrix, target))) whileHalvingMidpoint  src/bounds.ts:38
@@ -267,12 +264,6 @@ O(max(xs, fast)) hotIfBranch  src/branches.ts:1
 O(max(re, needles)) regexpVarCall  src/methods.ts:27 [partial]
     does re.test() [regexp]                               src/methods.ts:29  x N
 
-O(max(m, cb))  mapLinearCall  src/methods.ts:13 [partial]
-    does m.forEach()                                      src/methods.ts:14  x N
-
-O(max(s, cb))  setLinearCall  src/methods.ts:9 [partial]
-    does s.forEach()                                      src/methods.ts:10  x N
-
 O(max(xs, needle)) arrayLinearCall  src/methods.ts:1
     does xs.includes()                                    src/methods.ts:2  x N
 
@@ -285,15 +276,6 @@ O(max(1, n^2)) callbackSubstituted  src/calls.ts:13
     in loop for                                              src/calls.ts:9  x N
         calls cb() [callback parameter]                    src/calls.ts:9  = O(n)
         in loop for                                          src/calls.ts:3  x N
-
-O(max(1, xs^2)) setCallbackCallsMethod  src/methods.ts:112 [partial]
-    does s.forEach()                                      src/methods.ts:114  x N
-        calls RoundEngine.run()                            src/methods.ts:114  = O(xs)
-        does xs.indexOf()                                 src/methods.ts:104  x N
-
-O(max(1, n^2)) setCallback  src/methods.ts:80
-    does s.forEach()                                      src/methods.ts:83  x N
-        does list.map()                                   src/methods.ts:83  x N
 
 O(max(1, rows)) spreadAtCallSite  src/calls.ts:21 [partial]
     does spread ...xs                                     src/calls.ts:23  x N
@@ -428,6 +410,10 @@ O(n)           factorialLike  src/recursion.ts:1
     calls factorialLike()                                  src/recursion.ts:2  = O(n)
     calls factorialLike()                                  src/recursion.ts:2  = O(n)
 
+O(xs)          setCallbackCallsMethod  src/methods.ts:112 [partial]
+    calls RoundEngine.run()                                src/methods.ts:114  = O(xs)
+    does xs.indexOf()                                     src/methods.ts:104  x N
+
 O(xs)          RoundEngine.run  src/methods.ts:103
     does xs.indexOf()                                     src/methods.ts:104  x N
 
@@ -436,6 +422,9 @@ O(prefix)      nextLineLabel  src/methods.ts:98
 
 O(prefix)      surrogateCutLabel  src/methods.ts:94
     does (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa�....split() [string] src/methods.ts:95  x N
+
+O(n)           setCallback  src/methods.ts:80 [partial]
+    does list.map()                                       src/methods.ts:83  x N
 
 O(rows)        newSetNonConst  src/methods.ts:59 [partial]
     calls Set(xs)                                          src/methods.ts:61  = O(N)
@@ -536,6 +525,10 @@ O(1)           constEnumKeys  src/constants.ts:41
 O(1)           asConstArray  src/constants.ts:45
 
 O(1)           stringLiteralConstant  src/constants.ts:49
+
+O(1)           setLinearCall  src/methods.ts:9 [partial]
+
+O(1)           mapLinearCall  src/methods.ts:13 [partial]
 
 O(1)           regexpConstCall  src/methods.ts:23
 

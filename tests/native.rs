@@ -661,3 +661,220 @@ fn repeated_strings_keep_materialization_unknown() {
         (true, false)
     );
 }
+
+fn assert_unknown_visits(cases: &[(&str, &str, &str)]) {
+    for (declarations, body, expected) in cases {
+        let (cost, complete, reasons) = selected_of(declarations, body);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert!(!complete, "{body}: {reasons:?}");
+        assert!(
+            reasons.contains(&UnknownReason::Bound),
+            "{body}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn live_collection_callbacks_run_once_per_budgeted_visit() {
+    assert_selected(&[
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length * xs.length) values.add(values.size); }); return values; }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length) values.add(values.size); scan(xs); }); return values; }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); const alias = values; values.forEach(() => { if (alias.size < xs.length * xs.length) alias.add(alias.size); }); return values; }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(n: number) { const table = new Map<number, number>(); table.set(0, 0); table.forEach((value, key) => { if (n >= table.size) table.set(key + 1, value); }); return table; }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(s: Set<number>) { let total = 0; s.forEach((value) => { if (s.size < 10) s.add(value + 1); total += value; }); return total; }",
+            "O(N)",
+            true,
+        ),
+    ]);
+
+    assert_eq!(
+        bound_result_of(
+            "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length * xs.length) values.add(values.size); }); return values; }",
+            "O(max(1, xs^2))"
+        ),
+        (true, true)
+    );
+}
+
+#[test]
+fn unsupported_live_collection_growth_leaves_visits_unknown() {
+    assert_unknown_visits(&[
+        (
+            "function grow(target: Set<number>, limit: number) { if (target.size < limit) target.add(target.size); }",
+            "(xs: number[]) { const values = new Set([0]); values.forEach(() => { grow(values, xs.length); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach((value, key, set) => { if (set.size < xs.length) set.add(set.size); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); let alias = values; values.forEach(() => { if (alias.size < xs.length) alias.add(alias.size); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach(function (this: Set<number>) { if (this.size < xs.length) this.add(this.size); scan(xs); }, values); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach((value) => { values.add(value + 1); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); let limit = xs.length; values.forEach(() => { if (values.size < limit) { values.add(values.size); limit++; } scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length) {} else values.add(values.size); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length) for (let i = 0; i < 2; i++) values.add(values.size + i); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[], other: Set<number>) { const values = new Set([0]); values.forEach(() => { if (other.size < xs.length) values.add(values.size); scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(m: Map<number, number>, xs: number[]) { m.forEach((value, key) => { m.set(key, value + 1); scan(xs); }); return m; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(xs: number[]) { const values = new Set([0]); const limits = [0]; values.forEach(() => { if (values.size < limits.length) { values.add(values.size); limits.length = values.size + 1; } scan(xs); }); return values; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { s.forEach((value) => { if (s.size < xs.length) s.add(value + 1); s.add(value + 2); scan(xs); }); return s; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { const limits = [0]; s.forEach((value) => { if (s.size < xs.length) s.add(value + 1); if (s.size < limits.length) { s.add(value + 2); limits.length = s.size + 1; } scan(xs); }); return s; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(this: { items: number[] }, s: Set<number>, xs: number[]) { s.forEach((value) => { if (s.size < xs.length) s.add(value + 1); if (s.size < this.items.length) s.add(value + 2); scan(xs); }); return s; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(s: Set<number>, xs: number[], o: { count: number }) { s.forEach((value) => { if (s.size < xs.length) s.add(value + 1); if (s.size < o.count) s.add(value + 2); scan(xs); }); return s; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { s.forEach((value) => { if (s.size < xs.concat(xs).length) s.add(value + 1); scan(xs); }); return s; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(s: Set<number>, callback: (value: number) => void) { s.forEach(callback); }",
+            "O(1)",
+        ),
+    ]);
+}
+
+#[test]
+fn reinserted_entries_can_exceed_the_final_size() {
+    assert_unknown_visits(&[
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { s.forEach((value) => { if (s.size < xs.length) { s.delete(value); s.add(value); } scan(xs); }); return s; }",
+            "O(N)",
+        ),
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { let count = 0; s.forEach((value) => { if (count < xs.length) { count++; s.delete(value); s.add(value); } scan(xs); }); return count; }",
+            "O(N)",
+        ),
+    ]);
+}
+
+#[test]
+fn stable_live_collections_stay_size_bounded() {
+    assert_selected(&[
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { s.forEach(() => scan(xs)); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(m: Map<number, number>, xs: number[]) { m.forEach(() => scan(xs)); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(s: Set<number>, xs: number[]) { s.forEach(() => { s.clear(); scan(xs); }); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(s: Set<number>, t: Set<number>, xs: number[]) { s.forEach((value) => { t.delete(value); scan(xs); }); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(target: Set<number>, table: Map<number, number>) { target.add(1); table.set(1, 2); target.delete(1); table.clear(); }",
+            "O(1)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn array_for_each_keeps_its_snapshot_length() {
+    for body in [
+        "(xs: number[]) { xs.forEach((x) => { if (xs.length < 2 * xs.length) xs.push(x); scan(xs); }); }",
+        "(xs: number[]) { const values = [0]; values.forEach(() => { if (values.length < xs.length) values.push(values.length); scan(xs); }); }",
+    ] {
+        let (cost, complete, reasons) = selected_of("", body);
+
+        assert_eq!(cost, Cost::parse("O(N^2)").unwrap(), "{body}: {reasons:?}");
+        assert!(!complete, "{body}: {reasons:?}");
+        assert!(
+            !reasons.contains(&UnknownReason::Bound),
+            "{body}: {reasons:?}"
+        );
+    }
+}

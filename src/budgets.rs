@@ -19,6 +19,7 @@ use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::cost::{Cost, CostComparison};
 use crate::declarations::{Binding, Declaration, FunctionId, FunctionNode, ParameterNode};
+use crate::native::Role;
 use crate::project::FileId;
 use crate::syntax::{
     body_root_of, call_of, collapsed_text_of, compact_text_of, identifier_of,
@@ -26,6 +27,7 @@ use crate::syntax::{
     unwrap, Root,
 };
 use crate::tables::MUTATORS;
+use crate::values::ValueId;
 
 #[derive(Clone, Debug)]
 pub enum WriteKind {
@@ -96,6 +98,41 @@ pub struct Spend {
 impl Spend {
     pub fn cancels(&self) -> bool {
         self.magnitude == StepMagnitude::Constant
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisitBudget {
+    pub cost: Cost,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Visits {
+    Stable { written: bool },
+    Budgeted(VisitBudget),
+    Unresolved,
+}
+
+pub(crate) struct Addition<'a> {
+    pub file: FileId,
+    pub call: NodeId,
+    pub guard: Option<(&'a Expression<'a>, String)>,
+}
+
+#[derive(Default)]
+pub(crate) struct CollectionWrites<'a> {
+    pub additions: Vec<Addition<'a>>,
+    pub deletions: Vec<(FileId, NodeId)>,
+}
+
+impl CollectionWrites<'_> {
+    pub(crate) fn sites(&self) -> Vec<(FileId, NodeId)> {
+        self.additions
+            .iter()
+            .map(|addition| (addition.file, addition.call))
+            .chain(self.deletions.iter().copied())
+            .collect()
     }
 }
 
@@ -971,6 +1008,151 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 })
             }
             _ => None,
+        }
+    }
+
+    pub(crate) fn collection_writes_in(
+        &mut self,
+        file: FileId,
+        body: Root<'a>,
+        collection: ValueId,
+        writes: &mut CollectionWrites<'a>,
+    ) {
+        let root = match body {
+            Root::Statement(node) => node.node_id(),
+            Root::Expression(node) => node.node_id(),
+            Root::Body(node) => node.node_id(),
+        };
+
+        for kind in self.counted_subtree(file, body, Event::BudgetPrepassNode) {
+            let AstKind::CallExpression(call) = kind else {
+                continue;
+            };
+            let Some(member) = member_expression_of(unwrap(&call.callee)) else {
+                continue;
+            };
+
+            let receiver = self.storage_value_of(file, member.object());
+
+            if !self.values.may_alias(receiver, collection) {
+                continue;
+            }
+
+            let Some((_, model)) = self.modelled_call_of(file, call) else {
+                continue;
+            };
+
+            match model.receiver {
+                Role::Grown if receiver == collection => {
+                    let guard = self.size_guard_of(file, call.node_id(), root, collection);
+
+                    writes.additions.push(Addition {
+                        file,
+                        call: call.node_id(),
+                        guard,
+                    });
+                }
+                Role::Shrunk => writes.deletions.push((file, call.node_id())),
+                _ => {}
+            }
+        }
+    }
+
+    fn size_guard_of(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        root: NodeId,
+        collection: ValueId,
+    ) -> Option<(&'a Expression<'a>, String)> {
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let mut child = node;
+
+        while child != root {
+            if !self.charge_work(Event::BudgetPrepassNode, 1) {
+                return None;
+            }
+
+            let parent = nodes.parent_id(child);
+
+            if parent == child {
+                return None;
+            }
+
+            match nodes.kind(parent) {
+                AstKind::IfStatement(statement) if statement.consequent.node_id() == child => {
+                    if let Some(guard) = self.size_guard_in(file, &statement.test, collection) {
+                        return Some(guard);
+                    }
+                }
+                AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => return None,
+                kind if is_iteration_kind(&kind) => return None,
+                _ => {}
+            }
+
+            child = parent;
+        }
+
+        None
+    }
+
+    fn size_guard_in(
+        &mut self,
+        file: FileId,
+        test: &'a Expression<'a>,
+        collection: ValueId,
+    ) -> Option<(&'a Expression<'a>, String)> {
+        for conjunct in conjuncts_of(test) {
+            let Some(pairs) = comparison_pairs_of(conjunct) else {
+                continue;
+            };
+
+            for (measured, endpoint, direction, _) in pairs {
+                let Expression::StaticMemberExpression(member) = measured else {
+                    continue;
+                };
+
+                if direction != Direction::Up
+                    || member.property.name != "size"
+                    || self.storage_value_of(file, &member.object) != collection
+                    || self.intrinsic_replaced_of(file, measured)
+                {
+                    continue;
+                }
+
+                return Some((
+                    endpoint,
+                    collapsed_text_of(self.text_of(file, conjunct.span())),
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn endpoint_cost_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<Cost> {
+        if !self.charge_work(Event::BudgetPrepassNode, 1) {
+            return None;
+        }
+
+        match unwrap(e) {
+            Expression::BinaryExpression(binary)
+                if matches!(
+                    binary.operator,
+                    BinaryOperator::Multiplication | BinaryOperator::Addition
+                ) =>
+            {
+                let left = self.endpoint_cost_of(file, &binary.left)?;
+                let right = self.endpoint_cost_of(file, &binary.right)?;
+                let combined = match binary.operator {
+                    BinaryOperator::Multiplication => Cost::product(vec![left, right]),
+                    _ => Cost::sum(vec![left, right]),
+                };
+
+                combined.ok()
+            }
+            other => self.count_of(file, other),
         }
     }
 }
