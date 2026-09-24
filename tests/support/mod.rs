@@ -207,17 +207,43 @@ pub fn summary_of(analysis: &mut Analysis<'_, '_>, file: FileId, name: &str) -> 
         .total(&mut analysis.unknowns, &mut analysis.traces)
 }
 
-pub fn legacy_result_of(
-    source: &str,
-    name: &str,
-) -> (
+pub type LegacyResult = (
     olint::cost::Cost,
     bool,
     std::collections::BTreeSet<olint::unknowns::UnknownReason>,
-) {
+);
+
+pub fn legacy_result_of(source: &str, name: &str) -> LegacyResult {
+    prepared_result_of(source, name, |_| {})
+}
+
+pub fn repository_helper_of() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(olint::regex::HELPER_NAME)
+}
+
+pub fn classified_result_of(source: &str, name: &str) -> LegacyResult {
+    prepared_result_of(source, name, |analysis| {
+        let helper = repository_helper_of();
+        let limits = olint::regex::RegexLimits::default();
+
+        analysis
+            .gather_regex_answers(|requests| olint::regex::ask(&helper, requests, &limits))
+            .expect("the regex helper answers");
+    })
+}
+
+pub fn prepared_result_of(
+    source: &str,
+    name: &str,
+    prepare: impl for<'p, 'a> FnOnce(&mut Analysis<'p, 'a>),
+) -> LegacyResult {
     let mut found = None;
 
     run_with_source(source, |analysis, file| {
+        prepare(analysis);
+
         let function = function_of_name(analysis.project, file, name);
         let part = summary_of(analysis, file, name);
         let cost = legacy_class_of(analysis, file, function, &part.cost);

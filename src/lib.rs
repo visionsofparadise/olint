@@ -16,6 +16,7 @@ pub mod project;
 pub mod public;
 pub mod receivers;
 pub mod recurrences;
+pub mod regex;
 pub mod report;
 pub mod summaries;
 pub mod syntax;

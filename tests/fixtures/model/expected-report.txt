@@ -1,8 +1,8 @@
 public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
-O(1)               34
-O(1) [partial]     19
+O(1)               33
+O(1) [partial]     20
 O(xs)              13
 O(rows^2)           9
 O(xs) [partial]     8

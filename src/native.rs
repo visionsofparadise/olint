@@ -57,10 +57,25 @@ pub enum Count {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matching {
+    Rejected,
+    Once,
+    Flagged,
+    Repeated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pattern {
+    pub keys: &'static [&'static str],
+    pub matching: Matching,
+    pub compiles: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Read,
     Coerced,
-    Pattern(&'static [&'static str]),
+    Pattern(Pattern),
     Iterated,
     Inspected,
     Serialized,
@@ -130,6 +145,14 @@ const MATCH_KEYS: &[&str] = &["@@match"];
 const MATCH_ALL_KEYS: &[&str] = &["@@match", "@@matchAll"];
 const SEARCH_KEYS: &[&str] = &["@@search"];
 const TO_JSON_KEYS: &[&str] = &["toJSON"];
+
+const fn pattern_of(keys: &'static [&'static str], matching: Matching, compiles: bool) -> Role {
+    Role::Pattern(Pattern {
+        keys,
+        matching,
+        compiles,
+    })
+}
 
 const fn model_of(
     identity: Identity,
@@ -349,7 +372,10 @@ pub static MODELS: &[NativeModel] = &[
         Identity::Receiver(Kind::String),
         &["replace"],
         Work::Linear(Operand::Receiver),
-        &[Role::Pattern(REPLACE_KEYS), Role::Callback(Count::PerMatch)],
+        &[
+            pattern_of(REPLACE_KEYS, Matching::Flagged, false),
+            Role::Callback(Count::PerMatch),
+        ],
         Role::Read,
     ),
     model_of(
@@ -357,7 +383,7 @@ pub static MODELS: &[NativeModel] = &[
         &["replaceAll"],
         Work::Linear(Operand::Receiver),
         &[
-            Role::Pattern(REPLACE_ALL_KEYS),
+            pattern_of(REPLACE_ALL_KEYS, Matching::Repeated, false),
             Role::Callback(Count::PerElement),
         ],
         Role::Read,
@@ -366,35 +392,35 @@ pub static MODELS: &[NativeModel] = &[
         Identity::Receiver(Kind::String),
         &["split"],
         Work::Linear(Operand::Receiver),
-        &[Role::Pattern(SPLIT_KEYS)],
+        &[pattern_of(SPLIT_KEYS, Matching::Repeated, false)],
         Role::Coerced,
     ),
     model_of(
         Identity::Receiver(Kind::String),
         &["match"],
         Work::Linear(Operand::Receiver),
-        &[Role::Pattern(MATCH_KEYS)],
+        &[pattern_of(MATCH_KEYS, Matching::Flagged, true)],
         Role::Read,
     ),
     model_of(
         Identity::Receiver(Kind::String),
         &["matchAll"],
         Work::Linear(Operand::Receiver),
-        &[Role::Pattern(MATCH_ALL_KEYS)],
+        &[pattern_of(MATCH_ALL_KEYS, Matching::Repeated, true)],
         Role::Read,
     ),
     model_of(
         Identity::Receiver(Kind::String),
         &["search"],
         Work::Linear(Operand::Receiver),
-        &[Role::Pattern(SEARCH_KEYS)],
+        &[pattern_of(SEARCH_KEYS, Matching::Once, true)],
         Role::Read,
     ),
     model_of(
         Identity::Receiver(Kind::String),
         &["includes", "startsWith", "endsWith"],
         Work::Linear(Operand::Receiver),
-        &[Role::Pattern(MATCH_KEYS)],
+        &[pattern_of(MATCH_KEYS, Matching::Rejected, false)],
         Role::Coerced,
     ),
     model_of(
@@ -740,10 +766,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for (index, argument) in site.arguments.iter().enumerate() {
             let role = site.role_of(model, index);
             let (part, count) = self.argument_part_of(site, argument, role);
+            let count = match (role, model.arguments.first(), site.expression_at(0)) {
+                (Role::Callback(_), Some(Role::Pattern(_)), Some(pattern))
+                    if self.is_matched_once_pattern(pattern) =>
+                {
+                    Count::Once
+                }
+                _ => count,
+            };
 
             match count {
                 Count::Once => beside = beside.max(part, &mut self.unknowns, &mut self.traces),
                 _ => inner = inner.max(part, &mut self.unknowns, &mut self.traces),
+            }
+
+            if let (Role::Pattern(pattern), Some(expression)) = (role, argument.as_expression()) {
+                let matched =
+                    self.matching_part_of((file, site.span), expression, pattern, &charge.length);
+
+                beside = beside.max(matched, &mut self.unknowns, &mut self.traces);
             }
         }
 
@@ -994,7 +1035,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         match role {
             Role::Read | Role::Forwarded | Role::Callee => (Part::none(), Count::Once),
             Role::Coerced => (self.operand_coercion_part_of(file, expression), Count::Once),
-            Role::Pattern(keys) => (self.searched_part_of(file, expression, keys), Count::Once),
+            Role::Pattern(pattern) => (
+                self.searched_part_of(file, expression, pattern.keys),
+                Count::Once,
+            ),
             Role::Iterated => (
                 self.delegated_part_of(file, expression.span(), expression, false)
                     .unwrap_or_default(),

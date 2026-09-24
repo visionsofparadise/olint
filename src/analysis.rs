@@ -91,6 +91,7 @@ pub struct Analysis<'p, 'a> {
     pub(crate) dynamic_scopes: HashMap<(FileId, NodeId), (bool, bool)>,
     pub(crate) unclassified_writes: HashMap<(Binding, Option<NodeId>), bool>,
     pub(crate) prototype_members: crate::values::PrototypeMembers<'a>,
+    pub regex_answers: HashMap<crate::regex::RegexRequest, crate::regex::RegexAnswer>,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -131,6 +132,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             dynamic_scopes: HashMap::new(),
             unclassified_writes: HashMap::new(),
             prototype_members: HashMap::new(),
+            regex_answers: HashMap::new(),
         }
     }
 }

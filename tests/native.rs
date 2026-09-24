@@ -8,7 +8,7 @@ use olint::unknowns::UnknownReason;
 
 mod support;
 
-use support::{legacy_result_of, SYNTACTIC};
+use support::{classified_result_of, legacy_result_of, SYNTACTIC};
 
 const HELPERS: &str = "function quadratic(xs: number[]) { let total = 0; for (const x of xs) for (const y of xs) total += x + y; return total; }\nfunction scan(xs: number[]) { let total = 0; for (const x of xs) total += x; return total; }\nfunction cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; }";
 
@@ -41,19 +41,19 @@ fn replacement_callbacks_run_once_per_match_or_once_per_call() {
             "",
             r#"(s: string, xs: number[]) { return s.replace(/x/g, () => { quadratic(xs); return "y"; }); }"#,
             "O(N^3)",
-            true,
+            false,
         ),
         (
             "",
             r#"(s: string, xs: number[], pattern: RegExp) { return s.replace(pattern, () => { quadratic(xs); return "y"; }); }"#,
             "O(N^3)",
-            true,
+            false,
         ),
         (
             "",
             r#"(s: string, xs: number[]) { return s.replace(/x/, () => { quadratic(xs); return "y"; }); }"#,
             "O(N^2)",
-            true,
+            false,
         ),
         (
             "",
@@ -65,15 +65,72 @@ fn replacement_callbacks_run_once_per_match_or_once_per_call() {
             "",
             r#"(s: string) { return s.replace(/x/g, "y"); }"#,
             "O(N)",
-            true,
+            false,
         ),
         (
             "",
             r#"(s: string, t: string) { return s.replace(/x/g, t); }"#,
             "O(N)",
-            true,
+            false,
         ),
     ]);
+}
+
+#[test]
+fn replacement_callbacks_compose_with_classified_matching() {
+    for (body, expected, complete) in [
+        (
+            r#"(s: string, xs: number[]) { return s.replace(/^a*a*$/, () => { cube(xs); return ""; }); }"#,
+            "O(N^3)",
+            true,
+        ),
+        (
+            r#"(s: string, xs: number[]) { return s.replace(/^a*$/, () => { scan(xs); return ""; }); }"#,
+            "O(N)",
+            true,
+        ),
+        (
+            r#"(s: string) { return s.replace(/^a*a*$/, () => "b"); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            r#"(s: string, xs: number[]) { return s.replace(/^a*a*$/g, () => { cube(xs); return ""; }); }"#,
+            "O(N^3)",
+            true,
+        ),
+        (
+            r#"(s: string, xs: number[]) { return s.replaceAll(/^a*a*$/g, () => { cube(xs); return ""; }); }"#,
+            "O(N^3)",
+            true,
+        ),
+        (
+            r#"(s: string, xs: number[]) { return s.replace(/x*y/g, () => { quadratic(xs); return ""; }); }"#,
+            "O(N^3)",
+            true,
+        ),
+        (
+            r#"(s: string, xs: number[]) { return s.replace(/^a*a*$/gm, () => { quadratic(xs); return ""; }); }"#,
+            "O(N^3)",
+            false,
+        ),
+        (
+            r#"(s: string, xs: number[]) { return s.replace(/^(a+)+$/, () => { scan(xs); return ""; }); }"#,
+            "O(N)",
+            false,
+        ),
+    ] {
+        let (cost, found, reasons) = classified_result_of(
+            &format!(
+                "{HELPERS}
+export function selected{body}"
+            ),
+            "selected",
+        );
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert_eq!(found, complete, "{body}: {reasons:?}");
+    }
 }
 
 #[test]

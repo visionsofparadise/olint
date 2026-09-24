@@ -16,7 +16,7 @@
 	},
 	"scripts": {
 		"start": "cargo run --locked --",
-		"build": "cargo build --locked --release",
+		"build": "cargo build --locked --release && node -e \"require('node:fs').copyFileSync('src/regex_sidecar.mjs','target/release/regex_sidecar.mjs')\"",
 		"unit": "cargo test --locked --lib",
 		"integration": "cargo test --locked --test \"*\"",
 		"prepare": "node -e \"const c=require('node:child_process');if(c.spawnSync('git',['rev-parse','--is-inside-work-tree'],{stdio:'ignore'}).status===0)c.execFileSync('git',['config','core.hooksPath','.githooks'])\" && node tools.mjs install && cargo install styling-lint --version 0.1.0 --locked && cargo install cargo-machete --version 0.9.2 --locked",
@@ -32,5 +32,8 @@
 		"prettier": "3.9.6",
 		"typescript": "5.9.3"
 	},
-	"allowScripts": {}
+	"allowScripts": {},
+	"dependencies": {
+		"recheck": "4.5.0"
+	}
 }

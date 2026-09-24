@@ -12,6 +12,7 @@ use olint::config::{
 use olint::cost::CostComparison;
 use olint::project::{Project, ProjectError};
 use olint::public::{public_functions, public_roots};
+use olint::regex::{companion_of, RegexError, RegexLimits};
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
 use olint::tsc::{ask, Query, TscError, TscReply};
 use olint::unknowns::{SourceSpan, UnknownReason};
@@ -37,6 +38,7 @@ enum Failure {
     Project(ProjectError),
     Config(ConfigError),
     Tsc(TscError),
+    Regex(RegexError),
     Usage(String),
 }
 
@@ -95,6 +97,12 @@ impl fmt::Display for Failure {
                 format!("ignore pattern {pattern} is not a valid glob")
             }
             Failure::Tsc(error) => format!("tsc unavailable: {}", reason_of(error)),
+            Failure::Regex(RegexError::Malformed(message)) => {
+                format!("regex helper replied malformed: {message}")
+            }
+            Failure::Regex(RegexError::Unavailable(message)) => {
+                format!("regex classification unavailable: {message}")
+            }
             Failure::Usage(message) => message.clone(),
         };
 
@@ -185,6 +193,20 @@ fn run_with_ask(
             }
             Err(error) => return Err(Failure::Tsc(error)),
         }
+    }
+
+    let helper = std::env::current_exe().map(|executable| companion_of(&executable));
+    let unavailable = analysis
+        .gather_regex_answers(|requests| match &helper {
+            Ok(helper) => olint::regex::ask(helper, requests, &RegexLimits::default()),
+            Err(error) => Err(RegexError::Unavailable(format!(
+                "the olint executable path is unknown ({error})"
+            ))),
+        })
+        .map_err(Failure::Regex)?;
+
+    if let Some(reason) = unavailable {
+        eprintln!("olint: regex classification unavailable ({reason})");
     }
 
     let public = public_functions(&mut analysis, &config).map_err(Failure::Config)?;

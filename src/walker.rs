@@ -22,7 +22,7 @@ use crate::flow::{
     class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, loop_phases_of,
     Completion, Resumption,
 };
-use crate::native::Native;
+use crate::native::{Matching, Native, Pattern};
 use crate::project::{FileId, Site};
 use crate::syntax::{
     body_root_of, identifier_of, is_identifier_pattern, is_iteration_kind, loop_body_of,
@@ -2441,18 +2441,35 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method) {
-            if let Some(argument) = first {
-                if !self.is_constant_sized_argument(file, argument) {
-                    return self.append_linear_operation(
-                        reading,
-                        label(" [regexp]"),
-                        site,
-                        (file, call.span),
-                    );
-                }
+            let subject = match first {
+                Some(argument) if !self.is_constant_sized_argument(file, argument) => Cost::N,
+                _ => Cost::ONE,
+            };
+            let pattern = Pattern {
+                keys: &[],
+                matching: Matching::Once,
+                compiles: false,
+            };
+            let matched = self.matching_part_of((file, call.span), receiver, pattern, &subject);
+            let reading = match subject.is_one() {
+                true => reading,
+                false => self.append_linear_operation(
+                    reading,
+                    label(" [regexp]"),
+                    site,
+                    (file, call.span),
+                ),
+            };
+
+            if matched == Part::none() {
+                return reading;
             }
 
-            return reading;
+            return reading.merge(
+                Reading::of_part(matched),
+                &mut self.unknowns,
+                &mut self.traces,
+            );
         }
 
         let unknown = self.unknown_invocation(
