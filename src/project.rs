@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{Program, Statement, TSModuleReference};
+use oxc_ast::ast::{Argument, CallExpression, Expression, Program, Statement, TSModuleReference};
+use oxc_ast::AstKind;
 use oxc_parser::Parser;
 use oxc_resolver::{
     ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
@@ -32,6 +34,7 @@ pub struct SourceFile<'a> {
     pub module_record: &'a ModuleRecord<'a>,
     pub line_starts: Vec<u32>,
     pub external_library: bool,
+    pub implementation: bool,
     pub owners: Vec<usize>,
     pub diagnostics: Vec<SourceDiagnostic>,
     flow_index: FlowIndex,
@@ -122,6 +125,10 @@ pub struct Project<'a> {
     resolvers: Vec<Resolver>,
     pub configurations: Vec<SelectedProject>,
     configless_resolver: Resolver,
+    runtime_resolvers: [Resolver; 2],
+    counterparts: HashMap<FileId, FileId>,
+    implementation_limit: usize,
+    implementation_stats: Cell<ImplementationStats>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +137,35 @@ pub enum Resolved {
     External(PathBuf),
     Unresolved,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RequestKind {
+    Static,
+    Dynamic,
+    Require,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeCondition {
+    Import,
+    Require,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimeTarget {
+    Implementation(PathBuf),
+    Boundary(PathBuf),
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImplementationStats {
+    pub resolutions: usize,
+    pub files: usize,
+    pub exhausted: bool,
+}
+
+pub const IMPLEMENTATION_FILE_LIMIT: usize = 4096;
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -169,11 +205,13 @@ struct Walk<'a> {
     imports: HashMap<PathBuf, Vec<Import>>,
     externally_walked: HashSet<PathBuf>,
     stack: Vec<Frame<'a>>,
+    pairs: Vec<(PathBuf, PathBuf)>,
 }
 
 struct Import {
     target: PathBuf,
     external: bool,
+    runtime: bool,
 }
 
 const PARSED_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -182,6 +220,14 @@ const JAVASCRIPT_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs"];
 
 impl<'a> Project<'a> {
     pub fn load(allocator: &'a Allocator, tsconfig: &Path) -> Result<Project<'a>, ProjectError> {
+        Self::load_with_limit(allocator, tsconfig, IMPLEMENTATION_FILE_LIMIT)
+    }
+
+    pub fn load_with_limit(
+        allocator: &'a Allocator,
+        tsconfig: &Path,
+        implementation_limit: usize,
+    ) -> Result<Project<'a>, ProjectError> {
         let selection = select_files(tsconfig)?;
         let tsconfig_path = canonical_path_of(tsconfig).map_err(|source| ProjectError::Read {
             path: tsconfig.to_path_buf(),
@@ -204,7 +250,15 @@ impl<'a> Project<'a> {
             resolvers,
             configurations: selection.projects,
             configless_resolver,
+            runtime_resolvers: [
+                Resolver::new(runtime_options_of(RuntimeCondition::Import)),
+                Resolver::new(runtime_options_of(RuntimeCondition::Require)),
+            ],
+            counterparts: HashMap::new(),
+            implementation_limit,
+            implementation_stats: Cell::new(ImplementationStats::default()),
         };
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         for owner in 0..project.configurations.len() {
             let selected = project.configurations[owner].clone();
@@ -214,11 +268,12 @@ impl<'a> Project<'a> {
                 imports: HashMap::new(),
                 externally_walked: HashSet::new(),
                 stack: Vec::new(),
+                pairs: Vec::new(),
             };
 
             for root in selected.files {
                 if is_parsed_path(&root, allow_js) {
-                    project.visit(allocator, root, false, allow_js, &mut walk)?;
+                    project.visit(allocator, root, false, false, allow_js, &mut walk)?;
                 }
 
                 while let Some(top) = walk.stack.last_mut() {
@@ -231,13 +286,20 @@ impl<'a> Project<'a> {
                         .imports
                         .get(&path)
                         .and_then(|found| found.get(*next))
-                        .map(|import| (import.target.clone(), external || import.external));
+                        .map(|import| {
+                            (
+                                import.target.clone(),
+                                external || import.external,
+                                import.runtime,
+                            )
+                        });
 
                     match import {
-                        Some((target, external)) => {
+                        Some((target, external, runtime)) => {
                             *next += 1;
 
-                            project.visit(allocator, target, external, allow_js, &mut walk)?;
+                            project
+                                .visit(allocator, target, external, runtime, allow_js, &mut walk)?;
                         }
                         None => {
                             if let Some(Frame::Open { mut file, .. }) = walk.stack.pop() {
@@ -258,7 +320,30 @@ impl<'a> Project<'a> {
                     }
                 }
             }
+
+            pairs.append(&mut walk.pairs);
         }
+
+        let mut counterparts: HashMap<FileId, Option<FileId>> = HashMap::new();
+
+        for (runtime, declared) in pairs {
+            let (Some(runtime), Some(declared)) = (
+                project.file_by_path(&runtime),
+                project.file_by_path(&declared),
+            ) else {
+                continue;
+            };
+            let entry = counterparts.entry(runtime).or_insert(Some(declared));
+
+            if *entry != Some(declared) {
+                *entry = None;
+            }
+        }
+
+        project.counterparts = counterparts
+            .into_iter()
+            .filter_map(|(runtime, declared)| Some((runtime, declared?)))
+            .collect();
 
         Ok(project)
     }
@@ -268,6 +353,7 @@ impl<'a> Project<'a> {
         allocator: &'a Allocator,
         path: PathBuf,
         external: bool,
+        runtime: bool,
         allow_js: bool,
         walk: &mut Walk<'a>,
     ) -> Result<(), ProjectError> {
@@ -285,7 +371,7 @@ impl<'a> Project<'a> {
 
         if let Some(id) = stored {
             if !self.files[id.0 as usize].owners.contains(&walk.owner) {
-                let imports = self.imports_of(&self.files[id.0 as usize], allow_js, walk.owner)?;
+                let imports = self.imports_of(&self.files[id.0 as usize], allow_js, walk)?;
                 let file = &mut self.files[id.0 as usize];
 
                 file.owners.push(walk.owner);
@@ -326,13 +412,30 @@ impl<'a> Project<'a> {
             return Ok(());
         }
 
+        if runtime {
+            let mut stats = self.implementation_stats.get();
+
+            if stats.files >= self.implementation_limit {
+                stats.exhausted = true;
+
+                self.implementation_stats.set(stats);
+
+                return Ok(());
+            }
+
+            stats.files += 1;
+
+            self.implementation_stats.set(stats);
+        }
+
         let mut file = match parse_file(allocator, path, &self.root) {
             Ok(file) => file,
-            Err(_) if declaration => return Ok(()),
+            Err(_) if declaration || runtime => return Ok(()),
             Err(error) => return Err(error),
         };
 
         file.external_library = external || declaration;
+        file.implementation = runtime;
 
         file.owners.push(walk.owner);
 
@@ -340,10 +443,9 @@ impl<'a> Project<'a> {
             walk.externally_walked.insert(file.path.clone());
         }
 
-        walk.imports.insert(
-            file.path.clone(),
-            self.imports_of(&file, allow_js, walk.owner)?,
-        );
+        let imports = self.imports_of(&file, allow_js, walk)?;
+
+        walk.imports.insert(file.path.clone(), imports);
         walk.stack.push(Frame::Open {
             file: Box::new(file),
             next: 0,
@@ -356,44 +458,85 @@ impl<'a> Project<'a> {
         &self,
         file: &SourceFile<'a>,
         allow_js: bool,
-        owner: usize,
+        walk: &mut Walk<'a>,
     ) -> Result<Vec<Import>, ProjectError> {
+        let owner = walk.owner;
         let directory = file.path.parent().unwrap_or(Path::new("")).to_path_buf();
         let resolver = &self.resolvers[owner];
         let tsconfig = resolver
             .resolve_tsconfig(&self.configurations[owner].path)
             .ok();
+        let mut imports: Vec<Import> = Vec::new();
 
-        let mut imports: Vec<Import> = import_specifiers_of(file)
-            .into_iter()
-            .filter_map(|specifier| {
-                let resolution = resolver.resolve(&directory, &specifier).ok()?;
-                let target = strip_verbatim_prefix(resolution.path());
-                let target = canonical_path_of(&target).unwrap_or(target);
-                let mapped = tsconfig.as_ref().is_some_and(|tsconfig| {
-                    tsconfig
-                        .resolve_path_alias_or_base_url(&specifier)
-                        .iter()
-                        .filter_map(|candidate| {
-                            self.configless_resolver
-                                .resolve(&directory, &candidate.to_string_lossy())
-                                .ok()
-                        })
-                        .any(|candidate| {
-                            let candidate = strip_verbatim_prefix(candidate.path());
+        for (specifier, kind, typed) in module_requests_of(file) {
+            let mut declared = None;
 
-                            canonical_path_of(&candidate).unwrap_or(candidate) == target
-                        })
+            if typed && !file.implementation {
+                if let Ok(resolution) = resolver.resolve(&directory, &specifier) {
+                    let target = strip_verbatim_prefix(resolution.path());
+                    let target = canonical_path_of(&target).unwrap_or(target);
+                    let mapped = tsconfig.as_ref().is_some_and(|tsconfig| {
+                        tsconfig
+                            .resolve_path_alias_or_base_url(&specifier)
+                            .iter()
+                            .filter_map(|candidate| {
+                                self.configless_resolver
+                                    .resolve(&directory, &candidate.to_string_lossy())
+                                    .ok()
+                            })
+                            .any(|candidate| {
+                                let candidate = strip_verbatim_prefix(candidate.path());
+
+                                canonical_path_of(&candidate).unwrap_or(candidate) == target
+                            })
+                    });
+                    let package_lookup = is_package_specifier(&specifier) && !mapped;
+                    let external =
+                        package_lookup || forward_slashes_of(&target).contains("/node_modules/");
+                    let loaded = is_parsed_path(&target, allow_js)
+                        && !(package_lookup && is_javascript_path(&target));
+
+                    if loaded {
+                        imports.push(Import {
+                            target: target.clone(),
+                            external,
+                            runtime: false,
+                        });
+                    }
+
+                    declared = Some((target, external, loaded));
+                }
+            }
+
+            let runtime = file.implementation
+                || (is_package_specifier(&specifier)
+                    && !self.is_path_mapped(&directory, owner, &specifier)
+                    && declared.as_ref().is_none_or(|(_, external, _)| *external));
+
+            if !runtime {
+                continue;
+            }
+
+            if let RuntimeTarget::Implementation(target) =
+                self.runtime_target_of(file, &specifier, kind, &[owner])
+            {
+                if let Some((declared, _, loaded)) = &declared {
+                    if *declared == target && *loaded {
+                        continue;
+                    }
+
+                    if *declared != target {
+                        walk.pairs.push((target.clone(), declared.clone()));
+                    }
+                }
+
+                imports.push(Import {
+                    target,
+                    external: true,
+                    runtime: true,
                 });
-                let package_lookup = is_package_specifier(&specifier) && !mapped;
-                let external =
-                    package_lookup || forward_slashes_of(&target).contains("/node_modules/");
-
-                (is_parsed_path(&target, allow_js)
-                    && !(package_lookup && is_javascript_path(&target)))
-                .then_some(Import { target, external })
-            })
-            .collect();
+            }
+        }
 
         for reference in reference_paths_of(file.text) {
             let path = reference_target_of(&directory, reference, allow_js);
@@ -413,10 +556,168 @@ impl<'a> Project<'a> {
             imports.push(Import {
                 target,
                 external: false,
+                runtime: false,
             });
         }
 
         Ok(imports)
+    }
+
+    fn is_path_mapped(&self, directory: &Path, owner: usize, specifier: &str) -> bool {
+        self.resolvers[owner]
+            .resolve_tsconfig(&self.configurations[owner].path)
+            .ok()
+            .is_some_and(|tsconfig| {
+                tsconfig
+                    .resolve_path_alias_or_base_url(specifier)
+                    .iter()
+                    .any(|candidate| {
+                        self.configless_resolver
+                            .resolve(directory, &candidate.to_string_lossy())
+                            .is_ok()
+                    })
+            })
+    }
+
+    fn runtime_target_of(
+        &self,
+        file: &SourceFile<'a>,
+        specifier: &str,
+        kind: RequestKind,
+        owners: &[usize],
+    ) -> RuntimeTarget {
+        let directory = file.path.parent().unwrap_or(Path::new(""));
+        let mut found: Option<RuntimeTarget> = None;
+
+        for condition in self.conditions_of(file, kind, owners) {
+            let mut stats = self.implementation_stats.get();
+
+            stats.resolutions += 1;
+
+            self.implementation_stats.set(stats);
+
+            let resolver = match condition {
+                RuntimeCondition::Import => &self.runtime_resolvers[0],
+                RuntimeCondition::Require => &self.runtime_resolvers[1],
+            };
+            let target = match resolver.resolve(directory, specifier) {
+                Ok(resolution) => {
+                    let path = strip_verbatim_prefix(resolution.path());
+                    let path = canonical_path_of(&path).unwrap_or(path);
+
+                    if is_parsed_path(&path, true) && !is_declaration_path(&path) {
+                        RuntimeTarget::Implementation(path)
+                    } else {
+                        RuntimeTarget::Boundary(path)
+                    }
+                }
+                Err(_) => RuntimeTarget::Unresolved,
+            };
+
+            match &found {
+                None => found = Some(target),
+                Some(previous) if *previous != target => return RuntimeTarget::Unresolved,
+                Some(_) => {}
+            }
+        }
+
+        found.unwrap_or(RuntimeTarget::Unresolved)
+    }
+
+    fn conditions_of(
+        &self,
+        file: &SourceFile<'a>,
+        kind: RequestKind,
+        owners: &[usize],
+    ) -> Vec<RuntimeCondition> {
+        if kind == RequestKind::Require {
+            return vec![RuntimeCondition::Require];
+        }
+
+        let extension = file
+            .path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        match extension.as_str() {
+            "mjs" | "mts" => return vec![RuntimeCondition::Import],
+            "cjs" | "cts" if kind == RequestKind::Static => return vec![RuntimeCondition::Require],
+            "cjs" | "cts" => return vec![RuntimeCondition::Import],
+            _ => {}
+        }
+
+        if file.implementation || file.external_library {
+            return vec![RuntimeCondition::Import];
+        }
+
+        let mut conditions = Vec::new();
+
+        for owner in owners {
+            let module = self.configurations[*owner]
+                .output
+                .module
+                .as_deref()
+                .map(str::to_ascii_lowercase);
+            let found: &[RuntimeCondition] = match module.as_deref() {
+                Some("commonjs") => &[RuntimeCondition::Require],
+                Some("node16" | "node18" | "node20" | "nodenext") => {
+                    if kind == RequestKind::Dynamic || is_module_package_path(&file.path) {
+                        &[RuntimeCondition::Import]
+                    } else {
+                        &[RuntimeCondition::Require]
+                    }
+                }
+                Some("es6" | "es2015" | "es2020" | "es2022" | "esnext" | "preserve") => {
+                    &[RuntimeCondition::Import]
+                }
+                _ => &[RuntimeCondition::Import, RuntimeCondition::Require],
+            };
+
+            for condition in found {
+                if !conditions.contains(condition) {
+                    conditions.push(*condition);
+                }
+            }
+        }
+
+        conditions
+    }
+
+    pub fn implementation_of(&self, from: FileId, specifier: &str, kind: RequestKind) -> Resolved {
+        let file = self.file(from);
+        let declared = self.resolve(from, specifier);
+
+        if !file.implementation {
+            let directory = file.path.parent().unwrap_or(Path::new(""));
+
+            if !is_package_specifier(specifier)
+                || file
+                    .owners
+                    .iter()
+                    .any(|owner| self.is_path_mapped(directory, *owner, specifier))
+                || matches!(declared, Resolved::File(id) if self.is_project_file(id))
+            {
+                return declared;
+            }
+        }
+
+        match self.runtime_target_of(file, specifier, kind, &file.owners) {
+            RuntimeTarget::Implementation(path) => match self.file_by_path(&path) {
+                Some(id) => Resolved::File(id),
+                None => Resolved::External(path),
+            },
+            RuntimeTarget::Boundary(path) => Resolved::External(path),
+            RuntimeTarget::Unresolved => Resolved::Unresolved,
+        }
+    }
+
+    pub fn counterpart_of(&self, id: FileId) -> Option<FileId> {
+        self.counterparts.get(&id).copied()
+    }
+
+    pub fn implementation_stats(&self) -> ImplementationStats {
+        self.implementation_stats.get()
     }
 
     pub fn file(&self, id: FileId) -> &SourceFile<'a> {
@@ -704,6 +1005,29 @@ fn resolve_options_of(tsconfig: &Path) -> ResolveOptions {
     }
 }
 
+fn runtime_options_of(condition: RuntimeCondition) -> ResolveOptions {
+    let condition = match condition {
+        RuntimeCondition::Import => "import",
+        RuntimeCondition::Require => "require",
+    };
+
+    ResolveOptions {
+        condition_names: ["node", condition, "default"].map(String::from).to_vec(),
+        node_path: false,
+        builtin_modules: true,
+        ..ResolveOptions::default()
+    }
+}
+
+fn is_module_package_path(path: &Path) -> bool {
+    path.ancestors().skip(1).find_map(|directory| {
+        let text = std::fs::read_to_string(directory.join("package.json")).ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+        Some(manifest.get("type").and_then(serde_json::Value::as_str) == Some("module"))
+    }) == Some(true)
+}
+
 fn is_package_specifier(specifier: &str) -> bool {
     !(specifier.starts_with('.')
         || specifier.starts_with('/')
@@ -717,15 +1041,15 @@ fn is_javascript_path(path: &Path) -> bool {
     })
 }
 
-fn import_specifiers_of(file: &SourceFile<'_>) -> Vec<String> {
-    let mut static_imports: Vec<(u32, String)> = file
+fn module_requests_of(file: &SourceFile<'_>) -> Vec<(String, RequestKind, bool)> {
+    let mut static_imports: Vec<(u32, String, RequestKind)> = file
         .module_record
         .requested_modules
         .iter()
         .filter_map(|(specifier, requests)| {
             let start = requests.iter().map(|request| request.span.start).min()?;
 
-            Some((start, specifier.to_string()))
+            Some((start, specifier.to_string(), RequestKind::Static))
         })
         .collect();
 
@@ -737,12 +1061,13 @@ fn import_specifiers_of(file: &SourceFile<'_>) -> Vec<String> {
                 static_imports.push((
                     declaration.span.start,
                     reference.expression.value.to_string(),
+                    RequestKind::Require,
                 ));
             }
         }
     }
 
-    static_imports.sort_by_key(|(start, _)| *start);
+    static_imports.sort_by_key(|(start, _, _)| *start);
 
     let dynamic_imports = file
         .module_record
@@ -759,14 +1084,74 @@ fn import_specifiers_of(file: &SourceFile<'_>) -> Vec<String> {
                 .map(str::to_string)
         });
 
+    let mut requires = required_specifiers_of(file);
+
+    requires.sort_by_key(|(start, _)| *start);
+
     static_imports
         .into_iter()
-        .map(|(_, specifier)| specifier)
-        .chain(dynamic_imports)
+        .map(|(_, specifier, kind)| (specifier, kind, true))
+        .chain(dynamic_imports.map(|specifier| (specifier, RequestKind::Dynamic, true)))
+        .chain(
+            requires
+                .into_iter()
+                .map(|(_, specifier)| (specifier, RequestKind::Require, false)),
+        )
         .collect()
 }
 
-fn is_declaration_path(path: &Path) -> bool {
+fn required_specifiers_of(file: &SourceFile<'_>) -> Vec<(u32, String)> {
+    let scoping = file.semantic.scoping();
+    let nodes = file.semantic.nodes();
+    let Some(references) = scoping.root_unresolved_references().get("require") else {
+        return Vec::new();
+    };
+
+    references
+        .iter()
+        .filter_map(|reference| {
+            let node = scoping.get_reference(*reference).node_id();
+            let AstKind::CallExpression(call) = nodes.parent_kind(node) else {
+                return None;
+            };
+
+            required_specifier_of(file, call).map(|specifier| (call.span.start, specifier))
+        })
+        .collect()
+}
+
+pub(crate) fn required_specifier_of(
+    file: &SourceFile<'_>,
+    call: &CallExpression<'_>,
+) -> Option<String> {
+    let Expression::Identifier(callee) = &call.callee else {
+        return None;
+    };
+    let reference = callee.reference_id.get()?;
+
+    if callee.name != "require"
+        || file
+            .semantic
+            .scoping()
+            .get_reference(reference)
+            .symbol_id()
+            .is_some()
+    {
+        return None;
+    }
+
+    match call.arguments.as_slice() {
+        [Argument::StringLiteral(literal)] => Some(literal.value.to_string()),
+        [Argument::TemplateLiteral(template)] if template.expressions.is_empty() => template
+            .quasis
+            .first()
+            .and_then(|quasi| quasi.value.cooked.as_ref())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_declaration_path(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -881,6 +1266,7 @@ fn parse_file<'a>(
         module_record,
         line_starts: line_starts_of(text),
         external_library: false,
+        implementation: false,
         owners: Vec::new(),
         diagnostics,
         flow_index,

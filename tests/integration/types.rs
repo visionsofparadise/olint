@@ -519,3 +519,74 @@ fn callee_targets_outside_the_utf8_text_are_malformed() {
         }
     });
 }
+
+const PACKAGE_CONSUMER: [(&str, &str); 5] = [
+    (
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" } }"#,
+    ),
+    (
+        "index.ts",
+        "import { run, type Box } from \"pkg\";\nimport * as pkg from \"pkg\";\nexport function go(box: Box) {\n\trun(box.items);\n\t(0, pkg.run)(box.items);\n\tbox.items.includes(1);\n}",
+    ),
+    (
+        "node_modules/pkg/package.json",
+        r#"{ "name": "pkg", "type": "module", "main": "index.js", "types": "index.d.ts" }"#,
+    ),
+    (
+        "node_modules/pkg/index.d.ts",
+        "export declare function run(xs: number[]): number;\nexport interface Box { items: number[] }",
+    ),
+    (
+        "node_modules/pkg/index.js",
+        "export function run(xs) { let total = 0; for (const x of xs) total += x; return total; }",
+    ),
+];
+
+#[test]
+fn callee_targets_reach_package_implementations_while_declared_types_remain() {
+    run_in_project(&PACKAGE_CONSUMER, |project, root| {
+        let file = file_of(project, root, "index.ts");
+        let implementation = file_of(project, root, "node_modules/pkg/index.js");
+        let mut analysis = Analysis::new(project, SYNTACTIC);
+        let direct = analysis.callee_targets_of(file, call_of(project, file, "run"));
+        let sequence_call = support::first_node_of(project, file, |kind| match kind {
+            oxc_ast::AstKind::CallExpression(call)
+                if matches!(
+                    call.callee.without_parentheses(),
+                    Expression::SequenceExpression(_)
+                ) =>
+            {
+                Some(call)
+            }
+            _ => None,
+        });
+        let sequence = analysis.callee_targets_of(file, sequence_call);
+
+        assert_eq!(
+            direct
+                .known
+                .iter()
+                .map(|known| known.file)
+                .collect::<Vec<_>>(),
+            vec![implementation]
+        );
+        assert!(!direct.open);
+        assert_eq!(
+            sequence
+                .known
+                .iter()
+                .map(|known| known.file)
+                .collect::<Vec<_>>(),
+            vec![implementation]
+        );
+        assert_eq!(
+            analysis.kind_of(
+                file,
+                receiver_of(project, file, "box.items.includes"),
+                "includes"
+            ),
+            Kind::Array
+        );
+    });
+}

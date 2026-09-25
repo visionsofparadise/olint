@@ -3,12 +3,12 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, Class, ClassElement, ExportDefaultDeclarationKind,
-    Expression, FormalParameter, FormalParameterRest, FormalParameters, Function,
-    IdentifierReference, MethodDefinitionKind, ObjectProperty, PropertyKey, Statement,
-    TSEnumDeclaration, TSEnumMember, TSInterfaceDeclaration, TSModuleReference, TSSignature,
-    TSTypeAliasDeclaration, TSTypeName, TSTypeParameter, VariableDeclarationKind,
-    VariableDeclarator,
+    Argument, ArrowFunctionExpression, AssignmentTarget, BindingPattern, CallExpression, Class,
+    ClassElement, ExportDefaultDeclarationKind, Expression, FormalParameter, FormalParameterRest,
+    FormalParameters, Function, IdentifierReference, MethodDefinitionKind, ObjectExpression,
+    ObjectProperty, ObjectPropertyKind, PropertyKey, Statement, TSEnumDeclaration, TSEnumMember,
+    TSInterfaceDeclaration, TSModuleReference, TSSignature, TSTypeAliasDeclaration, TSTypeName,
+    TSTypeParameter, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, NodeId};
@@ -17,10 +17,13 @@ use oxc_syntax::module_record::{
     ExportEntry, ExportExportName, ExportImportName, ExportLocalName, ImportImportName,
     ModuleRecord,
 };
+use oxc_syntax::operator::UnaryOperator;
 use oxc_syntax::scope::ScopeId;
 use oxc_syntax::symbol::SymbolId;
 
-use crate::project::{FileId, Project, Resolved, SourceFile};
+use crate::project::{
+    is_declaration_path, required_specifier_of, FileId, Project, RequestKind, Resolved, SourceFile,
+};
 use crate::syntax::unwrap;
 use crate::tables::{MUTATORS, REFLECTIVE_WRITES};
 
@@ -199,12 +202,32 @@ pub struct ResolutionStats {
     pub stack_peak: usize,
     pub span_index_visits: usize,
     pub construction_visits: usize,
+    pub implementation_visits: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ConstructionLineage {
     constructor: bool,
     initialized: bool,
+}
+
+#[derive(Default)]
+struct CommonJsExports {
+    open: bool,
+    es_module: bool,
+    replaced: Option<NodeId>,
+    names: HashMap<String, Option<NodeId>>,
+}
+
+enum CommonJsWrite {
+    Named(String),
+    Replaced,
+}
+
+enum ModuleUse {
+    Read,
+    Forward,
+    Escape,
 }
 
 enum ResolutionStep<'a> {
@@ -227,6 +250,8 @@ pub struct Declarations<'a> {
     block_functions: RefCell<HashMap<FileId, BlockFunctions>>,
     declaration_spans: RefCell<HashMap<FileId, DeclarationSpans>>,
     assignments: RefCell<HashMap<FileId, Option<NodeId>>>,
+    commonjs: RefCell<HashMap<FileId, std::rc::Rc<CommonJsExports>>>,
+    patched: RefCell<Option<std::rc::Rc<HashSet<FileId>>>>,
     constructions: RefCell<HashMap<(FileId, NodeId), ConstructionLineage>>,
     resolution_epoch: Cell<usize>,
     resolution_stats: Cell<ResolutionStats>,
@@ -248,6 +273,8 @@ impl<'a> Declarations<'a> {
             block_functions: RefCell::new(HashMap::new()),
             declaration_spans: RefCell::new(HashMap::new()),
             assignments: RefCell::new(HashMap::new()),
+            commonjs: RefCell::new(HashMap::new()),
+            patched: RefCell::new(None),
             constructions: RefCell::new(HashMap::new()),
             resolution_epoch: Cell::new(0),
             resolution_stats: Cell::new(ResolutionStats::default()),
@@ -706,7 +733,12 @@ impl<'a> Declarations<'a> {
                 .filter(|entry| !entry.is_type)
             {
                 if let Some(request) = &entry.module_request {
-                    if let Resolved::File(target) = project.resolve(file, request.name.as_str()) {
+                    if let Resolved::File(target) = self.module_target_of(
+                        project,
+                        file,
+                        request.name.as_str(),
+                        RequestKind::Static,
+                    ) {
                         pending.push((target, false));
                     }
                 }
@@ -1428,11 +1460,21 @@ impl<'a> Declarations<'a> {
                 reference.as_ref()
             }
             TSModuleReference::ExternalModuleReference(external) => {
-                let Resolved::File(file) =
-                    project.resolve(file, external.expression.value.as_str())
-                else {
+                let Resolved::File(file) = self.module_target_of(
+                    project,
+                    file,
+                    external.expression.value.as_str(),
+                    RequestKind::Require,
+                ) else {
                     return (Target::External, names);
                 };
+
+                if is_commonjs_file(project.file(file)) {
+                    return (
+                        self.module_value_of(project, file, &mut HashSet::new()),
+                        Vec::new(),
+                    );
+                }
 
                 return self.assignment_input(project, file);
             }
@@ -1508,23 +1550,39 @@ impl<'a> Declarations<'a> {
         let semantic = &project.file(file).semantic;
         let node = semantic.scoping().symbol_declaration(symbol);
         let nodes = semantic.nodes();
-        let imported = match nodes.kind(node) {
-            AstKind::ImportSpecifier(specifier) => Some(specifier.imported.name().as_str()),
-            AstKind::ImportDefaultSpecifier(_) => Some("default"),
-            AstKind::ImportNamespaceSpecifier(_) => None,
+        let (imported, typed) = match nodes.kind(node) {
+            AstKind::ImportSpecifier(specifier) => (
+                Some(specifier.imported.name().as_str()),
+                specifier.import_kind.is_type(),
+            ),
+            AstKind::ImportDefaultSpecifier(_) => (Some("default"), false),
+            AstKind::ImportNamespaceSpecifier(_) => (None, false),
+            AstKind::VariableDeclarator(declarator) => {
+                return self
+                    .required_binding_target_of(project, file, symbol, declarator)
+                    .unwrap_or(Target::Symbol(file, symbol))
+            }
             _ => return Target::Symbol(file, symbol),
         };
         let source = nodes
             .ancestors(node)
             .find_map(|ancestor| match ancestor.kind() {
-                AstKind::ImportDeclaration(declaration) => Some(declaration.source.value.as_str()),
+                AstKind::ImportDeclaration(declaration) => Some((
+                    declaration.source.value.as_str(),
+                    declaration.import_kind.is_type(),
+                )),
                 _ => None,
             });
-        let Some(source) = source else {
+        let Some((source, declaration_typed)) = source else {
             return Target::External;
         };
+        let module = if typed || declaration_typed {
+            project.resolve(file, source)
+        } else {
+            self.module_target_of(project, file, source, RequestKind::Static)
+        };
 
-        match (project.resolve(file, source), imported) {
+        match (module, imported) {
             (Resolved::File(target), Some(name)) => self
                 .followed_export_of(project, target, name)
                 .unwrap_or(Target::External),
@@ -1547,7 +1605,19 @@ impl<'a> Declarations<'a> {
 
         let mut visited = HashSet::new();
         let epoch = self.resolution_epoch.get();
-        let target = self.export_target_of(project, file, name, &mut visited);
+        let mut target = self.export_target_of(project, file, name, &mut visited);
+
+        if target.is_none_or(|target| target == Target::External) {
+            if let Some(declared) = project.counterpart_of(file) {
+                let fallback = self.export_target_of(project, declared, name, &mut visited);
+                let accepted = is_declaration_path(&project.file(declared).path)
+                    || fallback.is_some_and(|fallback| is_type_only(project, fallback));
+
+                if accepted && fallback.is_some() {
+                    target = fallback;
+                }
+            }
+        }
 
         if epoch == self.resolution_epoch.get()
             || target.is_some_and(|target| target != Target::External)
@@ -1594,7 +1664,7 @@ impl<'a> Declarations<'a> {
 
             let specifier = entry.module_request.as_ref()?.name.as_str();
 
-            return match project.resolve(file, specifier) {
+            return match self.module_target_of(project, file, specifier, RequestKind::Static) {
                 Resolved::File(target) => match &entry.import_name {
                     ExportImportName::All => Some(Target::Namespace(target)),
                     ExportImportName::Name(imported) => {
@@ -1609,13 +1679,522 @@ impl<'a> Declarations<'a> {
             };
         }
 
+        if is_commonjs_file(project.file(file)) {
+            return self.commonjs_export_of(project, file, name, visited);
+        }
+
         if name == "default" {
             return None;
         }
 
-        star_targets_of(project, module_record, file)
+        self.star_targets_of(project, module_record, file)
             .into_iter()
             .find_map(|target| self.export_target_of(project, target, name, visited))
+    }
+
+    fn star_targets_of(
+        &self,
+        project: &Project<'a>,
+        module_record: &ModuleRecord<'_>,
+        file: FileId,
+    ) -> Vec<FileId> {
+        module_record
+            .star_export_entries
+            .iter()
+            .filter_map(|entry| entry.module_request.as_ref())
+            .filter_map(|request| {
+                match self.module_target_of(
+                    project,
+                    file,
+                    request.name.as_str(),
+                    RequestKind::Static,
+                ) {
+                    Resolved::File(target) => Some(target),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn module_target_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        specifier: &str,
+        kind: RequestKind,
+    ) -> Resolved {
+        let mut stats = self.resolution_stats.get();
+
+        stats.implementation_visits = stats.implementation_visits.saturating_add(1);
+
+        self.resolution_stats.set(stats);
+
+        let runtime = project.implementation_of(file, specifier, kind);
+
+        match runtime {
+            Resolved::File(_) => runtime,
+            runtime => match project.resolve(file, specifier) {
+                Resolved::File(declared) if is_declaration_path(&project.file(declared).path) => {
+                    Resolved::File(declared)
+                }
+                _ => runtime,
+            },
+        }
+    }
+
+    fn required_binding_target_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        symbol: SymbolId,
+        declarator: &'a VariableDeclarator<'a>,
+    ) -> Option<Target> {
+        let Expression::CallExpression(call) = unwrap(declarator.init.as_ref()?) else {
+            return None;
+        };
+        let specifier = required_specifier_of(project.file(file), call)?;
+
+        if !self.is_write_free(project, Binding::Symbol { file, symbol }) {
+            return None;
+        }
+
+        let mut visited = HashSet::new();
+
+        match &declarator.id {
+            BindingPattern::BindingIdentifier(_) => {
+                Some(self.required_module_of(project, file, &specifier, &mut visited))
+            }
+            BindingPattern::ObjectPattern(pattern) => {
+                let name = pattern.properties.iter().find_map(|property| {
+                    let BindingPattern::BindingIdentifier(binding) = &property.value else {
+                        return None;
+                    };
+
+                    (binding.symbol_id.get() == Some(symbol) && !property.computed)
+                        .then(|| property.key.static_name())
+                        .flatten()
+                })?;
+                let Resolved::File(target) =
+                    self.module_target_of(project, file, &specifier, RequestKind::Require)
+                else {
+                    return Some(Target::External);
+                };
+
+                Some(
+                    self.followed_export_of(project, target, &name)
+                        .unwrap_or(Target::External),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn required_module_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        specifier: &str,
+        visited: &mut HashSet<(FileId, String)>,
+    ) -> Target {
+        match self.module_target_of(project, file, specifier, RequestKind::Require) {
+            Resolved::File(target) => self.module_value_of(project, target, visited),
+            _ => Target::External,
+        }
+    }
+
+    fn module_value_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        visited: &mut HashSet<(FileId, String)>,
+    ) -> Target {
+        if !is_commonjs_file(project.file(file)) {
+            return match self.assignment_input(project, file) {
+                (target, names) if names.is_empty() => target,
+                _ => Target::External,
+            };
+        }
+
+        if !visited.insert((file, String::new())) {
+            return Target::External;
+        }
+
+        let exports = self.commonjs_exports_of(project, file);
+
+        match exports.replaced {
+            _ if exports.open || self.patched_of(project).contains(&file) => Target::External,
+            Some(replaced) if exports.names.is_empty() => {
+                match commonjs_expression_of(project, file, replaced) {
+                    Some(replaced) => self.commonjs_value_of(project, file, replaced, visited),
+                    None => Target::External,
+                }
+            }
+            _ => Target::Namespace(file),
+        }
+    }
+
+    fn commonjs_export_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        name: &str,
+        visited: &mut HashSet<(FileId, String)>,
+    ) -> Option<Target> {
+        let exports = self.commonjs_exports_of(project, file);
+
+        if exports.open || self.patched_of(project).contains(&file) {
+            return None;
+        }
+
+        if name == "default" && !exports.es_module {
+            return Some(self.module_value_of(project, file, visited));
+        }
+
+        if let Some(value) = exports.names.get(name) {
+            return Some(
+                match value.and_then(|value| commonjs_expression_of(project, file, value)) {
+                    Some(value) => self.commonjs_value_of(project, file, value, visited),
+                    None => Target::External,
+                },
+            );
+        }
+
+        match exports
+            .replaced
+            .and_then(|replaced| commonjs_expression_of(project, file, replaced))
+            .map(unwrap)
+        {
+            Some(Expression::ObjectExpression(object)) => {
+                self.object_member_of(project, file, object, name, visited)
+            }
+            Some(replaced) => match self.commonjs_value_of(project, file, replaced, visited) {
+                Target::Namespace(target) => self.export_target_of(project, target, name, visited),
+                owner => self.member_target_of(project, owner, name),
+            },
+            None => None,
+        }
+    }
+
+    fn object_member_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        object: &'a ObjectExpression<'a>,
+        name: &str,
+        visited: &mut HashSet<(FileId, String)>,
+    ) -> Option<Target> {
+        let mut found = None;
+        let mut hidden = false;
+
+        for property in &object.properties {
+            match property {
+                ObjectPropertyKind::ObjectProperty(property)
+                    if !property.computed
+                        && property.key.static_name().as_deref() == Some(name) =>
+                {
+                    found = Some(property);
+                    hidden = false;
+                }
+                ObjectPropertyKind::ObjectProperty(property) if !property.computed => {}
+                _ => {
+                    found = None;
+                    hidden = true;
+                }
+            }
+        }
+
+        match found {
+            Some(property) if property.kind != oxc_ast::ast::PropertyKind::Init => {
+                Some(Target::External)
+            }
+            Some(property)
+                if property.method || function_of_initializer(Some(&property.value)).is_some() =>
+            {
+                Some(Target::Node(file, property.node_id()))
+            }
+            Some(property) => Some(self.commonjs_value_of(project, file, &property.value, visited)),
+            None if hidden => Some(Target::External),
+            None => None,
+        }
+    }
+
+    fn commonjs_value_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        value: &'a Expression<'a>,
+        visited: &mut HashSet<(FileId, String)>,
+    ) -> Target {
+        match unwrap(value) {
+            Expression::Identifier(reference) => self
+                .symbol_of_reference(project, file, reference)
+                .map(|(file, symbol)| self.target_of_symbol(project, file, symbol))
+                .unwrap_or(Target::External),
+            Expression::FunctionExpression(function) => Target::Node(file, function.node_id()),
+            Expression::ArrowFunctionExpression(function) => Target::Node(file, function.node_id()),
+            Expression::ClassExpression(class) => Target::Node(file, class.node_id()),
+            Expression::CallExpression(call) => {
+                match required_specifier_of(project.file(file), call) {
+                    Some(specifier) => self.required_module_of(project, file, &specifier, visited),
+                    None => Target::External,
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                let owner = self.commonjs_value_of(project, file, &member.object, visited);
+
+                self.member_target_of(project, owner, member.property.name.as_str())
+                    .unwrap_or(Target::External)
+            }
+            _ => Target::External,
+        }
+    }
+
+    fn commonjs_exports_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+    ) -> std::rc::Rc<CommonJsExports> {
+        if let Some(cached) = self.commonjs.borrow().get(&file) {
+            return cached.clone();
+        }
+
+        let source = project.file(file);
+        let program: &'a oxc_ast::ast::Program<'a> = source.program;
+        let mut stats = self.resolution_stats.get();
+        let mut exports = CommonJsExports::default();
+        let mut recognized: HashSet<NodeId> = HashSet::new();
+
+        for statement in &program.body {
+            stats.implementation_visits = stats.implementation_visits.saturating_add(1);
+
+            let Statement::ExpressionStatement(statement) = statement else {
+                continue;
+            };
+
+            match unwrap(&statement.expression) {
+                Expression::AssignmentExpression(assignment) => {
+                    let mut writes = Vec::new();
+                    let mut current = assignment;
+
+                    let value = loop {
+                        if !current.operator.is_assign() {
+                            break None;
+                        }
+
+                        writes.push(commonjs_write_of(source, &current.left, &mut recognized));
+
+                        match unwrap(&current.right) {
+                            Expression::AssignmentExpression(next) => current = next,
+                            _ => break Some(current),
+                        }
+                    };
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let value = (!is_void_expression(&value.right)).then(|| value.node_id());
+
+                    for write in writes.into_iter().rev().flatten() {
+                        match write {
+                            CommonJsWrite::Named(name) if exports.replaced.is_none() => {
+                                exports.names.insert(name, value);
+                            }
+                            CommonJsWrite::Named(_) => exports.open = true,
+                            CommonJsWrite::Replaced if value.is_some() => {
+                                exports.replaced = value;
+                                exports.open |= !exports.names.is_empty();
+                            }
+                            CommonJsWrite::Replaced => exports.open = true,
+                        }
+                    }
+                }
+                Expression::CallExpression(call) => {
+                    if let Some((name, value)) = defined_export_of(source, call, &mut recognized) {
+                        match name.as_str() {
+                            "__esModule" => exports.es_module = true,
+                            _ if exports.replaced.is_none() => {
+                                exports.names.insert(name, value);
+                            }
+                            _ => exports.open = true,
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let scoping = source.semantic.scoping();
+        let nodes = source.semantic.nodes();
+
+        for name in ["exports", "module"] {
+            for reference in scoping
+                .root_unresolved_references()
+                .get(name)
+                .into_iter()
+                .flatten()
+            {
+                stats.implementation_visits = stats.implementation_visits.saturating_add(1);
+
+                let node = scoping.get_reference(*reference).node_id();
+
+                if !recognized.contains(&node) && !is_commonjs_read(nodes, node, name) {
+                    exports.open = true;
+                }
+            }
+        }
+
+        for node in nodes.iter() {
+            if let AstKind::ThisExpression(_) = node.kind() {
+                let top = !nodes.ancestors(node.id()).any(|ancestor| {
+                    matches!(ancestor.kind(), AstKind::Function(_) | AstKind::Class(_))
+                });
+
+                if top && is_written_object(nodes, node.id()) {
+                    exports.open = true;
+                }
+            }
+        }
+
+        self.resolution_stats.set(stats);
+
+        let exports = std::rc::Rc::new(exports);
+
+        self.commonjs.borrow_mut().insert(file, exports.clone());
+
+        exports
+    }
+
+    fn patched_of(&self, project: &Project<'a>) -> std::rc::Rc<HashSet<FileId>> {
+        if let Some(patched) = self.patched.borrow().as_ref() {
+            return patched.clone();
+        }
+
+        let mut patched = HashSet::new();
+        let mut forwards: Vec<(FileId, FileId)> = Vec::new();
+
+        for source in &project.files {
+            let file = source.id;
+            let scoping = source.semantic.scoping();
+            let nodes = source.semantic.nodes();
+            let module_of = |specifier: &str, kind: RequestKind| match self
+                .module_target_of(project, file, specifier, kind)
+            {
+                Resolved::File(target) if is_commonjs_file(project.file(target)) => Some(target),
+                _ => None,
+            };
+
+            for reference in scoping
+                .root_unresolved_references()
+                .get("require")
+                .into_iter()
+                .flatten()
+            {
+                let node = scoping.get_reference(*reference).node_id();
+                let call_node = nodes.parent_id(node);
+                let AstKind::CallExpression(call) = nodes.kind(call_node) else {
+                    continue;
+                };
+                let Some(target) = required_specifier_of(source, call)
+                    .and_then(|specifier| module_of(&specifier, RequestKind::Require))
+                else {
+                    continue;
+                };
+
+                match module_use_of(source, call_node) {
+                    ModuleUse::Read => {}
+                    ModuleUse::Forward => forwards.push((file, target)),
+                    ModuleUse::Escape => {
+                        patched.insert(target);
+                    }
+                }
+            }
+
+            for statement in &source.program.body {
+                let (specifier, local, kind) = match statement {
+                    Statement::ImportDeclaration(declaration)
+                        if !declaration.import_kind.is_type() =>
+                    {
+                        let Some(local) =
+                            declaration
+                                .specifiers
+                                .iter()
+                                .flatten()
+                                .find_map(|specifier| {
+                                    match specifier {
+                                oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(
+                                    default,
+                                ) => default.local.symbol_id.get(),
+                                _ => None,
+                            }
+                                })
+                        else {
+                            continue;
+                        };
+
+                        (
+                            declaration.source.value.as_str(),
+                            local,
+                            RequestKind::Static,
+                        )
+                    }
+                    Statement::TSImportEqualsDeclaration(declaration) => {
+                        let TSModuleReference::ExternalModuleReference(reference) =
+                            &declaration.module_reference
+                        else {
+                            continue;
+                        };
+                        let Some(local) = declaration.id.symbol_id.get() else {
+                            continue;
+                        };
+
+                        (
+                            reference.expression.value.as_str(),
+                            local,
+                            RequestKind::Require,
+                        )
+                    }
+                    _ => continue,
+                };
+                let Some(target) = module_of(specifier, kind) else {
+                    continue;
+                };
+
+                if !is_member_read_only(nodes, scoping, local) {
+                    patched.insert(target);
+                }
+            }
+        }
+
+        for source in &project.files {
+            if is_commonjs_file(source) && self.commonjs_exports_of(project, source.id).open {
+                patched.insert(source.id);
+            }
+        }
+
+        let mut changed = true;
+
+        while changed {
+            changed = false;
+
+            for (from, to) in &forwards {
+                if patched.contains(from) && patched.insert(*to) {
+                    changed = true;
+                }
+            }
+        }
+
+        let mut stats = self.resolution_stats.get();
+
+        stats.implementation_visits = stats
+            .implementation_visits
+            .saturating_add(project.files.len());
+
+        self.resolution_stats.set(stats);
+
+        let patched = std::rc::Rc::new(patched);
+
+        *self.patched.borrow_mut() = Some(patched.clone());
+
+        patched
     }
 
     fn collect_export_names(
@@ -1651,7 +2230,7 @@ impl<'a> Declarations<'a> {
             }
         }
 
-        for target in star_targets_of(project, module_record, file) {
+        for target in self.star_targets_of(project, module_record, file) {
             self.collect_export_names(project, target, false, visited, seen, names);
         }
     }
@@ -1775,7 +2354,8 @@ pub(crate) fn surface_write_of(nodes: &AstNodes<'_>, reference: NodeId) -> Optio
 }
 
 fn is_module_file(source: &SourceFile<'_>) -> bool {
-    source.module_record.has_module_syntax
+    source.implementation
+        || source.module_record.has_module_syntax
         || source.program.body.iter().any(|statement| match statement {
             Statement::TSImportEqualsDeclaration(declaration) => matches!(
                 declaration.module_reference,
@@ -1814,24 +2394,6 @@ fn exported_function_statements_of(project: &Project<'_>, file: FileId) -> HashS
         .collect()
 }
 
-fn star_targets_of(
-    project: &Project<'_>,
-    module_record: &ModuleRecord<'_>,
-    file: FileId,
-) -> Vec<FileId> {
-    module_record
-        .star_export_entries
-        .iter()
-        .filter_map(|entry| entry.module_request.as_ref())
-        .filter_map(
-            |request| match project.resolve(file, request.name.as_str()) {
-                Resolved::File(target) => Some(target),
-                _ => None,
-            },
-        )
-        .collect()
-}
-
 fn target_of_declaration(declaration: Declaration<'_>) -> Target {
     match declaration {
         Declaration::Function { file, function } => Target::Node(file, function.node_id()),
@@ -1857,6 +2419,304 @@ fn target_of_declaration(declaration: Declaration<'_>) -> Target {
         Declaration::TypeParameter { file, parameter } => Target::Node(file, parameter.node_id()),
         Declaration::Namespace { file } => Target::Namespace(file),
         Declaration::External => Target::External,
+    }
+}
+
+fn is_commonjs_file(source: &SourceFile<'_>) -> bool {
+    let extension = source
+        .path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    matches!(extension.as_str(), "js" | "cjs" | "jsx") && !source.module_record.has_module_syntax
+}
+
+fn is_type_only(project: &Project<'_>, target: Target) -> bool {
+    match target {
+        Target::Symbol(file, symbol) | Target::OpenSymbol(file, symbol) => !project
+            .file(file)
+            .semantic
+            .scoping()
+            .symbol_flags(symbol)
+            .is_value(),
+        _ => false,
+    }
+}
+
+fn global_reference_of(
+    source: &SourceFile<'_>,
+    expression: &Expression<'_>,
+    name: &str,
+) -> Option<NodeId> {
+    let Expression::Identifier(reference) = unwrap(expression) else {
+        return None;
+    };
+    let id = reference.reference_id.get()?;
+
+    (reference.name == name
+        && source
+            .semantic
+            .scoping()
+            .get_reference(id)
+            .symbol_id()
+            .is_none())
+    .then(|| reference.node_id())
+}
+
+fn commonjs_write_of(
+    source: &SourceFile<'_>,
+    target: &AssignmentTarget<'_>,
+    recognized: &mut HashSet<NodeId>,
+) -> Option<CommonJsWrite> {
+    let (object, name) = match target {
+        AssignmentTarget::StaticMemberExpression(member) => {
+            (&member.object, member.property.name.to_string())
+        }
+        AssignmentTarget::ComputedMemberExpression(member) => match unwrap(&member.expression) {
+            Expression::StringLiteral(key) => (&member.object, key.value.to_string()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    if let Some(node) = global_reference_of(source, object, "exports") {
+        recognized.insert(node);
+
+        return Some(CommonJsWrite::Named(name));
+    }
+
+    if let Some(node) = global_reference_of(source, object, "module") {
+        if name != "exports" {
+            return None;
+        }
+
+        recognized.insert(node);
+
+        return Some(CommonJsWrite::Replaced);
+    }
+
+    match unwrap(object) {
+        Expression::StaticMemberExpression(owner) if owner.property.name == "exports" => {
+            let node = global_reference_of(source, &owner.object, "module")?;
+
+            recognized.insert(node);
+
+            Some(CommonJsWrite::Named(name))
+        }
+        _ => None,
+    }
+}
+
+fn module_use_of(source: &SourceFile<'_>, call: NodeId) -> ModuleUse {
+    let nodes = source.semantic.nodes();
+    let scoping = source.semantic.scoping();
+    let span = nodes.kind(call).span();
+    let parent = nodes.parent_id(call);
+
+    match nodes.kind(parent) {
+        AstKind::ExpressionStatement(_) => ModuleUse::Read,
+        AstKind::VariableDeclarator(declarator)
+            if declarator
+                .init
+                .as_ref()
+                .is_some_and(|init| init.span() == span) =>
+        {
+            match &declarator.id {
+                BindingPattern::ObjectPattern(pattern)
+                    if pattern.rest.is_none()
+                        && pattern.properties.iter().all(|property| {
+                            matches!(property.value, BindingPattern::BindingIdentifier(_))
+                        }) =>
+                {
+                    ModuleUse::Read
+                }
+                BindingPattern::BindingIdentifier(binding) => match binding.symbol_id.get() {
+                    Some(symbol) if is_member_read_only(nodes, scoping, symbol) => ModuleUse::Read,
+                    _ => ModuleUse::Escape,
+                },
+                _ => ModuleUse::Escape,
+            }
+        }
+        AstKind::StaticMemberExpression(member) if member.object.span() == span => {
+            if is_written_member(nodes, parent) {
+                ModuleUse::Escape
+            } else {
+                ModuleUse::Read
+            }
+        }
+        AstKind::ComputedMemberExpression(member) if member.object.span() == span => {
+            if is_written_member(nodes, parent) {
+                ModuleUse::Escape
+            } else {
+                ModuleUse::Read
+            }
+        }
+        AstKind::AssignmentExpression(assignment)
+            if assignment.right.span() == span
+                && matches!(
+                    &assignment.left,
+                    AssignmentTarget::StaticMemberExpression(member)
+                        if member.property.name == "exports"
+                            && global_reference_of(source, &member.object, "module").is_some()
+                )
+                && matches!(nodes.parent_kind(parent), AstKind::ExpressionStatement(_)) =>
+        {
+            ModuleUse::Forward
+        }
+        _ => ModuleUse::Escape,
+    }
+}
+
+fn is_member_read_only(
+    nodes: &AstNodes<'_>,
+    scoping: &oxc_semantic::Scoping,
+    symbol: SymbolId,
+) -> bool {
+    scoping.get_resolved_references(symbol).all(|reference| {
+        let node = reference.node_id();
+        let span = nodes.kind(node).span();
+        let parent = nodes.parent_id(node);
+
+        reference.is_write()
+            || match nodes.kind(parent) {
+                AstKind::StaticMemberExpression(member) => {
+                    member.object.span() == span && !is_written_member(nodes, parent)
+                }
+                AstKind::ComputedMemberExpression(member) => {
+                    member.object.span() == span && !is_written_member(nodes, parent)
+                }
+                AstKind::CallExpression(call) => call.callee.span() == span,
+                AstKind::UnaryExpression(unary) => unary.operator == UnaryOperator::Typeof,
+                _ => false,
+            }
+    })
+}
+
+fn is_void_expression(expression: &Expression<'_>) -> bool {
+    matches!(unwrap(expression), Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::Void)
+}
+
+fn commonjs_expression_of<'a>(
+    project: &Project<'a>,
+    file: FileId,
+    node: NodeId,
+) -> Option<&'a Expression<'a>> {
+    match project.file(file).semantic.nodes().kind(node) {
+        AstKind::AssignmentExpression(assignment) => Some(&assignment.right),
+        AstKind::ReturnStatement(statement) => statement.argument.as_ref(),
+        AstKind::ObjectProperty(property) => Some(&property.value),
+        _ => None,
+    }
+}
+
+fn defined_export_of(
+    source: &SourceFile<'_>,
+    call: &CallExpression<'_>,
+    recognized: &mut HashSet<NodeId>,
+) -> Option<(String, Option<NodeId>)> {
+    let Expression::StaticMemberExpression(callee) = unwrap(&call.callee) else {
+        return None;
+    };
+
+    global_reference_of(source, &callee.object, "Object")?;
+
+    if callee.property.name != "defineProperty" {
+        return None;
+    }
+
+    let [owner, Argument::StringLiteral(name), Argument::ObjectExpression(descriptor)] =
+        call.arguments.as_slice()
+    else {
+        return None;
+    };
+    let node = global_reference_of(source, owner.as_expression()?, "exports")?;
+
+    if name.value == "__esModule" {
+        recognized.insert(node);
+
+        return Some(("__esModule".to_string(), None));
+    }
+
+    let value = descriptor.properties.iter().find_map(|property| {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+
+        match property.key.static_name().as_deref() {
+            Some("value") => Some(property.node_id()),
+            Some("get") => {
+                let Expression::FunctionExpression(getter) = unwrap(&property.value) else {
+                    return None;
+                };
+
+                match getter.body.as_ref()?.statements.as_slice() {
+                    [Statement::ReturnStatement(statement)] if statement.argument.is_some() => {
+                        Some(statement.node_id())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    })?;
+
+    recognized.insert(node);
+
+    Some((name.value.to_string(), Some(value)))
+}
+
+fn is_commonjs_read(nodes: &AstNodes<'_>, node: NodeId, name: &str) -> bool {
+    let span = nodes.kind(node).span();
+    let parent = nodes.parent_id(node);
+
+    match nodes.kind(parent) {
+        AstKind::UnaryExpression(unary) => unary.operator == UnaryOperator::Typeof,
+        AstKind::StaticMemberExpression(member) if member.object.span() == span => {
+            if name == "module" && member.property.name == "exports" {
+                matches!(
+                    nodes.parent_kind(parent),
+                    AstKind::StaticMemberExpression(outer) if outer.object.span() == member.span
+                ) && !is_written_object(nodes, parent)
+            } else {
+                name == "module" || !is_written_object(nodes, node)
+            }
+        }
+        AstKind::ComputedMemberExpression(member) if member.object.span() == span => {
+            name == "exports" && !is_written_object(nodes, node)
+        }
+        _ => false,
+    }
+}
+
+fn is_written_object(nodes: &AstNodes<'_>, node: NodeId) -> bool {
+    let span = nodes.kind(node).span();
+    let member = nodes.parent_id(node);
+    let object = match nodes.kind(member) {
+        AstKind::StaticMemberExpression(access) => access.object.span(),
+        AstKind::ComputedMemberExpression(access) => access.object.span(),
+        _ => return false,
+    };
+
+    object == span && is_written_member(nodes, member)
+}
+
+fn is_written_member(nodes: &AstNodes<'_>, member: NodeId) -> bool {
+    let span = nodes.kind(member).span();
+
+    match nodes.parent_kind(member) {
+        AstKind::AssignmentExpression(assignment) => assignment.left.span() == span,
+        AstKind::UpdateExpression(_)
+        | AstKind::ArrayAssignmentTarget(_)
+        | AstKind::ObjectAssignmentTarget(_)
+        | AstKind::AssignmentTargetWithDefault(_)
+        | AstKind::AssignmentTargetPropertyProperty(_)
+        | AstKind::AssignmentTargetPropertyIdentifier(_)
+        | AstKind::AssignmentTargetRest(_) => true,
+        AstKind::UnaryExpression(unary) => unary.operator == UnaryOperator::Delete,
+        AstKind::ForInStatement(statement) => statement.left.span() == span,
+        AstKind::ForOfStatement(statement) => statement.left.span() == span,
+        _ => false,
     }
 }
 
@@ -1931,6 +2791,10 @@ pub(crate) fn declaration_of_node<'a>(
         AstKind::Function(function) => Some(Declaration::Function {
             file,
             function: FunctionNode::Function(function),
+        }),
+        AstKind::ArrowFunctionExpression(arrow) => Some(Declaration::Function {
+            file,
+            function: FunctionNode::Arrow(arrow),
         }),
         AstKind::VariableDeclarator(declarator) => {
             let constant = matches!(

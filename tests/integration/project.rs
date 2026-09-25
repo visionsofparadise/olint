@@ -1,5 +1,5 @@
-use olint::paths::canonical_path_of;
-use olint::project::Resolved;
+use olint::paths::{canonical_path_of, forward_slashes_of};
+use olint::project::{RequestKind, Resolved};
 use olint::tsconfig::select_files;
 use oxc_ast::AstKind;
 
@@ -208,15 +208,18 @@ fn resolve_loads_a_package_declaration_file_outside_the_project() {
         };
 
         let global = file_of(project, root, "types/global.d.ts");
+        let Resolved::File(plain) = project.implementation_of(index, "plain", RequestKind::Static)
+        else {
+            panic!("the package implementation is loaded");
+        };
 
-        assert_eq!(project.files.len(), 3);
+        assert_eq!(project.files.len(), 4);
         assert!(!project.is_project_file(global));
         assert!(project.file(package).external_library);
         assert!(!project.is_project_file(package));
-        assert!(matches!(
-            project.resolve(index, "plain"),
-            Resolved::External(_)
-        ));
+        assert_eq!(project.file(plain).relative, "node_modules/plain/index.js");
+        assert!(project.file(plain).implementation);
+        assert!(!project.is_project_file(plain));
     });
 }
 
@@ -618,12 +621,25 @@ fn resolve_prefers_a_package_typings_field_over_a_typescript_main() {
             .map(|file| file.relative.as_str())
             .collect();
 
+        let implementation = project.implementation_of(
+            file_of(project, root, "src/index.ts"),
+            "patch",
+            RequestKind::Static,
+        );
+
         assert_eq!(
             loaded,
-            vec!["node_modules/patch/index.d.ts", "src/index.ts"]
+            vec![
+                "node_modules/patch/index.d.ts",
+                "node_modules/patch/index.js",
+                "src/index.ts"
+            ]
         );
         assert!(
             matches!(resolved, Resolved::File(id) if project.file(id).relative == "node_modules/patch/index.d.ts")
+        );
+        assert!(
+            matches!(implementation, Resolved::File(id) if project.file(id).relative == "node_modules/patch/index.js")
         );
     });
 }
@@ -919,4 +935,343 @@ fn global_lookup_is_scoped_to_every_applicable_project() {
                 .is_none());
         },
     );
+}
+
+const BUNDLER: &str = r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler" }, "include": ["src"] }"#;
+
+fn implementation_flags_of<'p>(
+    project: &'p olint::project::Project<'_>,
+) -> Vec<(&'p str, bool, bool)> {
+    project
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.relative.as_str(),
+                file.implementation,
+                project.is_project_file(file.id),
+            )
+        })
+        .collect()
+}
+
+fn implementation_relative_of(
+    project: &olint::project::Project<'_>,
+    from: olint::project::FileId,
+    specifier: &str,
+    kind: RequestKind,
+) -> Option<String> {
+    match project.implementation_of(from, specifier, kind) {
+        Resolved::File(id) => Some(project.file(id).relative.clone()),
+        Resolved::External(path) => Some(olint::paths::relative_path_of(&project.root, &path)),
+        Resolved::Unresolved => None,
+    }
+}
+
+#[test]
+fn load_walks_runtime_implementations_beside_declarations() {
+    let files = [
+        ("tsconfig.json", BUNDLER),
+        (
+            "src/index.ts",
+            "import { run } from \"pkg\";\nexport const go = (xs: number[]) => run(xs);",
+        ),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "type": "module", "main": "index.js", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/pkg/index.d.ts",
+            "export declare function run(xs: number[]): number;",
+        ),
+        (
+            "node_modules/pkg/index.js",
+            "import { helper } from \"./helper.js\";\nexport function run(xs) { return helper(xs); }",
+        ),
+        (
+            "node_modules/pkg/helper.d.ts",
+            "export declare function helper(xs: number[]): number;",
+        ),
+        (
+            "node_modules/pkg/helper.js",
+            "export function helper(xs) { return xs.length; }",
+        ),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let index = file_of(project, root, "src/index.ts");
+        let declared = file_of(project, root, "node_modules/pkg/index.d.ts");
+        let implementation = file_of(project, root, "node_modules/pkg/index.js");
+
+        assert_eq!(
+            implementation_flags_of(project),
+            vec![
+                ("node_modules/pkg/index.d.ts", false, false),
+                ("node_modules/pkg/helper.js", true, false),
+                ("node_modules/pkg/index.js", true, false),
+                ("src/index.ts", false, true)
+            ]
+        );
+        assert_eq!(project.resolve(index, "pkg"), Resolved::File(declared));
+        assert_eq!(
+            project.implementation_of(index, "pkg", RequestKind::Static),
+            Resolved::File(implementation)
+        );
+        assert_eq!(project.counterpart_of(implementation), Some(declared));
+        assert_eq!(project.counterpart_of(declared), None);
+        assert!(project.file(implementation).external_library);
+    });
+}
+
+#[test]
+fn runtime_conditions_follow_the_request_and_the_emitted_module_format() {
+    let package = [
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "types": "./index.d.ts", "exports": { ".": { "types": "./index.d.ts", "import": "./esm.mjs", "require": "./cjs.cjs" } } }"#,
+        ),
+        (
+            "node_modules/pkg/index.d.ts",
+            "export declare function run(): number;",
+        ),
+        (
+            "node_modules/pkg/esm.mjs",
+            "export function run() { return 1; }",
+        ),
+        ("node_modules/pkg/cjs.cjs", "exports.run = () => 2;"),
+    ];
+    let cases = [
+        (
+            "esnext",
+            "src/index.ts",
+            None,
+            Some("node_modules/pkg/esm.mjs"),
+        ),
+        (
+            "commonjs",
+            "src/index.ts",
+            None,
+            Some("node_modules/pkg/cjs.cjs"),
+        ),
+        (
+            "nodenext",
+            "src/index.ts",
+            Some(r#"{ "type": "module" }"#),
+            Some("node_modules/pkg/esm.mjs"),
+        ),
+        (
+            "nodenext",
+            "src/index.ts",
+            Some("{}"),
+            Some("node_modules/pkg/cjs.cjs"),
+        ),
+        (
+            "nodenext",
+            "src/index.mts",
+            Some("{}"),
+            Some("node_modules/pkg/esm.mjs"),
+        ),
+        ("", "src/index.ts", None, None),
+    ];
+
+    for (module, entry, manifest, expected) in cases {
+        let tsconfig = match module {
+            "" => r#"{ "include": ["src"] }"#.to_string(),
+            module => format!(
+                r#"{{ "compilerOptions": {{ "module": "{module}" }}, "include": ["src"] }}"#
+            ),
+        };
+        let mut files = vec![
+            ("tsconfig.json", tsconfig.as_str()),
+            (
+                entry,
+                "import { run } from \"pkg\";\nexport const go = () => run();",
+            ),
+        ];
+
+        files.extend(package);
+
+        if let Some(manifest) = manifest {
+            files.push(("package.json", manifest));
+        }
+
+        run_in_project(&files, |project, root| {
+            let index = file_of(project, root, entry);
+
+            assert_eq!(
+                implementation_relative_of(project, index, "pkg", RequestKind::Static).as_deref(),
+                expected,
+                "{module} {entry}"
+            );
+            assert_eq!(
+                implementation_relative_of(project, index, "pkg", RequestKind::Require).as_deref(),
+                Some("node_modules/pkg/cjs.cjs"),
+                "{module} {entry}"
+            );
+        });
+    }
+}
+
+#[test]
+fn runtime_graph_follows_literal_requires_and_terminates_cycles() {
+    let files = [
+        ("tsconfig.json", BUNDLER),
+        (
+            "src/index.ts",
+            "import { run } from \"pkg\";\nexport const go = () => run();",
+        ),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "main": "a.js", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/pkg/index.d.ts",
+            "export declare function run(): number;",
+        ),
+        (
+            "node_modules/pkg/a.js",
+            "const b = require(\"./b\");\nconst addon = require(\"./addon.node\");\nconst util = require(\"node:util\");\nconst name = \"./c\";\nconst dynamic = require(name);\nexports.run = () => b.run();",
+        ),
+        (
+            "node_modules/pkg/b.js",
+            "const a = require(`./a.js`);\nexports.run = () => a.run();",
+        ),
+        ("node_modules/pkg/c.js", "exports.run = () => 3;"),
+        ("node_modules/pkg/addon.node", "binary"),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let a = file_of(project, root, "node_modules/pkg/a.js");
+
+        assert_eq!(
+            implementation_flags_of(project),
+            vec![
+                ("node_modules/pkg/index.d.ts", false, false),
+                ("node_modules/pkg/b.js", true, false),
+                ("node_modules/pkg/a.js", true, false),
+                ("src/index.ts", false, true)
+            ]
+        );
+        assert!(matches!(
+            project.implementation_of(a, "./addon.node", RequestKind::Require),
+            Resolved::External(_)
+        ));
+        assert_eq!(
+            project.implementation_of(a, "node:util", RequestKind::Require),
+            Resolved::Unresolved
+        );
+        assert!(project
+            .file_by_path(&root.join("node_modules/pkg/c.js"))
+            .is_none());
+    });
+}
+
+#[test]
+fn implementation_walk_is_bounded_and_counted() {
+    let files = [
+        ("tsconfig.json", BUNDLER),
+        (
+            "src/index.ts",
+            "import { run } from \"pkg\";\nexport const go = () => run();",
+        ),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "main": "a.js" }"#,
+        ),
+        (
+            "node_modules/pkg/a.js",
+            "exports.run = require(\"./b\").run;",
+        ),
+        (
+            "node_modules/pkg/b.js",
+            "exports.run = require(\"./c\").run;",
+        ),
+        (
+            "node_modules/pkg/c.js",
+            "exports.run = require(\"./d\").run;",
+        ),
+        ("node_modules/pkg/d.js", "exports.run = () => 4;"),
+    ];
+    let directory = project_of(&files);
+    let tsconfig = directory.path().join("tsconfig.json");
+    let counted = |limit: usize| {
+        let allocator = oxc_allocator::Allocator::default();
+        let project = olint::project::Project::load_with_limit(&allocator, &tsconfig, limit)
+            .expect("project loads");
+
+        (project.files.len(), project.implementation_stats())
+    };
+
+    assert_eq!(
+        counted(2),
+        (
+            3,
+            olint::project::ImplementationStats {
+                resolutions: 3,
+                files: 2,
+                exhausted: true
+            }
+        )
+    );
+    assert_eq!(
+        counted(olint::project::IMPLEMENTATION_FILE_LIMIT),
+        (
+            5,
+            olint::project::ImplementationStats {
+                resolutions: 4,
+                files: 4,
+                exhausted: false
+            }
+        )
+    );
+}
+
+#[test]
+fn loading_package_implementations_never_executes_them() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let marker = directory.path().join("executed.txt");
+    let marker_text = forward_slashes_of(&marker);
+    let commonjs = format!(
+        "require(\"fs\").writeFileSync(\"{marker_text}\", \"cjs\");\nexports.run = () => 1;"
+    );
+    let module = format!(
+        "import {{ writeFileSync }} from \"node:fs\";\nwriteFileSync(\"{marker_text}\", \"esm\");\nthrow new Error(\"executed\");\nexport function other() {{ return 2; }}"
+    );
+    let files = [
+        ("tsconfig.json", BUNDLER),
+        (
+            "src/index.ts",
+            "import { run } from \"pkg\";\nimport { other } from \"other\";\nexport const go = () => run() + other();",
+        ),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "main": "index.js" }"#,
+        ),
+        ("node_modules/pkg/index.js", commonjs.as_str()),
+        (
+            "node_modules/other/package.json",
+            r#"{ "name": "other", "type": "module", "exports": "./index.js" }"#,
+        ),
+        ("node_modules/other/index.js", module.as_str()),
+    ];
+
+    for (relative, text) in files {
+        let path = directory.path().join(relative);
+
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("directories");
+        std::fs::write(path, text).expect("file");
+    }
+
+    let allocator = oxc_allocator::Allocator::default();
+    let project =
+        olint::project::Project::load(&allocator, &directory.path().join("tsconfig.json"))
+            .expect("project loads");
+    let mut analysis = olint::analysis::Analysis::new(&project, support::SYNTACTIC);
+
+    for (file, function) in analysis.reportable() {
+        analysis.summarize(file, function);
+    }
+
+    assert_eq!(project.implementation_stats().files, 2);
+    assert!(!marker.exists());
 }

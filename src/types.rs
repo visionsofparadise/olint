@@ -165,7 +165,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         callee: &'a Expression<'a>,
     ) -> ResolvedCallee<'a> {
-        let callee = unwrap(callee);
+        let callee = match unwrap(callee) {
+            Expression::SequenceExpression(sequence)
+                if matches!(
+                    sequence.expressions.as_slice(),
+                    [Expression::NumericLiteral(_), _]
+                ) =>
+            {
+                unwrap(&sequence.expressions[1])
+            }
+            callee => callee,
+        };
 
         if let Expression::Identifier(reference) = callee {
             let (declaration, closed) =

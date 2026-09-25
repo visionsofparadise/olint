@@ -495,3 +495,152 @@ fn reports_show_scheduled_and_lazy_work_without_charging_unconsumed_generators()
     assert!(!stdout.contains("  rows  index.ts:"), "{stdout}");
     assert!(stdout.contains("1 over limit"), "{stdout}");
 }
+
+type PackageCase<'c> = (&'c str, String, &'c str, Vec<(&'c str, &'c str)>);
+
+#[test]
+fn lint_walks_package_implementations_statically_and_keeps_boundaries_visible() {
+    let cube = "let t = 0; for (const a of xs) for (const b of xs) for (const c of xs) t += a * b * c; return t;";
+    let linear = "let t = 0; for (const a of xs) t += a; return t;";
+    let consumer = "import { run } from \"pkg\";\nexport function selected(xs: number[]) {\n\treturn run(xs);\n}\n";
+    let declaration = "export declare function run(xs: number[]): number;\n";
+    let module_of = |module: &str| {
+        format!(
+            r#"{{"compilerOptions":{{"strict":true,"module":"{module}"}},"files":["index.ts"]}}"#
+        )
+    };
+    let esm = format!("export function run(xs) {{ {cube} }}\n");
+    let commonjs = format!("exports.run = function (xs) {{ {linear} }};\n");
+    let dynamic = format!(
+        "exports.run = function (xs, name) {{ {} return require(\"./\" + name).fast(xs) + t; }};\n",
+        cube.replace("return t;", "")
+    );
+    let native_types = format!("export function run(xs: number[]) {{ {linear} }}\n");
+    let conditions = r#"{"name":"pkg","types":"./index.d.ts","exports":{".":{"types":"./index.d.ts","import":"./esm.mjs","require":"./cjs.cjs"}}}"#;
+    let limit = r#"{"entrypoints":["index.ts"],"max":"O(N^2)"}"#;
+    let ignored = r#"{"entrypoints":["index.ts"],"max":"O(N^2)","ignore":["node_modules/pkg/**"]}"#;
+    let module_manifest = (
+        "node_modules/pkg/package.json",
+        r#"{"name":"pkg","type":"module","main":"index.js","types":"index.d.ts"}"#,
+    );
+    let declared = ("node_modules/pkg/index.d.ts", declaration);
+    let conditional = vec![
+        ("node_modules/pkg/package.json", conditions),
+        declared,
+        ("node_modules/pkg/esm.mjs", esm.as_str()),
+        ("node_modules/pkg/cjs.cjs", commonjs.as_str()),
+    ];
+    let cases: [PackageCase<'_>; 6] = [
+        (
+            "declaration beside an expensive module",
+            module_of("esnext"),
+            limit,
+            vec![
+                module_manifest,
+                declared,
+                ("node_modules/pkg/index.js", "import { writeFileSync } from \"node:fs\";\nwriteFileSync(\"executed.txt\", \"module\");\nexport { run } from \"./esm.mjs\";\n"),
+                ("node_modules/pkg/esm.mjs", &esm),
+            ],
+        ),
+        (
+            "import condition",
+            module_of("esnext"),
+            limit,
+            conditional.clone(),
+        ),
+        (
+            "require condition",
+            module_of("commonjs"),
+            limit,
+            conditional,
+        ),
+        (
+            "ignored package",
+            module_of("esnext"),
+            ignored,
+            vec![module_manifest, declared, ("node_modules/pkg/index.js", &esm)],
+        ),
+        (
+            "native runtime entry",
+            module_of("esnext"),
+            limit,
+            vec![
+                ("node_modules/pkg/package.json", r#"{"name":"pkg","main":"build/addon.node","types":"src/index.ts"}"#),
+                ("node_modules/pkg/src/index.ts", &native_types),
+                ("node_modules/pkg/build/addon.node", "binary"),
+            ],
+        ),
+        (
+            "computed require inside a walked body",
+            module_of("esnext"),
+            limit,
+            vec![
+                ("node_modules/pkg/package.json", r#"{"name":"pkg","main":"index.js","types":"index.d.ts"}"#),
+                declared,
+                ("node_modules/pkg/index.js", &dynamic),
+            ],
+        ),
+    ];
+
+    let expectations = [
+        ("O((xs * xs^2))", false, true),
+        ("O((xs * xs^2))", false, true),
+        ("O(xs)", false, false),
+        ("O((xs * xs^2))", false, true),
+        ("O(1)", true, false),
+        ("O((xs * xs^2))", true, true),
+    ];
+
+    for ((label, tsconfig, config, package), (cost, partial, over_limit)) in
+        cases.into_iter().zip(expectations)
+    {
+        let mut files = vec![
+            ("tsconfig.json", tsconfig.as_str()),
+            ("index.ts", consumer),
+            ("olint.config.json", config),
+        ];
+
+        files.extend(package);
+
+        let directory = support::project_of(&files);
+        let (row, stderr) = reported_row_of(directory.path(), "selected");
+
+        assert!(row.starts_with(&format!("{cost} ")), "{label}: {row}");
+        assert_eq!(row.contains("[partial]"), partial, "{label}: {row}");
+        assert_eq!(
+            stderr.contains("unknown call target"),
+            partial,
+            "{label}: {stderr}"
+        );
+
+        lint_diagnostics_of(directory.path(), over_limit);
+
+        let (_, report, _) = captured(
+            Command::new(env!("CARGO_BIN_EXE_olint"))
+                .args(["--types", "syntactic", "--report", "--min", "0"])
+                .current_dir(directory.path()),
+        );
+        let (_, lint, _) = captured(
+            Command::new(env!("CARGO_BIN_EXE_olint"))
+                .args(["--types", "syntactic"])
+                .current_dir(directory.path()),
+        );
+
+        assert!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("O("))
+                .all(|line| !line.contains("node_modules/")),
+            "{label}: {report}"
+        );
+        assert!(lint.contains("1 public functions"), "{label}: {lint}");
+        assert!(!directory.path().join("executed.txt").exists(), "{label}");
+        assert!(
+            !directory
+                .path()
+                .join("node_modules/pkg/executed.txt")
+                .exists(),
+            "{label}"
+        );
+    }
+}

@@ -35,6 +35,7 @@ pub struct OutputOptions {
     pub no_emit: Option<bool>,
     pub emit_declaration_only: Option<bool>,
     pub jsx: Option<String>,
+    pub module: Option<String>,
 }
 
 impl OutputOptions {
@@ -52,7 +53,8 @@ impl OutputOptions {
             declaration,
             no_emit,
             emit_declaration_only,
-            jsx
+            jsx,
+            module
         );
     }
 }
