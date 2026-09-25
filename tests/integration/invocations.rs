@@ -263,7 +263,7 @@ fn iterators_close_on_every_abrupt_path_out_of_the_body() {
     let cases = [
         (index_of(format!("{QUADRATIC}\n{thrower}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ thrower(v); }} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {closing} for (const v of it) {{ yield v; }} }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {closing} for (const v of it) {{ await v; }} }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {closing} for (const v of it) {{ await v; }} }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ switch (v) {{ case 1: break; }} }} }}")), "O(N)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} let t = 0; for (const v of it) {{ t += v; }} return t; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} const box = {{ get bad(): number {{ throw 0; }} }}; let t = 0; for (const v of it) {{ t = box.bad; }} return t; }}")), "O(N^2)", false),
@@ -339,8 +339,8 @@ fn awaits_invoke_their_known_then_implementations() {
     let class_thenable =
         "class Thenable { then(resolve: (value: number) => void) { quadratic(xs); } }";
     let cases = [
-        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {thenable} return await (thenable as unknown as Promise<number>); }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {class_thenable} return await (new Thenable() as unknown as Promise<number>); }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {thenable} return await (thenable as unknown as Promise<number>); }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {class_thenable} return await (new Thenable() as unknown as Promise<number>); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ const box = {{ get then() {{ quadratic(xs); return undefined; }} }}; return await (box as any); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {thenable} let total = 0; for (const x of xs) total += await (thenable as unknown as Promise<number>); return total; }}")), "O(N^3)", false),
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", true),
@@ -349,13 +349,13 @@ fn awaits_invoke_their_known_then_implementations() {
     assert_selected(&cases);
 
     let controls = [
-        (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected() {{ return await producer(); }}")), "O(1)", false),
-        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(source: Promise<number>) {{ return await source; }}")), "O(1)", false),
-        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected() {{ return await Promise.resolve(1); }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected() {{ return await producer(); }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(source: Promise<number>) {{ return await source; }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected() {{ return await Promise.resolve(1); }}")), "O(1)", true),
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected(xs: number[]) {{ let total = 0; for (const x of xs) total += await producer(); return total; }}")), "O(N)", false),
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(value: number) {{ return await value; }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(rows: AsyncIterable<number>) {{ let total = 0; for await (const row of rows) total += row; return total; }}")), "O(N)", false),
-        (index_of(format!("{QUADRATIC}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", true),
     ];
 
     assert_selected(&controls);

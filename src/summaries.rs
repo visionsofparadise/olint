@@ -231,10 +231,23 @@ struct SummaryTask {
 }
 
 #[derive(Clone)]
-struct CallbackDescriptor {
-    function: FunctionId,
-    captured: Substitutions,
-    generation: u64,
+enum CallbackDescriptor {
+    Source {
+        function: FunctionId,
+        captured: Substitutions,
+        generation: u64,
+    },
+    PromiseResolve {
+        generation: u64,
+    },
+}
+
+impl CallbackDescriptor {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Source { generation, .. } | Self::PromiseResolve { generation } => *generation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -295,6 +308,8 @@ pub(crate) struct Scheduler {
     fallback_active: bool,
     active_credit: Option<FallbackCredit>,
     callbacks: Vec<CallbackDescriptor>,
+    promise_resolver: Option<usize>,
+    assimilating: HashSet<(FileId, NodeId)>,
     callback_keys: HashMap<SummaryKey, usize>,
     callback_values: HashMap<ValueId, usize>,
     local_records: HashMap<TaskId, SummaryRecord>,
@@ -339,6 +354,8 @@ impl Scheduler {
             fallback_active: false,
             active_credit: None,
             callbacks: Vec::new(),
+            promise_resolver: None,
+            assimilating: HashSet::new(),
             callback_keys: HashMap::new(),
             callback_values: HashMap::new(),
             local_records: HashMap::new(),
@@ -2868,7 +2885,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             None if self.charge_work(Event::CallbackDescriptor, 1) => {
                 let id = self.scheduler.callbacks.len();
 
-                self.scheduler.callbacks.push(CallbackDescriptor {
+                self.scheduler.callbacks.push(CallbackDescriptor::Source {
                     function: key.function,
                     captured,
                     generation: self.scheduler.generation,
@@ -3087,14 +3104,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .get(&facts.value.value)
             .copied()
         {
-            let descriptor = &self.scheduler.callbacks[id];
+            let descriptor = self.scheduler.callbacks[id].clone();
 
-            if descriptor.generation != self.scheduler.generation {
+            if descriptor.generation() != self.scheduler.generation {
                 return Reading::of_part(self.deferred_unknown(file, span, UnknownReason::Target));
             }
 
-            let function = self.function_at(descriptor.function);
-            let target = descriptor.function;
+            let (target, captured) = match descriptor {
+                CallbackDescriptor::PromiseResolve { .. } => {
+                    return match implicit {
+                        true => {
+                            Reading::of_part(self.unknown_part(file, span, UnknownReason::Target))
+                        }
+                        false => self.resolved_promise_reading_of(file, span, arguments),
+                    };
+                }
+                CallbackDescriptor::Source {
+                    function, captured, ..
+                } => (function, captured),
+            };
+            let function = self.function_at(target);
 
             let (mut part, cyclic) = if self.fallback_active() {
                 self.fallback_invocation(
@@ -3108,12 +3137,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     },
                 )
             } else {
-                let descriptor = descriptor.clone();
-                let captured = self.supplied_substitutions_of(
-                    (target.file, function),
-                    descriptor.captured,
-                    supplied,
-                );
+                let captured =
+                    self.supplied_substitutions_of((target.file, function), captured, supplied);
 
                 self.call_with_captures(
                     (target.file, function),
@@ -5488,4 +5513,194 @@ fn slots_from(
     }
 
     slots.into_iter().collect()
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn promise_settlers_of(
+        &mut self,
+        file: FileId,
+        span: oxc_span::Span,
+    ) -> [ArgumentFacts; 2] {
+        let descriptor = match self.scheduler.promise_resolver {
+            Some(descriptor) => descriptor,
+            None => {
+                let descriptor = self.scheduler.callbacks.len();
+
+                self.scheduler
+                    .callbacks
+                    .push(CallbackDescriptor::PromiseResolve {
+                        generation: self.scheduler.generation,
+                    });
+
+                self.scheduler.promise_resolver = Some(descriptor);
+
+                descriptor
+            }
+        };
+        let resolve = self.values.callback(descriptor);
+
+        self.scheduler
+            .callback_values
+            .insert(resolve.value, descriptor);
+
+        [
+            ArgumentFacts {
+                value: resolve,
+                callback: None,
+                preference: Preference::Absent,
+                definedness: Definedness::Defined,
+            },
+            ArgumentFacts {
+                value: self.values.at(self.source_span(file, span)),
+                callback: Some(Part::none()),
+                preference: Preference::Absent,
+                definedness: Definedness::Defined,
+            },
+        ]
+    }
+
+    pub(crate) fn enter_promise_assimilation(&mut self, file: FileId, node: NodeId) -> bool {
+        self.charge_work(Event::CallbackDescriptor, 1)
+            && self.scheduler.assimilating.len() < MAXIMUM_LATENT_DEPTH
+            && self.scheduler.assimilating.insert((file, node))
+    }
+
+    pub(crate) fn leave_promise_assimilation(&mut self, file: FileId, node: NodeId) {
+        self.scheduler.assimilating.remove(&(file, node));
+    }
+
+    pub(crate) fn invoke_promise_handler(
+        &mut self,
+        facts: &ArgumentFacts,
+        file: FileId,
+        span: oxc_span::Span,
+    ) -> Reading {
+        self.invoke_callback_with_facts(facts, file, span, &[], true)
+    }
+
+    pub(crate) fn invoke_callback_with_facts(
+        &mut self,
+        facts: &ArgumentFacts,
+        file: FileId,
+        span: oxc_span::Span,
+        supplied: &[ArgumentFacts],
+        assimilate_result: bool,
+    ) -> Reading {
+        let Some(descriptor) = self
+            .scheduler
+            .callback_values
+            .get(&facts.value.value)
+            .copied()
+        else {
+            return self.invoke_callback(facts, file, span, &[]);
+        };
+        let descriptor = self.scheduler.callbacks[descriptor].clone();
+
+        if descriptor.generation() != self.scheduler.generation {
+            return Reading::of_part(self.deferred_unknown(file, span, UnknownReason::Target));
+        }
+
+        let CallbackDescriptor::Source {
+            function: target,
+            mut captured,
+            ..
+        } = descriptor
+        else {
+            return Reading::of_part(self.unknown_part(file, span, UnknownReason::Target));
+        };
+        let function = self.function_at(target);
+
+        if let Some(parameters) = parameters_of(function) {
+            for (parameter, facts) in parameters.items.iter().zip(supplied) {
+                let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                    continue;
+                };
+
+                if let Some(symbol) = identifier.symbol_id.get() {
+                    captured.insert(
+                        Binding::Symbol {
+                            file: target.file,
+                            symbol,
+                        },
+                        facts.clone(),
+                    );
+                }
+            }
+        }
+
+        let (mut reading, cyclic) = if self.fallback_active() {
+            self.fallback_invocation(target, file, span, Deferral::Excluded)
+        } else {
+            self.call_with_captures(
+                (target.file, function),
+                (file, &[], span),
+                (true, Deferral::Excluded),
+                captured.clone(),
+            )
+        };
+
+        if assimilate_result
+            && !matches!(function, FunctionNode::Function(inner) if inner.r#async)
+            && !matches!(function, FunctionNode::Arrow(inner) if inner.r#async)
+        {
+            let returned = self.assimilated_returns_of(target, captured, file, span);
+
+            reading = reading.merge(returned, &mut self.unknowns, &mut self.traces);
+        }
+
+        if facts.value.targets.open {
+            let unknown = self.unknown_part(file, span, UnknownReason::Target);
+
+            reading = reading.merge(
+                Reading::of_part(unknown),
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+        }
+
+        self.called_reading_of(target.file, function, reading, cyclic)
+    }
+
+    fn assimilated_returns_of(
+        &mut self,
+        target: FunctionId,
+        captured: Substitutions,
+        file: FileId,
+        span: oxc_span::Span,
+    ) -> Reading {
+        if !self.charge_work(Event::CallbackDescriptor, 1) {
+            return Reading::of_part(self.deferred_unknown(
+                file,
+                span,
+                UnknownReason::ResourceExhaustion,
+            ));
+        }
+
+        if self.is_generator_target(target) {
+            return match self
+                .may_implement_any(&[crate::values::MemberKey::Name("then".to_string())])
+            {
+                true => Reading::of_part(self.unknown_part(file, span, UnknownReason::Target)),
+                false => Reading::empty(),
+            };
+        }
+
+        let function = self.function_at(target);
+        let substitutions =
+            self.invocation_substitutions_of((target.file, function), (file, &[]), true, captured);
+        let substitutions = self.defaulted_substitutions_of((target.file, function), substitutions);
+        let substitutions = self.function_inputs(target.file, function, substitutions);
+        let previous = std::mem::replace(&mut self.current_substitutions, substitutions);
+        let mut reading = Reading::empty();
+
+        for returned in self.returned_expressions_of(target) {
+            let assimilated = self.assimilated_reading_of(target.file, returned);
+
+            reading = reading.merge(assimilated, &mut self.unknowns, &mut self.traces);
+        }
+
+        self.current_substitutions = previous;
+
+        reading
+    }
 }

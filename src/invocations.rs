@@ -1,5 +1,5 @@
 use oxc_ast::ast::{
-    ArrayExpressionElement, AssignmentTarget, AssignmentTargetMaybeDefault,
+    Argument, ArrayExpressionElement, AssignmentTarget, AssignmentTargetMaybeDefault,
     AssignmentTargetProperty, BindingPattern, Class, Expression, ForOfStatement, FormalParameter,
     JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElementName, JSXExpression,
     JSXExpressionContainer, JSXMemberExpression, JSXMemberExpressionObject, JSXOpeningElement,
@@ -14,7 +14,7 @@ use oxc_syntax::scope::ScopeId;
 
 use crate::analysis::Analysis;
 use crate::constants::constant_initializer_of;
-use crate::cost::{Cost, Part, Preference, Reading};
+use crate::cost::{Cost, ExecutionPhase, Part, Preference, Reading};
 use crate::declarations::{Declaration, FunctionId, FunctionNode, TargetSet};
 use crate::declared_types::{is_primitive_result, Kind};
 use crate::project::{has_key_after_spread, FileId, JsxRuntime, Project};
@@ -749,14 +749,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let Some(operand) = awaited_operand_of(kind) {
-            let targets = self.awaited_targets_of(file, operand);
-
-            parts.push(self.implicit_call_reading_of(
-                (file, kind.span()),
-                &targets,
-                "await",
-                &[operand],
-            ));
+            parts.push(self.assimilated_reading_of(file, operand));
         }
 
         if matches!(
@@ -938,6 +931,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let operand = unwrap(operand);
+
+        if let Expression::AwaitExpression(awaited) = operand {
+            return self.is_primitive_operand(file, &awaited.argument);
+        }
 
         if is_primitive_result(operand) {
             return true;
@@ -2390,5 +2387,140 @@ fn accessed_object_of<'a>(kind: AstKind<'a>) -> Option<&'a Expression<'a>> {
         AstKind::ComputedMemberExpression(member) => Some(&member.object),
         AstKind::PrivateFieldExpression(member) => Some(&member.object),
         _ => None,
+    }
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn resolved_promise_reading_of(
+        &mut self,
+        file: FileId,
+        span: Span,
+        arguments: &'a [Argument<'a>],
+    ) -> Reading {
+        match arguments.first() {
+            None => Reading::empty(),
+            Some(argument) => match argument.as_expression() {
+                Some(expression) => self.assimilated_reading_of(file, expression),
+                None => Reading::of_part(self.unknown_part(file, span, UnknownReason::Target)),
+            },
+        }
+    }
+
+    pub(crate) fn assimilated_reading_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Reading {
+        if self.is_primitive_operand(file, expression) {
+            return Reading::empty();
+        }
+
+        let key = MemberKey::Name("then".to_string());
+        let accessors = self.property_accessors_of((file, expression), key.clone(), false);
+
+        if self.is_intrinsic_promise(file, expression) {
+            let replacement =
+                self.protocol_targets_of(file, expression, std::slice::from_ref(&key));
+
+            if replacement.known.is_empty()
+                && !replacement.open
+                && accessors.known.is_empty()
+                && !accessors.open
+            {
+                return Reading::empty();
+            }
+        }
+
+        if !self.enter_promise_assimilation(file, expression.node_id()) {
+            return Reading::of_part(self.unknown_part(
+                file,
+                expression.span(),
+                UnknownReason::ResourceExhaustion,
+            ));
+        }
+
+        let getter = self.implicit_call_reading_of(
+            (file, expression.span()),
+            &accessors,
+            "promise then getter",
+            &[expression],
+        );
+        let mut reading = getter;
+        let (values, open) = self.property_values_of((file, expression), &key);
+        let targets = self.protocol_targets_of(file, expression, std::slice::from_ref(&key));
+        let settlers = self.promise_settlers_of(file, expression.span());
+        let mut callbacks = Vec::new();
+
+        for (source, value) in values {
+            if self.is_primitive_operand(source, value)
+                || self.is_non_callable_expression(source, value)
+                || matches!(
+                    unwrap(value),
+                    Expression::ObjectExpression(_) | Expression::ArrayExpression(_)
+                )
+            {
+                continue;
+            }
+
+            let facts = self.expression_facts_of(source, value.span(), Some(value));
+
+            callbacks.push(facts);
+        }
+
+        for target in &targets.known {
+            if accessors.known.contains(target)
+                || callbacks
+                    .iter()
+                    .any(|facts| facts.value.targets.known.contains(target))
+            {
+                continue;
+            }
+
+            let function = self.function_at(*target);
+            let value = self.values.at(self.source_span(file, expression.span()));
+            let facts = self.callback_facts_of(
+                (file, expression.span()),
+                value,
+                (target.file, function),
+                false,
+            );
+
+            callbacks.push(facts);
+        }
+
+        for facts in callbacks {
+            let invoked =
+                self.invoke_callback_with_facts(&facts, file, expression.span(), &settlers, false);
+            let invoked = invoked.in_phase(
+                ExecutionPhase::Scheduled,
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+
+            reading = reading.merge(invoked, &mut self.unknowns, &mut self.traces);
+        }
+
+        let builtin = !matches!(
+            self.proven_kind(file, expression),
+            Kind::Unknown | Kind::Other
+        );
+
+        if targets.open || (open && !builtin) {
+            let unknown = self.unknown_part(file, expression.span(), UnknownReason::Target);
+
+            reading = reading.merge(
+                Reading::of_part(unknown).in_phase(
+                    ExecutionPhase::Scheduled,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                ),
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+        }
+
+        self.leave_promise_assimilation(file, expression.node_id());
+
+        reading
     }
 }

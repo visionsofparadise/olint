@@ -160,7 +160,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 self.cost_of_node(file, kind)
             }
-            Some(Root::Expression(expression)) => self.cost_of_expression(file, expression),
+            Some(Root::Expression(expression)) => {
+                let reading = self.cost_of_expression(file, expression);
+
+                if matches!(function, FunctionNode::Arrow(arrow) if arrow.r#async) {
+                    let returned = self.assimilated_reading_of(file, expression);
+
+                    reading.merge(returned, &mut self.unknowns, &mut self.traces)
+                } else {
+                    reading
+                }
+            }
             _ => Reading::empty(),
         }
     }
@@ -647,6 +657,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 let implicit = self.implicit_reading_of(file, kind);
 
+                if let AstKind::YieldExpression(yielded) = kind {
+                    if !yielded.delegate && self.is_async_context(file, yielded.node_id(), true) {
+                        if let Some(argument) = &yielded.argument {
+                            let returned = self.async_generator_resolution_of(file, argument);
+
+                            reading = reading.merge(returned, &mut self.unknowns, &mut self.traces);
+                        }
+                    }
+                }
+
                 reading.merge(implicit, &mut self.unknowns, &mut self.traces)
             }
         }
@@ -665,7 +685,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let asynchronous = statements
             .first()
-            .is_some_and(|statement| self.is_async_context(file, statement.node_id()));
+            .is_some_and(|statement| self.is_async_context(file, statement.node_id(), false));
         let mut suspended = None;
 
         for statement in statements {
@@ -799,18 +819,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .unwrap_or(false)
     }
 
-    fn is_async_context(&self, file: FileId, node: NodeId) -> bool {
+    fn is_async_context(&self, file: FileId, node: NodeId, generator: bool) -> bool {
         self.project
             .file(file)
             .semantic
             .nodes()
             .ancestors(node)
             .find_map(|ancestor| match ancestor.kind() {
-                AstKind::Function(function) => Some(function.r#async && !function.generator),
-                AstKind::ArrowFunctionExpression(arrow) => Some(arrow.r#async),
+                AstKind::Function(function) => {
+                    Some(function.r#async && function.generator == generator)
+                }
+                AstKind::ArrowFunctionExpression(arrow) => Some(arrow.r#async && !generator),
                 _ => None,
             })
             .unwrap_or(false)
+    }
+
+    fn async_generator_resolution_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Reading {
+        let reading = self.assimilated_reading_of(file, expression);
+
+        if self.is_primitive_operand(file, expression) {
+            return reading;
+        }
+
+        let unknown = self.unknown_part(file, expression.span(), UnknownReason::UnsupportedModel);
+
+        reading.merge(
+            Reading::of_part(unknown),
+            &mut self.unknowns,
+            &mut self.traces,
+        )
     }
 
     fn sibling_of(&mut self, file: FileId, kind: AstKind<'a>, reading: Reading) -> Reading {
@@ -1397,8 +1439,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             assumed_bound || !invalidation.bound,
         ));
 
-        let suspends =
-            self.is_async_context(file, body.node_id()) && self.suspends(file, body.node_id());
+        let suspends = self.is_async_context(file, body.node_id(), false)
+            && self.suspends(file, body.node_id());
         let body_raw =
             self.cost_of_statement(file, body)
                 .merge(visit, &mut self.unknowns, &mut self.traces);
@@ -1651,7 +1693,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
         completion: Completion,
     ) -> Reading {
         let inner = match argument {
-            Some(argument) => self.cost_of_expression(file, argument),
+            Some(argument) => {
+                let reading = self.cost_of_expression(file, argument);
+
+                if completion == Completion::Return && self.is_async_context(file, node, false) {
+                    let returned = self.assimilated_reading_of(file, argument);
+
+                    reading.merge(returned, &mut self.unknowns, &mut self.traces)
+                } else if completion == Completion::Return
+                    && self.is_async_context(file, node, true)
+                {
+                    let returned = self.async_generator_resolution_of(file, argument);
+
+                    reading.merge(returned, &mut self.unknowns, &mut self.traces)
+                } else {
+                    reading
+                }
+            }
             None => Reading::empty(),
         };
         let project = self.project;

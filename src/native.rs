@@ -812,7 +812,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for (index, argument) in site.arguments.iter().enumerate() {
             let role = site.role_of(model, index);
-            let (part, count) = self.argument_part_of(site, argument, role);
+            let (part, count) =
+                self.argument_part_of(site, argument, role, model.identity == Identity::Promise);
             let count = match (role, model.arguments.first(), site.expression_at(0)) {
                 (Role::Callback(_), Some(Role::Pattern(_)), Some(pattern))
                     if self.is_matched_once_pattern(pattern) =>
@@ -1125,6 +1126,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site: &NativeSite<'a>,
         argument: &'a Argument<'a>,
         role: Role,
+        promise_handler: bool,
     ) -> (Reading, Count) {
         let file = site.file;
         let Some(expression) = argument.as_expression() else {
@@ -1164,7 +1166,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
 
                 let facts = self.argument_facts_of(file, argument);
-                let part = self.invoke_callback(&facts, file, argument.span(), &[]);
+                let part = match promise_handler {
+                    true => self.invoke_promise_handler(&facts, file, argument.span()),
+                    false => self.invoke_callback(&facts, file, argument.span(), &[]),
+                };
                 let count = match count {
                     Count::PerMatch => match site.expression_at(0) {
                         Some(pattern) => match global_flag_of(pattern) {
@@ -1445,7 +1450,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let facts = self.argument_facts_of(file, argument);
 
-        self.invoke_callback(&facts, file, argument.span(), &[Part::none(), Part::none()])
+        let settlers = self.promise_settlers_of(file, argument.span());
+
+        self.invoke_callback_with_facts(&facts, file, argument.span(), &settlers, false)
     }
 
     fn forwarded_part_of(&mut self, site: &NativeSite<'a>) -> Reading {

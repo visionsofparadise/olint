@@ -319,7 +319,7 @@ fn awaited_values_alias_their_operand() {
         assert_eq!(legacy_cost_of(source, "f"), cost("O(N^2)"), "{source}");
     }
 
-    let control = "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total = ys.length; for (let i = 0; i < n; i++) { for (const x of xs) total += x; } return total; }";
+    let control = "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total: number = ys.length; for (let i = 0; i < n; i++) { for (const x of xs) total += x; } return total; }";
 
     assert_eq!(result_of(control, "f"), (cost("O(N)"), true));
 }

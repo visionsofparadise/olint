@@ -1045,7 +1045,10 @@ fn async_continuations_after_an_await_are_scheduled() {
     let (cost, reasons) = selected_result(&format!("{LAZY_HELPERS}\nasync function work(xs: number[]) {{ await 0; return quadratic(xs); }}\nexport async function selected(xs: number[]) {{ return await work(xs); }}"));
 
     assert_eq!(cost, Cost::parse("O(N^2)").unwrap(), "{reasons:?}");
-    assert!(reasons.is_empty(), "{reasons:?}");
+    assert_eq!(
+        reasons,
+        std::collections::BTreeSet::from([olint::unknowns::UnknownReason::Target])
+    );
 }
 
 #[test]

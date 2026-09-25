@@ -963,6 +963,36 @@ fn scheduled_labels_of(labels: &[String]) -> usize {
         .count()
 }
 
+fn assert_phase_costs(source: &str, immediate: &str, scheduled: &str) {
+    support::run_with_source(source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "selected");
+        let reading = analysis.summarize(file, function);
+
+        for (phase, expected) in [
+            (ExecutionPhase::Immediate, immediate),
+            (ExecutionPhase::Scheduled, scheduled),
+        ] {
+            let costs: Vec<_> = reading
+                .completions
+                .iter()
+                .filter(|channel| channel.0 == phase)
+                .map(|channel| channel.2.cost.clone())
+                .collect();
+            let cost = if costs.is_empty() {
+                Cost::ONE
+            } else {
+                Cost::maximum(costs).unwrap()
+            };
+
+            assert_eq!(
+                support::legacy_class_of(analysis, file, function, &cost),
+                Cost::parse(expected).unwrap(),
+                "{phase:?}: {source}: {reading:?}"
+            );
+        }
+    });
+}
+
 #[test]
 fn scheduled_channels_survive_calls_callbacks_loops_and_returns() {
     let cases = [
@@ -990,33 +1020,7 @@ fn scheduled_channels_survive_calls_callbacks_loops_and_returns() {
     for (body, helper, immediate, scheduled) in cases {
         let source = format!("{HELPERS}\n{helper}\nexport function selected(xs: number[], p: Promise<number>) {{ {body} }}");
 
-        support::run_with_source(&source, |analysis, file| {
-            let function = support::function_of_name(analysis.project, file, "selected");
-            let reading = analysis.summarize(file, function);
-
-            for (phase, expected) in [
-                (ExecutionPhase::Immediate, immediate),
-                (ExecutionPhase::Scheduled, scheduled),
-            ] {
-                let costs: Vec<_> = reading
-                    .completions
-                    .iter()
-                    .filter(|channel| channel.0 == phase)
-                    .map(|channel| channel.2.cost.clone())
-                    .collect();
-                let cost = if costs.is_empty() {
-                    Cost::ONE
-                } else {
-                    Cost::maximum(costs).unwrap()
-                };
-
-                assert_eq!(
-                    support::legacy_class_of(analysis, file, function, &cost),
-                    Cost::parse(expected).unwrap(),
-                    "{phase:?}: {body}: {reading:?}"
-                );
-            }
-        });
+        assert_phase_costs(&source, immediate, scheduled);
     }
 }
 
@@ -1116,7 +1120,7 @@ fn an_awaited_continuation_is_attributed_once() {
             support::legacy_class_of(analysis, file, function, &part.cost),
             Cost::parse("O(N^2)").unwrap()
         );
-        assert!(part.is_complete(), "{labels:?}");
+        assert!(!part.is_complete(), "{labels:?}");
         assert_eq!(scheduled_labels_of(&labels), 1, "{labels:?}");
     });
 }
@@ -1195,4 +1199,110 @@ fn generator_resumption_and_iterated_consumers_charge_lazy_work() {
             true,
         ),
     ]);
+}
+
+#[test]
+fn promise_resolution_retains_known_thenable_work() {
+    assert_selected(&[
+        ("", "(xs: number[]) { class Thenable { then(done) { cube(xs); done(1); } } return new Promise(resolve => resolve(new Thenable())); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => { const done = resolve; done({ then(settle) { cube(xs); settle(1); } }); }); }", "O(N^3)", true),
+        ("function settle(done, xs) { done({ then(resolve) { cube(xs); resolve(1); } }); }", "(xs: number[]) { return new Promise(resolve => settle(resolve, xs)); }", "O(N^3)", true),
+        ("function settle(done, value) { done(value); }", "(xs: number[]) { cube(xs); return new Promise(resolve => settle(resolve, { then(done) { cube(xs); done(1); } })); }", "O(N^3)", false),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve(1)).then(() => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise((resolve, reject) => reject(1)).catch(() => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve(1)).finally(() => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve({ get then() { quadratic(xs); return done => { cube(xs); done(1); }; } })); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve({ get then() { quadratic(xs); return 1; } })); }", "O(N^2)", true),
+        ("", "(xs: number[]) { return new Promise((resolve, reject) => reject({ then(done) { cube(xs); done(1); } })); }", "O(1)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve({ then: 1 })); }", "O(1)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve({ then: {} })); }", "O(1)", true),
+    ]);
+}
+
+#[test]
+fn promise_resolution_keeps_unknown_chains_partial() {
+    for body in [
+        "(xs: number[], value: { then(done): void }) { cube(xs); return new Promise(resolve => resolve(value)); }",
+        "(xs: number[], value: { then(done): void }) { return new Promise(resolve => resolve(1)).then(() => { cube(xs); return value; }); }",
+        "(xs: number[]) { const value = { then(done) { cube(xs); done(value); } }; return new Promise(resolve => resolve(value)); }",
+    ] {
+        let (cost, complete, reasons) = selected_of("", body);
+
+        assert_eq!(cost, Cost::parse("O(N^3)").unwrap(), "{body}: {reasons:?}");
+        assert!(!complete, "{body}: {reasons:?}");
+    }
+}
+
+#[test]
+fn promise_async_returns_assimilate_known_thenables() {
+    assert_selected(&[
+        ("async function run(xs) { await { then(done) { done({ then(settle) { cube(xs); settle(1); } }); } }; }", "(xs: number[]) { return run(xs); }", "O(N^3)", true),
+        ("async function run(xs) { quadratic(xs); return 1; }", "(xs: number[]) { return run(xs); }", "O(N^2)", true),
+        ("async function run(xs) { return new Promise(resolve => { quadratic(xs); resolve(1); }); }", "(xs: number[]) { return run(xs); }", "O(N^2)", true),
+        ("async function run(xs) { return { then(done) { cube(xs); done(1); } }; }", "(xs: number[]) { return run(xs); }", "O(N^3)", true),
+        ("async function run(xs) { await 0; return { then(done) { cube(xs); done(1); } }; }", "(xs: number[]) { return run(xs); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve(1)).then(async () => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Promise(resolve => resolve({ work() { cube(xs); }, then(done) { this.work(); done(1); } })); }", "O(N^3)", false),
+        ("function settle(done) { this.work(); done(1); }", "(xs: number[]) { cube(xs); return new Promise(resolve => resolve({ work() { cube(xs); }, then: settle })); }", "O(N^3)", false),
+    ]);
+}
+
+#[test]
+fn promise_getters_and_then_bodies_keep_their_execution_phases() {
+    for (body, immediate, scheduled) in [
+        ("(xs: number[]) { const p = new Promise(resolve => resolve(1)); Object.defineProperty(p, 'then', { get() { cube(xs); return 1; } }); return new Promise(resolve => resolve(p)); }", "O(N^3)", "O(1)"),
+        ("(xs: number[]) { const p = new Promise(resolve => resolve(1)); Object.defineProperty(p, 'then', { get() { quadratic(xs); return done => { cube(xs); done(1); }; } }); return new Promise(resolve => resolve(p)); }", "O(N^2)", "O(N^3)"),
+        ("(xs: number[]) { return new Promise(resolve => resolve({ get then() { quadratic(xs); return 1; } })); }", "O(N^2)", "O(1)"),
+        ("(xs: number[]) { return new Promise(resolve => resolve({ get then() { quadratic(xs); return done => { cube(xs); done(1); }; } })); }", "O(N^2)", "O(N^3)"),
+        ("(xs: number[]) { return new Promise(resolve => resolve(1)).then(() => ({ get then() { quadratic(xs); return done => { cube(xs); done(1); }; } })); }", "O(1)", "O(N^3)"),
+        ("(xs: number[]) { async function run() { return { get then() { quadratic(xs); return done => { cube(xs); done(1); }; } }; } return run(); }", "O(N^2)", "O(N^3)"),
+        ("(xs: number[]) { async function run() { await 0; return { get then() { quadratic(xs); return done => { cube(xs); done(1); }; } }; } return run(); }", "O(1)", "O(N^3)"),
+        ("(xs: number[]) { async function run() { await { get then() { quadratic(xs); return done => { cube(xs); done(1); }; } }; } return run(); }", "O(N^2)", "O(N^3)"),
+    ] {
+        let source = format!("{HELPERS}\nexport function selected{body}");
+
+        assert_phase_costs(&source, immediate, scheduled);
+    }
+}
+
+#[test]
+fn promise_settlers_refresh_between_analysis_generations() {
+    let source = format!("{HELPERS}\nexport function selected(xs: number[]) {{ return new Promise(resolve => resolve({{ then(done) {{ cube(xs); done(1); }} }})); }}");
+
+    support::run_with_source(&source, |analysis, file| {
+        for _ in 0..2 {
+            let function = support::function_of_name(analysis.project, file, "selected");
+            let part = support::summary_of(analysis, file, "selected");
+
+            assert_eq!(
+                support::legacy_class_of(analysis, file, function, &part.cost),
+                Cost::parse("O(N^3)").unwrap()
+            );
+            assert!(part.is_complete());
+            analysis.reset_between_passes();
+        }
+    });
+}
+
+#[test]
+fn promise_async_generator_results_retain_known_work_with_protocol_uncertainty() {
+    for completion in ["yield", "return"] {
+        let declarations = format!("async function* produce(xs) {{ {completion} {{ then(done) {{ cube(xs); done(1); }} }}; }} async function run(xs) {{ for await (const value of produce(xs)) void value; }}");
+
+        assert_selected(&[
+            (
+                &declarations,
+                "(xs: number[]) { return run(xs); }",
+                "O(N^3)",
+                false,
+            ),
+            (
+                &declarations,
+                "(xs: number[]) { const iterator = produce(xs); }",
+                "O(1)",
+                true,
+            ),
+        ]);
+    }
 }
