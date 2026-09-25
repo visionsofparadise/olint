@@ -187,6 +187,7 @@ fn resource_fallback_keeps_observed_scheduled_and_joined_latent_work() {
         yields: Some(Cost::ONE),
         effects: Effects::default(),
         record: None,
+        storage: crate::effects::Storage::default(),
         deferred: Some(Reading::of_completion(
             phase,
             Completion::Return,

@@ -56,7 +56,7 @@ pub(crate) struct BudgetStorage {
     exhausted: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Storage {
     bindings: Vec<Binding>,
     values: Vec<(ValueId, Option<Binding>)>,
@@ -64,10 +64,56 @@ pub(crate) struct Storage {
     calls: bool,
 }
 
+impl Storage {
+    pub(crate) fn weight(&self) -> u64 {
+        (self.bindings.len() + self.values.len() + 1) as u64
+    }
+
+    pub(crate) fn unresolved() -> Self {
+        Self {
+            unresolved: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn joined(mut self, other: Self) -> Self {
+        self.extend(other);
+        self.bindings.sort_by_key(|binding| match binding {
+            Binding::Symbol { file, symbol } => (file.0, symbol.index()),
+        });
+        self.bindings.dedup();
+        self.values.sort_by_key(|(value, holder)| {
+            (
+                *value,
+                holder.map(|binding| match binding {
+                    Binding::Symbol { file, symbol } => (file.0, symbol.index()),
+                }),
+            )
+        });
+        self.values.dedup();
+
+        self
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.bindings.extend(other.bindings);
+        self.values.extend(other.values);
+
+        self.unresolved |= other.unresolved;
+        self.calls |= other.calls;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Writes {
     All,
     Qualified,
+}
+
+#[derive(Default)]
+struct Scheduling {
+    active: std::collections::HashSet<FunctionId>,
+    cycles: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +320,27 @@ impl Storage {
 }
 
 impl Effects {
+    pub(crate) fn canonicalize(&mut self) {
+        self.binding_writes.sort_by_key(|binding| match binding {
+            Binding::Symbol { file, symbol } => (file.0, symbol.index()),
+        });
+        self.binding_writes.dedup();
+        self.member_writes.sort();
+        self.member_writes.dedup();
+        self.escapes.sort();
+        self.escapes.dedup();
+        self.unknown_reachable.sort();
+        self.unknown_reachable.dedup();
+    }
+
+    pub(crate) fn weight(&self) -> u64 {
+        (self.binding_writes.len()
+            + self.member_writes.len()
+            + self.unknown_reachable.len()
+            + self.escapes.len()
+            + 1) as u64
+    }
+
     pub fn unknown() -> Self {
         Self {
             unknown_global: true,
@@ -791,6 +858,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         invalidation.bound |= header.unknown_global || !header.unknown_reachable.is_empty();
 
+        let pending = self.pending_invalidation_of(file, loop_kind);
+        invalidation.bound |= pending.bound;
+        invalidation.budget |= pending.budget;
+
         invalidation
     }
 
@@ -799,7 +870,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         statement: &'a ForOfStatement<'a>,
     ) -> Option<Visits> {
-        if statement.r#await || !matches!(unwrap(&statement.right), Expression::Identifier(_)) {
+        if !matches!(unwrap(&statement.right), Expression::Identifier(_)) {
             return None;
         }
 
@@ -810,11 +881,658 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        if self
+            .pending_invalidation_of(file, AstKind::ForOfStatement(statement))
+            .bound
+        {
+            return Some(Visits::Unresolved);
+        }
+
+        if statement.r#await {
+            return None;
+        }
+
         Some(self.live_visits_of(
             file,
             &statement.right,
             &[(file, Root::Statement(&statement.body))],
         ))
+    }
+
+    fn pending_invalidation_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Invalidation {
+        let owner = self.enclosing_function_of(file, loop_kind.node_id());
+        let asynchronous =
+            owner.is_some_and(|node| match self.function_at(FunctionId { file, node }) {
+                crate::declarations::FunctionNode::Function(function) => function.r#async,
+                crate::declarations::FunctionNode::Arrow(arrow) => arrow.r#async,
+                crate::declarations::FunctionNode::Construction(_) => false,
+            });
+        let awaiting = matches!(loop_kind, AstKind::ForOfStatement(statement) if statement.r#await);
+
+        if !awaiting && !asynchronous {
+            return Invalidation::default();
+        }
+
+        if !awaiting && !self.suspends(file, loop_kind.node_id()) {
+            let generator = owner.is_some_and(|node| matches!(self.function_at(FunctionId { file, node }), crate::declarations::FunctionNode::Function(function) if function.r#async && function.generator));
+            let yielding = generator
+                && loop_body_of(loop_kind).is_some_and(|body| {
+                    self.counted_subtree(file, Root::Statement(body), Event::EffectPrepassNode)
+                        .into_iter()
+                        .any(|kind| matches!(kind, AstKind::YieldExpression(_)))
+                        || self.work_exhausted()
+                });
+
+            if !yielding {
+                return Invalidation::default();
+            }
+        }
+
+        let Some(owner) = owner else {
+            return Invalidation {
+                bound: true,
+                budget: true,
+            };
+        };
+        let mut effects = self.interference.clone();
+
+        for (_, pending) in self.pending_effects_of(FunctionId { file, node: owner }) {
+            if !self.charge_work(
+                Event::EffectPrepassNode,
+                pending.weight().saturating_mul(effects.weight()),
+            ) {
+                return Invalidation {
+                    bound: true,
+                    budget: true,
+                };
+            }
+
+            effects.join(&pending);
+        }
+
+        if self.work_exhausted() || effects.unknown_global {
+            return Invalidation {
+                bound: true,
+                budget: true,
+            };
+        }
+
+        if effects.binding_writes.is_empty()
+            && effects.member_writes.is_empty()
+            && effects.unknown_reachable.is_empty()
+        {
+            return Invalidation::default();
+        }
+
+        let header = match loop_kind {
+            AstKind::ForOfStatement(statement) => match self.latent_of(file, &statement.right) {
+                Some(latent) => latent.storage,
+                None => self.header_storage_of(file, loop_kind, false),
+            },
+            _ => self.header_storage_of(file, loop_kind, false),
+        };
+        let mut header = self.interference_storage_of(header);
+
+        header.bindings.retain(|binding| {
+            effects.binding_writes.contains(binding) || !effects.unknown_reachable.is_empty()
+        });
+
+        let bound = self.affects(file, Some(owner), &effects, &header, None);
+        let budget = self
+            .budget_storage_of(file, loop_kind.node_id())
+            .is_some_and(|storage| {
+                let storage = self.interference_storage_of(storage);
+
+                self.affects(file, Some(owner), &effects, &storage, None)
+            });
+
+        if self.work_exhausted() || header.unresolved {
+            return Invalidation {
+                bound: true,
+                budget: true,
+            };
+        }
+
+        Invalidation { bound, budget }
+    }
+
+    pub(crate) fn generator_storage_of(
+        &mut self,
+        file: FileId,
+        function: crate::declarations::FunctionNode<'a>,
+    ) -> Storage {
+        let Some(root) = body_root_of(function) else {
+            return Storage::unresolved();
+        };
+        let kinds = self.counted_subtree(file, root, Event::EffectPrepassNode);
+        let mut storage = Storage::default();
+
+        for kind in kinds {
+            if loop_body_of(kind).is_some() {
+                storage.extend(self.header_storage_of(file, kind, false));
+            }
+
+            if let AstKind::YieldExpression(yielded) = kind {
+                if yielded.delegate {
+                    if let Some(argument) = &yielded.argument {
+                        let delegated = match self.latent_of(file, argument) {
+                            Some(latent) => latent.storage,
+                            None => {
+                                let mut found = Storage::default();
+
+                                self.collect_storage(file, argument.node_id(), &mut found);
+                                self.collect_value(file, argument, &mut found);
+
+                                found
+                            }
+                        };
+
+                        storage.extend(delegated);
+                    }
+                }
+            }
+        }
+
+        storage = self.interference_storage_of(storage);
+        let size = storage.weight();
+
+        if !self.charge_work(
+            Event::EffectPrepassNode,
+            size.saturating_mul(u64::from(size.ilog2()) + 1),
+        ) {
+            return Storage::unresolved();
+        }
+
+        storage.unresolved |= self.work_exhausted();
+
+        storage.joined(Storage::default())
+    }
+
+    fn interference_storage_of(&mut self, mut storage: Storage) -> Storage {
+        for index in 0..self.storage_arguments.len() {
+            if !self.charge_work(Event::EffectPrepassNode, storage.weight()) {
+                storage.unresolved = true;
+
+                break;
+            }
+
+            let (binding, actual) = self.storage_arguments[index];
+
+            let Some(declared) = self.parameter_storage_of(binding) else {
+                continue;
+            };
+
+            for (value, _) in &mut storage.values {
+                if *value == declared {
+                    *value = actual;
+                }
+            }
+        }
+
+        storage
+    }
+
+    fn parameter_storage_of(&mut self, binding: Binding) -> Option<ValueId> {
+        if !self.is_parameter_unwritten(binding) {
+            return None;
+        }
+
+        let declaration = self.declarations.of_binding(self.project, binding)?;
+        let Binding::Symbol { file, .. } = binding;
+
+        Some(self.declared_value_of(declaration, file, Span::default()))
+    }
+
+    pub(crate) fn pending_enabled(&mut self) -> bool {
+        if let Some(enabled) = self.pending_enabled {
+            return enabled;
+        }
+
+        let project = self.project;
+
+        for source in &project.files {
+            for node in source.semantic.nodes().iter() {
+                if !self.charge_work(Event::EffectPrepassNode, 1) {
+                    return true;
+                }
+
+                if matches!(node.kind(), AstKind::AwaitExpression(_))
+                    || matches!(node.kind(), AstKind::ForOfStatement(statement) if statement.r#await)
+                    || matches!(node.kind(), AstKind::Function(function) if function.r#async && function.generator)
+                {
+                    self.pending_enabled = Some(true);
+
+                    return true;
+                }
+            }
+        }
+
+        self.pending_enabled = Some(false);
+
+        false
+    }
+
+    pub(crate) fn invocation_interference_of(
+        &mut self,
+        file: FileId,
+        span: oxc_span::Span,
+    ) -> Effects {
+        if self.collecting_pending || !self.pending_enabled() {
+            return Effects::default();
+        }
+
+        let mut effects = self.interference.clone();
+
+        if let Some(owner) = self.active_function_of() {
+            for (site, pending) in self.pending_effects_of(owner) {
+                if site != self.source_span(file, span) {
+                    if !self.charge_work(
+                        Event::EffectPrepassNode,
+                        pending.weight().saturating_mul(effects.weight()),
+                    ) {
+                        effects.unknown_global = true;
+
+                        break;
+                    }
+
+                    effects.join(&pending);
+                }
+            }
+        }
+
+        effects.escapes.clear();
+        effects.canonicalize();
+
+        effects
+    }
+
+    fn pending_effects_of(
+        &mut self,
+        owner: FunctionId,
+    ) -> Vec<(crate::unknowns::SourceSpan, Effects)> {
+        let unknown = vec![(
+            self.source_span(owner.file, self.kind_of_node(owner.file, owner.node).span()),
+            Effects::unknown(),
+        )];
+        let Some(key) = self.pending_effect_key_of(owner) else {
+            return unknown;
+        };
+
+        if let Some(found) = self.pending_effects.get(&key) {
+            return found.clone().unwrap_or(unknown);
+        }
+
+        self.pending_effects.insert(key.clone(), None);
+
+        let Some(root) = body_root_of(self.function_at(owner)) else {
+            self.pending_effects.remove(&key);
+
+            return unknown;
+        };
+        let kinds = self.counted_subtree(owner.file, root, Event::EffectPrepassNode);
+        let mut active = Scheduling::default();
+        let mut effects = Vec::new();
+
+        for kind in kinds {
+            let schedules = self.kind_may_schedule(owner.file, kind, &mut active);
+
+            if schedules {
+                let saved = std::mem::take(&mut self.current_effects);
+                let collecting = std::mem::replace(&mut self.collecting_pending, true);
+
+                self.prepass_effects_of(owner.file, vec![kind], Prepass::Traversal);
+                self.record_pending_latent_effects(owner.file, kind);
+
+                self.collecting_pending = collecting;
+                let mut pending = std::mem::replace(&mut self.current_effects, saved);
+
+                for index in 0..self.storage_arguments.len() {
+                    if !self.charge_work(Event::EffectPrepassNode, pending.weight()) {
+                        pending.unknown_global = true;
+
+                        break;
+                    }
+
+                    let (binding, actual) = self.storage_arguments[index];
+
+                    let Some(declared) = self.parameter_storage_of(binding) else {
+                        continue;
+                    };
+
+                    pending.substitute(declared, actual);
+                }
+
+                if pending != Effects::default() {
+                    effects.push((self.source_span(owner.file, kind.span()), pending));
+                }
+            }
+
+            if self.work_exhausted() {
+                self.pending_effects.remove(&key);
+                effects.extend(unknown);
+
+                return effects;
+            }
+        }
+
+        self.pending_effects.insert(key, Some(effects.clone()));
+
+        effects
+    }
+    fn record_pending_latent_effects(&mut self, file: FileId, kind: AstKind<'a>) {
+        let mut consumed = Vec::new();
+
+        match kind {
+            AstKind::ForOfStatement(statement) => consumed.push(&statement.right),
+            AstKind::SpreadElement(spread) => consumed.push(&spread.argument),
+            AstKind::CallExpression(call) => {
+                if let Some((site, model)) = self.modelled_call_of(file, call) {
+                    if model.receiver == crate::native::Role::Iterated {
+                        consumed.extend(site.receiver);
+                    }
+
+                    for (index, argument) in site.arguments.iter().enumerate() {
+                        if model.arguments.get(index).copied().unwrap_or(model.rest)
+                            == crate::native::Role::Iterated
+                        {
+                            consumed.extend(argument.as_expression());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for expression in consumed {
+            if let Some(latent) = self.latent_of(file, expression) {
+                if !self.charge_work(
+                    Event::EffectPrepassNode,
+                    latent
+                        .effects
+                        .weight()
+                        .saturating_mul(self.current_effects.weight()),
+                ) {
+                    self.current_effects.unknown_global = true;
+
+                    return;
+                }
+
+                self.current_effects.join(&latent.effects);
+            }
+        }
+    }
+
+    fn kind_may_schedule(
+        &mut self,
+        file: FileId,
+        kind: AstKind<'a>,
+        active: &mut Scheduling,
+    ) -> bool {
+        match kind {
+            AstKind::CallExpression(call) => self.call_may_schedule(file, call, active),
+            AstKind::NewExpression(new) => {
+                if let Expression::Identifier(reference) = unwrap(&new.callee) {
+                    if matches!(
+                        reference.name.as_str(),
+                        "Set" | "Map" | "WeakSet" | "WeakMap"
+                    ) && self.is_intrinsic_reference(file, reference)
+                    {
+                        if self.intrinsic_replaced_of(file, &new.callee)
+                            || self.may_implement_any(&[crate::values::MemberKey::Name(
+                                if reference.name.as_str().contains("Map") {
+                                    "set"
+                                } else {
+                                    "add"
+                                }
+                                .to_string(),
+                            )])
+                        {
+                            return true;
+                        }
+
+                        return new.arguments.first().is_some_and(|argument| {
+                            match argument.as_expression() {
+                                Some(expression) => {
+                                    self.iteration_may_schedule(file, expression, false, active)
+                                }
+                                None => true,
+                            }
+                        });
+                    }
+                }
+
+                let Some(model) = self.construction_model_of(file, new) else {
+                    let construction = self.construction_of(file, &new.callee);
+
+                    return construction.targets.open || !construction.targets.known.is_empty()
+                        || construction.implicit.into_iter().any(|(_, class)| {
+                            !self.charge_work(Event::EffectPrepassNode, class.body.body.len() as u64)
+                                || class.heritage.is_some() || crate::flow::class_phases_of(class).decorated.is_some() || class.body.body.iter().any(|element| matches!(element,
+                                ClassElement::PropertyDefinition(property) if !property.r#static)
+                                || matches!(element, ClassElement::AccessorProperty(property) if !property.r#static))
+                        });
+                };
+
+                if self.intrinsic_replaced_of(file, &new.callee) {
+                    return true;
+                }
+
+                for (index, argument) in new.arguments.iter().enumerate() {
+                    let role = model.arguments.get(index).copied().unwrap_or(model.rest);
+
+                    if role.invokes() {
+                        return true;
+                    }
+
+                    let Some(expression) = argument.as_expression() else {
+                        return true;
+                    };
+
+                    if matches!(role, crate::native::Role::Iterated)
+                        && self.iteration_may_schedule(file, expression, false, active)
+                    {
+                        return true;
+                    }
+
+                    if matches!(
+                        role,
+                        crate::native::Role::Coerced
+                            | crate::native::Role::Inspected
+                            | crate::native::Role::Serialized
+                    ) {
+                        return true;
+                    }
+                }
+
+                false
+            }
+            AstKind::ForOfStatement(statement) => {
+                self.iteration_may_schedule(file, &statement.right, statement.r#await, active)
+            }
+            AstKind::SpreadElement(spread) => {
+                self.iteration_may_schedule(file, &spread.argument, false, active)
+            }
+            AstKind::TaggedTemplateExpression(_)
+            | AstKind::JSXSpreadAttribute(_)
+            | AstKind::JSXSpreadChild(_) => true,
+            _ => self.has_implicit_calls(file, kind),
+        }
+    }
+
+    fn iteration_may_schedule(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        asynchronous: bool,
+        active: &mut Scheduling,
+    ) -> bool {
+        let saved = std::mem::replace(&mut self.collecting_pending, true);
+        let latent = self.latent_of(file, value);
+        self.collecting_pending = saved;
+
+        if latent.is_some_and(|latent| self.latent_may_schedule(&latent)) {
+            return true;
+        }
+
+        let iteration = self.iteration_of(file, value, asynchronous);
+
+        [iteration.acquire, iteration.next, iteration.close]
+            .into_iter()
+            .any(|targets| {
+                targets.open
+                    || targets
+                        .known
+                        .into_iter()
+                        .any(|target| self.function_may_schedule(target, active))
+            })
+    }
+
+    fn call_may_schedule(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        active: &mut Scheduling,
+    ) -> bool {
+        if !self.charge_work(Event::EffectPrepassNode, 1) {
+            return true;
+        }
+
+        if let Some((site, model)) = self.modelled_call_of(file, call) {
+            if model.phase == crate::cost::ExecutionPhase::Scheduled {
+                return true;
+            }
+
+            for (index, argument) in site.arguments.iter().enumerate() {
+                let role = model.arguments.get(index).copied().unwrap_or(model.rest);
+
+                if !role.invokes() {
+                    if role == crate::native::Role::Iterated {
+                        if argument.as_expression().is_none_or(|expression| {
+                            self.iteration_may_schedule(file, expression, false, active)
+                        }) {
+                            return true;
+                        }
+                    } else if matches!(
+                        role,
+                        crate::native::Role::Inspected
+                            | crate::native::Role::Coerced
+                            | crate::native::Role::Serialized
+                    ) {
+                        return true;
+                    }
+
+                    continue;
+                }
+
+                let Some(expression) = argument.as_expression() else {
+                    return true;
+                };
+                let targets = self
+                    .resolved_expression_callee_of(file, expression, expression.node_id())
+                    .targets;
+
+                if targets.open || targets.known.is_empty() {
+                    return true;
+                }
+
+                for target in targets.known {
+                    if self.function_may_schedule(target, active) {
+                        return true;
+                    }
+                }
+            }
+
+            if model.receiver != crate::native::Role::Callee {
+                if model.receiver == crate::native::Role::Iterated {
+                    return site.receiver.is_none_or(|receiver| {
+                        self.iteration_may_schedule(file, receiver, false, active)
+                    });
+                }
+
+                if matches!(
+                    model.receiver,
+                    crate::native::Role::Inspected
+                        | crate::native::Role::Coerced
+                        | crate::native::Role::Serialized
+                ) {
+                    return true;
+                }
+
+                return false;
+            }
+        }
+
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        if targets.open || targets.known.is_empty() {
+            return true;
+        }
+
+        for target in targets.known {
+            if self.function_may_schedule(target, active) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn function_may_schedule(&mut self, target: FunctionId, active: &mut Scheduling) -> bool {
+        let Some(key) = self.scheduling_key_of(target) else {
+            return true;
+        };
+
+        if let Some(found) = self.scheduling.get(&key) {
+            return *found;
+        }
+
+        if active.active.contains(&target) {
+            active.cycles = active.cycles.saturating_add(1);
+
+            return false;
+        }
+
+        if active.active.len() >= 64 || !self.charge_work(Event::EffectPrepassNode, 1) {
+            return true;
+        }
+
+        let cycles = active.cycles;
+
+        active.active.insert(target);
+
+        let function = self.function_at(target);
+        let (asynchronous, generator) = match function {
+            crate::declarations::FunctionNode::Function(function) => {
+                (function.r#async, function.generator)
+            }
+            crate::declarations::FunctionNode::Arrow(arrow) => (arrow.r#async, false),
+            crate::declarations::FunctionNode::Construction(_) => (false, false),
+        };
+        let schedules = if generator {
+            false
+        } else if asynchronous {
+            true
+        } else if let Some(body) = body_root_of(function) {
+            let kinds = self.counted_subtree(target.file, body, Event::EffectPrepassNode);
+
+            kinds
+                .into_iter()
+                .any(|kind| self.kind_may_schedule(target.file, kind, active))
+                || self.work_exhausted()
+        } else {
+            true
+        };
+
+        active.active.remove(&target);
+
+        if (schedules || active.cycles == cycles || active.active.is_empty())
+            && !self.work_exhausted()
+            && self.charge_work(Event::GraphNode, 1)
+        {
+            self.scheduling.insert(key, schedules);
+        }
+
+        schedules || self.work_exhausted()
     }
 
     pub(crate) fn live_visits_of(

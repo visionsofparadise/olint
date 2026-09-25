@@ -61,6 +61,7 @@ pub struct Latent {
     pub effects: Effects,
     pub record: Option<SummaryId>,
     deferred: Option<Reading>,
+    pub(crate) storage: crate::effects::Storage,
 }
 
 impl Latent {
@@ -71,6 +72,7 @@ impl Latent {
             effects: Effects::unknown(),
             record: None,
             deferred: None,
+            storage: crate::effects::Storage::unresolved(),
         }
     }
 }
@@ -128,6 +130,7 @@ pub struct LatentKey {
     pub unknowns: crate::unknowns::SemanticKeyId,
     pub yields: Option<Cost>,
     pub channels: Vec<LatentChannelKey>,
+    pub(crate) storage: crate::effects::Storage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -156,6 +159,8 @@ pub struct ArgumentKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SummaryKey {
+    pub(crate) interference: Effects,
+    pub(crate) storage_arguments: Vec<(Binding, crate::values::ValueId)>,
     pub generation: u64,
     pub raw: bool,
     pub root_sizes: Vec<Cost>,
@@ -165,6 +170,8 @@ pub struct SummaryKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ConstructionKey {
+    interference: Effects,
+    storage_arguments: Vec<(Binding, crate::values::ValueId)>,
     class: (FileId, NodeId),
     inherited: bool,
     root_sizes: Vec<Cost>,
@@ -228,6 +235,7 @@ struct SummaryTask {
     passes: u64,
     produced: Option<Produced>,
     deferred_reading: Option<Reading>,
+    deferred_storage: Option<crate::effects::Storage>,
 }
 
 #[derive(Clone)]
@@ -235,6 +243,7 @@ enum CallbackDescriptor {
     Source {
         function: FunctionId,
         captured: Substitutions,
+        storage: Vec<(Binding, crate::values::ValueId)>,
         generation: u64,
     },
     PromiseResolve {
@@ -580,12 +589,70 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         reading
     }
+    pub(crate) fn active_function_of(&self) -> Option<FunctionId> {
+        self.scheduler
+            .active
+            .map(|task| self.scheduler.tasks[task.0].key.function)
+    }
+
+    pub(crate) fn pending_effect_key_of(&mut self, function: FunctionId) -> Option<SummaryKey> {
+        let inputs = self.current_substitutions.clone();
+        let mut key = self
+            .key_of(function.file, self.function_at(function), &inputs)
+            .ok()?;
+        key.interference = self.interference.clone();
+
+        Some(key)
+    }
+
+    pub(crate) fn scheduling_key_of(&mut self, target: FunctionId) -> Option<SummaryKey> {
+        if !self.charge_work(
+            Event::CaptureEdge,
+            (self.current_substitutions.len() + self.storage_arguments.len()) as u64,
+        ) {
+            return None;
+        }
+
+        let mut owners: HashSet<_> = self
+            .enclosing_functions_of(target.file, target.node)
+            .into_iter()
+            .map(|owner| owner.node_id())
+            .collect();
+
+        owners.insert(target.node);
+
+        let relevant = |binding: &Binding| matches!(self.declarations.of_binding(self.project,*binding),Some(Declaration::Parameter {file,function,..}) if file==target.file && owners.contains(&function.node_id()));
+        let inputs = self
+            .current_substitutions
+            .iter()
+            .filter(|(binding, _)| relevant(binding))
+            .map(|(binding, facts)| (*binding, facts.clone()))
+            .collect();
+        let storage = self
+            .storage_arguments
+            .iter()
+            .filter(|(binding, _)| relevant(binding))
+            .copied()
+            .collect();
+        let mut key = self
+            .key_of(target.file, self.function_at(target), &inputs)
+            .ok()?;
+        key.storage_arguments = storage;
+        key.interference = self.interference.clone();
+
+        Some(key)
+    }
+
     fn key_of(
         &mut self,
         file: FileId,
         function: FunctionNode<'a>,
         substitutions: &Substitutions,
     ) -> Result<SummaryKey, crate::unknowns::SemanticError> {
+        if !self.charge_work(Event::SemanticIdentity, self.storage_arguments.len() as u64) {
+            return Err(crate::unknowns::SemanticError::Resource);
+        }
+
         let mut facts: Vec<_> = substitutions
             .iter()
             .map(|(binding, facts)| {
@@ -603,16 +670,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .map(|record| {
                         let mut effects = record.effects.clone();
 
-                        effects.binding_writes.sort_by_key(|binding| match binding {
-                            Binding::Symbol { file, symbol } => (file.0, symbol.index()),
-                        });
-                        effects.binding_writes.dedup();
-                        effects.member_writes.sort();
-                        effects.member_writes.dedup();
-                        effects.escapes.sort();
-                        effects.escapes.dedup();
-                        effects.unknown_reachable.sort();
-                        effects.unknown_reachable.dedup();
+                        effects.canonicalize();
 
                         effects
                     });
@@ -622,6 +680,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .map(|record| (record.reading.clone(), record.result.size.clone()))
                 {
                     Some((reading, yields)) => {
+                        let storage = value
+                            .latent
+                            .and_then(|id| self.latent_storage.get(&id))
+                            .cloned()
+                            .unwrap_or_else(crate::effects::Storage::unresolved);
+
+                        if !self.charge_work(Event::SemanticIdentity, storage.weight()) {
+                            return Err(crate::unknowns::SemanticError::Resource);
+                        }
+
                         let work = reading.latent(&mut self.unknowns, &mut self.traces);
                         let deferred = value
                             .latent
@@ -668,6 +736,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                             })?,
                             yields,
                             channels,
+                            storage,
                         })
                     }
                     None => None,
@@ -704,6 +773,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         });
 
         Ok(SummaryKey {
+            interference: Effects::default(),
+            storage_arguments: self.storage_arguments.clone(),
             generation: self.scheduler.generation,
             raw: false,
             root_sizes: self.root_sizes.clone().unwrap_or_default(),
@@ -722,6 +793,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         mut effects: Effects,
         produced: Option<Produced>,
         deferred_reading: Option<Reading>,
+        deferred_storage: Option<crate::effects::Storage>,
     ) -> SummaryId {
         effects
             .binding_writes
@@ -748,6 +820,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(deferred) = deferred_reading {
             self.latent_readings.insert(id, deferred);
+        }
+
+        if let Some(storage) = deferred_storage {
+            self.latent_storage.insert(id, storage);
         }
 
         self.summaries.insert(key, id);
@@ -1028,7 +1104,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .plus(Event::QueuePush, 2)
             .ok()?;
         let ordinary = Charges::one(Event::TaskKey, 1)
-            .plus(Event::GraphNode, key.root_sizes.len() as u64)
+            .plus(
+                Event::GraphNode,
+                (key.root_sizes.len() + key.storage_arguments.len()) as u64
+                    + if key.interference.is_empty() {
+                        0
+                    } else {
+                        key.interference.weight()
+                    },
+            )
             .ok()?
             .plus(Event::Specialization, 1)
             .ok()?
@@ -1063,6 +1147,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             passes: 0,
             produced: None,
             deferred_reading: None,
+            deferred_storage: None,
         });
         self.scheduler.keys.insert(key, id);
 
@@ -1225,12 +1310,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let produced = self.scheduler.tasks[id.0].produced.take();
         let deferred = self.scheduler.tasks[id.0].deferred_reading.take();
-        let record = self.store_summary(key, reading, effects, produced, deferred);
+        let storage = self.scheduler.tasks[id.0].deferred_storage.take();
+        let record = self.store_summary(key, reading, effects, produced, deferred, storage);
         self.scheduler.tasks[id.0].state = TaskState::Ready(record);
 
         let task = &self.scheduler.tasks[id.0];
 
-        if task.key.substitutions.is_empty() && self.closed_function(task.key.function) {
+        if task.key.interference == Effects::default()
+            && task.key.storage_arguments.is_empty()
+            && task.key.substitutions.is_empty()
+            && self.closed_function(task.key.function)
+        {
             self.scheduler
                 .closed_ready
                 .insert((task.key.function, task.key.raw, task.root_id), id);
@@ -1290,7 +1380,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let saved_factors = std::mem::take(&mut self.enclosing_factors);
         let saved_produced = self.produced.take();
         let saved_deferred = self.deferred_reading.take();
+        let saved_deferred_storage = self.deferred_storage.take();
         let saved_scoped = std::mem::take(&mut self.pending_scoped);
+        let saved_interference =
+            std::mem::replace(&mut self.interference, key.interference.clone());
+        let saved_storage =
+            std::mem::replace(&mut self.storage_arguments, key.storage_arguments.clone());
+        let saved_collecting = std::mem::replace(&mut self.collecting_pending, false);
+        let saved_pending_effects = std::mem::take(&mut self.pending_effects);
         let saved_bounds = std::mem::take(&mut self.bound_seen);
         let saved_warnings = std::mem::take(&mut self.warnings);
         let saved_errors = std::mem::take(&mut self.errors);
@@ -1337,6 +1434,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .map(|reading| self.finish_reading(key.function.file, function, reading, &inputs));
 
         self.scheduler.tasks[id.0].deferred_reading = deferred;
+        self.scheduler.tasks[id.0].deferred_storage =
+            std::mem::replace(&mut self.deferred_storage, saved_deferred_storage);
 
         let effects = std::mem::replace(&mut self.current_effects, saved_effects);
         self.current_substitutions = saved_inputs;
@@ -1346,6 +1445,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.enclosing_factors = saved_factors;
         self.pending_scoped = saved_scoped;
         self.bound_seen = saved_bounds;
+        self.pending_effects = saved_pending_effects;
+        self.interference = saved_interference;
+        self.storage_arguments = saved_storage;
+        self.collecting_pending = saved_collecting;
         let pending = std::mem::take(&mut self.scheduler.missing);
         let exhausted = self.scheduler.exhausted;
         let warnings = std::mem::replace(&mut self.warnings, saved_warnings);
@@ -2394,6 +2497,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let body = match generator {
                 true => {
                     self.deferred_reading = Some(body.clone());
+                    self.deferred_storage = Some(self.generator_storage_of(file, function));
 
                     body.in_phase(
                         crate::cost::ExecutionPhase::Lazy,
@@ -2620,6 +2724,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         Some(ConstructionKey {
+            interference: self
+                .invocation_interference_of(class.0, self.kind_of_node(class.0, class.1).span()),
+            storage_arguments: self.storage_arguments.clone(),
             class,
             inherited,
             root_sizes: self.root_sizes.clone().unwrap_or_default(),
@@ -2888,6 +2995,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.scheduler.callbacks.push(CallbackDescriptor::Source {
                     function: key.function,
                     captured,
+                    storage: key.storage_arguments.clone(),
                     generation: self.scheduler.generation,
                 });
                 self.scheduler.callback_keys.insert(key, id);
@@ -3110,7 +3218,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return Reading::of_part(self.deferred_unknown(file, span, UnknownReason::Target));
             }
 
-            let (target, captured) = match descriptor {
+            let (target, captured, storage) = match descriptor {
                 CallbackDescriptor::PromiseResolve { .. } => {
                     return match implicit {
                         true => {
@@ -3120,10 +3228,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     };
                 }
                 CallbackDescriptor::Source {
-                    function, captured, ..
-                } => (function, captured),
+                    function,
+                    captured,
+                    storage,
+                    ..
+                } => (function, captured, storage),
             };
             let function = self.function_at(target);
+            let saved_storage = self.enter_callback_storage(storage);
 
             let (mut part, cyclic) = if self.fallback_active() {
                 self.fallback_invocation(
@@ -3161,6 +3273,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 part = part.retaining(unknown.main().unknowns, &mut self.unknowns);
             }
 
+            self.storage_arguments = saved_storage;
+
             return self.called_reading_of(target.file, function, part, cyclic);
         }
 
@@ -3172,6 +3286,33 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .clone()
                 .unwrap_or_else(|| self.unknown_part(file, span, UnknownReason::Target)),
         )
+    }
+
+    fn enter_callback_storage(
+        &mut self,
+        mut storage: Vec<(Binding, crate::values::ValueId)>,
+    ) -> Vec<(Binding, crate::values::ValueId)> {
+        let saved = std::mem::take(&mut self.storage_arguments);
+        let size = (storage.len() + saved.len()) as u64;
+
+        if size > 0
+            && !self.charge_work(
+                Event::CaptureEdge,
+                size.saturating_mul(u64::from(size.ilog2()) + 1),
+            )
+        {
+            return saved;
+        }
+
+        storage.extend(saved.iter().copied());
+        storage.sort_by_key(|(binding, _)| match binding {
+            Binding::Symbol { file, symbol } => (file.0, symbol.index()),
+        });
+        storage.dedup_by_key(|(binding, _)| *binding);
+
+        self.storage_arguments = storage;
+
+        saved
     }
 
     fn supplied_substitutions_of(
@@ -3551,6 +3692,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         };
 
+        let mut key = key;
+        key.interference = self.invocation_interference_of(call_file, span);
+        key.storage_arguments = self.storage_arguments_of(file, function, call_file, arguments);
+
         self.observe_invocation(&key, call_file, span);
 
         let (reading, cyclic) = self.request_reading(key.clone(), substitutions);
@@ -3918,6 +4063,115 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Some((found, targets.open))
     }
 
+    fn storage_arguments_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        call_file: FileId,
+        arguments: &'a [Argument<'a>],
+    ) -> Vec<(Binding, crate::values::ValueId)> {
+        if !self.pending_enabled() {
+            return Vec::new();
+        }
+
+        if !self.charge_work(Event::CaptureEdge, self.storage_arguments.len() as u64) {
+            return Vec::new();
+        }
+
+        let owners: HashSet<_> = self
+            .enclosing_functions_of(file, function.node_id())
+            .into_iter()
+            .map(|owner| owner.node_id())
+            .collect();
+        let mut found: Vec<_> = self.storage_arguments.iter().filter(|(binding, _)| {
+            matches!(self.declarations.of_binding(self.project, *binding), Some(Declaration::Parameter { file: owner, function, .. }) if owner == file && owners.contains(&function.node_id()))
+        }).copied().collect();
+        let Some(parameters) = parameters_of(function) else {
+            return found;
+        };
+
+        for (parameter, argument) in parameters.items.iter().zip(arguments) {
+            if !self.charge_work(Event::CaptureEdge, 1) {
+                break;
+            }
+
+            let (BindingPattern::BindingIdentifier(identifier), Some(expression)) =
+                (&parameter.pattern, argument.as_expression())
+            else {
+                break;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            let binding = Binding::Symbol { file, symbol };
+
+            if !self.is_parameter_unwritten(binding) {
+                continue;
+            }
+
+            if self.is_primitive_operand(call_file, expression) {
+                continue;
+            }
+
+            let mut actual = self.storage_value_of(call_file, expression);
+
+            for index in 0..self.storage_arguments.len() {
+                if !self.charge_work(Event::CaptureEdge, 1) {
+                    break;
+                }
+
+                let (source, supplied) = self.storage_arguments[index];
+
+                if !self.is_parameter_unwritten(source) {
+                    continue;
+                }
+
+                let Some(Declaration::Parameter {
+                    file: owner,
+                    parameter,
+                    ..
+                }) = self.declarations.of_binding(self.project, source)
+                else {
+                    continue;
+                };
+                let span = match parameter {
+                    crate::declarations::ParameterNode::Formal(parameter) => {
+                        parameter.pattern.span()
+                    }
+                    crate::declarations::ParameterNode::Rest(parameter) => {
+                        parameter.rest.argument.span()
+                    }
+                };
+
+                if actual == self.values.at(self.source_span(owner, span)).value {
+                    actual = supplied;
+
+                    break;
+                }
+            }
+
+            found.push((binding, actual));
+        }
+
+        let size = found.len() as u64;
+
+        if size > 0
+            && !self.charge_work(
+                Event::CaptureEdge,
+                size.saturating_mul(u64::from(size.ilog2()) + 1),
+            )
+        {
+            return Vec::new();
+        }
+
+        found.sort_by_key(|(binding, _)| match binding {
+            Binding::Symbol { file, symbol } => (file.0, symbol.index()),
+        });
+        found.dedup_by_key(|(binding, _)| *binding);
+
+        found
+    }
+
     fn substitute_parameter_values(
         &mut self,
         file: FileId,
@@ -4015,6 +4269,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         }
 
+        let interference = self.invocation_interference_of(file, span);
         let (observed, incomplete): (Vec<TaskId>, bool) = self
             .scheduler
             .active
@@ -4027,7 +4282,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .unwrap_or_default();
 
                 match observed.is_empty() {
-                    false => (observed, incomplete),
+                    false => {
+                        let mismatched = observed
+                            .iter()
+                            .any(|id| self.scheduler.tasks[id.0].key.interference != interference);
+
+                        (observed, incomplete || mismatched)
+                    }
+                    true if interference != Effects::default() => (Vec::new(), true),
                     true => (
                         self.scheduler
                             .closed_ready
@@ -4410,6 +4672,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.bound_seen.clear();
         self.pending_scoped.clear();
+        self.pending_effects.clear();
+        self.scheduling.clear();
+
+        self.interference = Effects::default();
+
+        self.storage_arguments.clear();
+
+        self.collecting_pending = false;
+        self.pending_enabled = None;
 
         self.current_effects = Effects::default();
         self.stats = Stats::default();
@@ -4505,6 +4776,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.deferred_reading = Some(self.reading_of_latent(&latent));
+        self.deferred_storage = Some(latent.storage.clone());
         self.produced = Some(Produced {
             count: latent.yields,
             yielded: true,
@@ -4553,6 +4825,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         effects.join(&latent.effects);
 
+        let size = held
+            .storage
+            .weight()
+            .saturating_add(latent.storage.weight());
+        let storage = if self.charge_work(
+            Event::LatentStep,
+            size.saturating_mul(u64::from(size.ilog2()) + 1),
+        ) {
+            held.storage.joined(latent.storage)
+        } else {
+            crate::effects::Storage::unresolved()
+        };
         let mut result = Latent {
             work: held
                 .work
@@ -4564,6 +4848,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             effects,
             record: None,
             deferred: Some(deferred.clone()),
+            storage,
         };
 
         result.record = self.store_latent_record(result.clone(), deferred, origin);
@@ -4581,6 +4866,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.latent_at(file, expression, 0)
+    }
+
+    pub(crate) fn latent_may_schedule(&mut self, latent: &Latent) -> bool {
+        !latent.work.is_complete()
+            || self
+                .reading_of_latent(latent)
+                .completions
+                .iter()
+                .any(|channel| channel.0 == crate::cost::ExecutionPhase::Scheduled)
     }
 
     fn latent_at(
@@ -4747,6 +5041,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Some(self.unresolved_latent_of(origin, UnknownReason::ResourceExhaustion));
         }
 
+        let mut key = key;
+        key.interference = self.invocation_interference_of(file, call.span);
+        key.storage_arguments =
+            self.storage_arguments_of(target.file, function, file, &call.arguments);
         let (reading, cyclic) = self.request_reading(key.clone(), substitutions);
 
         if cyclic {
@@ -4805,6 +5103,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             effects,
             record: Some(id),
             deferred: self.latent_readings.get(&id).cloned(),
+            storage: self
+                .latent_storage
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(crate::effects::Storage::unresolved),
         }
     }
 
@@ -4850,6 +5153,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         });
 
         self.latent_readings.insert(id, deferred);
+        self.latent_storage.insert(id, latent.storage);
 
         Some(id)
     }
@@ -5603,12 +5907,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let CallbackDescriptor::Source {
             function: target,
             mut captured,
+            storage,
             ..
         } = descriptor
         else {
             return Reading::of_part(self.unknown_part(file, span, UnknownReason::Target));
         };
         let function = self.function_at(target);
+
+        let saved_storage = self.enter_callback_storage(storage);
 
         if let Some(parameters) = parameters_of(function) {
             for (parameter, facts) in parameters.items.iter().zip(supplied) {
@@ -5657,6 +5964,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 &mut self.traces,
             );
         }
+
+        self.storage_arguments = saved_storage;
 
         self.called_reading_of(target.file, function, reading, cyclic)
     }

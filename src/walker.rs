@@ -773,7 +773,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.cost_of_statements(file, None, &body.statements)
     }
 
-    fn suspends(&mut self, file: FileId, node: NodeId) -> bool {
+    pub(crate) fn suspends(&mut self, file: FileId, node: NodeId) -> bool {
         let mut pending = vec![(node, false)];
 
         while let Some((current, visited)) = pending.pop() {
@@ -2183,6 +2183,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let node = decorated?;
         let span = self.kind_of_node(file, node).span();
 
+        self.current_effects.unknown_global = true;
+
         Some(self.unknown_part(file, span, UnknownReason::UnsupportedSyntax))
     }
 
@@ -2192,14 +2194,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let phases = class_phases_of(class);
-        let reading = match self.decorated_part_of(file, phases.decorated) {
-            Some(part) => {
-                self.current_effects.unknown_global = true;
-
-                Reading::of_part(part)
-            }
-            None => Reading::empty(),
-        };
+        let reading = self
+            .decorated_part_of(file, phases.decorated)
+            .map_or_else(Reading::empty, Reading::of_part);
         let elements: Vec<NodeId> = phases.keys.iter().map(|(element, _)| *element).collect();
         let evaluated = phases
             .heritage
