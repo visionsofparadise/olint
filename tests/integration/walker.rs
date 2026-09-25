@@ -36,7 +36,7 @@ impl Deref for TestReading {
     }
 }
 
-mod support;
+use crate::support;
 
 #[test]
 fn set_callback_fixture_declarations_typecheck() {

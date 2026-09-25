@@ -7,7 +7,7 @@ use olint::trace::{
 use olint::unknowns::{SourceSpan, UnknownReason, Unknowns};
 use std::fmt::{self, Write};
 
-mod support;
+use crate::support;
 
 #[test]
 fn oversized_source_names_fail_before_trace_label_allocation() {

@@ -6,7 +6,7 @@ use olint::cost::{Cost, CostComparison, ExecutionPhase, Reading};
 use olint::public::public_functions;
 use olint::unknowns::UnknownReason;
 
-mod support;
+use crate::support;
 
 use support::{classified_result_of, legacy_result_of, SYNTACTIC};
 

@@ -9,7 +9,7 @@ use olint::project::FileId;
 use olint::summaries::{SchedulerLimits, SchedulerStats};
 use olint::unknowns::UnknownReason;
 
-mod support;
+use crate::support;
 
 use support::{
     assert_scheduler_terminal as assert_terminal, function_of_name, run_with_source, summary_of,

@@ -10,7 +10,7 @@ use olint::regex::{
 use olint::unknowns::UnknownReason;
 use tempfile::TempDir;
 
-mod support;
+use crate::support;
 
 use support::{
     classified_result_of, legacy_result_of, prepared_result_of, repository_helper_of, LegacyResult,

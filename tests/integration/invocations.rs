@@ -4,7 +4,7 @@ use olint::analysis::TypeMode;
 use olint::cost::Cost;
 use olint::unknowns::UnknownReason;
 
-mod support;
+use crate::support;
 
 use support::{assert_selected, index_of, selected_result_in};
 

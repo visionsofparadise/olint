@@ -4,7 +4,7 @@ use olint::project::{FileId, Project};
 use oxc_ast::ast::IdentifierReference;
 use oxc_ast::AstKind;
 
-mod support;
+use crate::support;
 
 fn calls_in<'a>(project: &Project<'a>, file: FileId) -> Vec<&'a oxc_ast::ast::CallExpression<'a>> {
     project

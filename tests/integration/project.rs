@@ -3,7 +3,7 @@ use olint::project::Resolved;
 use olint::tsconfig::select_files;
 use oxc_ast::AstKind;
 
-mod support;
+use crate::support;
 
 use support::{file_of, first_node_of, project_of, run_in_project, TYPED_PACKAGE};
 

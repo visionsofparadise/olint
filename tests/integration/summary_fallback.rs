@@ -5,7 +5,7 @@ use olint::declarations::FunctionId;
 use olint::summaries::{SchedulerLimits, SchedulerStats};
 use olint::unknowns::UnknownReason;
 
-mod support;
+use crate::support;
 
 fn first_body_limits(analysis: &mut Analysis<'_, '_>) -> SchedulerLimits {
     let mut limits = SchedulerLimits::default();

@@ -1,6 +1,6 @@
 use olint::declared_types::{DeclaredType, Kind};
 
-mod support;
+use crate::support;
 
 use support::probe_results_of;
 

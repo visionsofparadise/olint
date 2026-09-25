@@ -9,7 +9,7 @@ use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
 use oxc_span::GetSpan;
 
-mod support;
+use crate::support;
 
 use support::{file_of, first_node_of, project_of, run_in_project};
 

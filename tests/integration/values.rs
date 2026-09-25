@@ -2,7 +2,7 @@ use olint::analysis::Analysis;
 use olint::cost::Cost;
 use olint::values::{Cardinality, Failure, Limits, Primitive, SizeQuantity};
 
-mod support;
+use crate::support;
 
 use support::{file_of, probe_results_of, probes_of, run_in_project, run_with_source, summary_of};
 

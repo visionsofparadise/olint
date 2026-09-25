@@ -10,7 +10,7 @@ use olint::tsc::{
 use olint::types::TscPass;
 use oxc_allocator::Allocator;
 
-mod support;
+use crate::support;
 
 #[test]
 fn triple_path_reader_matches_typescript_leading_directives() {

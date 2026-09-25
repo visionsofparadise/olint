@@ -11,7 +11,7 @@ use olint::unknowns::SourceSpan;
 use olint::values::{ArgumentFacts, ValueId};
 use oxc_ast::ast::BindingPattern;
 
-mod support;
+use crate::support;
 
 fn reply(answers: Vec<Option<TscAnswer>>) -> TscReply {
     TscReply {

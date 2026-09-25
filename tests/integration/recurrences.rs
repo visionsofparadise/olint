@@ -3,7 +3,7 @@ use olint::cost::{Cost, CostComparison, Part};
 use olint::project::FileId;
 use olint::unknowns::UnknownReason;
 
-mod support;
+use crate::support;
 
 use support::{function_of_name, legacy_class_of, run_with_source, summary_of, unknown_reasons};
 

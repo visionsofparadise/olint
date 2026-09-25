@@ -1,7 +1,7 @@
 use olint::declarations::{Declaration, Declarations, FunctionNode};
 use oxc_ast::ast::PropertyKey;
 
-mod support;
+use crate::support;
 
 use support::{file_of, member_callee_of, run_in_project};
 

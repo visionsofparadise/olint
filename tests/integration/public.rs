@@ -7,7 +7,7 @@ use olint::project::Project;
 use olint::public::public_functions;
 use oxc_allocator::Allocator;
 
-mod support;
+use crate::support;
 
 use support::SYNTACTIC;
 

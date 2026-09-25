@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use olint::cost::{Cost, CostComparison};
 use support::{function_of_name, run_with_source, summary_of};

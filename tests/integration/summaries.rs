@@ -4,7 +4,7 @@ use olint::cost::{Cost, CostComparison, ExecutionPhase};
 use olint::public::public_functions;
 use std::path::Path;
 
-mod support;
+use crate::support;
 
 #[test]
 fn recovered_alias_and_overload_calls_retain_known_work() {

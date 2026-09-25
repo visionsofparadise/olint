@@ -1,7 +1,7 @@
 use olint::cost::Cost;
 use olint::unknowns::UnknownReason;
 
-mod support;
+use crate::support;
 
 const DECLARED: &str =
     "declare function opaque(value: unknown): void;\ndeclare function poke(): void;\n";

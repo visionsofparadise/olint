@@ -4,7 +4,7 @@ use std::process::Command;
 #[test]
 fn public_value_surfaces_retain_known_functions_and_partial_coverage() {
     assert_selection_cases(
-        &serde_json::from_str(include_str!("fixtures/public-surfaces.json")).unwrap(),
+        &serde_json::from_str(include_str!("../fixtures/public-surfaces.json")).unwrap(),
     );
 }
 
@@ -67,20 +67,22 @@ fn public_coverage_policy_survives_filtering_without_a_numeric_surcharge() {
 #[test]
 fn explicit_source_paths_override_heuristics_in_both_modes() {
     assert_selection_cases(
-        &serde_json::from_str(include_str!("fixtures/source-paths.json")).unwrap(),
+        &serde_json::from_str(include_str!("../fixtures/source-paths.json")).unwrap(),
     );
 }
 
 #[test]
 fn package_entry_mappings_select_costly_apis_and_diagnose_unknown_mappings() {
     assert_selection_cases(
-        &serde_json::from_str(include_str!("fixtures/package-entries.json")).unwrap(),
+        &serde_json::from_str(include_str!("../fixtures/package-entries.json")).unwrap(),
     );
 }
 
 #[test]
 fn explicit_selection_matrix_rejects_invalid_coverage_and_preserves_empty_controls() {
-    assert_selection_cases(&serde_json::from_str(include_str!("fixtures/selection.json")).unwrap());
+    assert_selection_cases(
+        &serde_json::from_str(include_str!("../fixtures/selection.json")).unwrap(),
+    );
 }
 
 fn assert_selection_cases(cases: &serde_json::Value) {
@@ -223,7 +225,7 @@ fn fixtures_print_their_golden_output() {
     assert!(differences.is_empty(), "{}", differences.join("\n\n"));
 }
 
-mod support;
+use crate::support;
 
 #[test]
 fn minimum_filter_preserves_logarithmic_exception_and_unknown_policy() {

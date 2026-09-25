@@ -8,7 +8,7 @@ use olint::tsc::{CalleeAnswer, CalleeTarget, Query, TscAnswer, TscError, TscRepl
 use olint::types::TscPass;
 use oxc_ast::ast::Expression;
 
-mod support;
+use crate::support;
 
 #[test]
 fn recovered_callable_targets_keep_dispatch_closedness_separate() {

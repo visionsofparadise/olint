@@ -7,7 +7,7 @@ use olint::syntax::is_iteration_kind;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 
-mod support;
+use crate::support;
 
 use olint::unknowns::UnknownReason;
 use support::{run_with_source, SYNTACTIC};

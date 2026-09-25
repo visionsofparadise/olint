@@ -3,7 +3,7 @@ use std::process::Command;
 use olint::cost::{Cost, ExecutionPhase};
 use olint::unknowns::{UnknownNode, UnknownReason};
 
-mod support;
+use crate::support;
 use support::{function_of_name, project_of, run_with_source};
 
 fn summary_of(

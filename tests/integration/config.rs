@@ -2,7 +2,7 @@ use std::path::Path;
 
 use olint::config::{package_entries, read_config, Config, ConfigError};
 
-mod support;
+use crate::support;
 
 use support::run_in_project;
 
