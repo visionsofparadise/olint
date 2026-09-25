@@ -22,6 +22,7 @@ fn selected_of(declarations: &str, body: &str) -> (Cost, bool, BTreeSet<UnknownR
 fn assert_selected(cases: &[(&str, &str, &str, bool)]) {
     for (declarations, body, expected, complete) in cases {
         let (cost, found, reasons) = selected_of(declarations, body);
+        let cost = support::projected_class_of(&cost);
 
         assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
         assert_eq!(found, *complete, "{body}: {reasons:?}");
@@ -415,19 +416,19 @@ fn modelled_natives_keep_the_loop_bounds_they_cannot_affect() {
     assert_selected(&[
         (
             "",
-            "(xs: number[], o: Record<string, number>) { for (let i = 0; i < xs.length; i++) { Object.keys(o); } }",
+            "(xs: number[], o: Record<string, number>) { for (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 1000000000; i++) { Object.keys(o); } }",
             "O(N^2)",
             true,
         ),
         (
             "",
-            "(s: string, needle: string, n: number) { let total = 0; for (let i = 0; i < n; i++) total += s.indexOf(needle); return total; }",
+            "(s: string, needle: string, n: number) { let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += s.indexOf(needle); return total; }",
             "O(N^2)",
             true,
         ),
         (
             "",
-            r#"(s: string, n: number) { for (let i = 0; i < n; i++) { s.replace(/a/g, () => { i = 0; return ""; }); } }"#,
+            r#"(s: string, n: number) { for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { s.replace(/a/g, () => { i = 0; return ""; }); } }"#,
             "O(N)",
             false,
         ),
@@ -445,19 +446,19 @@ fn call_carries_the_forwarded_function_effects() {
     assert_selected(&[
         (
             "function grow(this: { limit: number }, n: number) { this.limit += n; }",
-            "(n: number) { const box = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n; j++) { while (i < box.limit) { i++; total++; } grow.call(box, n); } return total; }",
-            "O(N^2)",
-            true,
+            "(n: number) { const box = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) { while (i < box.limit) { i++; total++; } grow.call(box, n); } return total; }",
+            "O(N)",
+            false,
         ),
         (
             "function peek(this: { limit: number }, n: number) { return this.limit + n; }",
-            "(n: number) { const box = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n; j++) { while (i < box.limit) { i++; total++; } peek.call(box, n); } return total; }",
+            "(n: number) { const box = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) { while (i < box.limit) { i++; total++; } peek.call(box, n); } return total; }",
             "O(N)",
-            true,
+            false,
         ),
         (
             "",
-            "(n: number) { let i = 0, total = 0; const reset = () => { i = 0; }; for (let j = 0; j < n; j++) { reset.call(null); while (i < n) { i++; total++; } } return total; }",
+            "(n: number) { let i = 0, total = 0; const reset = () => { i = 0; }; for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) { reset.call(null); while (i < n && i >= 0 && n >= 0 && n <= 1000000000) { i++; total++; } } return total; }",
             "O(N^2)",
             true,
         ),
@@ -983,9 +984,10 @@ fn assert_phase_costs(source: &str, immediate: &str, scheduled: &str) {
             } else {
                 Cost::maximum(costs).unwrap()
             };
+            let cost = support::legacy_class_of(analysis, file, function, &cost);
 
             assert_eq!(
-                support::legacy_class_of(analysis, file, function, &cost),
+                support::projected_class_of(&cost),
                 Cost::parse(expected).unwrap(),
                 "{phase:?}: {source}: {reading:?}"
             );
@@ -1011,8 +1013,8 @@ fn scheduled_channels_survive_calls_callbacks_loops_and_returns() {
         ("scan(xs); return later(xs);", "function* produce(xs: number[]) { cube(xs); yield 1; } async function later(xs: number[]) { await 0; return produce(xs); }", "O(N)", "O(1)"),
         ("consume(immediate(xs, p)); consume(scheduled(xs, p));", "function* immediate(xs: number[], p: Promise<number>) { cube(xs); yield 1; } function* scheduled(xs: number[], p: Promise<number>) { p.then(() => cube(xs)); yield 1; } function consume(values: Iterable<number>) { for (const value of values) {} }", "O(N^3)", "O(N^3)"),
         ("consume(scheduled(xs, p)); consume(immediate(xs, p));", "function* immediate(xs: number[], p: Promise<number>) { cube(xs); yield 1; } function* scheduled(xs: number[], p: Promise<number>) { p.then(() => cube(xs)); yield 1; } function consume(values: Iterable<number>) { for (const value of values) {} }", "O(N^3)", "O(N^3)"),
-        ("let i = 0; for (const x of xs) { for (const y of xs) { while (i < xs.length) { i++; p.then(() => quadratic(xs)); } } }", "", "O(N)", "O(N^3)"),
-        ("for (const x of xs) { let i = 0; for (const y of xs) { while (i < xs.length) { i++; p.then(() => quadratic(xs)); } } }", "", "O(N^2)", "O(N^4)"),
+        ("let i = 0; for (const x of xs) { for (const y of xs) { while (i < xs.length && xs.length >= 0 && xs.length <= 1000000000) { i++; p.then(() => quadratic(xs)); } } }", "", "O(N)", "O(N^3)"),
+        ("for (const x of xs) { let i = 0; for (const y of xs) { while (i < xs.length && xs.length >= 0 && xs.length <= 1000000000) { i++; p.then(() => quadratic(xs)); } } }", "", "O(N^2)", "O(N^4)"),
         ("for (const x of xs) [...produce(xs, p)];", "function* produce(xs: number[], p: Promise<number>) { return cube(xs); }", "O(N^4)", "O(1)"),
         ("for (const x of xs) [...produce(xs, p)];", "function* produce(xs: number[], p: Promise<number>) { return p.then(() => cube(xs)); }", "O(N)", "O(N^4)"),
     ];

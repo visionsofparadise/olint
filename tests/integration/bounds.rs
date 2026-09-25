@@ -43,7 +43,7 @@ fn loop_reasons_of(
 }
 
 #[test]
-fn every_bound_reason_fires_on_the_model_fixture() {
+fn the_model_fixture_distinguishes_proven_and_unresolved_bounds() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model");
     let allocator = Allocator::default();
     let project = Project::load(&allocator, &root.join("tsconfig.json")).expect("fixture loads");
@@ -60,10 +60,10 @@ fn every_bound_reason_fires_on_the_model_fixture() {
 
     for (function, reason) in [
         ("constantBoundLoop", "constant bound"),
-        ("constantOffsetFromStart", "constant offset from start"),
-        ("geometricStepLoop", "geometric step"),
-        ("whileHalvingShift", "halving"),
-        ("whileHalvingMidpoint", "halving"),
+        ("constantOffsetFromStart", "iteration bound"),
+        ("geometricStepLoop", "iteration bound"),
+        ("whileHalvingShift", "iteration bound"),
+        ("whileHalvingMidpoint", "iteration bound"),
         ("forOfTuple", "N"),
         ("forInClosed", "N"),
         ("forInRecord", "N"),
@@ -103,7 +103,7 @@ fn fresh_collections_keep_constant_and_closed_bounds() {
 #[test]
 fn a_while_counter_stepped_linearly_is_linear() {
     run_with_source(
-        "export function f(n: number) {\n\twhile (n > 1) {\n\t\tn = n - 1;\n\t}\n}",
+        "export function f(n: number) {\n\twhile (n > 1 && n <= 1000000000) {\n\t\tn = n - 1;\n\t}\n}",
         |analysis, file| {
             assert_eq!(
                 loop_reasons_of(analysis, file),
@@ -120,13 +120,13 @@ fn unary_reads_preserve_bounds_while_updates_invalidate_them() {
         ("-n", "halving"),
         ("!n", "halving"),
         ("~n", "halving"),
-        ("++n", "N"),
-        ("--n", "N"),
-        ("n++", "N"),
-        ("n--", "N"),
+        ("++n", "iteration bound"),
+        ("--n", "iteration bound"),
+        ("n++", "iteration bound"),
+        ("n--", "iteration bound"),
     ] {
         let source = format!(
-            "export function f(n: number) {{ while (n > 1) {{ consume({expression}); n >>= 1; }} }}"
+            "export function f(n: number) {{ while (n > 1 && n <= 1000000000) {{ consume({expression}); n >>= 1; }} }}"
         );
 
         run_with_source(&source, |analysis, file| {
@@ -167,7 +167,7 @@ fn bound_is_unknown(source: &str, name: &str) -> bool {
 #[test]
 fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
     for (body, expected) in [
-        ("let sum = 0; for (let i = n; i > 0; i--) sum++;", "N"),
+        ("let sum = 0; for (let i = n; i > 0 && n >= 0 && n <= 1000000000; i--) sum++;", "N"),
         (
             "let sum = 0; for (let i = 0; i < 1; i += 1 / n) sum++;",
             "iteration bound",
@@ -202,15 +202,15 @@ fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
         ),
         (
             "let sum = 0; for (let i = 0; i < 10; i++) { if (n > 0) i--; sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let limit = 10; for (let i = 0; i < limit; i++) limit = n;",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; let i = 0; while (i < 10) { step: { if (n > 0) break step; i++; } sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; let i = 0; while (i < 10) { step: { i++; if (n > 0) break step; } sum++; }",
@@ -222,19 +222,19 @@ fn a_constant_endpoint_proves_nothing_without_initial_distance_and_progress() {
         ),
         (
             "let sum = 0; for (let i = 0; i < 10; n > 0 ? i++ : 0) sum++;",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; for (let i = 0; i < 10; n > 0 && i++) sum++;",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; for (let i = 0; i < 10; n > 0 || i++) sum++;",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; for (let i = 0; i < 10; (() => i++)()) sum++;",
-            "N",
+            "iteration bound",
         ),
         (
             "let sum = 0; for (let i = 0; i < 10; (i++)) sum++;",
@@ -274,10 +274,17 @@ fn a_stable_base_and_a_constant_offset_keep_a_fixed_window() {
         ),
         ("start", "i < xs.length + 5", "i++", "N"),
         ("start", "i < start + n", "i++", "N"),
-        ("start", "i > start + 5", "i--", "N"),
+        (
+            "start",
+            "i > start + 5",
+            "i--",
+            "constant offset from start",
+        ),
     ] {
+        let initial = initial.replace("xs.length", "size");
+        let test = test.replace("xs.length", "size");
         let source = format!(
-            "export function f(xs: number[], start: number, n: number) {{ let sum = 0; for (let i = {initial}; {test}; {update}) sum += xs[i] ?? 0; return sum; }}"
+            "export function f(xs: number[], start: number, n: number) {{ const size = xs.length; if (start >= 0 && start <= 1000000000 && n >= 0 && n <= 1000000000 && size >= 0 && size <= 1000000000) {{ let sum = 0; for (let i = {initial}; {test}; {update}) sum += xs[i] ?? 0; return sum; }} return 0; }}"
         );
 
         assert_eq!(first_reason_of(&source), expected, "{test}");
@@ -293,21 +300,27 @@ fn geometric_progress_needs_a_positive_start_and_no_competing_write() {
         ),
         (
             "for (let i = 1; i < xs.length; i <<= 1) sum += i;",
-            "geometric step",
+            "iteration bound",
         ),
-        ("for (let i = 0; i < xs.length; i *= 2) sum += i;", "N"),
+        (
+            "for (let i = 0; i < xs.length; i *= 2) sum += i;",
+            "iteration bound",
+        ),
         (
             "for (let i = 1; i < xs.length; i *= 2) { i = Math.floor(i / 2) + 1; sum++; }",
-            "N",
+            "iteration bound",
         ),
-        ("for (let i = 1; i < xs.length; i *= 1.5) sum += i;", "N"),
+        (
+            "for (let i = 1; i < xs.length; i *= 1.5) sum += i;",
+            "geometric step",
+        ),
         (
             "for (let i = 1; i < xs.length; sum > 0 ? (i *= 2) : 0) sum += i;",
-            "N",
+            "iteration bound",
         ),
         (
             "for (let i = 1; i < xs.length; sum > 0 && (i *= 2)) sum += i;",
-            "N",
+            "iteration bound",
         ),
         (
             "for (let i = 1; i < xs.length; (i *= 2)) sum += i;",
@@ -319,7 +332,7 @@ fn geometric_progress_needs_a_positive_start_and_no_competing_write() {
         ),
     ] {
         let source =
-            format!("export function f(xs: number[]) {{ let sum = 0; {body} return sum; }}");
+            format!("export function f(xs: number[]) {{ if (xs.length >= 0 && xs.length <= 1000000000) {{ let sum = 0; {body} return sum; }} return 0; }}");
 
         assert_eq!(first_reason_of(&source), expected, "{body}");
     }
@@ -335,7 +348,7 @@ fn contraction_must_hold_on_every_repeating_path() {
         ("let i = xs.length; while (i > 1) { i /= 2; sum++; }", "halving"),
         (
             "let i = xs.length; while (i > 1) { if (sum > 2) i /= 2; sum++; }",
-            "N",
+            "iteration bound",
         ),
         ("let i = xs.length; while (i > 1) { i = i - 1; sum++; }", "N"),
         (
@@ -356,7 +369,7 @@ fn contraction_must_hold_on_every_repeating_path() {
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; lo = mid; sum++; }",
@@ -364,7 +377,7 @@ fn contraction_must_hold_on_every_repeating_path() {
         ),
         (
             "let i = xs.length; while (i > 1) { step: { if (sum > 2) break step; i /= 2; } sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let i = xs.length; while (i > 1) { step: { i /= 2; if (sum > 2) break step; } sum++; }",
@@ -396,18 +409,19 @@ fn contraction_must_hold_on_every_repeating_path() {
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo <= hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid - xs.length; sum++; }",
-            "N",
+            "iteration bound",
         ),
         (
             "let lo = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < 0) lo = mid + 1; else hi = mid - xs.length; sum++; }",
-            "N",
+            "iteration bound",
         ),
-        ("let i = xs.length; while (i >= 0) { i /= 2; sum++; }", "N"),
+        ("let i = xs.length; while (i >= 0) { i /= 2; sum++; }", "iteration bound"),
         ("let i = xs.length; while (i > 0) { i /= 2; sum++; }", "halving"),
         ("let i = xs.length; while (i >= 1) { i /= 2; sum++; }", "halving"),
     ] {
+        let body = body.replace("xs.length", "size");
         let source =
-            format!("export function f(xs: number[]) {{ let sum = 0; {body} return sum; }}");
+            format!("export function f(xs: number[]) {{ const size = xs.length; if (size >= 0 && size <= 1000000000) {{ let sum = 0; {body} return sum; }} return 0; }}");
 
         assert_eq!(first_reason_of(&source), expected, "{body}");
     }
@@ -457,7 +471,7 @@ fn an_additive_step_of_unknown_magnitude_leaves_the_bound_unresolved() {
         ("for (let i = 0; i < n; i++) sum++;", "N"),
     ] {
         let source = format!(
-            "export function f(n: number, step: number) {{ let sum = 0; {body} return sum; }}"
+            "export function f(n: number, step: number) {{ if (n >= 0 && n <= 1000000000) {{ let sum = 0; {body} return sum; }} return 0; }}"
         );
 
         assert_eq!(first_reason_of(&source), expected, "{body}");
@@ -481,9 +495,12 @@ fn a_counter_whose_unconditional_writes_cancel_leaves_the_bound_unresolved() {
         ),
         (
             "let i = 0; while (i < 10) { i -= 1; for (const x of xs) { i += 1; sum++; } }",
-            "N",
+            "iteration bound",
         ),
-        ("for (let i = 0; i < 10; i++) { i += 2; i--; sum++; }", "N"),
+        (
+            "for (let i = 0; i < 10; i++) { i += 2; i--; sum++; }",
+            "constant bound",
+        ),
         ("for (let i = 0; i < 10; i++) sum++;", "constant bound"),
     ] {
         let source = format!(
@@ -520,7 +537,10 @@ fn a_body_that_can_repeat_loses_the_single_iteration_proof() {
 fn a_readonly_field_a_constructor_can_reassign_is_not_a_constant_endpoint() {
     for (declared, expected) in [
         ("", "constant bound"),
-        ("constructor(n: number) { this.limit = n; }", "N"),
+        (
+            "constructor(n: number) { this.limit = n; }",
+            "iteration bound",
+        ),
     ] {
         let source = format!(
             "export class K {{ readonly limit: number = 4; {declared} run(): number {{ let total = 0; for (let i = 0; i < this.limit; i++) total++; return total; }} }}"
@@ -562,7 +582,7 @@ fn cost(text: &str) -> olint::cost::Cost {
 
 fn nested_budget_source(step: &str) -> String {
     format!(
-        "export function f(n: number) {{ const step = {step}; let i = 0, total = 0; for (let j = 0; j < n; j++) {{ while (i < n) {{ i += step; total++; }} }} return total; }}"
+        "export function f(n: number) {{ if (n >= 0 && n <= 1000000000) {{ const step = {step}; let i = 0, total = 0; for (let j = 0; j < n; j++) {{ while (i < n) {{ i += step; total++; }} }} return total; }} return 0; }}"
     )
 }
 
@@ -584,29 +604,39 @@ fn a_budget_spent_in_steps_of_unproven_magnitude_keeps_its_nested_work() {
 
 #[test]
 fn a_unit_step_two_pointer_budget_still_collapses() {
-    let source = "export function f(xs: number[]) { let i = 0, total = 0; for (let j = 0; j < xs.length; j++) { while (i < xs.length) { i++; total++; } } return total; }";
+    let source = "export function f(xs: number[]) { if (xs.length >= 0 && xs.length <= 1000000000) { let i = 0, total = 0; for (let j = 0; j < xs.length; j++) { while (i < xs.length) { i++; total++; } } return total; } return 0; }";
 
     assert_eq!(legacy_cost_of(source, "f"), (cost("O(N)"), true));
 }
 
 #[test]
 fn a_replenished_budget_separates_from_an_unrelated_counter() {
-    let unrelated = "export function f(n: number, m: number) { let i = 0, k = 0, total = 0; const bump = () => { k = 0; }; for (let j = 0; j < n; j++) { bump(); while (i < n) { i++; total++; } } while (k < m) { k++; total++; } return total; }";
-    let escaped = "export function f(n: number, use: (fn: () => void) => void) { let i = 0, total = 0; const reset = () => { i = 0; }; for (let j = 0; j < n; j++) { use(reset); while (i < n) { i++; total++; } } return total; }";
+    let unrelated = "export function f(n: number, m: number) { if (n >= 0 && n <= 1000000000 && m >= 0 && m <= 1000000000) { let i = 0, k = 0, total = 0; const bump = () => { k = 0; }; for (let j = 0; j < n; j++) { bump(); while (i < n) { i++; total++; } } while (k >= 0 && k < m) { k++; total++; } return total; } return 0; }";
+    let escaped = "export function f(n: number, use: (fn: () => void) => void) { if (n >= 0 && n <= 1000000000) { let i = 0, total = 0; const reset = () => { i = 0; }; for (let j = 0; j < n; j++) { use(reset); while (i < n) { i++; total++; } } return total; } return 0; }";
 
     assert_eq!(legacy_cost_of(unrelated, "f"), (cost("O(N)"), true));
-    assert_eq!(legacy_cost_of(escaped, "f"), (cost("O(N^2)"), false));
+    assert_named_cost(escaped, "O(n)", false);
 }
 
 fn shared_window_source(inner: &str) -> String {
+    let inner = inner.replace(
+        "k < offset + step",
+        "k < offset + step && offset >= 0 && offset <= 1000000000",
+    );
+
     format!(
-        "export function f(n: number, step: number, q: number, xs: Uint8Array) {{ let offset = 0, total = 0; const fine = 1 / n; while (offset < n) {{ {inner} offset += step; }} return total; }}"
+        "export function f(n: number, step: number, q: number, xs: Uint8Array) {{ if (n >= 0 && n <= 1000000000 && step >= 0 && step <= 1000000000) {{ let offset = 0, total = 0; const fine = 1 / n; while (offset < n) {{ {inner} offset += step; }} return total; }} return 0; }}"
     )
 }
 
 fn halving_share_source(inner: &str) -> String {
+    let inner = inner.replace(
+        "k < offset + step",
+        "k < offset + step && offset >= 0 && offset <= 1000000000",
+    );
+
     format!(
-        "export function f(n: number, step: number) {{ let offset = 0, total = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} return total; }}"
+        "export function f(n: number, step: number) {{ if (n >= 0 && n <= 1000000000 && step >= 0 && step <= 1000000000) {{ let offset = 0, total = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} return total; }} return 0; }}"
     )
 }
 
@@ -653,8 +683,11 @@ const SHARE_CONSUMER_ROWS: [(&str, &str); 11] = [
     ("a step of an unproven identifier", "iteration bound"),
     ("a proven quarter step", "N"),
     ("a bare share endpoint under a quarter step", "N"),
-    ("a unit step the body can skip", "N"),
-    ("a unit update a conditional write undoes", "N"),
+    ("a unit step the body can skip", "iteration bound"),
+    (
+        "a unit update a conditional write undoes",
+        "iteration bound",
+    ),
 ];
 
 const SHARE_CONSUMER_BODIES: [&str; 11] = [
@@ -688,34 +721,73 @@ fn a_share_collapses_only_where_the_consuming_loop_advances_a_whole_unit() {
 
 type LegacyRow<'r> = (&'r str, String, &'r str, bool);
 
-fn assert_legacy_rows(rows: &[LegacyRow<'_>]) {
-    let found: Vec<(&str, (olint::cost::Cost, bool))> = rows
-        .iter()
-        .map(|(label, source, _, _)| (*label, legacy_cost_of(source, "f")))
-        .collect();
-    let expected: Vec<(&str, (olint::cost::Cost, bool))> = rows
-        .iter()
-        .map(|(label, _, text, complete)| (*label, (cost(text), *complete)))
-        .collect();
+fn assert_named_cost(source: &str, expected: &str, complete: bool) {
+    run_with_source(source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "f");
+        let part = support::summary_of(analysis, file, "f");
+        let bound = analysis
+            .bind_function_cost(file, function, &cost(expected))
+            .unwrap();
+        let bound = olint::cost::Cost::maximum(vec![olint::cost::Cost::ONE, bound]).unwrap();
 
-    assert_eq!(found, expected);
+        assert_eq!(part.unknowns.is_none(), complete, "{source}");
+
+        let actual =
+            olint::cost::Cost::maximum(vec![olint::cost::Cost::ONE, part.cost.clone()]).unwrap();
+
+        assert_eq!(
+            actual.compare(&bound),
+            olint::cost::CostComparison::Within,
+            "{source}: {:?} versus {:?}",
+            actual,
+            bound
+        );
+        assert_eq!(
+            bound.compare(&actual),
+            olint::cost::CostComparison::Within,
+            "{source}: {:?} versus {:?}",
+            actual,
+            bound
+        );
+    });
+}
+
+fn assert_legacy_rows(rows: &[LegacyRow<'_>]) {
+    for (_, source, text, complete) in rows {
+        assert_named_cost(source, text, *complete);
+    }
 }
 
 fn halving_window_source(inner: &str) -> String {
+    let inner = inner.replace(
+        "k < offset + step",
+        "k < offset + step && offset >= 0 && offset <= 1000000000",
+    );
+
     format!(
-        "export function f(n: number, step: number, xs: Uint8Array) {{ let offset = 0, total = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} return total; }}"
+        "export function f(n: number, step: number, xs: Uint8Array) {{ if (n >= 0 && n <= 1000000000 && step >= 0 && step <= 1000000000) {{ let offset = 0, total = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} return total; }} return 0; }}"
     )
 }
 
 fn reset_halving_window_source(inner: &str) -> String {
+    let inner = inner.replace(
+        "k < offset + step",
+        "k < offset + step && offset >= 0 && offset <= 1000000000",
+    );
+
     format!(
-        "export function f(n: number, step: number, xs: Uint8Array, ys: number[]) {{ let total = 0; for (const y of ys) {{ let offset = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} }} return total; }}"
+        "export function f(n: number, step: number, xs: Uint8Array, ys: number[]) {{ if (n >= 0 && n <= 1000000000 && step >= 0 && step <= 1000000000) {{ let total = 0; for (const y of ys) {{ let offset = 0, size = n; while (size > 1 && offset < n) {{ {inner} offset += step; size = size / 2; }} }} return total; }} return 0; }}"
     )
 }
 
 fn reset_window_source(inner: &str) -> String {
+    let inner = inner.replace(
+        "k < offset + step",
+        "k < offset + step && offset >= 0 && offset <= 1000000000",
+    );
+
     format!(
-        "export function f(n: number, step: number, xs: Uint8Array, ys: number[]) {{ let total = 0; for (const y of ys) {{ let offset = 0; while (offset < n) {{ {inner} offset += step; }} }} return total; }}"
+        "export function f(n: number, step: number, xs: Uint8Array, ys: number[]) {{ if (n >= 0 && n <= 1000000000 && step >= 0 && step <= 1000000000) {{ let total = 0; for (const y of ys) {{ let offset = 0; while (offset < n) {{ {inner} offset += step; }} }} return total; }} return 0; }}"
     )
 }
 
@@ -725,7 +797,7 @@ fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential(
         (
             "a bare share endpoint under a halving budget loop",
             halving_window_source("for (let k = 0; k < step; k += 1) total++;"),
-            "O(N * log(N))",
+            "O(step * log(N))",
             true,
         ),
         (
@@ -737,19 +809,19 @@ fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential(
         (
             "a counter the enclosing loop resets",
             reset_halving_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(N^2 * log(N))",
+            "O(max(1,step * log(N)) * N)",
             true,
         ),
         (
             "an offset share endpoint under an unresolved budget loop",
             shared_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(1)",
+            "O(step)",
             false,
         ),
         (
             "a counter the enclosing unresolved loop resets",
             reset_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(N)",
+            "O(step * N)",
             false,
         ),
     ];
@@ -763,28 +835,304 @@ fn a_subunit_share_consumer_keeps_the_factor_its_enclosing_loop_multiplies() {
         (
             "a quarter step under an unresolved budget loop",
             shared_window_source("for (let k = offset; k < offset + step; k += 1 / 4) total++;"),
-            "O(N)",
+            "O(step)",
             false,
         ),
         (
             "a unit step under an unresolved budget loop",
             shared_window_source("for (let k = offset; k < offset + step; k++) total++;"),
-            "O(1)",
+            "O(step)",
             false,
         ),
         (
             "a quarter step under a halving budget loop",
             halving_share_source("for (let k = offset; k < offset + step; k += 1 / 4) total++;"),
-            "O(N * log(N))",
+            "O(step * log(N))",
             true,
         ),
         (
             "a unit step under a halving budget loop",
             halving_share_source("for (let k = offset; k < offset + step; k++) total++;"),
-            "O(N * log(N))",
+            "O(step * log(N))",
             true,
         ),
     ];
 
     assert_legacy_rows(&rows);
+}
+
+#[test]
+fn additive_distance_requires_finite_progress_and_retains_symbolic_sizes() {
+    for source in [
+        "export function f(xs:number[]){let total=0; for(let i=0;i<xs.length && xs.length>=0 && xs.length<=4294967295;i++)total++; return total}",
+        "export function f(xs:number[]){const size=xs.length;let total=0; for(let i=size;i>0 && size>=0 && size<=4294967295;i--)total++; return total}",
+        "export function f(xs:number[]){const copy=[...xs];let total=0; for(let i=0;i<copy.length;i++)total++; return total}",
+        "export function f(xs:number[]){const k=xs.length;let total=0;for(let i=0;i<k&&k>=0&&k<=1000000000;i++)total++;return total}",
+        "export function f(n:number){let total=0; for(let i=0;i<n && n>=0 && n<=1000000000;i++)total++; return total}",
+        "export function f(n:number){let total=0; while(n>0 && n<=1000000000){n--;total++} return total}",
+        "export function f(n:number){let total=0; for(let i=0;i<n && n>=0 && n<=1000000000;i+=0.25)total++; return total}",
+    ] {
+        assert_eq!(legacy_cost_of(source, "f"), (cost("O(N)"), true), "{source}");
+        assert!(!bound_is_unknown(source, "f"), "{source}");
+    }
+}
+
+#[test]
+fn unbounded_number_inputs_and_stalled_updates_supply_no_iteration_proof() {
+    for body in [
+        "for(let i=0;i<n;i++)void i;",
+        "while(n>0)n--;",
+        "for(let i=0;i<Infinity;i++)void i;",
+        "for(let i=9007199254740992;i<9007199254740994;i++)void i;",
+        "for(let i=1;i<xs.length;i<<=1)void i;",
+        "for(let i=0;i<n && n>=0 && n<=1000000000;i+=step)void i;",
+        "for(let i=0;i<10;flag?i++:0)void i;",
+        "while(true)void 0;",
+        "for(;;)void 0;",
+    ] {
+        let source =
+            format!("export function f(n:number,step:number,flag:boolean,xs:number[]){{{body}}}");
+
+        assert!(bound_is_unknown(&source, "f"), "{source}");
+    }
+}
+
+#[test]
+fn unresolved_repetition_retains_proven_local_collection_work() {
+    let source = "export function f(n:number,xs:number[]){for(let i=0;i<n;i++){for(const x of xs)for(const y of xs)void y;}}";
+
+    assert_eq!(legacy_cost_of(source, "f"), (cost("O(N^2)"), false));
+    assert!(bound_is_unknown(source, "f"));
+}
+
+#[test]
+fn finite_exact_net_progress_and_geometric_ratios_keep_their_proofs() {
+    for (body, expected) in [
+        ("for(let i=0;i<10;i++){i+=2;i--;total++;}", "constant bound"),
+        (
+            "for(let i=start;i>start+5 && start>=0 && start<=1000000000;i--)total++;",
+            "constant offset from start",
+        ),
+        (
+            "for(let i=1;i<n && n>=0 && n<=1000000000;i*=1.5)total++;",
+            "geometric step",
+        ),
+    ] {
+        let source =
+            format!("export function f(start:number,n:number){{let total=0;{body}return total;}}");
+
+        assert_eq!(first_reason_of(&source), expected, "{source}");
+        assert!(!bound_is_unknown(&source, "f"), "{source}");
+    }
+}
+
+#[test]
+fn repetition_requires_a_proven_bound_before_it_supplies_generator_yields() {
+    for repetition in ["while (true)", "for (;;)", "while (condition)"] {
+        let source = format!(
+            "export function f(condition: boolean, xs: number[]) {{ {repetition} {{ for (const x of xs) void x; }} }}"
+        );
+
+        assert!(bound_is_unknown(&source, "f"), "{source}");
+
+        for consumption in [
+            "for (const value of values) { for (const x of xs) void x; }",
+            "values.next();",
+        ] {
+            let source = format!(
+                "function* generate(condition: boolean) {{ {repetition} yield 1; }} export function f(condition: boolean, xs: number[]) {{ const values = generate(condition); {consumption} }}"
+            );
+
+            assert!(bound_is_unknown(&source, "f"), "{source}");
+        }
+    }
+
+    for repetition in ["while (false)", "for (; false;)", "do"] {
+        let suffix = if repetition == "do" {
+            "while (false);"
+        } else {
+            ""
+        };
+        let source = format!("export function f() {{ {repetition} {{ void 0; }} {suffix} }}");
+
+        assert!(!bound_is_unknown(&source, "f"), "{source}");
+        assert_eq!(legacy_cost_of(&source, "f").0, cost("O(1)"), "{source}");
+    }
+
+    assert!(!bound_is_unknown(
+        "export function f() { for (;;) { break; } }",
+        "f"
+    ));
+}
+
+#[test]
+fn midpoint_proofs_require_a_finite_nonwrapping_interval() {
+    for endpoint in ["Infinity", "n", "4294967295"] {
+        let source = format!("export function f(n:number){{let lo=0,hi={endpoint};while(lo<hi){{const mid=(lo+hi)>>1;if(n>mid)lo=mid+1;else hi=mid;}}}}");
+
+        assert!(bound_is_unknown(&source, "f"), "{source}");
+    }
+
+    let source = "export function f(n:number){if(n>=0&&n<=1000000000){let lo=0,hi=n;while(lo<hi){const mid=(lo+hi)>>1;if(n>mid)lo=mid+1;else hi=mid;}}}";
+
+    assert_eq!(legacy_cost_of(source, "f"), (cost("O(log N)"), true));
+}
+
+#[test]
+fn guarded_independent_endpoints_remain_distinct() {
+    let source = "export function f(n:number,m:number){if(n>=0&&n<=1000000000&&m>=0&&m<=1000000000){let i=0;for(let j=0;j<n;j++){while(i<m)i++;}}}";
+
+    assert_named_cost(source, "O(m)", true);
+}
+
+#[test]
+fn guarded_local_assignments_preserve_the_source_quantity() {
+    let source = "export function f(xs:number[],run?: (n:number)=>void){let n=1;run?.(n=xs.length);for(let i=0;i<n&&n>=0&&n<=1000000000;i++)for(const x of xs)void x;}";
+    let (cost, complete, reasons) = support::legacy_result_of(source, "f");
+
+    assert_eq!(
+        support::projected_class_of(&cost),
+        olint::cost::Cost::parse("O(N^2)").unwrap()
+    );
+    assert!(!complete);
+    assert!(!reasons.contains(&UnknownReason::Bound));
+    assert!(reasons.contains(&UnknownReason::Target));
+}
+
+#[test]
+fn cyclic_guard_constraints_are_metered_and_keep_finite_witnesses() {
+    use olint::analysis::work::Event;
+
+    let mut previous = 0;
+
+    for count in [16, 32, 64] {
+        let guards = "n <= m && m <= n && ".repeat(count);
+        let source = format!("export function f(n:number,m:number){{for(let i=0;i<n&&n>=0&&m>=0&&{guards}n<=1000000000;i++)void i;}}");
+
+        run_with_source(&source, |analysis, file| {
+            let part = support::summary_of(analysis, file, "f");
+
+            assert!(part.is_complete());
+
+            let work = analysis
+                .scheduler_stats()
+                .work
+                .consumed(Event::BudgetPrepassNode);
+
+            if previous > 0 {
+                assert!(work <= 3 * previous, "{previous} then {work}");
+            }
+
+            previous = work;
+        });
+    }
+
+    assert!(bound_is_unknown(
+        "export function f(n:number,m:number){for(let i=0;i<n&&n>=0&&m>=0&&n<=m&&m<=n;i++)void i;}",
+        "f"
+    ));
+}
+
+#[test]
+fn guarded_numeric_bounds_satisfy_their_exact_named_limits() {
+    assert_named_cost(
+        "export function f(n:number){for(let i=0;i<n&&n>=0&&n<=1000000000;i++)void i;}",
+        "O(n)",
+        true,
+    );
+    assert_named_cost("export function f(n:number){let i=0;const reset=()=>{i=0};for(let j=0;j<n&&n>=0&&n<=1000000000;j++){reset();while(i<n&&i>=0&&n>=0&&n<=1000000000)i++;}}", "O(n^2)", true);
+}
+
+#[test]
+fn guarded_captured_parameters_keep_their_dimension_when_reported_alone() {
+    let source = "export function outer(n:number){function inner(){for(let i=0;i<n&&n>=0&&n<=1000000000;i++)void i;}inner();}";
+
+    run_with_source(source, |analysis, file| {
+        for name in ["inner", "outer"] {
+            let function = support::function_of_name(analysis.project, file, name);
+            let part = support::summary_of(analysis, file, name);
+            let expected = analysis
+                .bind_function_cost(file, function, &cost("O(n)"))
+                .unwrap();
+
+            assert!(part.is_complete());
+            assert_eq!(
+                part.cost.compare(&expected),
+                olint::cost::CostComparison::Within
+            );
+            assert_eq!(
+                expected.compare(&part.cost),
+                olint::cost::CostComparison::Within
+            );
+            assert!(!part.cost.is_one());
+        }
+    });
+}
+
+#[test]
+fn guarded_reassigned_parameters_retain_the_assigned_source_dimension() {
+    run_with_source("export function f(n:number,xs:number[]){n=xs.length;for(let i=0;i<n&&n>=0&&n<=1000000000;i++)for(const x of xs)void x;}", |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "f");
+        let part = support::summary_of(analysis, file, "f");
+        let old_input = analysis.bind_function_cost(file, function, &cost("O(n)")).unwrap();
+
+        assert!(part.is_complete());
+        assert_ne!(part.cost.compare(&old_input), olint::cost::CostComparison::Within);
+        assert_eq!(support::projected_class_of(&part.cost), cost("O(N^2)"));
+    });
+}
+
+#[test]
+fn current_guards_do_not_certify_a_captured_mutable_reading() {
+    for source in [
+        "export function f(n:number){const k=n;n=1;for(let i=0;i<k&&n>=0&&n<=1000000000;i++)void i;}",
+        "export function f(n:number){let i=n;n=1;while(i>0&&n>=0&&n<=1000000000)i--;}",
+        "export function f(box:{limit:number}){const k=box.limit;box.limit=1;for(let i=0;i<k&&box.limit>=0&&box.limit<=1000000000;i++)void i;}",
+        "export function f(xs:number[]){const k=xs.length;xs.length=1;for(let i=0;i<k&&xs.length>=0&&xs.length<=1000000000;i++)void i;}",
+    ] {
+        assert!(bound_is_unknown(source, "f"), "{source}");
+    }
+
+    let source =
+        "export function f(n:number){const k=n;for(let i=0;i<k&&n>=0&&n<=1000000000;i++)void i;}";
+
+    assert_eq!(legacy_cost_of(source, "f"), (cost("O(N)"), true));
+}
+
+#[test]
+fn quantity_memo_preserves_historical_guard_provenance() {
+    for endpoint in ["n+k", "k+n"] {
+        let source = format!("export function f(n:number){{const k=n;n=1;for(let i=0;i<{endpoint}&&n>=0&&n<=1000000000;i++)void i;}}");
+
+        assert!(bound_is_unknown(&source, "f"), "{source}");
+    }
+}
+
+#[test]
+fn replaced_rounding_intrinsics_cannot_prove_bisection_progress() {
+    for operation in ["floor", "trunc"] {
+        let source = format!("Math.{operation}=()=>2;export function f(){{let lo=0,hi=2;while(lo<hi){{hi=Math.{operation}((lo+hi)/2);}}}}");
+
+        assert!(bound_is_unknown(&source, "f"), "{source}");
+    }
+}
+
+#[test]
+fn reassigned_budget_endpoints_keep_the_current_quantity_at_calls() {
+    let source = "function cube(xs:number[]){for(const x of xs)for(const y of xs)for(const z of xs)void z;}function helper(n:number,xs:number[]){n=xs.length;let i=0;while(i<n&&n>=0&&n<=1000000000){i++;cube(xs);}}export function f(xs:number[]){helper(0,xs);}";
+    let (known, complete, reasons) = support::legacy_result_of(source, "f");
+
+    assert_eq!(support::projected_class_of(&known), cost("O(N^4)"));
+    assert!(complete, "{reasons:?}");
+}
+
+#[test]
+fn getter_readings_need_a_guarded_snapshot_for_a_finite_bound() {
+    let source = "export function f(){const xs={get length(){return Math.random()<0.5?Infinity:1;}} as unknown as number[];for(let i=0;i<xs.length&&xs.length>=0&&xs.length<=1000000000;i++){}}";
+
+    assert!(bound_is_unknown(source, "f"));
+
+    let snapshot = "export function f(){const xs={get length(){return Math.random()<0.5?Infinity:1;}} as unknown as number[];const size=xs.length;for(let i=0;i<size&&size>=0&&size<=1000000000;i++){}}";
+
+    assert!(!bound_is_unknown(snapshot, "f"));
 }

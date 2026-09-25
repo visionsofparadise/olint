@@ -199,7 +199,8 @@ fn result_of(source: &str, name: &str) -> (Cost, bool) {
     run_with_source(source, |analysis, file| {
         let function = support::function_of_name(analysis.project, file, name);
         let part = summary_of(analysis, file, name);
-        let cost = support::legacy_class_of(analysis, file, function, &part.cost);
+        let legacy = support::legacy_class_of(analysis, file, function, &part.cost);
+        let cost = support::projected_class_of(&legacy);
 
         found = Some((cost, part.is_complete()));
     });
@@ -218,12 +219,18 @@ fn cost(text: &str) -> Cost {
 #[test]
 fn growing_const_alias_and_readonly_collections_are_quadratic() {
     for source in [
-        "export function f(n: number) { const values: number[] = []; let total = 0; for (let i = 0; i < n; i++) { values.push(i); for (const value of values) total += value; } return total; }",
-        "export function f(n: number) { const values: number[] = []; const alias = values; let total = 0; for (let i = 0; i < n; i++) { alias.push(i); for (const value of values) total += value; } return total; }",
-        "class Holder { readonly values: number[] = []; } export function f(n: number) { const holder = new Holder(); let total = 0; for (let i = 0; i < n; i++) { holder.values.push(i); for (const value of holder.values) total += value; } return total; }",
-        "export function f(n: number) { const values = [0]; let total = 0; for (let i = 0; i < n; i++) { values[values.length] = i; for (let j = 0; j < values.length; j++) total += j; } return total; }",
+        "export function f(n: number) { const values: number[] = []; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { values.push(i); for (const value of values) total += value; } return total; }",
+        "export function f(n: number) { const values: number[] = []; const alias = values; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { alias.push(i); for (const value of values) total += value; } return total; }",
+        "class Holder { readonly values: number[] = []; } export function f(n: number) { const holder = new Holder(); let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { holder.values.push(i); for (const value of holder.values) total += value; } return total; }",
+        "export function f(n: number) { const values = [0]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { values[values.length] = i; for (let j = 0; j < values.length; j++) total += j; } return total; }",
     ] {
-        assert_eq!(legacy_cost_of(source, "f"), cost("O(N^2)"), "{source}");
+        let expected = if source.contains("values[values.length]") {
+            "O(max(1,N*max(1,N)))"
+        } else {
+            "O(N^2)"
+        };
+
+        assert_eq!(legacy_cost_of(source, "f"), cost(expected), "{source}");
     }
 }
 
@@ -267,7 +274,7 @@ fn prototype_enumeration_is_closed_only_without_reachable_prototype_writes() {
     let array = "export function tag(target: any[]) { target.extra = 1; } export function f() { const values = [1, 2]; let total = 0; for (const key in values) total += key.length; return total; }";
 
     let inherited = "export function f(source: Record<string, number>) { const table = { __proto__: source, a: 1 }; let total = 0; for (const key in table) total += key.length; return total; }";
-    let accessor = "export function f(n: number) { const table = { get a() { for (let i = 0; i < n; i++) (this as any)[i] = i; return 1; } }; let total = table.a; for (const key in table) total += key.length; return total; }";
+    let accessor = "export function f(n: number) { const table = { get a() { for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) (this as any)[i] = i; return 1; } }; let total = table.a; for (const key in table) total += key.length; return total; }";
 
     assert_eq!(result_of(enumeration, "f"), (cost("O(1)"), true));
     assert_eq!(legacy_cost_of(&written, "f"), cost("O(N)"));
@@ -313,13 +320,13 @@ fn exact_lengths_require_histories_without_shrinking() {
 #[test]
 fn awaited_values_alias_their_operand() {
     for source in [
-        "export async function f(n: number) { const xs: number[] = [1, 2, 3]; const ys: number[] = await xs; let total = 0; for (let i = 0; i < n; i++) { ys[ys.length] = i; for (const x of xs) total += x; } return total; }",
-        "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total = 0; for (let i = 0; i < n; i++) { ys.push(i); for (const x of xs) total += x; } return total; }",
+        "export async function f(n: number) { const xs: number[] = [1, 2, 3]; const ys: number[] = await xs; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { ys[ys.length] = i; for (const x of xs) total += x; } return total; }",
+        "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { ys.push(i); for (const x of xs) total += x; } return total; }",
     ] {
         assert_eq!(legacy_cost_of(source, "f"), cost("O(N^2)"), "{source}");
     }
 
-    let control = "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total: number = ys.length; for (let i = 0; i < n; i++) { for (const x of xs) total += x; } return total; }";
+    let control = "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total: number = ys.length; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { for (const x of xs) total += x; } return total; }";
 
     assert_eq!(result_of(control, "f"), (cost("O(N)"), true));
 }
@@ -327,15 +334,15 @@ fn awaited_values_alias_their_operand() {
 #[test]
 fn implicit_coercions_respect_own_methods_and_replaced_intrinsics() {
     for source in [
-        "export function f(n: number) { let count = 0; const o: Record<string, unknown> = { a: 1, toString(): string { (this as Record<string, unknown>)['k' + count++] = 1; return ''; } }; let total = 0; for (let i = 0; i < n; i++) { total += `${o}`.length; for (const k in o) total += k.length; } return total; }",
-        "export function f(n: number) { let count = 0; const o: Record<string, unknown> = { a: 1, valueOf(): number { (this as Record<string, unknown>)['k' + count++] = 1; return 0; } }; let total = 0; for (let i = 0; i < n; i++) { total += +o; for (const k of Object.keys(o)) total += k.length; } return total; }",
-        "(Array.prototype as { join: unknown }).join = function (this: number[]): string { this.push(1); return ''; }; export function f(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n; i++) { total += `${xs}`.length; for (const x of xs) total += x; } return total; }",
-        "(Array.prototype as any)[Symbol.iterator] = function* (this: number[]) { this.push(1); yield 1; }; export function f(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n; i++) { total += [...xs].length; for (let j = 0; j < xs.length; j++) total += j; } return total; }",
+        "export function f(n: number) { let count = 0; const o: Record<string, unknown> = { a: 1, toString(): string { (this as Record<string, unknown>)['k' + count++] = 1; return ''; } }; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += `${o}`.length; for (const k in o) total += k.length; } return total; }",
+        "export function f(n: number) { let count = 0; const o: Record<string, unknown> = { a: 1, valueOf(): number { (this as Record<string, unknown>)['k' + count++] = 1; return 0; } }; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += +o; for (const k of Object.keys(o)) total += k.length; } return total; }",
+        "(Array.prototype as { join: unknown }).join = function (this: number[]): string { this.push(1); return ''; }; export function f(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += `${xs}`.length; for (const x of xs) total += x; } return total; }",
+        "(Array.prototype as any)[Symbol.iterator] = function* (this: number[]) { this.push(1); yield 1; }; export function f(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += [...xs].length; for (let j = 0; j < xs.length; j++) total += j; } return total; }",
     ] {
         assert_eq!(legacy_cost_of(source, "f"), cost("O(N^2)"), "{source}");
     }
 
-    let inert = "export function f(n: number) { const xs = [1, 2, 3]; const o = { a: 1 }; let total = 0; for (let i = 0; i < n; i++) { total += `${xs}${o}`.length + [...xs].length + (xs + '').length; for (const x of xs) total += x; for (const k in o) total += k.length; } return total; }";
+    let inert = "export function f(n: number) { const xs = [1, 2, 3]; const o = { a: 1 }; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += `${xs}${o}`.length + [...xs].length + (xs + '').length; for (const x of xs) total += x; for (const k in o) total += k.length; } return total; }";
 
     assert_eq!(result_of(inert, "f"), (cost("O(N)"), true));
 }
@@ -439,12 +446,12 @@ fn spread_object_copies_carry_their_source_members() {
 
 #[test]
 fn rest_copies_compose_getter_and_custom_iterator_work() {
-    let getter = "export function f(n: number) { const source = { get a(): number { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; return t; } }; const { ...rest } = source; return rest; }";
-    let iterated = "export function f(n: number) { const source = { *[Symbol.iterator](): Generator<number> { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; yield t; } }; const [, ...rest] = source; return rest; }";
+    let getter = "export function f(n: number) { const source = { get a(): number { let t = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) t += j; return t; } }; const { ...rest } = source; return rest; }";
+    let iterated = "export function f(n: number) { const source = { *[Symbol.iterator](): Generator<number> { let t = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) t += j; yield t; } }; const [, ...rest] = source; return rest; }";
     let inert = "export function f() { const source = { a: 1, b: 2 }; const { ...rest } = source; return rest; }";
 
-    let copied = "export function f(n: number) { const source = { get a(): number { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; return t; } }; return { ...source }; }";
-    let nested = "export function f(n: number) { const holder = { inner: { get a(): number { let t = 0; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) t += j; return t; } } }; const { inner: { ...rest } } = holder; return rest; }";
+    let copied = "export function f(n: number) { const source = { get a(): number { let t = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) t += j; return t; } }; return { ...source }; }";
+    let nested = "export function f(n: number) { const holder = { inner: { get a(): number { let t = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) t += j; return t; } } }; const { inner: { ...rest } } = holder; return rest; }";
 
     assert_eq!(result_of(getter, "f"), (cost("O(N^2)"), false));
     assert_eq!(result_of(copied, "f"), (cost("O(N^2)"), false));
@@ -467,7 +474,7 @@ fn produced_sizes_reach_the_operations_that_visit_them() {
         "export function f(xs: number[]) { const m = xs.map(() => xs).flat(); let t = 0; for (const a of xs) t += [...m].length + a; return t; }",
         "export function f(xs: number[]) { const m = xs.flatMap(() => xs); let t = 0; for (const a of xs) t += Array.from(m).length + a; return t; }",
         "export function f(xs: number[]) { let t = 0; xs.flatMap(() => xs).forEach(() => { for (const y of xs) t += y; }); return t; }",
-        "export function f(xs: number[]) { const m = xs.flatMap(() => xs).filter((v) => v > 0); let t = 0; for (let i = 0; i < xs.length; i++) for (const v of m) t += v; return t; }",
+        "export function f(xs: number[]) { const m = xs.flatMap(() => xs).filter((v) => v > 0); let t = 0; for (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 4294967295; i++) for (const v of m) t += v; return t; }",
     ] {
         assert_eq!(result_of(source, "f"), (cost("O(N^3)"), true), "{source}");
     }
@@ -493,12 +500,12 @@ fn repeated_string_lengths_reach_later_scans() {
 
 #[test]
 fn pushes_grow_their_holder_by_every_visit() {
-    let nested = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) out.push(j); let c = 0; for (let i = 0; i < n; i++) if (out.includes(i)) c++; return c; }";
-    let spread = "export function f(n: number) { const out: number[] = []; const row = [1, 2, 3]; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) out.push(...row); let c = 0; for (let i = 0; i < n; i++) c += out.indexOf(i); return c; }";
-    let shifted = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n; i++) out.unshift(i); let c = 0; for (let i = 0; i < n; i++) c += out.indexOf(i); return c; }";
-    let scoped = "export function f(n: number) { let c = 0; for (let i = 0; i < n; i++) { const out: number[] = []; for (let j = 0; j < n; j++) out.push(j); for (let k = 0; k < n; k++) c += out.indexOf(k); } return c; }";
-    let once = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n; i++) out.push(i); return out.slice(); }";
-    let produced = "export function f(xs: number[]) { const m = xs.flatMap(() => xs); const out: number[] = []; for (const v of m) out.push(v); const k = xs.length; let c = 0; for (let i = 0; i < k; i++) c += out.indexOf(i); return c; }";
+    let nested = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) out.push(j); let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) if (out.includes(i)) c++; return c; }";
+    let spread = "export function f(n: number) { const out: number[] = []; const row = [1, 2, 3]; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) out.push(...row); let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) c += out.indexOf(i); return c; }";
+    let shifted = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) out.unshift(i); let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) c += out.indexOf(i); return c; }";
+    let scoped = "export function f(n: number) { let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { const out: number[] = []; for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) out.push(j); for (let k = 0; k < n && n >= 0 && n <= 1000000000; k++) c += out.indexOf(k); } return c; }";
+    let once = "export function f(n: number) { const out: number[] = []; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) out.push(i); return out.slice(); }";
+    let produced = "export function f(xs: number[]) { const m = xs.flatMap(() => xs); const out: number[] = []; for (const v of m) out.push(v); const k = xs.length; let c = 0; for (let i = 0; i < k && k >= 0 && k <= 4294967295; i++) c += out.indexOf(i); return c; }";
 
     assert_eq!(legacy_cost_of(nested, "f"), cost("O(N^3)"));
     assert_eq!(legacy_cost_of(spread, "f"), cost("O(N^3)"));
@@ -511,8 +518,8 @@ fn pushes_grow_their_holder_by_every_visit() {
 #[test]
 fn growth_the_analysis_cannot_count_stays_unresolved() {
     for source in [
-        "export function f(n: number) { const out: number[] = []; const alias = out; for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) alias.push(j); out.push(1); let c = 0; for (let i = 0; i < n; i++) if (out.includes(i)) c++; return c; }",
-        "export function f(n: number, xs: number[]) { const out: number[] = []; out.push(1); xs.forEach((x) => out.push(x)); let c = 0; for (let i = 0; i < n; i++) if (out.includes(i)) c++; return c; }",
+        "export function f(n: number) { const out: number[] = []; const alias = out; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) alias.push(j); out.push(1); let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) if (out.includes(i)) c++; return c; }",
+        "export function f(n: number, xs: number[]) { const out: number[] = []; out.push(1); xs.forEach((x) => out.push(x)); let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) if (out.includes(i)) c++; return c; }",
     ] {
         let (found, complete) = result_of(source, "f");
 

@@ -181,9 +181,9 @@ fn an_equality_base_case_cannot_prove_a_decrement_terminates() {
 
 #[test]
 fn a_measure_sized_multiplicity_keeps_its_factorial_expression() {
-    let source = "export function f(n: number): number {\n\tif (n <= 0) return 1;\n\tlet total = 0;\n\tfor (let i = 0; i < n; i++) total += f(n - 1);\n\treturn total;\n}\n";
+    let source = "export function f(n: number): number {\n\tif (n <= 0) return 1;\n\tlet total = 0;\n\tfor (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += f(n - 1);\n\treturn total;\n}\n";
 
-    assert_exceeds_quartic(source, "f", "O(((n)! * max(1, n)))");
+    assert_exceeds_quartic(source, "f", "O((n * (n)!))");
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
         (
             "a constant number",
             "f",
-            "export function f(n: number, xs: number[], k: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; for (let i = 0; i < k; i++) t += i; return t + f(n - 1, xs, 3); }",
+            "export function f(n: number, xs: number[], k: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; for (let i = 0; i < k && k >= 0 && k <= 1000000000; i++) t += i; return t + f(n - 1, xs, 3); }",
             "O(max(n, xs, k, (n * max(1, n, xs, k))))",
         ),
         (
@@ -433,14 +433,14 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
         (
             "a second number decremented under its guard",
             "f",
-            "export function f(n: number, m: number): number { if (n <= 0) return 0; if (m <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m - 1); }",
-            "O(max(n, m, (n * max(1, n, m))))",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; if (m <= 0) return 0; let t = 0; for (let i = 0; i < m && m >= 0 && m <= 1000000000; i++) t += i; return t + f(n - 1, m - 1); }",
+            "O(max(m, (n * max(1, m))))",
         ),
         (
             "a second number halved",
             "f",
-            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m; i++) t += i; return t + f(n - 1, m >> 1); }",
-            "O(max(n, m, (n * max(1, n, m))))",
+            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m && m >= 0 && m <= 1000000000; i++) t += i; return t + f(n - 1, m >> 1); }",
+            "O(max(m, (n * max(1, m))))",
         ),
     ];
     let sources: Vec<RecurrenceRow<'_>> = rows

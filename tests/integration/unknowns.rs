@@ -199,11 +199,11 @@ fn unknown_effects_remove_dependent_iteration_proofs() {
     }
 
     run_with_source(
-        "export function f(n: number) { for (let i = 0; i < n; i++) {} }",
+        "export function f(n: number) { for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) {} }",
         |analysis, file| {
             let part = summary_of(analysis, file, "f");
 
-            assert_eq!(part.cost, Cost::N);
+            assert_eq!(support::projected_class_of(&part.cost), Cost::N);
             assert!(part.unknowns.is_none());
         },
     );

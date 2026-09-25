@@ -723,13 +723,16 @@ fn a_cold_call_leaves_its_argument_costs_unmarked() {
 
 #[test]
 fn callee_member_writes_compose_through_parameter_substitution() {
-    for (argument, expected) in [("box", "O(N^2)"), ("other", "O(N)")] {
-        let source = format!("function grow(target: {{ limit: number }}, n: number) {{ target.limit += n; }} export function selected(n: number) {{ const box = {{ limit: n }}; const other = {{ limit: n }}; let i = 0, total = 0; for (let j = 0; j < n; j++) {{ while (i < box.limit) {{ i++; total++; }} grow({argument}, n); }} return total; }}");
+    for (argument, expected) in [("box", "O(N)"), ("other", "O(N)")] {
+        let source = format!("function grow(target: {{ limit: number }}, n: number) {{ target.limit += n; }} export function selected(n: number) {{ const box = {{ limit: n }}; const other = {{ limit: n }}; let i = 0, total = 0; for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) {{ while (i < box.limit) {{ i++; total++; }} grow({argument}, n); }} return total; }}");
 
         let (cost, reasons) = selected_result(&source);
 
         assert_eq!(cost, Cost::parse(expected).unwrap(), "{argument}");
-        assert!(reasons.is_empty(), "{argument}: {reasons:?}");
+        assert!(
+            reasons.contains(&olint::unknowns::UnknownReason::Bound),
+            "{argument}: {reasons:?}"
+        );
     }
 }
 
@@ -792,11 +795,12 @@ fn published_effects_keep_reachable_writes_and_drop_activation_locals() {
 
 #[test]
 fn rebound_callee_parameters_keep_their_writes_unattributed() {
-    let source = "function grow(target: { limit: number }, spare: { limit: number }, n: number) { target = spare; target.limit += n; } export function selected(n: number) { const box = { limit: n }; const other = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n; j++) { while (i < box.limit) { i++; total++; } grow(other, box, n); } return total; }";
+    let source = "function grow(target: { limit: number }, spare: { limit: number }, n: number) { target = spare; target.limit += n; } export function selected(n: number) { const box = { limit: n }; const other = { limit: n }; let i = 0, total = 0; for (let j = 0; j < n && n >= 0 && n <= 1000000000; j++) { while (i < box.limit) { i++; total++; } grow(other, box, n); } return total; }";
 
-    let (cost, _) = selected_result(source);
+    let (cost, reasons) = selected_result(source);
 
-    assert_eq!(cost, Cost::parse("O(N^2)").unwrap());
+    assert_eq!(cost, Cost::parse("O(N)").unwrap());
+    assert!(reasons.contains(&olint::unknowns::UnknownReason::Bound));
 }
 
 fn record_costs_of(

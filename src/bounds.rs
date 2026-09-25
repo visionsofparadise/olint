@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentTarget, BindingPattern, Expression, ForStatement,
     ForStatementInit, Statement,
@@ -12,8 +14,8 @@ use crate::analysis::Analysis;
 use crate::budgets::{
     comparison_pairs_of, conjuncts_of, is_less, Direction, Strictness, Subtree, Visits,
 };
-use crate::cost::Cost;
-use crate::declarations::{Binding, Declaration};
+use crate::cost::{Cost, CostComparison};
+use crate::declarations::{Binding, Declaration, ParameterNode};
 use crate::directives::PerfTag;
 use crate::flow::{completion_of, control_target_of, Completion};
 use crate::project::FileId;
@@ -22,13 +24,35 @@ use crate::syntax::{
     member_expression_of, unwrap, Root,
 };
 use crate::unknowns::UnknownReason;
-use crate::values::Primitive;
+use crate::values::{Primitive, SizeQuantity};
 
 const MAXIMUM_VALUE_DEPTH: usize = 4;
 
-const SMALLEST_GROWTH_RATIO: f64 = 2.0;
-
 const LARGEST_CONTRACTION_RATIO: f64 = 0.5;
+
+fn quantity_maximum(left: Cost, right: Cost) -> Option<Cost> {
+    if left.is_one() && left.compare(&right) == CostComparison::Within {
+        return Some(right);
+    }
+
+    if right.is_one() && right.compare(&left) == CostComparison::Within {
+        return Some(left);
+    }
+
+    Cost::maximum(vec![left, right]).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum QuantityKey {
+    Binding(Binding),
+    Expression(NodeId),
+}
+
+#[derive(Default)]
+struct QuantityProof {
+    visiting: HashSet<QuantityKey>,
+    settled: HashMap<QuantityKey, Option<(Cost, f64)>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Bound {
@@ -148,6 +172,7 @@ struct CounterWrite {
 }
 
 struct Comparison<'a> {
+    expression: &'a Expression<'a>,
     counter: Binding,
     endpoint: &'a Expression<'a>,
     direction: Direction,
@@ -219,7 +244,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub fn bound_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Bound {
+        let key = (file, loop_kind.node_id());
+
+        if !self.active_bounds.insert(key) {
+            return unresolved_bound_of();
+        }
+
         let bound = self.inner_bound_of(file, loop_kind);
+
+        self.active_bounds.remove(&key);
 
         if self.bound_seen.insert((file, loop_kind.node_id())) {
             self.stats.count(&format!(
@@ -306,7 +339,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         body: &'a Statement<'a>,
     ) -> Bound {
         let Some(test) = statement.test.as_ref() else {
-            return linear_bound_of();
+            return unresolved_bound_of();
         };
         let variable = self.loop_variable_of(file, statement);
         let repetition = Repetition {
@@ -350,6 +383,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         test: &'a Expression<'a>,
         repetition: &Repetition<'a>,
     ) -> Bound {
+        if matches!(unwrap(test), Expression::BooleanLiteral(literal) if !literal.value) {
+            return constant_bound_of("false condition");
+        }
+
         let comparisons = self.comparisons_of(file, test);
         let mut best: Option<Bound> = None;
 
@@ -366,7 +403,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        best.unwrap_or_else(linear_bound_of)
+        best.unwrap_or_else(unresolved_bound_of)
     }
 
     fn comparisons_of(&mut self, file: FileId, test: &'a Expression<'a>) -> Vec<Comparison<'a>> {
@@ -378,6 +415,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
 
             for (counter, endpoint, direction, strictness) in pairs {
+                let expression = counter;
                 let Some(reference) = identifier_of(counter) else {
                     continue;
                 };
@@ -386,6 +424,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 };
 
                 found.push(Comparison {
+                    expression,
                     counter,
                     endpoint,
                     direction,
@@ -663,7 +702,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let name = member.static_property_name()?;
 
-        if !matches!(name, "floor" | "trunc") {
+        if !matches!(name, "floor" | "trunc") || self.intrinsic_replaced_of(file, &call.callee) {
             return None;
         }
 
@@ -747,9 +786,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        let initial = self
+            .initial_expression_of(file, comparison.counter, repetition)
+            .or_else(|| {
+                matches!(
+                    self.declarations
+                        .of_binding(self.project, comparison.counter),
+                    Some(Declaration::Parameter { .. })
+                )
+                .then_some(comparison.expression)
+            })?;
+
+        self.bounded_quantity_of(file, initial, repetition, 0)?;
+        self.bounded_quantity_of(file, comparison.endpoint, repetition, 0)?;
+
         let mut ratios = Vec::new();
 
         for write in &progression.writes {
+            if let AstKind::AssignmentExpression(assignment) = self.kind_of_node(file, write.site) {
+                if assignment.operator == AssignmentOperator::ShiftLeft
+                    || Subtree::of(Root::Expression(&assignment.right), false, false).iter().any(|kind|
+                        matches!(kind, AstKind::BinaryExpression(binary) if binary.operator == BinaryOperator::ShiftLeft))
+                {
+                    return Some(unresolved_bound_of());
+                }
+            }
+
             match write.step {
                 Step::Geometric(Some(ratio)) if write.updating || !write.deferred => {
                     ratios.push(ratio)
@@ -768,14 +830,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match comparison.direction {
             Direction::Up => {
-                if !ratios.iter().all(|ratio| *ratio >= SMALLEST_GROWTH_RATIO) {
+                if !ratios.iter().all(|ratio| *ratio > 1.0) {
                     return None;
                 }
 
-                let (_, initial) = repetition
-                    .initial
-                    .filter(|(binding, _)| *binding == comparison.counter)
-                    .or_else(|| self.entry_value_of(file, comparison.counter, repetition))?;
+                let initial = self.initial_expression_of(file, comparison.counter, repetition)?;
 
                 (self.numeric_value_of(file, initial)? >= 1.0)
                     .then(|| logarithmic_bound_of(repetition.geometric_proof))
@@ -838,17 +897,534 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .iter()
             .all(|advance| advance.is_some_and(|advance| advance >= 0.0))
         {
-            return None;
+            return self.exact_additive_distance_of(file, comparison, progression, repetition);
         }
 
         if !self.is_stable_endpoint(file, comparison.endpoint, repetition) {
             return None;
         }
 
-        let (distance, proof) = self.distance_of(file, comparison, repetition)?;
-        let repetitions = (distance / guaranteed).floor() + 1.0;
+        let initial = self
+            .initial_expression_of(file, comparison.counter, repetition)
+            .unwrap_or(comparison.expression);
+        let (initial_cost, initial_magnitude) = self
+            .bounded_quantity_of(file, initial, repetition, 0)
+            .or_else(|| self.bounded_quantity_of(file, comparison.expression, repetition, 0))?;
+        let (endpoint_cost, endpoint_magnitude) =
+            self.bounded_quantity_of(file, comparison.endpoint, repetition, 0)?;
+        let magnitude = initial_magnitude.max(endpoint_magnitude);
 
-        repetitions.is_finite().then(|| constant_bound_of(proof))
+        if !progression.unconditional.iter().any(|write| {
+            matches!(write.step, Step::Additive(Some(delta))
+                if delta * toward > 0.0 && magnitude + (delta * toward) / 2.0 > magnitude)
+        }) {
+            return Some(unresolved_bound_of());
+        }
+
+        if let Some((distance, proof)) = self.distance_of(file, comparison, repetition) {
+            let repetitions = (distance / guaranteed).floor() + 1.0;
+
+            return repetitions.is_finite().then(|| constant_bound_of(proof));
+        }
+
+        quantity_maximum(initial_cost, endpoint_cost).map(|factor| Bound::Proven {
+            factor,
+            proof: None,
+        })
+    }
+
+    fn exact_additive_distance_of(
+        &mut self,
+        file: FileId,
+        comparison: &Comparison<'a>,
+        progression: &Progression,
+        repetition: &Repetition<'a>,
+    ) -> Option<Bound> {
+        if progression.unconditional.len() != progression.writes.len()
+            || progression.writes.iter().any(|write| write.deferred)
+            || !self.is_stable_endpoint(file, comparison.endpoint, repetition)
+        {
+            return None;
+        }
+
+        let initial = self.initial_expression_of(file, comparison.counter, repetition)?;
+        let initial = self.numeric_value_of(file, initial)?;
+        let endpoint = self.numeric_value_of(file, comparison.endpoint)?;
+        let mut magnitude = initial.abs().max(endpoint.abs());
+
+        if [initial, endpoint]
+            .iter()
+            .any(|value| (value * 4.0).fract() != 0.0)
+        {
+            return None;
+        }
+
+        let nodes = self.project.file(file).semantic.nodes();
+
+        for write in &progression.writes {
+            if nodes
+                .ancestor_ids(write.site)
+                .take_while(|node| *node != repetition.node)
+                .any(|node| is_iteration_kind(&nodes.kind(node)))
+            {
+                return None;
+            }
+
+            let Step::Additive(Some(delta)) = write.step else {
+                return None;
+            };
+
+            if !delta.is_finite() || (delta * 4.0).fract() != 0.0 {
+                return None;
+            }
+
+            magnitude += delta.abs();
+        }
+
+        (magnitude <= 281_474_976_710_656.0).then(|| constant_bound_of("constant bound"))
+    }
+
+    fn bounded_quantity_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+        depth: usize,
+    ) -> Option<(Cost, f64)> {
+        self.bounded_quantity_with(
+            file,
+            expression,
+            repetition,
+            depth,
+            &mut QuantityProof::default(),
+        )
+    }
+
+    fn bounded_quantity_with(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+        depth: usize,
+        proof: &mut QuantityProof,
+    ) -> Option<(Cost, f64)> {
+        if depth > MAXIMUM_VALUE_DEPTH || !self.charge_work(Event::BudgetPrepassNode, 1) {
+            return None;
+        }
+
+        let test = match self.kind_of_node(file, repetition.node) {
+            AstKind::ForStatement(statement) => statement.test.as_ref(),
+            AstKind::WhileStatement(statement) => Some(&statement.test),
+            AstKind::DoWhileStatement(statement) => Some(&statement.test),
+            _ => None,
+        };
+        let current = test.is_some_and(|test| {
+            is_within(
+                self.project.file(file).semantic.nodes(),
+                expression.node_id(),
+                test.node_id(),
+            )
+        });
+        let key = identifier_of(unwrap(expression))
+            .filter(|_| current)
+            .and_then(|reference| self.binding_of_identifier(file, reference))
+            .map_or(
+                QuantityKey::Expression(expression.node_id()),
+                QuantityKey::Binding,
+            );
+
+        if let Some(found) = proof.settled.get(&key) {
+            return found.clone();
+        }
+
+        if !proof.visiting.insert(key) {
+            return None;
+        }
+
+        let found = self.bounded_quantity_inner(file, expression, repetition, depth, proof);
+
+        proof.visiting.remove(&key);
+        proof.settled.insert(key, found.clone());
+
+        found
+    }
+
+    fn bounded_quantity_inner(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+        depth: usize,
+        proof: &mut QuantityProof,
+    ) -> Option<(Cost, f64)> {
+        if depth > MAXIMUM_VALUE_DEPTH {
+            return None;
+        }
+
+        if let Some(value) = self.numeric_value_of(file, expression) {
+            return Some((Cost::ONE, value.abs()));
+        }
+
+        let expression = unwrap(expression);
+
+        if let Expression::BinaryExpression(binary) = expression {
+            if matches!(
+                binary.operator,
+                BinaryOperator::Addition | BinaryOperator::Subtraction
+            ) {
+                let (left, left_magnitude) =
+                    self.bounded_quantity_with(file, &binary.left, repetition, depth + 1, proof)?;
+                let (right, right_magnitude) =
+                    self.bounded_quantity_with(file, &binary.right, repetition, depth + 1, proof)?;
+                let magnitude = left_magnitude + right_magnitude;
+
+                if magnitude <= 9_007_199_254_740_991.0 {
+                    return Some((quantity_maximum(left, right)?, magnitude));
+                }
+            }
+
+            return None;
+        }
+
+        if let Expression::StaticMemberExpression(member) = expression {
+            if member.property.name == "length" {
+                let mut kind = self.proven_kind(file, &member.object);
+
+                if kind == crate::declared_types::Kind::Unknown
+                    && self.is_primitive_operand(file, &member.object)
+                    && self.declared_type_of_expression(file, &member.object).kind
+                        == crate::declared_types::Kind::String
+                {
+                    kind = crate::declared_types::Kind::String;
+                }
+
+                if matches!(
+                    kind,
+                    crate::declared_types::Kind::Array | crate::declared_types::Kind::String
+                ) {
+                    let size = self.collection_size_of(file, &member.object);
+
+                    if size.length_resolved {
+                        let magnitude = if kind == crate::declared_types::Kind::Array {
+                            4_294_967_295.0
+                        } else {
+                            9_007_199_254_740_991.0
+                        };
+
+                        return Some((size.length, magnitude));
+                    }
+                }
+            }
+        }
+
+        let binding = identifier_of(expression)
+            .and_then(|reference| self.binding_of_identifier(file, reference));
+        let declaration =
+            binding.and_then(|binding| self.declarations.of_binding(self.project, binding));
+
+        if let Some(Declaration::Variable {
+            file: owner,
+            declarator,
+            constant: true,
+        }) = declaration
+        {
+            if owner == file {
+                if let Some(initial) = declarator.init.as_ref() {
+                    if let Some(found) =
+                        self.bounded_quantity_with(file, initial, repetition, depth + 1, proof)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+
+        let test = match self.kind_of_node(file, repetition.node) {
+            AstKind::ForStatement(statement) => statement.test.as_ref()?,
+            AstKind::WhileStatement(statement) => &statement.test,
+            AstKind::DoWhileStatement(statement) => &statement.test,
+            _ => return None,
+        };
+        let mut tests = vec![test];
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+
+        if !is_within(nodes, expression.node_id(), test.node_id()) {
+            if member_expression_of(expression).is_some() {
+                return None;
+            }
+
+            let fresh = repetition.initial.is_some_and(|(_, initial)| {
+                is_within(nodes, expression.node_id(), initial.node_id())
+            });
+            let references = Subtree::of(Root::Expression(expression), false, false);
+
+            for kind in references.iter() {
+                if !self.charge_work(Event::BudgetPrepassNode, 1) {
+                    return None;
+                }
+
+                let AstKind::IdentifierReference(reference) = kind else {
+                    continue;
+                };
+                let binding = self.binding_of_identifier(file, reference)?;
+                let symbol = local_symbol_of(file, binding)?;
+
+                if project
+                    .file(file)
+                    .semantic
+                    .scoping()
+                    .get_resolved_references(symbol)
+                    .any(|reference| {
+                        reference.is_write()
+                            && (!fresh || is_within(nodes, reference.node_id(), repetition.node))
+                    })
+                {
+                    return None;
+                }
+            }
+        }
+
+        let guarded_binding = binding.or_else(|| {
+            member_expression_of(expression)
+                .and_then(|member| identifier_of(unwrap(member.object())))
+                .and_then(|reference| self.binding_of_identifier(file, reference))
+        });
+
+        if let Some(guarded_binding) = guarded_binding {
+            for ancestor in nodes.ancestor_ids(repetition.node) {
+                if !self.charge_work(Event::BudgetPrepassNode, 1) {
+                    return None;
+                }
+
+                let AstKind::IfStatement(statement) = nodes.kind(ancestor) else {
+                    continue;
+                };
+
+                if is_within(nodes, repetition.node, statement.consequent.node_id())
+                    && self
+                        .write_sites_of(file, guarded_binding, ancestor)
+                        .is_some_and(|writes| {
+                            writes
+                                .iter()
+                                .all(|write| is_within(nodes, *write, repetition.node))
+                        })
+                {
+                    tests.push(&statement.test);
+                }
+            }
+        }
+
+        let mut lower: Option<f64> = None;
+        let mut upper: Option<(Cost, f64)> = None;
+
+        for conjunct in tests.into_iter().flat_map(conjuncts_of) {
+            if !self.charge_work(Event::BudgetPrepassNode, 1) {
+                return None;
+            }
+
+            let Some(pairs) = comparison_pairs_of(conjunct) else {
+                continue;
+            };
+
+            for (value, endpoint, direction, _) in pairs {
+                if !self.is_same_reading(file, value, expression) {
+                    continue;
+                }
+
+                match direction {
+                    Direction::Up => {
+                        if let Some(candidate) =
+                            self.bounded_quantity_with(file, endpoint, repetition, depth + 1, proof)
+                        {
+                            if upper.as_ref().is_none_or(|held| candidate.1 < held.1) {
+                                upper = Some(candidate);
+                            }
+                        }
+                    }
+                    Direction::Down => {
+                        if let Some(endpoint) = self.numeric_value_of(file, endpoint) {
+                            lower = Some(lower.map_or(endpoint, |held| held.max(endpoint)));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (Some(lower), Some((upper_cost, upper))) = (lower, upper) else {
+            return None;
+        };
+
+        if lower < 0.0 || upper < lower || upper > 9_007_199_254_740_991.0 {
+            return None;
+        }
+
+        let stable_binding = binding.filter(|binding| {
+            if !matches!(declaration, Some(Declaration::Parameter { .. }))
+                || self.is_parameter_unwritten(*binding)
+            {
+                return true;
+            }
+
+            local_symbol_of(file, *binding).is_some_and(|symbol| {
+                project
+                    .file(file)
+                    .semantic
+                    .scoping()
+                    .get_resolved_references(symbol)
+                    .filter(|reference| reference.is_write())
+                    .all(|reference| is_within(nodes, reference.node_id(), repetition.node))
+            })
+        });
+        let cost = stable_binding
+            .and_then(|binding| self.current_substitutions.get(&binding))
+            .and_then(|facts| facts.value.size.clone())
+            .or_else(|| {
+                stable_binding
+                    .and(declaration)
+                    .and_then(|declaration| self.parameter_quantity_of(declaration))
+            });
+        let cost = match (cost, expression) {
+            (Some(cost), _) => cost,
+            (None, Expression::StaticMemberExpression(member))
+                if member.property.name == "length" =>
+            {
+                self.collection_size_of(file, &member.object).length
+            }
+            (None, Expression::Identifier(_)) if !upper_cost.is_one() => upper_cost,
+            (None, Expression::Identifier(_)) => {
+                let supplied = self.guarded_quantity_cost(file, expression, 0).or_else(|| {
+                    let binding = binding?;
+                    let (_, initial) = repetition
+                        .initial
+                        .filter(|(found, _)| *found == binding)
+                        .or_else(|| self.entry_value_of(file, binding, repetition))?;
+
+                    self.guarded_quantity_cost(file, initial, 0)
+                });
+
+                match supplied {
+                    Some(cost) => cost,
+                    None if repetition.initial.is_some_and(|(_, initial)| {
+                        self.is_same_reading(file, initial, expression)
+                    }) =>
+                    {
+                        Cost::ONE
+                    }
+                    None => return None,
+                }
+            }
+            _ => return None,
+        };
+
+        Some((cost, upper))
+    }
+
+    fn parameter_quantity_of(&mut self, declaration: Declaration<'a>) -> Option<Cost> {
+        let Declaration::Parameter {
+            file,
+            parameter: ParameterNode::Formal(parameter),
+            ..
+        } = declaration
+        else {
+            return None;
+        };
+        let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+            return None;
+        };
+        let origin = self.source_span(file, identifier.span);
+        let value = self.values.at(origin);
+
+        self.values
+            .quantity(
+                value.value,
+                SizeQuantity::Value,
+                identifier.name.to_string(),
+            )
+            .ok()
+    }
+
+    fn guarded_quantity_cost(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> Option<Cost> {
+        if depth > MAXIMUM_VALUE_DEPTH || !self.charge_work(Event::BudgetPrepassNode, 1) {
+            return None;
+        }
+
+        if self.numeric_value_of(file, expression).is_some() {
+            return Some(Cost::ONE);
+        }
+
+        let expression = unwrap(expression);
+
+        if let Expression::StaticMemberExpression(member) = expression {
+            if member.property.name == "length" {
+                let size = self.collection_size_of(file, &member.object);
+
+                return size.length_resolved.then_some(size.length);
+            }
+        }
+
+        let reference = identifier_of(expression)?;
+        let binding = self.binding_of_identifier(file, reference)?;
+        let declaration = self.declarations.of_binding(self.project, binding)?;
+        let (mut cost, function) = match declaration {
+            Declaration::Variable {
+                file: owner,
+                declarator,
+                ..
+            } if owner == file => (
+                self.guarded_quantity_cost(file, declarator.init.as_ref()?, depth + 1)?,
+                self.enclosing_function_of(file, declarator.node_id())?,
+            ),
+            Declaration::Parameter {
+                file: owner,
+                function,
+                ..
+            } if owner == file => {
+                let cost = self
+                    .current_substitutions
+                    .get(&binding)
+                    .and_then(|facts| facts.value.size.clone())
+                    .or_else(|| self.parameter_quantity_of(declaration))?;
+
+                if self.is_parameter_unwritten(binding) {
+                    return Some(cost);
+                }
+
+                (cost, function.node_id())
+            }
+            _ => return None,
+        };
+        let writes = self.write_sites_of(file, binding, function)?;
+
+        if matches!(declaration, Declaration::Parameter { .. }) && writes.is_empty() {
+            return None;
+        }
+
+        for site in writes {
+            if !self.charge_work(Event::BudgetPrepassNode, 1) {
+                return None;
+            }
+
+            let AstKind::AssignmentExpression(assignment) =
+                self.project.file(file).semantic.nodes().parent_kind(site)
+            else {
+                return None;
+            };
+
+            if assignment.operator != AssignmentOperator::Assign {
+                return None;
+            }
+
+            let assigned = self.guarded_quantity_cost(file, &assignment.right, depth + 1)?;
+            cost = quantity_maximum(cost, assigned)?;
+        }
+
+        Some(cost)
     }
 
     fn distance_of(
@@ -857,10 +1433,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         comparison: &Comparison<'a>,
         repetition: &Repetition<'a>,
     ) -> Option<(f64, &'static str)> {
-        let (_, initial) = repetition
-            .initial
-            .filter(|(binding, _)| *binding == comparison.counter)
-            .or_else(|| self.entry_value_of(file, comparison.counter, repetition))?;
+        let initial = self.initial_expression_of(file, comparison.counter, repetition)?;
         let toward = match comparison.direction {
             Direction::Up => 1.0,
             Direction::Down => -1.0,
@@ -875,7 +1448,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let offset = self.offset_of(file, initial, comparison.endpoint)? * toward;
 
-        (offset >= 0.0).then_some((offset, "constant offset from start"))
+        Some((offset.max(0.0), "constant offset from start"))
     }
 
     fn offset_of(
@@ -935,6 +1508,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         left_name == right_name
             && self.is_same_reading(file, unwrap(left.object()), unwrap(right.object()))
+    }
+
+    fn initial_expression_of(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        repetition: &Repetition<'a>,
+    ) -> Option<&'a Expression<'a>> {
+        repetition
+            .initial
+            .filter(|(binding, _)| *binding == counter)
+            .or_else(|| self.entry_value_of(file, counter, repetition))
+            .map(|(_, initial)| initial)
     }
 
     fn entry_value_of(
@@ -1046,6 +1632,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        for binding in [lower, upper] {
+            let (_, initial) = repetition
+                .initial
+                .filter(|(found, _)| *found == binding)
+                .or_else(|| self.entry_value_of(file, binding, repetition))?;
+
+            if self
+                .numeric_value_of(file, initial)
+                .is_some_and(|value| value < 0.0)
+            {
+                return None;
+            }
+
+            let (_, magnitude) = self.bounded_quantity_of(file, initial, repetition, 0)?;
+
+            if magnitude > 1_073_741_823.0 {
+                return None;
+            }
+        }
+
         let mut sites = Vec::new();
 
         for (binding, rising) in [(lower, true), (upper, false)] {
@@ -1149,7 +1755,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let value = self.truncated_argument_of(file, value).unwrap_or(value);
+        let truncated = self.truncated_argument_of(file, value);
+        let value = truncated.unwrap_or(value);
         let Expression::BinaryExpression(binary) = value else {
             return false;
         };
@@ -1160,7 +1767,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             BinaryOperator::Division
             | BinaryOperator::ShiftRight
             | BinaryOperator::ShiftRightZeroFill => {
-                self.is_halving_divisor(file, binary.operator, right)
+                (binary.operator != BinaryOperator::Division || truncated.is_some())
+                    && self.is_halving_divisor(file, binary.operator, right)
                     && self.is_interval_sum(file, interval, left)
             }
             BinaryOperator::Addition => {
@@ -1218,13 +1826,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         value: &'a Expression<'a>,
     ) -> bool {
         let value = unwrap(value);
-        let value = self.truncated_argument_of(file, value).unwrap_or(value);
+        let truncated = self.truncated_argument_of(file, value);
+        let value = truncated.unwrap_or(value);
         let Expression::BinaryExpression(binary) = value else {
             return false;
         };
         let halving = self.is_halving_divisor(file, binary.operator, &binary.right);
 
-        if !halving {
+        if !halving || (binary.operator == BinaryOperator::Division && truncated.is_none()) {
             return false;
         }
 
@@ -1238,6 +1847,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn share_bound_of(
+        &mut self,
+        file: FileId,
+        test: &'a Expression<'a>,
+        repetition: &Repetition<'a>,
+    ) -> Option<Bound> {
+        for conjunct in conjuncts_of(test) {
+            if let Some(bound) = self.share_conjunct_bound_of(file, conjunct, repetition) {
+                return Some(bound);
+            }
+        }
+
+        None
+    }
+
+    fn share_conjunct_bound_of(
         &mut self,
         file: FileId,
         test: &'a Expression<'a>,
@@ -1257,6 +1881,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .initial
             .filter(|(binding, _)| *binding == counter)?;
         let endpoint = unwrap(&binary.right);
+        let (_, initial_magnitude) = self.bounded_quantity_of(file, initial, repetition, 0)?;
+        let (_, endpoint_magnitude) = self.bounded_quantity_of(file, endpoint, repetition, 0)?;
+        let magnitude = initial_magnitude.max(endpoint_magnitude);
+
+        if magnitude + 0.5 <= magnitude {
+            return None;
+        }
+
         let shared =
             self.is_share_sized(file, endpoint) || self.is_share_offset_of(file, initial, endpoint);
 

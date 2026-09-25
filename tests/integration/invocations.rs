@@ -6,7 +6,7 @@ use olint::unknowns::UnknownReason;
 
 use crate::support;
 
-use support::{assert_selected, index_of, selected_result_in};
+use support::{assert_projected_selected, assert_selected, index_of, selected_result_in};
 
 const QUADRATIC: &str = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }";
 
@@ -95,16 +95,16 @@ fn iterator_protocols_charge_acquisition_each_visit_and_applicable_close() {
 #[test]
 fn unknown_implementations_keep_proven_multiplicity_and_surrounding_work() {
     let cases = [
-        (index_of(format!("{QUADRATIC}\nexport function selected(tag: (parts: TemplateStringsArray) => number, xs: number[], n: number) {{ let total = 0; for (let i = 0; i < n; i++) total += tag`x` + quadratic(xs); return total; }}")), "O(N^3)", true),
-        (index_of(format!("{QUADRATIC}\nexport function selected(descriptor: PropertyDescriptor, xs: number[], n: number) {{ const o = {{}} as {{ v: number }}; Object.defineProperty(o, 'v', descriptor); let total = 0; for (let i = 0; i < n; i++) total += o.v + quadratic(xs); return total; }}")), "O(N^3)", true),
-        (index_of(format!("{QUADRATIC}\nexport function selected(f: () => number, xs: number[], n: number) {{ const box = {{ valueOf() {{ return 1; }} }}; box.valueOf = f; let total = 0; for (let i = 0; i < n; i++) total += +box + quadratic(xs); return total; }}")), "O(N^3)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(tag: (parts: TemplateStringsArray) => number, xs: number[], n: number) {{ let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += tag`x` + quadratic(xs); return total; }}")), "O(N^3)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(descriptor: PropertyDescriptor, xs: number[], n: number) {{ const o = {{}} as {{ v: number }}; Object.defineProperty(o, 'v', descriptor); let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += o.v + quadratic(xs); return total; }}")), "O(N^3)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(f: () => number, xs: number[], n: number) {{ const box = {{ valueOf() {{ return 1; }} }}; box.valueOf = f; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += +box + quadratic(xs); return total; }}")), "O(N^3)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(step: () => IteratorResult<number>, xs: number[]) {{ const iterator = {{ next(): IteratorResult<number> {{ return {{ done: true, value: 0 }}; }} }}; iterator.next = step; const iterable = {{ [Symbol.iterator]() {{ return iterator; }} }}; let total = 0; for (const v of iterable) total += quadratic(xs); return total; }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport class Keys {{ [Symbol.iterator]() {{ return [1].values(); }} }}\nexport function selected(items: Iterable<number>, xs: number[]) {{ let total = 0; for (const v of items) total += quadratic(xs); return total; }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport class Keys {{ [Symbol.iterator]() {{ return [1].values(); }} }}\nexport function selected(xs: number[]) {{ let total = 0; for (const x of xs) total += quadratic(xs); return total; }}")), "O(N^3)", false),
-        (index_of(format!("{QUADRATIC}\nclass Holder {{ get value() {{ return 1; }} }}\nexport function selected(o: {{ value: number }}, xs: number[], n: number) {{ let total = 0; for (let i = 0; i < n; i++) total += o.value + quadratic(xs); return total + new Holder().value; }}")), "O(N^3)", true),
+        (index_of(format!("{QUADRATIC}\nclass Holder {{ get value() {{ return 1; }} }}\nexport function selected(o: {{ value: number }}, xs: number[], n: number) {{ let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += o.value + quadratic(xs); return total + new Holder().value; }}")), "O(N^3)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -119,22 +119,22 @@ fn implicit_calls_compose_their_writes_into_effects() {
     assert_reasons(&cases);
 
     let controls = [
-        (index_of("export function selected(xs: number[]) { const box = { get grow() { return 0; } }; let total = 0; for (let i = 0; i < xs.length; i++) total += box.grow; return total; }".to_string()), "O(N)", false),
-        (index_of("export function selected(xs: number[]) { const box = { toString() { return ''; } }; let text = ''; for (let i = 0; i < xs.length; i++) text += `${box}`; return text; }".to_string()), "O(N)", false),
+        (index_of("export function selected(xs: number[]) { const box = { get grow() { return 0; } }; let total = 0; for (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 1000000000; i++) total += box.grow; return total; }".to_string()), "O(N)", false),
+        (index_of("export function selected(xs: number[]) { const box = { toString() { return ''; } }; let text = ''; for (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 1000000000; i++) text += `${box}`; return text; }".to_string()), "O(N)", false),
     ];
 
-    assert_selected(&controls);
+    assert_projected_selected(&controls);
 }
 
 #[test]
 fn builtin_accessors_and_replaced_iterators_keep_fresh_arrays_variable() {
     let cases = [
-        (index_of("Object.defineProperty(Array.prototype, 'grow', { get(this: number[]) { this.push(1); return 0; } });\nexport function selected(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n; i++) { total += (xs as unknown as { grow: number }).grow; for (const x of xs) total += x; } return total; }".to_string()), "O(N^2)", false),
-        (index_of("export function selected(n: number) { const ys: number[] = [1, 2, 3]; const it: any = [][Symbol.iterator](); it.__proto__.next = function () { return { done: true, value: 0 }; }; let total = 0; for (let i = 0; i < n; i++) { for (const y of ys) total += y; } return total; }".to_string()), "O(N)", true),
-        (index_of("export function selected(n: number) { const zs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n; i++) { total += (zs as unknown as { grow: number }).grow; for (const z of zs) total += z; } return total; }".to_string()), "O(N)", false),
+        (index_of("Object.defineProperty(Array.prototype, 'grow', { get(this: number[]) { this.push(1); return 0; } });\nexport function selected(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += (xs as unknown as { grow: number }).grow; for (const x of xs) total += x; } return total; }".to_string()), "O(N^2)", false),
+        (index_of("export function selected(n: number) { const ys: number[] = [1, 2, 3]; const it: any = [][Symbol.iterator](); it.__proto__.next = function () { return { done: true, value: 0 }; }; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { for (const y of ys) total += y; } return total; }".to_string()), "O(N)", true),
+        (index_of("export function selected(n: number) { const zs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += (zs as unknown as { grow: number }).grow; for (const z of zs) total += z; } return total; }".to_string()), "O(N)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -737,9 +737,9 @@ fn jsx_spread_getters_follow_the_configured_output_target() {
 #[test]
 fn jsx_passed_values_escape_into_the_factory() {
     let extending = "export function h(type: any, props: any, ...children: any[]) { props.extra = 1; return { type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
-    let attribute = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n) { const e = <li a={1} items={ys}>{i}</li>; i++; } return i; }";
-    let child = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n) { const e = <li>{i}{ys}</li>; i++; } return i; }";
-    let plain = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n) { const e = <li>{i}</li>; i++; } return i; }";
+    let attribute = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n && n >= 0 && n <= 1000000000) { const e = <li a={1} items={ys}>{i}</li>; i++; } return i; }";
+    let child = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n && n >= 0 && n <= 1000000000) { const e = <li>{i}{ys}</li>; i++; } return i; }";
+    let plain = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n && n >= 0 && n <= 1000000000) { const e = <li>{i}</li>; i++; } return i; }";
     let cases = [
         (
             jsx_project_of(
@@ -797,5 +797,24 @@ fn jsx_passed_values_escape_into_the_factory() {
         ),
     ];
 
-    support::assert_project_cases("src/index.tsx", &cases);
+    for types in [TypeMode::Syntactic, TypeMode::Tsc] {
+        for (files, expected, partial) in &cases {
+            let files: Vec<_> = files
+                .iter()
+                .map(|(name, source)| (*name, source.as_str()))
+                .collect();
+            let (cost, reasons, _) = support::project_result_of(&files, "src/index.tsx", types);
+
+            assert_eq!(
+                support::projected_class_of(&cost),
+                Cost::parse(expected).unwrap(),
+                "{types:?} {files:?}"
+            );
+            assert_eq!(
+                !reasons.is_empty(),
+                *partial,
+                "{types:?} {files:?}: {reasons:?}"
+            );
+        }
+    }
 }

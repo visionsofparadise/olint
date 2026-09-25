@@ -467,6 +467,17 @@ pub fn selected_case_of(
 }
 
 pub fn assert_selected(cases: &[SelectedCase<'_>]) {
+    assert_selected_class(cases, Clone::clone);
+}
+
+pub fn assert_projected_selected(cases: &[SelectedCase<'_>]) {
+    assert_selected_class(cases, projected_class_of);
+}
+
+fn assert_selected_class(
+    cases: &[SelectedCase<'_>],
+    project: fn(&olint::cost::Cost) -> olint::cost::Cost,
+) {
     for types in [
         olint::analysis::TypeMode::Syntactic,
         olint::analysis::TypeMode::Tsc,
@@ -475,7 +486,7 @@ pub fn assert_selected(cases: &[SelectedCase<'_>]) {
             let (cost, reasons) = selected_case_of(sources, types);
 
             assert_eq!(
-                cost,
+                project(&cost),
                 olint::cost::Cost::parse(expected).unwrap(),
                 "{types:?} {sources:?}"
             );
@@ -490,4 +501,34 @@ pub fn assert_selected(cases: &[SelectedCase<'_>]) {
 
 pub fn index_of(source: String) -> Vec<(&'static str, String)> {
     vec![("index.ts", source)]
+}
+
+pub fn projected_class_of(cost: &olint::cost::Cost) -> olint::cost::Cost {
+    use olint::cost::{Cost, CostComparison, Domain};
+
+    let projected = Cost::parse(&cost.text_with(&|_| "N".to_owned())).unwrap();
+    let roots = [Cost::dimension(0, Domain::Size)];
+    let bound = projected.bind(&|_| None, &roots).unwrap();
+
+    for text in [
+        "O(1)",
+        "O(log N)",
+        "O(N)",
+        "O(N log N)",
+        "O(N^2)",
+        "O(N^2 log N)",
+        "O(N^3)",
+        "O(N^4)",
+    ] {
+        let legacy = Cost::parse(text).unwrap();
+        let expected = legacy.bind(&|_| None, &roots).unwrap();
+
+        if bound.compare(&expected) == CostComparison::Within
+            && expected.compare(&bound) == CostComparison::Within
+        {
+            return legacy;
+        }
+    }
+
+    projected
 }

@@ -79,9 +79,17 @@ if (diagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(
 }
 
 use support::{
-    assert_selected as assert_dispatched, function_of_name, index_of, run_with_source,
+    assert_projected_selected as assert_dispatched, function_of_name, index_of, run_with_source,
     selected_result_in as dispatched_result_in, SelectedResult as DispatchedResult,
 };
+
+fn projected_reading(mut reading: Reading) -> Reading {
+    for (_, _, part) in &mut reading.completions {
+        part.cost = support::projected_class_of(&part.cost);
+    }
+
+    reading
+}
 
 fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
     let mut found = (
@@ -95,7 +103,8 @@ fn reading_of(source: &str, name: &str) -> (TestReading, Vec<String>) {
 
     run_with_source(source, |analysis, file| {
         let function = function_of_name(analysis.project, file, name);
-        let reading = support::legacy_reading_of(analysis, file, function);
+        let reading = projected_reading(support::legacy_reading_of(analysis, file, function));
+
         let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
         let labels = support::trace_nodes(&analysis.traces, part.trace)
             .iter()
@@ -378,7 +387,9 @@ fn hot_and_cold_on_one_node_take_no_preference_and_warn() {
         "export function f(rows: number[][]) {\n\t// @perf hot\n\t// @perf cold\n\tfor (const row of rows) void row;\n\tfor (const row of rows) for (const cell of row) void cell;\n}",
         |analysis, file| {
             let function = function_of_name(analysis.project, file, "f");
-            let reading = support::legacy_reading_of(analysis, file, function);
+            let reading = projected_reading(support::legacy_reading_of(analysis, file, function));
+
+
             let warnings: Vec<String> = analysis.warnings.iter().cloned().collect();
 
             assert_eq!(reading.total(&mut analysis.unknowns, &mut analysis.traces).cost, Cost::parse("O(N^2)").unwrap());
@@ -460,7 +471,7 @@ fn an_if_without_else_yields_its_cold_branch_to_the_empty_else() {
 #[test]
 fn a_cold_scoped_budget_loop_yields_to_its_linear_sibling() {
     let (reading, labels) = reading_of(
-        "export function f(rows: number[][], width: number) {\n\tfor (let r = 0; r < rows.length; r++) {\n\t\tconst row = rows[r];\n\t\tlet i = 0;\n\t\t// @perf cold\n\t\twhile (i < width) {\n\t\t\tfor (const v of row) v;\n\t\t\ti++;\n\t\t}\n\t\tfor (const v of row) v;\n\t}\n}",
+        "export function f(rows: number[][], width: number) {\n\tfor (let r = 0; r < rows.length && rows.length >= 0 && rows.length <= 4294967295; r++) {\n\t\tconst row = rows[r];\n\t\tlet i = 0;\n\t\t// @perf cold\n\t\twhile (i >= 0 && i < width && width >= 0 && width <= 1000000000) {\n\t\t\tfor (const v of row) v;\n\t\t\ti++;\n\t\t}\n\t\tfor (const v of row) v;\n\t}\n}",
         "f",
     );
 
@@ -491,7 +502,7 @@ fn an_erased_this_parameter_keeps_the_callback_work_in_its_call() {
 }
 
 const CUBIC: &str = "for (const a of xs) for (const b of xs) for (const c of xs) void c;";
-const INDEXED_CUBIC: &str = "for (let a = 0; a < xs.length; a++) for (let b = 0; b < xs.length; b++) for (let c = 0; c < xs.length; c++) void c;";
+const INDEXED_CUBIC: &str = "if (xs.length >= 0 && xs.length <= 4294967295) { for (let a = 0; a < xs.length; a++) for (let b = 0; b < xs.length; b++) for (let c = 0; c < xs.length; c++) void c; }";
 
 fn dispatched_result_of(source: &str, types: olint::analysis::TypeMode) -> DispatchedResult {
     dispatched_result_in(&[("index.ts", source)], types)
@@ -761,8 +772,8 @@ fn nearer_members_shadow_prototype_writes_and_rebound_prototypes_stay_open() {
     let cube = format!("function cube(xs: number[]) {{ {INDEXED_CUBIC} }}");
     let selected = "export function selected(xs: number[]) { const zs = [1]; return zs.includes(0) && xs.includes(0); }";
     let cases = [
-        (index_of(format!("{slow}\nfunction F() {{}}\nconst G: any = F;\nG.prototype = Array.prototype;\n(F as any).prototype.includes = function () {{ return slow([1]); }};\n{selected}")), "O(N^3)", true),
-        (index_of(format!("{slow}\nfunction F() {{}}\nfunction rebind(f: any) {{ f.prototype = Array.prototype; }}\nrebind(F);\n(F as any).prototype.includes = function () {{ return slow([1]); }};\n{selected}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nfunction F() {{}}\nconst G: any = F;\nG.prototype = Array.prototype;\n(F as any).prototype.includes = function () {{ return slow([1]); }};\n{selected}")), "O(N)", true),
+        (index_of(format!("{slow}\nfunction F() {{}}\nfunction rebind(f: any) {{ f.prototype = Array.prototype; }}\nrebind(F);\n(F as any).prototype.includes = function () {{ return slow([1]); }};\n{selected}")), "O(N)", true),
         (index_of(format!("{cube}\nconst base = {{ m(xs: number[]) {{ cube(xs); }} }};\nexport function link(o: object) {{ Object.setPrototypeOf(o, base); }}\nclass K0 {{ m(xs: number[]) {{}} }}\nexport function selected(xs: number[]) {{ const c = new K0(); c.m(xs); }}")), "O(1)", true),
         (index_of(format!("{cube}\nfunction C0() {{}}\n(C0 as any).prototype.m = function (xs: number[]) {{ cube(xs); }};\nfunction C1() {{}}\n(C1 as any).prototype.m = function (xs: number[]) {{}};\nObject.setPrototypeOf((C1 as any).prototype, (C0 as any).prototype);\nexport function selected(xs: number[]) {{ const c = new (C1 as any)(); c.m(xs); }}")), "O(1)", true),
         (index_of(format!("{cube}\nfunction C0() {{}}\n(C0 as any).prototype.m = function (xs: number[]) {{ cube(xs); }};\nfunction C1() {{}}\nObject.setPrototypeOf((C1 as any).prototype, (C0 as any).prototype);\nclass K0 {{ m(xs: number[]) {{}} }}\nexport function selected(xs: number[]) {{ const c = new K0(); c.m(xs); }}")), "O(1)", true),
@@ -863,8 +874,8 @@ fn optional_calls_and_side_effecting_arguments_keep_their_conditional_work() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const obj = {{ run() {{ return quadratic(xs); }} }}; return obj?.run?.(); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], run?: (n: number) => number) {{ return run?.(quadratic(xs)); }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[], f?: () => number) {{ return (f ?? (() => quadratic(xs)))(); }}")), "O(N^2)", true),
-        (index_of(format!("{scan}\nexport function selected(xs: number[], run?: (n: number) => void) {{ let n = 1; run?.(n = xs.length); for (let i = 0; i < n; i++) scan(xs); }}")), "O(N^2)", true),
-        (index_of(format!("{scan}\nexport function selected(xs: number[]) {{ let n = 1; const table = {{ run() {{}} }}; table[(n = xs.length, 'run')](); for (let i = 0; i < n; i++) scan(xs); }}")), "O(N^2)", true),
+        (index_of(format!("{scan}\nexport function selected(xs: number[], run?: (n: number) => void) {{ let n = 1; run?.(n = xs.length); for (let i = 0; i < n && n >= 0 && n <= 4294967295; i++) scan(xs); }}")), "O(N^2)", true),
+        (index_of(format!("{scan}\nexport function selected(xs: number[]) {{ let n = 1; const table = {{ run() {{}} }}; table[(n = xs.length, 'run')](); for (let i = 0; i < n && n >= 0 && n <= 4294967295; i++) scan(xs); }}")), "O(N^2)", true),
     ];
 
     assert_dispatched(&cases);
@@ -1148,7 +1159,7 @@ fn collected_rest_arguments_specialize_their_length() {
 
 #[test]
 fn sloppy_arguments_writes_rebind_their_parameters() {
-    let helpers = format!("function quadratic(xs) {{ var t = 0; for (var i = 0; i < xs.length; i++) for (var j = 0; j < xs.length; j++) t += i + j; return t; }}\nfunction cube(xs) {{ {CUBIC} }}\nfunction cheap(xs) {{ return xs; }}\nfunction h(xs, n = quadratic(xs)) {{ return n; }}");
+    let helpers = format!("function quadratic(xs) {{ var t = 0; if (xs.length >= 0 && xs.length <= 4294967295) {{ for (var i = 0; i < xs.length; i++) for (var j = 0; j < xs.length; j++) t += i + j; }} return t; }}\nfunction cube(xs) {{ {CUBIC} }}\nfunction cheap(xs) {{ return xs; }}\nfunction h(xs, n = quadratic(xs)) {{ return n; }}");
     let script = |name: &'static str, source: String| vec![(name, source)];
     let cases = [
         (script("cases.js", format!("{helpers}\nfunction alias(xs, d) {{ arguments[1] = undefined; return h(xs, d); }}\nfunction selected(xs) {{ return alias(xs, 1); }}")), "O(N^2)", false),
@@ -1463,16 +1474,16 @@ fn loop_tests_and_updates_repeat_at_the_iteration_count() {
     let cubic = Cost::parse("O(N^3)").unwrap();
     let quadratic = Cost::parse("O(N^2)").unwrap();
     let (test, test_labels) = loop_cost_of(&format!(
-        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = 0; i < quadratic(xs); i++) total += i;\n\treturn total;\n}}"
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 4294967295 && quadratic(xs) >= 0; i++) total += i;\n\treturn total;\n}}"
     ));
     let (update, update_labels) = loop_cost_of(&format!(
-        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length; quadratic(xs), i++) total += i;\n\treturn total;\n}}"
+        "{LOOP_QUADRATIC}export function f(xs: number[]) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 4294967295; quadratic(xs), i++) total += i;\n\treturn total;\n}}"
     ));
     let (while_test, while_labels) = loop_cost_of(&format!(
-        "{LOOP_SCAN}export function f(xs: number[]) {{\n\tlet i = 0;\n\twhile (i < scan(xs)) i++;\n\treturn i;\n}}"
+        "{LOOP_SCAN}export function f(xs: number[]) {{\n\tlet i = 0;\n\twhile (i >= 0 && i < xs.length && xs.length >= 0 && xs.length <= 4294967295 && scan(xs) >= 0) i++;\n\treturn i;\n}}"
     ));
     let (do_while_test, _) = loop_cost_of(&format!(
-        "{LOOP_SCAN}export function f(xs: number[]) {{\n\tlet i = 0;\n\tdo {{\n\t\ti++;\n\t}} while (i < scan(xs));\n\treturn i;\n}}"
+        "{LOOP_SCAN}export function f(xs: number[]) {{\n\tlet i = 0;\n\tdo {{\n\t\ti++;\n\t}} while (i >= 0 && i < xs.length && xs.length >= 0 && xs.length <= 4294967295 && scan(xs) >= 0);\n\treturn i;\n}}"
     ));
 
     assert_eq!(test, cubic);
@@ -1482,9 +1493,34 @@ fn loop_tests_and_updates_repeat_at_the_iteration_count() {
     assert_eq!(while_test, quadratic);
     assert_eq!(
         while_labels,
-        vec!["while [budget: i < scan(xs)]", "call scan()"]
+        vec!["while [budget: i < xs.length]", "call scan()"]
     );
     assert_eq!(do_while_test, quadratic);
+}
+
+#[test]
+fn opaque_loop_endpoints_keep_known_test_work_partial() {
+    for (helper, body, expected) in [
+        (
+            LOOP_QUADRATIC,
+            "for (let i = 0; i < quadratic(xs); i++) void i;",
+            "O(N^2)",
+        ),
+        (LOOP_SCAN, "let i = 0; while (i < scan(xs)) i++;", "O(N)"),
+        (
+            LOOP_SCAN,
+            "let i = 0; do { i++; } while (i < scan(xs));",
+            "O(N)",
+        ),
+    ] {
+        let (reading, _) = reading_of(
+            &format!("{helper}export function f(xs: number[]) {{ {body} }}"),
+            "f",
+        );
+
+        assert_eq!(reading.total().cost, Cost::parse(expected).unwrap());
+        assert!(!reading.total().is_complete());
+    }
 }
 
 #[test]
@@ -1511,7 +1547,7 @@ fn zero_trip_and_short_circuit_loops_keep_their_test_work() {
         "{LOOP_SCAN}export function f(xs: number[], n: number) {{\n\tlet total = 0;\n\twhile (scan(xs) > n) {{\n\t\ttotal += 1;\n\t\tbreak;\n\t}}\n\treturn total;\n}}"
     ));
     let (short_circuit, _) = loop_cost_of(&format!(
-        "{LOOP_SCAN}export function f(xs: number[], n: number) {{\n\tlet i = 0;\n\twhile (i < n && scan(xs) >= 0) i++;\n\treturn i;\n}}"
+        "{LOOP_SCAN}export function f(xs: number[], n: number) {{\n\tlet i = 0;\n\twhile (i >= 0 && i < n && n >= 0 && n <= 1000000000 && scan(xs) >= 0) i++;\n\treturn i;\n}}"
     ));
 
     assert_eq!(zero_trip, Cost::N);
@@ -1523,7 +1559,7 @@ fn zero_trip_and_short_circuit_loops_keep_their_test_work() {
 fn a_continue_keeps_its_branch_and_the_update_inside_the_loop() {
     let quadratic = Cost::parse("O(N^2)").unwrap();
     let (updated, updated_labels) = loop_cost_of(&format!(
-        "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length; scan(xs), i++) {{\n\t\tif (flag) continue;\n\t\ttotal += 1;\n\t}}\n\treturn total;\n}}"
+        "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (let i = 0; i < xs.length && xs.length >= 0 && xs.length <= 4294967295; scan(xs), i++) {{\n\t\tif (flag) continue;\n\t\ttotal += 1;\n\t}}\n\treturn total;\n}}"
     ));
     let (branched, branched_labels) = loop_cost_of(&format!(
         "{LOOP_SCAN}export function f(xs: number[], flag: boolean) {{\n\tlet total = 0;\n\tfor (const x of xs) {{\n\t\tif (flag) {{\n\t\t\ttotal += scan(xs);\n\t\t\tcontinue;\n\t\t}}\n\t\ttotal += x;\n\t}}\n\treturn total;\n}}"
@@ -1945,7 +1981,7 @@ fn jsx_expressions_are_evaluated_and_stay_visible() {
     endpoint.0[2].1 = counting.to_string();
 
     let flows = [
-        jsx_case(JSX_CLASSIC, "export function selected(n: number) { let t = 0; for (let i = 1; i < (<div />, n); i *= 2) t += i; return t; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(n: number) { let t = 0; for (let i = 1; i < (<div />, n); i *= 2) t += i; return t; }", "O(1)", true),
         jsx_case(JSX_CLASSIC, "export function selected(s: Set<number>) { let t = 0; for (const x of s) { const e = <div {...{ get v() { s.add(1); return 1; } }} />; t += 1; } return t; }", "O(N)", false),
         jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { for (const x of xs) { try { const e = <div />; } catch { return quadratic(xs); } } return 0; }", "O(N^2)", false),
         endpoint,

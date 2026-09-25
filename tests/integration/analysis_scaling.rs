@@ -2009,10 +2009,10 @@ fn loop_phase_walks_of(loops: usize) -> u64 {
         .collect();
     let source = scanning_loop_source(statements);
 
-    quadratic_work_of(source, Event::WalkerNode)
+    known_work_of(source, Event::WalkerNode, "O(N)", true)
 }
 
-fn quadratic_work_of(source: String, event: Event) -> u64 {
+fn known_work_of(source: String, event: Event, expected: &str, unknown_bound: bool) -> u64 {
     let mut consumed = 0;
 
     run_with_source(&source, |analysis, file| {
@@ -2025,8 +2025,14 @@ fn quadratic_work_of(source: String, event: Event) -> u64 {
 
         assert_eq!(
             support::legacy_class_of(analysis, file, selected, &part.cost),
-            Cost::parse("O(N^2)").unwrap(),
+            Cost::parse(expected).unwrap(),
             "{source}"
+        );
+
+        assert_eq!(
+            support::unknown_reasons(analysis, part.unknowns)
+                .contains(&olint::unknowns::UnknownReason::Bound),
+            unknown_bound
         );
 
         consumed = stats.work.consumed(event);
@@ -2182,9 +2188,11 @@ export function selected(xs: number[]) {{ let total = 0; for (const x of xs) {{ 
 }
 
 fn nested_finalizer_edges_of(depth: usize, transfers: usize) -> u64 {
-    quadratic_work_of(
+    known_work_of(
         nested_finalizer_source(depth, transfers),
         Event::TraversalEdge,
+        "O(N^2)",
+        false,
     )
 }
 
@@ -2298,7 +2306,7 @@ fn repeating_body_scans_of(loops: usize) -> u64 {
         .collect();
     let source = scanning_loop_source(statements);
 
-    quadratic_work_of(source, Event::BudgetPrepassNode)
+    known_work_of(source, Event::BudgetPrepassNode, "O(N)", true)
 }
 
 #[test]
@@ -2306,7 +2314,7 @@ fn repeating_path_scans_resolve_once_per_loop() {
     for loops in [16_u64, 32, 48] {
         assert_eq!(
             repeating_body_scans_of(loops as usize),
-            130 * loops + 97,
+            142 * loops + 97,
             "{loops}"
         );
     }

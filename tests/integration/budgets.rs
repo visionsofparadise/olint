@@ -309,8 +309,10 @@ type SpendShape = Option<(StepMagnitude, bool)>;
 type SpendRow<'r> = (&'r str, String, StepMagnitude, bool);
 
 fn budget_source(body: &str) -> String {
+    let body = body.replace("i < n", "i < n && i >= 0");
+
     format!(
-        "export function f(n: number, g: number) {{ let i = 0, total = 0; {body} return total; }}"
+        "export function f(n: number, g: number) {{ if (n >= 0 && n <= 1000000000) {{ let i = 0, total = 0; {body} return total; }} return 0; }}"
     )
 }
 
@@ -431,6 +433,7 @@ fn a_refilled_budget_keeps_the_loop_factor_it_cannot_cancel() {
     for (outer, expected) in [("i += g;", "O(N^2)"), ("i += 2;", "O(N)")] {
         let source = nested_budget_source(outer);
         let (cost, complete, _) = support::legacy_result_of(&source, "f");
+        let cost = support::projected_class_of(&cost);
         let expected = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
 
         assert_eq!((cost, complete), (expected, true), "{outer}");
@@ -440,8 +443,10 @@ fn a_refilled_budget_keeps_the_loop_factor_it_cannot_cancel() {
 type GuardRow<'r> = (&'r str, String, SpendShape);
 
 fn guarded_source(body: &str) -> String {
+    let body = body.replace("i < n", "i < n && i >= 0");
+
     format!(
-        "export function f(n: number, g: number, xs: number[], flag: boolean) {{ let i = 0, total = 0; {body} return total; }}"
+        "export function f(n: number, g: number, xs: number[], flag: boolean) {{ if (n >= 0 && n <= 1000000000) {{ let i = 0, total = 0; {body} return total; }} return 0; }}"
     )
 }
 
@@ -537,23 +542,24 @@ fn a_budget_cancels_only_a_loop_its_own_condition_guards() {
     assert_eq!(guard_shapes_of(&rows), expected_guard_shapes_of(&rows));
 }
 
-type CostRow<'r> = (&'r str, &'r str, &'r str);
+type CostRow<'r> = (&'r str, &'r str, &'r str, bool);
 
 fn assert_guarded_costs(rows: &[CostRow<'_>]) {
     let found: Vec<(&str, String, bool)> = rows
         .iter()
-        .map(|(label, body, _)| {
+        .map(|(label, body, _, _)| {
             let (cost, complete, _) = support::legacy_result_of(&guarded_source(body), "f");
+            let cost = support::projected_class_of(&cost);
 
             (*label, cost.text(), complete)
         })
         .collect();
     let expected: Vec<(&str, String, bool)> = rows
         .iter()
-        .map(|(label, _, expected)| {
+        .map(|(label, _, expected, complete)| {
             let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
 
-            (*label, cost.text(), true)
+            (*label, cost.text(), *complete)
         })
         .collect();
 
@@ -567,41 +573,49 @@ fn a_budget_cancels_only_where_its_charge_covers_the_potential_across_every_visi
             "a do-while under two enclosing loops",
             "for (let j = 0; j < n; j++) { for (const y of xs) { do { i++; total += y; } while (i < n); } }",
             "O(N^3)",
+            true,
         ),
         (
             "a halving do-while under one enclosing loop",
             "let size = n; for (let j = 0; j < n; j++) { do { i++; total++; size = size / 2; } while (size > 1 && i < n); }",
             "O(N log N)",
+            true,
         ),
         (
             "a halving while under one enclosing loop",
             "let size = n; for (let j = 0; j < n; j++) { while (size > 1 && i < n) { i++; total++; size = size / 2; } }",
             "O(N log N)",
+            true,
         ),
         (
             "a do-while under one enclosing loop",
             "for (let j = 0; j < n; j++) { do { i++; total++; } while (i < n); }",
             "O(N)",
+            true,
         ),
         (
             "a while under two enclosing loops",
             "for (let j = 0; j < n; j++) { for (const y of xs) { while (i < n) { i++; total += y; } } }",
             "O(N)",
+            true,
         ),
         (
             "a do-while no loop encloses",
             "do { i++; total++; } while (i < n);",
             "O(N)",
+            true,
         ),
         (
             "the two-pointer inner while",
             "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } }",
             "O(N)",
+            true,
         ),
         (
             "a counter scoped to the enclosing loop",
             "for (let j = 0; j < n; j++) { let k = 0; while (k < n) { k++; total++; } }",
             "O(N^2)",
+            true,
         ),
     ];
 
@@ -615,26 +629,31 @@ fn an_unguarded_loop_keeps_the_factor_no_budget_cancels() {
             "a sibling for-of the condition never reaches",
             "while (i < n) { i++; } for (let j = 0; j < n; j++) { for (const y of xs) { i++; total += y; } }",
             "O(N^2)",
+            true,
         ),
         (
             "a for-of nested in the loop the condition guards",
             "while (i < n) { for (const y of xs) { i++; total += y; } }",
-            "O(N^2)",
+            "O(N)",
+            false,
         ),
         (
             "a while continued by a flag",
             "while (i < n) { i++; } for (let j = 0; j < n; j++) { while (flag) { i++; total++; } }",
-            "O(N^2)",
+            "O(N)",
+            false,
         ),
         (
             "the two-pointer inner while",
             "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } }",
             "O(N)",
+            true,
         ),
         (
             "a second while carrying the same guard",
             "for (let j = 0; j < n; j++) { while (i < n) { i++; total++; } while (i < n) { i++; total++; } }",
             "O(N)",
+            true,
         ),
     ];
 

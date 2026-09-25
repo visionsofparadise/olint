@@ -50,10 +50,11 @@ pub enum Strictness {
     Inclusive,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Potential {
     Constant(f64),
     Enveloped,
+    Symbolic(Cost),
 }
 
 impl Potential {
@@ -61,6 +62,7 @@ impl Potential {
         match self {
             Potential::Constant(_) => Cost::ONE,
             Potential::Enveloped => Cost::N,
+            Potential::Symbolic(cost) => cost.clone(),
         }
     }
 }
@@ -415,7 +417,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 let potential = match self.numeric_value_of(file, bound) {
                     Some(endpoint) => Potential::Constant((endpoint - origin.initial).abs()),
-                    None => Potential::Enveloped,
+                    None => {
+                        let size = identifier_of(unwrap(bound))
+                            .and_then(|reference| self.binding_of_identifier(file, reference))
+                            .and_then(|binding| self.current_substitutions.get(&binding))
+                            .and_then(|facts| facts.value.size.clone())
+                            .or_else(|| match unwrap(bound) {
+                                Expression::StaticMemberExpression(member)
+                                    if member.property.name == "length" =>
+                                {
+                                    Some(self.collection_size_of(file, &member.object).length)
+                                }
+                                _ => None,
+                            });
+
+                        size.map_or(Potential::Enveloped, Potential::Symbolic)
+                    }
                 };
 
                 budgets.insert(
@@ -908,12 +925,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     true => StepMagnitude::Constant,
                     false => StepMagnitude::Stable,
                 },
-                potential: budget.potential,
+                potential: budget.potential.clone(),
             });
         };
         let text = format!("{}, by {}", budget.text, identifier);
         let scope = budget.scope;
-        let potential = budget.potential;
+        let potential = budget.potential.clone();
         let stable = identifier_binding.is_some_and(|binding| {
             match self.declarations.of_binding(self.project, binding) {
                 Some(Declaration::Variable {

@@ -2,39 +2,33 @@ public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
 O(1)               33
-O(1) [partial]     20
+O(1) [partial]     31
 O(xs)              13
 O(rows^2)           9
-O(xs) [partial]     8
 O(rows^2) [partial]    7
 O(n) [partial]      6
 O((xs * log(xs)))    5
 O(N)                5
+O(xs) [partial]     5
 O(o)                4
 O(N) [partial]      4
 O((xs * xs^2))      3
 O(xs^2)             3
-O(x)                3
 O(n)                3
-O((matrix * log(matrix)))    2
+O(matrix) [partial]    2
 O(max(xs, fast))    2
 O((xs * log(xs))) [partial]    2
-O(max(n, xs))       2
+O(max(xs, n)) [partial]    2
 O(prefix)           2
 O((max(o, matrix))^(2))    2
-O((log(max(matrix, target)) * max(matrix, target)))    1
+O(max(matrix, target)) [partial]    1
 O(t)                1
 O(matrix^2)         1
-O(log(max(xs, target)))    1
 O(max(xs, mode))    1
 O(max(xs, channels))    1
 O(max(xs, target))    1
-O((max(rows, width))^(2))    1
-O((max(xs, n, next))^(2)) [partial]    1
-O((max(xs, n))^(2))    1
-O(max(xs, n)) [partial]    1
-O(max(n, cb)) [partial]    1
-O(max(1, n^2))      1
+O(max(n, g, xs)) [partial]    1
+O(max(xs, n, next)) [partial]    1
 O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
 O(obj) [partial]    1
@@ -49,14 +43,6 @@ O(items^2) [partial]    1
 O(rows) [partial]    1
 O((matrix * matrix^2))    1
 
-O((log(max(matrix, target)) * max(matrix, target))) whileHalvingMidpoint  src/bounds.ts:38
-    in loop for-of                                           src/bounds.ts:40  x N
-        in loop while [halving]                              src/bounds.ts:43  x log N
-
-O((matrix * log(matrix))) whileHalvingShift  src/bounds.ts:26
-    in loop for-of                                           src/bounds.ts:28  x N
-        in loop while [halving]                              src/bounds.ts:30  x log N
-
 O((xs * log(xs))) breakInsideLoop  src/branches.ts:126 [partial]
     does [break branch: runs once per loop]               src/branches.ts:129
     does row.sort() [n log n]                             src/branches.ts:130  x N log N
@@ -69,10 +55,6 @@ O((xs * xs^2)) maxTaggedPublicFn  src/branches.ts:110
     in loop for-of                                           src/branches.ts:112  x N
         in loop for-of                                       src/branches.ts:112  x N
             in loop for-of                                   src/branches.ts:112  x N
-
-O((matrix * log(matrix))) geometricStepLoop  src/bounds.ts:18
-    in loop for-of                                           src/bounds.ts:20  x N
-        in loop for [geometric step]                         src/bounds.ts:21  x log N
 
 O((xs * log(xs))) nlognExpressionStatementTagged  src/branches.ts:103
     reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))
@@ -104,18 +86,6 @@ O((matrix * matrix^2)) tripleNestedOverLimit  src/types.ts:70
 
 O((xs * log(xs))) sortMethodCall  src/methods.ts:5
     does xs.sort() [n log n]                              src/methods.ts:6  x N log N
-
-O((max(xs, n))^(2)) compoundBound  src/budgets.ts:74
-    in loop for-of                                           src/budgets.ts:77  x N
-        in loop while                                        src/budgets.ts:78  x N
-
-O((max(xs, n, next))^(2)) shorthandDestructure  src/budgets.ts:47 [partial]
-    in loop for-of                                           src/budgets.ts:50  x N
-        in loop while                                        src/budgets.ts:51  x N
-
-O((max(rows, width))^(2)) scopedBudget  src/budgets.ts:13
-    in loop for                                              src/budgets.ts:15  x N
-        in loop while [budget: i < width, per for at 15]     src/budgets.ts:18  x N
 
 O((max(o, matrix))^(2)) typeAliasChain  src/types.ts:45
     in loop for-of                                           src/types.ts:47  x N
@@ -230,10 +200,4 @@ O(rows^2)      callsStaticMethod  src/classes.ts:60 [partial]
     calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows^2)
     in loop for-of                                           src/classes.ts:56  x N
         in loop for-of                                       src/classes.ts:56  x N
-
-O(max(1, n^2)) callbackSubstituted  src/calls.ts:13
-    calls runNTimes()                                      src/calls.ts:14  = O(max(1, n^2))
-    in loop for                                              src/calls.ts:9  x N
-        calls cb() [callback parameter]                    src/calls.ts:9  = O(n)
-        in loop for                                          src/calls.ts:3  x N
 
