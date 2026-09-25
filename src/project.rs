@@ -504,6 +504,19 @@ impl<'a> Project<'a> {
                         });
                     }
 
+                    if !package_lookup {
+                        if let Some(implementation) =
+                            local_implementation_of(&target, &specifier, allow_js)
+                        {
+                            walk.pairs.push((implementation.clone(), target.clone()));
+                            imports.push(Import {
+                                target: implementation,
+                                external: false,
+                                runtime: false,
+                            });
+                        }
+                    }
+
                     declared = Some((target, external, loaded));
                 }
             }
@@ -698,7 +711,23 @@ impl<'a> Project<'a> {
                     .any(|owner| self.is_path_mapped(directory, *owner, specifier))
                 || matches!(declared, Resolved::File(id) if self.is_project_file(id))
             {
-                return declared;
+                return match declared {
+                    Resolved::File(id) => file
+                        .owners
+                        .iter()
+                        .map(|owner| {
+                            local_implementation_of(
+                                &self.file(id).path,
+                                specifier,
+                                self.configurations[*owner].allow_js,
+                            )
+                        })
+                        .reduce(|left, right| if left == right { left } else { None })
+                        .flatten()
+                        .and_then(|implementation| self.file_by_path(&implementation))
+                        .map_or(declared, Resolved::File),
+                    declared => declared,
+                };
             }
         }
 
@@ -977,13 +1006,23 @@ pub(crate) fn is_parsed_path(path: &Path, allow_js: bool) -> bool {
 
 fn resolve_options_of(tsconfig: &Path) -> ResolveOptions {
     ResolveOptions {
-        extensions: [".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".json"]
-            .map(String::from)
-            .to_vec(),
+        extensions: [
+            ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".json",
+        ]
+        .map(String::from)
+        .to_vec(),
         extension_alias: vec![
             (
                 ".js".to_string(),
-                [".ts", ".tsx", ".d.ts", ".js"].map(String::from).to_vec(),
+                [".ts", ".tsx", ".d.ts", ".js", ".jsx"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            (
+                ".jsx".to_string(),
+                [".tsx", ".ts", ".d.ts", ".jsx", ".js"]
+                    .map(String::from)
+                    .to_vec(),
             ),
             (
                 ".mjs".to_string(),
@@ -1026,6 +1065,37 @@ fn is_module_package_path(path: &Path) -> bool {
 
         Some(manifest.get("type").and_then(serde_json::Value::as_str) == Some("module"))
     }) == Some(true)
+}
+
+fn local_implementation_of(declared: &Path, specifier: &str, allow_js: bool) -> Option<PathBuf> {
+    let text = declared.to_string_lossy();
+    let lowered = text.to_ascii_lowercase();
+
+    if forward_slashes_of(declared).contains("/node_modules/") {
+        return None;
+    }
+
+    let (suffix, extensions): (&str, &[&str]) = if lowered.ends_with(".d.mts") {
+        (".d.mts", &[".mjs"])
+    } else if lowered.ends_with(".d.cts") {
+        (".d.cts", &[".cjs"])
+    } else if !lowered.ends_with(".d.ts") {
+        return None;
+    } else if specifier.ends_with(".jsx") {
+        (".d.ts", &[".jsx"])
+    } else if specifier.ends_with(".js") {
+        (".d.ts", &[".js"])
+    } else {
+        (".d.ts", &[".js", ".jsx"])
+    };
+    let stem = &text[..text.len() - suffix.len()];
+
+    extensions
+        .iter()
+        .map(|extension| PathBuf::from(format!("{stem}{extension}")))
+        .find(|candidate| candidate.is_file())
+        .filter(|candidate| is_parsed_path(candidate, allow_js))
+        .map(|candidate| canonical_path_of(&candidate).unwrap_or(candidate))
 }
 
 fn is_package_specifier(specifier: &str) -> bool {

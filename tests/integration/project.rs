@@ -1275,3 +1275,400 @@ fn loading_package_implementations_never_executes_them() {
     assert_eq!(project.implementation_stats().files, 2);
     assert!(!marker.exists());
 }
+
+const JSX_ROOTED: &str = r#"{ "compilerOptions": { "allowJs": true, "jsx": "preserve", "module": "esnext", "moduleResolution": "bundler" }, "files": ["src/index.ts"] }"#;
+const JSX_CUBE: &str = "export function cube(xs) { let t = 0; for (const a of xs) for (const b of xs) for (const c of xs) t += a * b * c; return t; }\nexport const View = () => <div />;";
+const TSX_CUBE: &str = "export function cube(xs: number[]) { let t = 0; for (const a of xs) for (const b of xs) for (const c of xs) t += a * b * c; return t; }";
+const JS_CUBE: &str = "export function cube(xs) { let t = 0; for (const a of xs) for (const b of xs) for (const c of xs) t += a * b * c; return t; }";
+const JS_LINEAR: &str =
+    "export function cube(xs) { let t = 0; for (const a of xs) t += a; return t; }";
+const TS_LINEAR: &str =
+    "export function cube(xs: number[]) { let t = 0; for (const a of xs) t += a; return t; }";
+const CUBE_DECLARATION: &str = "export declare function cube(xs: number[]): number;";
+
+type JsxSources<'s> = &'s [(&'s str, &'s str)];
+
+fn jsx_consumer_of(specifier: &str) -> String {
+    format!(
+        "import {{ cube }} from \"{specifier}\";\nexport function go(xs: number[]) {{ return cube(xs); }}"
+    )
+}
+
+fn run_in_jsx_project(
+    tsconfig: &str,
+    specifier: &str,
+    sources: &[(&str, &str)],
+    body: impl for<'a> FnOnce(&olint::project::Project<'a>, olint::project::FileId),
+) {
+    let consumer = jsx_consumer_of(specifier);
+    let mut files = vec![
+        ("tsconfig.json", tsconfig),
+        ("src/index.ts", consumer.as_str()),
+    ];
+
+    files.extend_from_slice(sources);
+
+    run_in_project(&files, |project, root| {
+        body(project, file_of(project, root, "src/index.ts"));
+    });
+}
+
+fn jsx_target_of(tsconfig: &str, specifier: &str, sources: &[(&str, &str)]) -> Option<String> {
+    let mut target = None;
+
+    run_in_jsx_project(tsconfig, specifier, sources, |project, index| {
+        target = match project.resolve(index, specifier) {
+            Resolved::File(id) => Some(project.file(id).relative.clone()),
+            Resolved::External(path) => Some(format!(
+                "external {}",
+                olint::paths::relative_path_of(&project.root, &path)
+            )),
+            Resolved::Unresolved => None,
+        };
+    });
+
+    target
+}
+
+fn jsx_go_of(tsconfig: &str, specifier: &str, sources: &[(&str, &str)]) -> (String, bool) {
+    let mut result = (String::new(), false);
+
+    run_in_jsx_project(tsconfig, specifier, sources, |project, index| {
+        let mut analysis = olint::analysis::Analysis::new(project, support::SYNTACTIC);
+        let part = support::summary_of(&mut analysis, index, "go");
+
+        result = (part.cost.text(), part.is_complete());
+    });
+
+    result
+}
+
+#[test]
+fn jsx_sources_resolve_in_typescript_extension_order() {
+    let cases: [(&str, JsxSources, &str); 15] = [
+        ("./cube", &[("src/cube.jsx", JSX_CUBE)], "src/cube.jsx"),
+        (
+            "./cube",
+            &[("src/cube/index.jsx", JSX_CUBE)],
+            "src/cube/index.jsx",
+        ),
+        ("./cube.jsx", &[("src/cube.jsx", JSX_CUBE)], "src/cube.jsx"),
+        ("./cube.js", &[("src/cube.jsx", JSX_CUBE)], "src/cube.jsx"),
+        ("./cube", &[("src/cube.tsx", TSX_CUBE)], "src/cube.tsx"),
+        ("./cube.js", &[("src/cube.tsx", TSX_CUBE)], "src/cube.tsx"),
+        (
+            "./cube.jsx",
+            &[("src/cube.tsx", TSX_CUBE), ("src/cube.jsx", JSX_CUBE)],
+            "src/cube.tsx",
+        ),
+        (
+            "./cube",
+            &[("src/cube.js", JS_LINEAR), ("src/cube.jsx", JSX_CUBE)],
+            "src/cube.js",
+        ),
+        (
+            "./cube.js",
+            &[("src/cube.js", JS_LINEAR), ("src/cube.jsx", JSX_CUBE)],
+            "src/cube.js",
+        ),
+        (
+            "./cube.jsx",
+            &[("src/cube.js", JS_LINEAR), ("src/cube.jsx", JSX_CUBE)],
+            "src/cube.jsx",
+        ),
+        (
+            "./cube",
+            &[("src/cube.jsx", JSX_CUBE), ("src/cube/index.ts", TS_LINEAR)],
+            "src/cube.jsx",
+        ),
+        ("./cube.jsx", &[("src/cube.js", JS_LINEAR)], "src/cube.js"),
+        (
+            "./cube.jsx",
+            &[("src/cube.ts", TS_LINEAR), ("src/cube.jsx", JSX_CUBE)],
+            "src/cube.ts",
+        ),
+        (
+            "./cube",
+            &[("src/cube.tsx", TSX_CUBE), ("src/cube.jsx", JSX_CUBE)],
+            "src/cube.tsx",
+        ),
+        (
+            "./cube",
+            &[
+                ("src/cube/index.tsx", TSX_CUBE),
+                ("src/cube/index.jsx", JSX_CUBE),
+            ],
+            "src/cube/index.tsx",
+        ),
+    ];
+
+    for (specifier, sources, expected) in cases {
+        assert_eq!(
+            jsx_target_of(JSX_ROOTED, specifier, sources).as_deref(),
+            Some(expected),
+            "{specifier} {sources:?}"
+        );
+    }
+}
+
+#[test]
+fn jsx_imports_load_their_bodies_through_every_local_specifier_form() {
+    let mapped = r#"{ "compilerOptions": { "allowJs": true, "jsx": "preserve", "module": "esnext", "moduleResolution": "bundler", "baseUrl": ".", "paths": { "@/*": ["src/*"] } }, "files": ["src/index.ts"] }"#;
+    let node10 = r#"{ "compilerOptions": { "allowJs": true, "jsx": "preserve", "module": "commonjs", "moduleResolution": "node10" }, "files": ["src/index.ts"] }"#;
+    let chained = [
+        (
+            "src/view.jsx",
+            "import { cube as inner } from \"./inner\";\nexport function cube(xs) { return inner(xs); }",
+        ),
+        ("src/inner.jsx", JSX_CUBE),
+    ];
+    let cubic = ("O((size_0 * size_0^2))".to_string(), true);
+
+    assert_eq!(
+        jsx_go_of(JSX_ROOTED, "./cube", &[("src/cube.jsx", JSX_CUBE)]),
+        cubic
+    );
+    assert_eq!(
+        jsx_go_of(JSX_ROOTED, "./cube", &[("src/cube/index.jsx", JSX_CUBE)]),
+        cubic
+    );
+    assert_eq!(
+        jsx_go_of(JSX_ROOTED, "./cube.js", &[("src/cube.jsx", JSX_CUBE)]),
+        cubic
+    );
+    assert_eq!(jsx_go_of(JSX_ROOTED, "./view", &chained), cubic);
+    assert_eq!(
+        jsx_go_of(mapped, "@/cube", &[("src/cube.jsx", JSX_CUBE)]),
+        cubic
+    );
+    assert_eq!(
+        jsx_go_of(node10, "./cube", &[("src/cube.jsx", JSX_CUBE)]),
+        cubic
+    );
+    assert_eq!(
+        jsx_go_of(
+            node10,
+            "./cube",
+            &[("src/cube.jsx", JSX_CUBE), ("src/cube/index.ts", TS_LINEAR)]
+        ),
+        cubic
+    );
+
+    let consumer = jsx_consumer_of("@/cube");
+
+    run_in_project(
+        &[
+            ("tsconfig.json", mapped),
+            ("src/index.ts", consumer.as_str()),
+            ("src/cube.jsx", JSX_CUBE),
+        ],
+        |project, root| {
+            let cube = file_of(project, root, "src/cube.jsx");
+
+            assert!(project.is_project_file(cube));
+        },
+    );
+}
+
+#[test]
+fn jsx_imports_honor_effective_javascript_inclusion() {
+    let excluded = r#"{ "compilerOptions": { "allowJs": false, "jsx": "preserve", "module": "esnext", "moduleResolution": "bundler" }, "files": ["src/index.ts"] }"#;
+    let checked = r#"{ "compilerOptions": { "checkJs": true, "jsx": "preserve", "module": "esnext", "moduleResolution": "bundler" }, "files": ["src/index.ts"] }"#;
+    let unset = r#"{ "compilerOptions": { "allowJs": true, "module": "esnext", "moduleResolution": "bundler" }, "files": ["src/index.ts"] }"#;
+    let sources = [("src/cube.jsx", JSX_CUBE)];
+
+    for specifier in ["./cube", "./cube.jsx"] {
+        assert_eq!(
+            jsx_target_of(excluded, specifier, &sources).as_deref(),
+            Some("external src/cube.jsx"),
+            "{specifier}"
+        );
+        assert_eq!(
+            jsx_go_of(excluded, specifier, &sources),
+            ("O(1)".to_string(), false)
+        );
+    }
+
+    assert_eq!(
+        jsx_target_of(checked, "./cube", &sources).as_deref(),
+        Some("src/cube.jsx")
+    );
+    assert_eq!(
+        jsx_target_of(unset, "./cube", &sources).as_deref(),
+        Some("src/cube.jsx")
+    );
+}
+
+#[test]
+fn jsx_specifiers_keep_typescript_declaration_mappings() {
+    let declared: JsxSources = &[("src/cube.d.ts", CUBE_DECLARATION)];
+
+    assert_eq!(
+        jsx_target_of(JSX_ROOTED, "./cube.jsx", declared).as_deref(),
+        Some("src/cube.d.ts")
+    );
+    assert_eq!(
+        jsx_go_of(JSX_ROOTED, "./cube.jsx", declared),
+        ("O(1)".to_string(), false)
+    );
+}
+
+#[test]
+fn local_declarations_pair_with_the_implementation_the_runtime_loads() {
+    let excluded = r#"{ "compilerOptions": { "allowJs": false, "jsx": "preserve", "module": "esnext", "moduleResolution": "bundler" }, "files": ["src/index.ts"] }"#;
+    let cubic = ("O((size_0 * size_0^2))".to_string(), true);
+    let unknown = ("O(1)".to_string(), false);
+    let cases = [
+        (
+            "./cube.jsx",
+            "src/cube.jsx",
+            JSX_CUBE,
+            "src/cube.d.ts",
+            "src/cube.js",
+        ),
+        (
+            "./cube.js",
+            "src/cube.js",
+            JS_CUBE,
+            "src/cube.d.ts",
+            "src/cube.jsx",
+        ),
+        ("./cube", "src/cube.jsx", JSX_CUBE, "src/cube.d.ts", ""),
+        (
+            "./cube",
+            "src/cube/index.js",
+            JS_CUBE,
+            "src/cube/index.d.ts",
+            "",
+        ),
+        ("./cube.mjs", "src/cube.mjs", JS_CUBE, "src/cube.d.mts", ""),
+        ("./cube.cjs", "src/cube.cjs", JS_CUBE, "src/cube.d.cts", ""),
+    ];
+
+    for (specifier, implementation, source, declaration, sibling) in cases {
+        let mut listed = vec![(implementation, source), (declaration, CUBE_DECLARATION)];
+
+        if !sibling.is_empty() {
+            listed.push((sibling, JS_LINEAR));
+        }
+
+        let sources = listed.as_slice();
+
+        assert_eq!(
+            jsx_go_of(JSX_ROOTED, specifier, sources),
+            cubic,
+            "{specifier} {sources:?}"
+        );
+        assert_eq!(
+            jsx_go_of(excluded, specifier, sources),
+            unknown,
+            "{specifier} {sources:?}"
+        );
+
+        run_in_jsx_project(JSX_ROOTED, specifier, sources, |project, index| {
+            let declared = project
+                .file_by_path(&project.root.join(declaration))
+                .expect("declaration loaded");
+            let walked = file_of(project, &project.root, implementation);
+
+            assert_eq!(project.resolve(index, specifier), Resolved::File(declared));
+            assert_eq!(
+                project.implementation_of(index, specifier, RequestKind::Static),
+                Resolved::File(walked)
+            );
+            assert_eq!(project.counterpart_of(walked), Some(declared));
+            assert!(project.is_project_file(walked));
+        });
+    }
+}
+
+#[test]
+fn runtime_requests_add_no_jsx_extension() {
+    let files = [
+        ("tsconfig.json", JSX_ROOTED),
+        (
+            "src/index.ts",
+            "import { run } from \"pkg\";\nexport function go(xs: number[]) { return run(xs); }",
+        ),
+        (
+            "node_modules/pkg/package.json",
+            r#"{ "name": "pkg", "type": "module", "main": "index.js" }"#,
+        ),
+        (
+            "node_modules/pkg/index.js",
+            "import { cube } from \"./cube.jsx\";\nexport function run(xs) { return cube(xs); }",
+        ),
+        ("node_modules/pkg/cube.jsx", JSX_CUBE),
+    ];
+
+    run_in_project(&files, |project, root| {
+        let package = file_of(project, root, "node_modules/pkg/index.js");
+
+        assert_eq!(
+            implementation_relative_of(project, package, "./cube.jsx", RequestKind::Static)
+                .as_deref(),
+            Some("node_modules/pkg/cube.jsx")
+        );
+        assert_eq!(
+            implementation_relative_of(project, package, "./cube", RequestKind::Static),
+            None
+        );
+        assert_eq!(
+            implementation_relative_of(project, package, "./cube.js", RequestKind::Static),
+            None
+        );
+    });
+}
+
+#[test]
+fn local_declaration_pairing_needs_every_owner_and_a_first_party_declaration() {
+    let shared = [
+        (
+            "tsconfig.json",
+            r#"{ "files": [], "references": [{ "path": "./left" }, { "path": "./right" }] }"#,
+        ),
+        (
+            "left/tsconfig.json",
+            r#"{ "compilerOptions": { "allowJs": true }, "files": ["../src/index.ts"] }"#,
+        ),
+        (
+            "right/tsconfig.json",
+            r#"{ "compilerOptions": { "allowJs": false }, "files": ["../src/index.ts"] }"#,
+        ),
+        (
+            "src/index.ts",
+            "import { cube } from \"./cube.js\";\nexport function go(xs: number[]) { return cube(xs); }",
+        ),
+        ("src/cube.js", JS_CUBE),
+        ("src/cube.d.ts", CUBE_DECLARATION),
+    ];
+
+    let packaged = [
+        ("tsconfig.json", JSX_ROOTED),
+        (
+            "src/index.ts",
+            "import { cube } from \"../node_modules/pkg/cube.js\";\nexport function go(xs: number[]) { return cube(xs); }",
+        ),
+        ("node_modules/pkg/cube.js", JS_CUBE),
+        ("node_modules/pkg/cube.d.ts", CUBE_DECLARATION),
+    ];
+
+    assert_keeps_declaration(&shared, "./cube.js", "src/cube.d.ts");
+    assert_keeps_declaration(
+        &packaged,
+        "../node_modules/pkg/cube.js",
+        "node_modules/pkg/cube.d.ts",
+    );
+}
+
+fn assert_keeps_declaration(files: &[(&str, &str)], specifier: &str, declaration: &str) {
+    run_in_project(files, |project, root| {
+        let index = file_of(project, root, "src/index.ts");
+        let declared = file_of(project, root, declaration);
+
+        assert_eq!(
+            project.implementation_of(index, specifier, RequestKind::Static),
+            Resolved::File(declared)
+        );
+    });
+}
