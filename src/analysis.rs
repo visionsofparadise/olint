@@ -4,7 +4,7 @@ use indexmap::{IndexMap, IndexSet};
 use oxc_semantic::NodeId;
 
 use crate::budgets::BudgetContext;
-use crate::cost::Part;
+use crate::cost::{Part, Reading};
 use crate::declarations::{Binding, Declarations, FunctionId};
 use crate::directives::PerfTag;
 use crate::effects::{BudgetStorage, Effects};
@@ -79,8 +79,11 @@ pub struct Analysis<'p, 'a> {
     pub share_bindings: Vec<Binding>,
     pub(crate) enclosing_factors: Vec<(FileId, NodeId, crate::cost::Cost, bool)>,
     pub(crate) produced: Option<crate::summaries::Produced>,
+    pub(crate) deferred_reading: Option<Reading>,
+    pub(crate) latent_readings: HashMap<crate::summaries::SummaryId, Reading>,
+    pub(crate) suspensions: HashMap<(FileId, NodeId), bool>,
     pub(crate) latent_returns: HashMap<(FunctionId, u64), crate::summaries::LatentSources>,
-    pub(crate) pending_scoped: HashMap<(FileId, NodeId), Part>,
+    pub(crate) pending_scoped: HashMap<(FileId, NodeId, crate::cost::ExecutionPhase), Part>,
     pub(crate) bound_seen: HashSet<(FileId, NodeId)>,
     pub(crate) repeating_bodies: HashMap<(FileId, NodeId), bool>,
     pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
@@ -123,6 +126,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             share_bindings: Vec::new(),
             enclosing_factors: Vec::new(),
             produced: None,
+            deferred_reading: None,
+            latent_readings: HashMap::new(),
+            suspensions: HashMap::new(),
             latent_returns: HashMap::new(),
             pending_scoped: HashMap::new(),
             bound_seen: HashSet::new(),

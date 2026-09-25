@@ -1897,13 +1897,69 @@ pub struct Reading {
     pub completions: Vec<(ExecutionPhase, Completion, Part)>,
 }
 
+impl From<Part> for Reading {
+    fn from(part: Part) -> Self {
+        Reading::of_completion(ExecutionPhase::Immediate, Completion::Normal, part)
+    }
+}
+
 impl Reading {
+    pub(crate) fn holds_no_work(&self) -> bool {
+        self.completions
+            .iter()
+            .all(|channel| channel.2.holds_no_work())
+    }
+
+    pub(crate) fn called(self, origin: SourceSpan, unknowns: &mut Unknowns) -> Reading {
+        self.map_parts(|part| part.called(origin, unknowns))
+    }
+
+    pub(crate) fn executed(self) -> Reading {
+        if self.completions.is_empty() {
+            return Reading::of_part(Part::none().executed());
+        }
+
+        self.map_parts(Part::executed)
+    }
+
+    pub(crate) fn map_parts(self, mut map: impl FnMut(Part) -> Part) -> Reading {
+        let mut reading = Reading::empty();
+
+        for (phase, completion, part) in self.completions {
+            reading.set(phase, completion, map(part));
+        }
+
+        reading
+    }
+
+    pub(crate) fn normalized(self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Reading {
+        let mut reading = Reading::empty();
+
+        for (phase, _, part) in self.completions {
+            reading.join(phase, Completion::Normal, part, unknowns, traces);
+        }
+
+        reading
+    }
+
+    pub(crate) fn retaining(
+        self,
+        unknown: Option<crate::unknowns::UnknownId>,
+        unknowns: &mut Unknowns,
+    ) -> Reading {
+        if self.completions.is_empty() {
+            return Reading::of_part(Part::none().retaining(unknown, unknowns));
+        }
+
+        self.map_parts(|part| part.retaining(unknown, unknowns))
+    }
+
     pub fn empty() -> Reading {
         Reading::default()
     }
 
-    pub fn of_part(part: Part) -> Reading {
-        Reading::of_completion(ExecutionPhase::Immediate, Completion::Normal, part)
+    pub fn of_part(part: impl Into<Reading>) -> Reading {
+        part.into()
     }
 
     pub fn of_completion(phase: ExecutionPhase, completion: Completion, part: Part) -> Reading {
@@ -1988,11 +2044,11 @@ impl Reading {
 
     pub fn merge(
         mut self,
-        other: Reading,
+        other: impl Into<Reading>,
         unknowns: &mut Unknowns,
         traces: &mut TraceArena,
     ) -> Reading {
-        for (phase, completion, part) in other.completions {
+        for (phase, completion, part) in other.into().completions {
             self.join(phase, completion, part, unknowns, traces);
         }
 
@@ -2028,8 +2084,10 @@ impl Reading {
     }
 
     pub fn sibling(self) -> Reading {
-        if !self.main().is_absent()
-            || self.main().holds_only_provenance()
+        if self
+            .completions
+            .iter()
+            .any(|channel| !channel.2.is_absent() || channel.2.holds_only_provenance())
             || self.retains_exit_work()
         {
             return self;
@@ -2075,7 +2133,13 @@ impl Reading {
     ) -> Reading {
         let mut reading = Reading::empty();
 
-        for (_, completion, part) in self.completions {
+        for (original, completion, part) in self.completions {
+            let phase = if original == ExecutionPhase::Lazy && phase == ExecutionPhase::Scheduled {
+                ExecutionPhase::Lazy
+            } else {
+                phase
+            };
+
             reading.join(phase, completion, part, unknowns, traces);
         }
 

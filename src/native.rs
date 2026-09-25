@@ -11,7 +11,6 @@ use crate::budgets::Visits;
 use crate::cost::{Cost, ExecutionPhase, Part, Reading};
 use crate::declarations::{Declaration, TargetSet};
 use crate::declared_types::Kind;
-use crate::flow::Completion;
 use crate::invocations::{coercion_keys, iteration_keys};
 use crate::project::FileId;
 use crate::syntax::{body_root_of, identifier_of, member_expression_of, unwrap};
@@ -800,15 +799,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let unresolved = visits == Some(Visits::Unresolved);
         let bounded = charge.length.is_one() || unresolved;
-        let mut inner = Part::none();
+        let mut inner = Reading::empty();
         let mut beside = match model.receiver {
             Role::Callee => self.forwarded_part_of(site),
             Role::Written | Role::Grown | Role::Shrunk => {
                 self.record_receiver_write(site);
 
-                Part::none()
+                Reading::empty()
             }
-            _ => Part::none(),
+            _ => Reading::empty(),
         };
 
         for (index, argument) in site.arguments.iter().enumerate() {
@@ -824,15 +823,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
 
             match count {
-                Count::Once => beside = beside.max(part, &mut self.unknowns, &mut self.traces),
-                _ => inner = inner.max(part, &mut self.unknowns, &mut self.traces),
+                Count::Once => beside = beside.merge(part, &mut self.unknowns, &mut self.traces),
+                _ => inner = inner.merge(part, &mut self.unknowns, &mut self.traces),
             }
 
             if let (Role::Pattern(pattern), Some(expression)) = (role, argument.as_expression()) {
                 let matched =
                     self.matching_part_of((file, site.span), expression, pattern, &charge.length);
 
-                beside = beside.max(matched, &mut self.unknowns, &mut self.traces);
+                beside = beside.merge(matched, &mut self.unknowns, &mut self.traces);
             }
         }
 
@@ -840,66 +839,70 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let result = self.result_size_of(file, site.arguments.first(), &charge.element, 0);
             let copied = Part::unmarked(result.length.clone(), None);
 
-            inner = inner.max(copied, &mut self.unknowns, &mut self.traces);
+            inner = inner.merge(copied, &mut self.unknowns, &mut self.traces);
 
             if !result.length_resolved {
                 let unresolved = self.unknown_part(file, site.span, UnknownReason::SizeRelation);
 
-                beside = beside.max(unresolved, &mut self.unknowns, &mut self.traces);
+                beside = beside.merge(unresolved, &mut self.unknowns, &mut self.traces);
             }
         }
 
         if !charge.length_resolved {
             let unresolved = self.unknown_part(file, site.span, UnknownReason::SizeRelation);
 
-            beside = beside.max(unresolved, &mut self.unknowns, &mut self.traces);
+            beside = beside.merge(unresolved, &mut self.unknowns, &mut self.traces);
         }
 
         if model.output.materializes() && !self.is_counted_argument(site) {
             let materialized = self.unknown_part(file, site.span, UnknownReason::UnsupportedModel);
 
-            beside = beside.max(materialized, &mut self.unknowns, &mut self.traces);
+            beside = beside.merge(materialized, &mut self.unknowns, &mut self.traces);
         }
 
         if site.hides_invocation(model) {
             let hidden = self.unknown_part(file, site.span, UnknownReason::Target);
 
-            beside = beside.max(hidden, &mut self.unknowns, &mut self.traces);
+            beside = beside.merge(hidden, &mut self.unknowns, &mut self.traces);
         }
 
         if unresolved {
             let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
             let scaled = self.unknowns.scale(Some(unknown), None);
 
-            self.note_unresolved_multiplicity(&inner);
+            for (_, _, part) in &inner.completions {
+                self.note_unresolved_multiplicity(part);
+            }
 
             inner = inner
-                .scaled(None, &mut self.unknowns)
+                .map_parts(|part| part.scaled(None, &mut self.unknowns))
                 .retaining(scaled, &mut self.unknowns);
         }
 
         if model.phase == ExecutionPhase::Lazy {
-            beside = beside.max(
+            beside = beside.merge(
                 self.resumed_part_of(site),
                 &mut self.unknowns,
                 &mut self.traces,
             );
         }
 
-        if model.phase == ExecutionPhase::Scheduled && !beside.cost.is_one() {
+        if model.phase == ExecutionPhase::Scheduled {
             let receiver = site
                 .receiver
                 .map(|receiver| short(self.text_of(file, receiver.span())))
                 .unwrap_or_default();
 
-            beside = beside.explain(
-                format_args!("call {receiver}.{}() callback [scheduled]", site.name),
-                self.project.site_of(file, site.span),
-                origin,
-                true,
-                &mut self.traces,
-                &mut self.unknowns,
-            );
+            beside = beside.map_parts(|part| {
+                part.explain(
+                    format_args!("call {receiver}.{}() callback [scheduled]", site.name),
+                    self.project.site_of(file, site.span),
+                    origin,
+                    true,
+                    &mut self.traces,
+                    &mut self.unknowns,
+                )
+            });
         }
 
         let label = self
@@ -919,53 +922,58 @@ impl<'p, 'a> Analysis<'p, 'a> {
             (false, Some(label)) => {
                 let site_of = self.project.site_of(file, site.span);
 
-                crate::cost::nest(
-                    label,
-                    site_of,
-                    origin,
-                    charge.length,
-                    inner.executed(),
-                    &mut self.unknowns,
-                    &mut self.traces,
-                )
+                inner.executed().map_parts(|part| {
+                    crate::cost::nest(
+                        label.clone(),
+                        site_of,
+                        origin,
+                        charge.length.clone(),
+                        part,
+                        &mut self.unknowns,
+                        &mut self.traces,
+                    )
+                })
             }
             _ => inner,
         };
-        let part = part.max(beside, &mut self.unknowns, &mut self.traces);
+        let part = part.merge(beside, &mut self.unknowns, &mut self.traces);
 
-        if part == Part::none() {
+        if part == Reading::empty() {
             return reading;
         }
 
-        let mut reading = reading;
+        let part = match model.phase {
+            ExecutionPhase::Scheduled => part.in_phase(
+                ExecutionPhase::Scheduled,
+                &mut self.unknowns,
+                &mut self.traces,
+            ),
+            _ => part,
+        };
 
-        reading.join(
-            ExecutionPhase::Immediate,
-            Completion::Normal,
-            part,
-            &mut self.unknowns,
-            &mut self.traces,
-        );
-
-        reading
+        reading.merge(part, &mut self.unknowns, &mut self.traces)
     }
 
-    fn resumed_part_of(&mut self, site: &NativeSite<'a>) -> Part {
+    fn resumed_part_of(&mut self, site: &NativeSite<'a>) -> Reading {
         let Some(receiver) = site.receiver else {
-            return Part::none();
+            return Reading::empty();
         };
         let Some(latent) = self.latent_of(site.file, receiver) else {
-            return Part::none();
+            return Reading::empty();
         };
-        let consumed = self.consumed_part_of(site.file, receiver.span(), &latent);
+        let consumed = Reading::of_part(self.consumed_part_of(site.file, receiver.span(), &latent));
         let Some(call) = site.call else {
             return consumed;
         };
         let replaced = self.intrinsic_protocol_of((site.file, call.node_id()), &site.name);
-        let replaced =
-            self.implicit_part_of((site.file, site.span), &replaced, "resumption", &[receiver]);
+        let replaced = self.implicit_call_reading_of(
+            (site.file, site.span),
+            &replaced,
+            "resumption",
+            &[receiver],
+        );
 
-        consumed.max(replaced, &mut self.unknowns, &mut self.traces)
+        consumed.merge(replaced, &mut self.unknowns, &mut self.traces)
     }
 
     fn native_label_of(&self, site: &NativeSite<'a>, model: &NativeModel) -> Option<String> {
@@ -1117,18 +1125,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site: &NativeSite<'a>,
         argument: &'a Argument<'a>,
         role: Role,
-    ) -> (Part, Count) {
+    ) -> (Reading, Count) {
         let file = site.file;
         let Some(expression) = argument.as_expression() else {
             if let Argument::SpreadElement(spread) = argument {
                 self.record_argument_reach(file, &spread.argument);
             }
 
-            return (Part::none(), Count::Once);
+            return (Reading::empty(), Count::Once);
         };
 
         match role {
-            Role::Read | Role::Forwarded | Role::Callee => (Part::none(), Count::Once),
+            Role::Read | Role::Forwarded | Role::Callee => (Reading::empty(), Count::Once),
             Role::Coerced => (self.operand_coercion_part_of(file, expression), Count::Once),
             Role::Pattern(pattern) => (
                 self.searched_part_of(file, expression, pattern.keys),
@@ -1147,7 +1155,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Role::Stored => {
                 self.record_stored_value(file, expression);
 
-                (Part::none(), Count::Once)
+                (Reading::empty(), Count::Once)
             }
             Role::Opaque => (self.opaque_part_of(file, expression), Count::Once),
             Role::Callback(count) => {
@@ -1178,7 +1186,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let keyed = self.grouping_key_part_of(file, expression, &facts.value.targets);
 
                 (
-                    part.max(keyed, &mut self.unknowns, &mut self.traces),
+                    part.merge(keyed, &mut self.unknowns, &mut self.traces),
                     Count::PerElement,
                 )
             }
@@ -1207,9 +1215,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn opaque_part_of(&mut self, file: FileId, expression: &'a Expression<'a>) -> Part {
+    fn opaque_part_of(&mut self, file: FileId, expression: &'a Expression<'a>) -> Reading {
         if self.is_primitive_operand(file, expression) {
-            return Part::none();
+            return Reading::empty();
         }
 
         self.record_argument_reach(file, expression);
@@ -1220,7 +1228,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .collect();
 
         if !self.may_access(None) && !self.may_implement_any(&keys) {
-            return Part::none();
+            return Reading::empty();
         }
 
         let targets = TargetSet {
@@ -1228,7 +1236,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             open: true,
         };
 
-        self.implicit_part_of((file, expression.span()), &targets, "native", &[expression])
+        self.implicit_call_reading_of((file, expression.span()), &targets, "native", &[expression])
     }
 
     fn searched_part_of(
@@ -1236,11 +1244,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         pattern: &'a Expression<'a>,
         names: &[&str],
-    ) -> Part {
+    ) -> Reading {
         if matches!(unwrap(pattern), Expression::RegExpLiteral(_))
             || self.is_primitive_operand(file, pattern)
         {
-            return Part::none();
+            return Reading::empty();
         }
 
         let keys: Vec<MemberKey> = names
@@ -1250,7 +1258,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .collect();
         let targets = self.protocol_targets_of(file, pattern, &keys);
 
-        self.implicit_part_of((file, pattern.span()), &targets, "pattern", &[pattern])
+        self.implicit_call_reading_of((file, pattern.span()), &targets, "pattern", &[pattern])
     }
 
     fn record_receiver_write(&mut self, site: &NativeSite<'a>) {
@@ -1310,7 +1318,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Some(self.live_visits_of(file, receiver, &bodies))
     }
 
-    fn written_part_of(&mut self, file: FileId, target: &'a Expression<'a>) -> Part {
+    fn written_part_of(&mut self, file: FileId, target: &'a Expression<'a>) -> Reading {
         let value = self.storage_value_of(file, target);
 
         if !self.current_effects.member_writes.contains(&value) {
@@ -1322,10 +1330,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             open: self.may_access(None),
         };
 
-        self.implicit_part_of((file, target.span()), &targets, "setter", &[target])
+        self.implicit_call_reading_of((file, target.span()), &targets, "setter", &[target])
     }
 
-    fn serialized_part_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Part {
+    fn serialized_part_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Reading {
         let inspected = self.inspected_part_of(file, value);
         let keys: Vec<MemberKey> = TO_JSON_KEYS
             .iter()
@@ -1337,15 +1345,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let targets = self.protocol_targets_of(file, value, &keys);
-        let root = self.implicit_part_of((file, value.span()), &targets, "toJSON", &[value]);
+        let root =
+            self.implicit_call_reading_of((file, value.span()), &targets, "toJSON", &[value]);
         let nested = match !targets.open && self.serializes_primitives(file, value, &targets) {
-            true => Part::none(),
+            true => Reading::empty(),
             false => self.unknown_visits_part_of(file, value),
         };
 
         inspected
-            .max(root, &mut self.unknowns, &mut self.traces)
-            .max(nested, &mut self.unknowns, &mut self.traces)
+            .merge(root, &mut self.unknowns, &mut self.traces)
+            .merge(nested, &mut self.unknowns, &mut self.traces)
     }
 
     fn serializes_primitives(
@@ -1401,9 +1410,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         callback: &'a Expression<'a>,
         targets: &TargetSet,
-    ) -> Part {
+    ) -> Reading {
         if !self.may_implement_any(&coercion_keys()) {
-            return Part::none();
+            return Reading::empty();
         }
 
         let primitive = !targets.open
@@ -1414,7 +1423,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .all(|target| self.returns_only_primitives(*target));
 
         if primitive {
-            return Part::none();
+            return Reading::empty();
         }
 
         let open = TargetSet {
@@ -1422,16 +1431,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             open: true,
         };
 
-        self.implicit_part_of((file, callback.span()), &open, "coercion", &[])
+        self.implicit_call_reading_of((file, callback.span()), &open, "coercion", &[])
     }
 
-    fn executor_part_of(&mut self, file: FileId, argument: &'a Argument<'a>) -> Part {
+    fn executor_part_of(&mut self, file: FileId, argument: &'a Argument<'a>) -> Reading {
         let Some(expression) = argument.as_expression() else {
-            return Part::none();
+            return Reading::empty();
         };
 
         if self.is_non_callable_argument(file, expression) {
-            return Part::none();
+            return Reading::empty();
         }
 
         let facts = self.argument_facts_of(file, argument);
@@ -1439,10 +1448,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.invoke_callback(&facts, file, argument.span(), &[Part::none(), Part::none()])
     }
 
-    fn forwarded_part_of(&mut self, site: &NativeSite<'a>) -> Part {
+    fn forwarded_part_of(&mut self, site: &NativeSite<'a>) -> Reading {
         let file = site.file;
         let Some(receiver) = site.receiver else {
-            return Part::none();
+            return Reading::empty();
         };
         let forwarded = match site.arguments.first() {
             Some(Argument::SpreadElement(_)) => None,
@@ -1450,9 +1459,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             None => Some(site.arguments),
         };
         let Some(forwarded) = forwarded else {
-            return self
-                .unknown_invocation(file, site.span, site.arguments, UnknownReason::Target)
-                .main();
+            return self.unknown_invocation(file, site.span, site.arguments, UnknownReason::Target);
         };
         let targets = self.callee_targets_of_expression(file, receiver);
         let origin = self.source_span(file, site.span);
@@ -1465,7 +1472,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             false => None,
         };
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         for known in &targets.known {
             let function = self.function_at(*known);
@@ -1474,13 +1481,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 (file, forwarded, site.span),
                 crate::summaries::Deferral::Escaped,
             );
-            let called = self.named_call_of((known.file, function), called, (site_of, origin));
+            let called =
+                self.named_reading_call_of((known.file, function), called, (site_of, origin));
             let called = called
                 .called(origin, &mut self.unknowns)
                 .retaining(remainder, &mut self.unknowns);
-            let called = self.called_part_of(known.file, function, called, cyclic);
+            let called = self.called_reading_of(known.file, function, called, cyclic);
 
-            part = part.max(called, &mut self.unknowns, &mut self.traces);
+            part = part.merge(called, &mut self.unknowns, &mut self.traces);
         }
 
         part

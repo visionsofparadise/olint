@@ -60,6 +60,7 @@ pub struct Latent {
     pub yields: Option<Cost>,
     pub effects: Effects,
     pub record: Option<SummaryId>,
+    deferred: Option<Reading>,
 }
 
 impl Latent {
@@ -69,6 +70,7 @@ impl Latent {
             yields: None,
             effects: Effects::unknown(),
             record: None,
+            deferred: None,
         }
     }
 }
@@ -125,6 +127,18 @@ pub struct LatentKey {
     pub cost_error: Option<CostError>,
     pub unknowns: crate::unknowns::SemanticKeyId,
     pub yields: Option<Cost>,
+    pub channels: Vec<LatentChannelKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LatentChannelKey {
+    pub phase: crate::cost::ExecutionPhase,
+    pub completion: Completion,
+    pub cost: Cost,
+    pub cost_error: Option<CostError>,
+    pub preference: Preference,
+    pub unknowns: crate::unknowns::SemanticKeyId,
+    pub retained: crate::unknowns::SemanticKeyId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -213,6 +227,7 @@ struct SummaryTask {
     fallback: bool,
     passes: u64,
     produced: Option<Produced>,
+    deferred_reading: Option<Reading>,
 }
 
 #[derive(Clone)]
@@ -284,7 +299,7 @@ pub(crate) struct Scheduler {
     callback_values: HashMap<ValueId, usize>,
     local_records: HashMap<TaskId, SummaryRecord>,
     body_sizes: HashMap<FunctionId, u64>,
-    constructions: HashMap<ConstructionKey, (Part, Effects)>,
+    constructions: HashMap<ConstructionKey, (Reading, Effects)>,
     initializing: HashSet<((FileId, NodeId), bool)>,
     constructing: Vec<(FileId, NodeId)>,
 }
@@ -591,6 +606,39 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 {
                     Some((reading, yields)) => {
                         let work = reading.latent(&mut self.unknowns, &mut self.traces);
+                        let deferred = value
+                            .latent
+                            .and_then(|id| self.latent_readings.get(&id))
+                            .cloned()
+                            .unwrap_or_else(|| Reading::of_part(work.clone()));
+                        let mut channels = Vec::new();
+
+                        for (phase, completion, part) in deferred.completions {
+                            let unknowns =
+                                self.unknowns.semantic_key(part.unknowns, &mut || {
+                                    self.scheduler
+                                        .work
+                                        .admit(Charges::one(Event::SemanticIdentity, 1))
+                                        .is_ok()
+                                })?;
+                            let retained =
+                                self.unknowns.semantic_key(part.retained, &mut || {
+                                    self.scheduler
+                                        .work
+                                        .admit(Charges::one(Event::SemanticIdentity, 1))
+                                        .is_ok()
+                                })?;
+
+                            channels.push(LatentChannelKey {
+                                phase,
+                                completion,
+                                cost: part.cost,
+                                cost_error: part.cost_error,
+                                preference: part.preference,
+                                unknowns,
+                                retained,
+                            });
+                        }
 
                         Some(LatentKey {
                             work: work.cost,
@@ -602,6 +650,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                                     .is_ok()
                             })?,
                             yields,
+                            channels,
                         })
                     }
                     None => None,
@@ -655,6 +704,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading: Reading,
         mut effects: Effects,
         produced: Option<Produced>,
+        deferred_reading: Option<Reading>,
     ) -> SummaryId {
         effects
             .binding_writes
@@ -678,6 +728,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             result,
             effects,
         });
+
+        if let Some(deferred) = deferred_reading {
+            self.latent_readings.insert(id, deferred);
+        }
+
         self.summaries.insert(key, id);
 
         id
@@ -990,6 +1045,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             fallback: false,
             passes: 0,
             produced: None,
+            deferred_reading: None,
         });
         self.scheduler.keys.insert(key, id);
 
@@ -1151,7 +1207,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .expect("task credit is owned");
 
         let produced = self.scheduler.tasks[id.0].produced.take();
-        let record = self.store_summary(key, reading, effects, produced);
+        let deferred = self.scheduler.tasks[id.0].deferred_reading.take();
+        let record = self.store_summary(key, reading, effects, produced, deferred);
         self.scheduler.tasks[id.0].state = TaskState::Ready(record);
 
         let task = &self.scheduler.tasks[id.0];
@@ -1215,6 +1272,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let saved_shares = std::mem::take(&mut self.share_bindings);
         let saved_factors = std::mem::take(&mut self.enclosing_factors);
         let saved_produced = self.produced.take();
+        let saved_deferred = self.deferred_reading.take();
         let saved_scoped = std::mem::take(&mut self.pending_scoped);
         let saved_bounds = std::mem::take(&mut self.bound_seen);
         let saved_warnings = std::mem::take(&mut self.warnings);
@@ -1256,6 +1314,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             });
 
         self.scheduler.tasks[id.0].produced = produced;
+
+        let deferred = std::mem::replace(&mut self.deferred_reading, saved_deferred);
+        let deferred = deferred
+            .map(|reading| self.finish_reading(key.function.file, function, reading, &inputs));
+
+        self.scheduler.tasks[id.0].deferred_reading = deferred;
 
         let effects = std::mem::replace(&mut self.current_effects, saved_effects);
         self.current_substitutions = saved_inputs;
@@ -2311,11 +2375,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let body = self.cost_of_function_body(file, function);
             let body = match generator {
-                true => body.in_phase(
-                    crate::cost::ExecutionPhase::Lazy,
-                    &mut self.unknowns,
-                    &mut self.traces,
-                ),
+                true => {
+                    self.deferred_reading = Some(body.clone());
+
+                    body.in_phase(
+                        crate::cost::ExecutionPhase::Lazy,
+                        &mut self.unknowns,
+                        &mut self.traces,
+                    )
+                }
                 false => self.returned_latent_reading_of(file, function, body),
             };
 
@@ -2366,7 +2434,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         class: &'a oxc_ast::ast::Class<'a>,
-    ) -> Part {
+    ) -> Reading {
         let site = (file, class.node_id());
         let owners = self.owners_of(file, site.1);
 
@@ -2378,9 +2446,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         class: &'a oxc_ast::ast::Class<'a>,
         plan: &ConstructionPlan,
-    ) -> Part {
+    ) -> Reading {
         if plan.initializers.is_empty() {
-            return Part::none();
+            return Reading::empty();
         }
 
         self.initializers_part_of(
@@ -2402,7 +2470,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (site, inherited): ((FileId, NodeId), bool),
         initializers: &[(FileId, NodeId)],
         owners: &HashSet<(FileId, NodeId)>,
-    ) -> Part {
+    ) -> Reading {
         let key = self.construction_key_of((site, inherited), owners);
 
         if let Some((part, effects)) = key
@@ -2418,21 +2486,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let span = self.kind_of_node(site.0, site.1).span();
 
         if !self.scheduler.initializing.insert((site, inherited)) {
-            return self.deferred_unknown(site.0, span, UnknownReason::Recurrence);
+            return Reading::of_part(self.deferred_unknown(
+                site.0,
+                span,
+                UnknownReason::Recurrence,
+            ));
         }
 
         let serial = self.scheduler.pending_serial;
         let diagnostics = (self.warnings.len(), self.errors.len());
         let members = self.active_recurrence_members();
         let outer = std::mem::take(&mut self.current_effects);
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         for (file, node) in initializers {
             if !self.charge_work(Event::DispatchStep, 1) {
                 let exhausted =
                     self.deferred_unknown(site.0, span, UnknownReason::ResourceExhaustion);
 
-                part = part.max(exhausted, &mut self.unknowns, &mut self.traces);
+                part = part.merge(exhausted, &mut self.unknowns, &mut self.traces);
 
                 break;
             }
@@ -2440,11 +2512,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let AstKind::Class(class) = self.kind_of_node(*file, *node) else {
                 continue;
             };
-            let fields = self
-                .cost_of_instance_fields(*file, class)
-                .total(&mut self.unknowns, &mut self.traces);
+            let fields = self.cost_of_instance_fields(*file, class);
 
-            part = part.max(fields, &mut self.unknowns, &mut self.traces);
+            part = part.merge(fields, &mut self.unknowns, &mut self.traces);
         }
 
         let effects = std::mem::replace(&mut self.current_effects, outer);
@@ -2954,11 +3024,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    pub(crate) fn part_of_argument(
+    pub(crate) fn reading_of_argument(
         &mut self,
         file: FileId,
         argument: Option<&'a Argument<'a>>,
-    ) -> Option<Part> {
+    ) -> Option<Reading> {
         let argument = argument?;
         let facts = self.argument_facts_of(file, argument);
 
@@ -2971,7 +3041,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         span: oxc_span::Span,
         supplied: &[Part],
-    ) -> Part {
+    ) -> Reading {
         self.invoke_argument_with(facts, file, span, &[], (true, supplied))
     }
 
@@ -2999,7 +3069,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         span: oxc_span::Span,
         arguments: &'a [Argument<'a>],
-    ) -> Part {
+    ) -> Reading {
         self.invoke_argument_with(facts, file, span, arguments, (false, &[]))
     }
 
@@ -3010,7 +3080,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         span: oxc_span::Span,
         arguments: &'a [Argument<'a>],
         (implicit, supplied): (bool, &[Part]),
-    ) -> Part {
+    ) -> Reading {
         if let Some(id) = self
             .scheduler
             .callback_values
@@ -3020,14 +3090,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let descriptor = &self.scheduler.callbacks[id];
 
             if descriptor.generation != self.scheduler.generation {
-                return self.deferred_unknown(file, span, UnknownReason::Target);
+                return Reading::of_part(self.deferred_unknown(file, span, UnknownReason::Target));
             }
 
             let function = self.function_at(descriptor.function);
             let target = descriptor.function;
 
             let (mut part, cyclic) = if self.fallback_active() {
-                self.fallback_invocation(target, file, span)
+                self.fallback_invocation(
+                    target,
+                    file,
+                    span,
+                    if implicit {
+                        Deferral::Excluded
+                    } else {
+                        Deferral::Escaped
+                    },
+                )
             } else {
                 let descriptor = descriptor.clone();
                 let captured = self.supplied_substitutions_of(
@@ -3039,7 +3118,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.call_with_captures(
                     (target.file, function),
                     (file, arguments, span),
-                    (implicit, Deferral::Escaped),
+                    (
+                        implicit,
+                        if implicit {
+                            Deferral::Excluded
+                        } else {
+                            Deferral::Escaped
+                        },
+                    ),
                     captured,
                 )
             };
@@ -3050,15 +3136,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 part = part.retaining(unknown.main().unknowns, &mut self.unknowns);
             }
 
-            return self.called_part_of(target.file, function, part, cyclic);
+            return self.called_reading_of(target.file, function, part, cyclic);
         }
 
         self.apply_argument_effects(facts, file, span, arguments);
 
-        facts
-            .callback
-            .clone()
-            .unwrap_or_else(|| self.unknown_part(file, span, UnknownReason::Target))
+        Reading::of_part(
+            facts
+                .callback
+                .clone()
+                .unwrap_or_else(|| self.unknown_part(file, span, UnknownReason::Target)),
+        )
     }
 
     fn supplied_substitutions_of(
@@ -3113,6 +3201,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    pub(crate) fn called_reading_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        reading: Reading,
+        cyclic: bool,
+    ) -> Reading {
+        if reading.completions.is_empty() {
+            return Reading::of_part(self.called_part_of(file, function, Part::none(), cyclic));
+        }
+
+        reading.map_parts(|part| self.called_part_of(file, function, part, cyclic))
+    }
+
     pub fn call_user(
         &mut self,
         file: FileId,
@@ -3121,6 +3223,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         arguments: &'a [Argument<'a>],
         span: oxc_span::Span,
     ) -> (Part, bool) {
+        let (reading, cyclic) = self.call_user_reading(file, function, call_file, arguments, span);
+
+        (reading.total(&mut self.unknowns, &mut self.traces), cyclic)
+    }
+
+    pub(crate) fn call_user_reading(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        call_file: FileId,
+        arguments: &'a [Argument<'a>],
+        span: oxc_span::Span,
+    ) -> (Reading, bool) {
         self.call_user_with(
             (file, function),
             (call_file, arguments, span),
@@ -3133,7 +3248,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (file, function): (FileId, FunctionNode<'a>),
         (call_file, arguments, span): (FileId, &'a [Argument<'a>], oxc_span::Span),
         deferral: Deferral,
-    ) -> (Part, bool) {
+    ) -> (Reading, bool) {
         if self.fallback_active() {
             return self.fallback_invocation(
                 FunctionId {
@@ -3142,12 +3257,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 },
                 call_file,
                 span,
+                deferral,
             );
         }
 
         let Some(captured) = self.inherited_substitutions_of(file, function) else {
             return (
-                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    call_file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             );
         };
@@ -3165,15 +3285,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         target: FunctionId,
         call_file: FileId,
         span: oxc_span::Span,
-    ) -> (Part, bool) {
+    ) -> (Reading, bool) {
         if self.fallback_active() {
-            return self.fallback_invocation(target, call_file, span);
+            return self.fallback_invocation(target, call_file, span, Deferral::Consumed);
         }
 
         let function = self.function_at(target);
         let Some(captured) = self.inherited_substitutions_of(target.file, function) else {
             return (
-                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    call_file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             );
         };
@@ -3191,15 +3315,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         target: FunctionId,
         (call_file, span): (FileId, oxc_span::Span),
         (supplied, rest): (Vec<Option<ArgumentFacts>>, Option<ArgumentFacts>),
-    ) -> (Part, bool) {
+    ) -> (Reading, bool) {
         if self.fallback_active() {
-            return self.fallback_invocation(target, call_file, span);
+            return self.fallback_invocation(target, call_file, span, Deferral::Excluded);
         }
 
         let function = self.function_at(target);
         let Some(mut captured) = self.inherited_substitutions_of(target.file, function) else {
             return (
-                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    call_file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             );
         };
@@ -3248,30 +3376,59 @@ impl<'p, 'a> Analysis<'p, 'a> {
         call: (FileId, &'a [Argument<'a>], oxc_span::Span),
         (implicit, deferral): (bool, Deferral),
         substitutions: Substitutions,
-    ) -> (Part, bool) {
-        let (reading, cyclic) = self.invocation_reading_of(function, call, implicit, substitutions);
-        let part = reading.total(&mut self.unknowns, &mut self.traces);
-        let latent = match deferral {
-            Deferral::Excluded => return (part, cyclic),
-            Deferral::Consumed => reading.latent(&mut self.unknowns, &mut self.traces),
-            Deferral::Escaped => {
-                let latent = reading.latent(&mut self.unknowns, &mut self.traces);
-                let unknown = match latent.is_absent() {
-                    true => None,
-                    false => Some(self.unknowns.origin(
-                        self.source_span(call.0, call.2),
-                        UnknownReason::Multiplicity,
-                    )),
-                };
-
-                latent.retaining(unknown, &mut self.unknowns)
-            }
-        };
+    ) -> (Reading, bool) {
+        let (reading, cyclic) = self.invocation_reading_of(
+            function,
+            call,
+            implicit,
+            substitutions,
+            deferral == Deferral::Consumed,
+        );
 
         (
-            part.max(latent, &mut self.unknowns, &mut self.traces),
+            self.called_phases_of(reading, deferral, call.0, call.2),
             cyclic,
         )
+    }
+
+    fn called_phases_of(
+        &mut self,
+        reading: Reading,
+        deferral: Deferral,
+        file: FileId,
+        span: oxc_span::Span,
+    ) -> Reading {
+        let mut result = Reading::empty();
+
+        for (phase, _, part) in reading.completions {
+            let (phase, part) = match (phase, deferral) {
+                (crate::cost::ExecutionPhase::Lazy, Deferral::Excluded) => continue,
+                (crate::cost::ExecutionPhase::Lazy, Deferral::Escaped) => {
+                    let unknown = self
+                        .unknowns
+                        .origin(self.source_span(file, span), UnknownReason::Multiplicity);
+
+                    (
+                        crate::cost::ExecutionPhase::Immediate,
+                        part.retaining(Some(unknown), &mut self.unknowns),
+                    )
+                }
+                (crate::cost::ExecutionPhase::Lazy, Deferral::Consumed) => {
+                    (crate::cost::ExecutionPhase::Immediate, part)
+                }
+                (phase, _) => (phase, part),
+            };
+
+            result.join(
+                phase,
+                crate::flow::Completion::Normal,
+                part,
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+        }
+
+        result
     }
 
     fn invocation_reading_of(
@@ -3280,6 +3437,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (call_file, arguments, span): (FileId, &'a [Argument<'a>], oxc_span::Span),
         implicit: bool,
         substitutions: Substitutions,
+        consume: bool,
     ) -> (Reading, bool) {
         let target = FunctionId {
             file,
@@ -3287,7 +3445,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         if self.fallback_active() {
-            let (part, cyclic) = self.fallback_invocation(target, call_file, span);
+            let (part, cyclic) = self.fallback_invocation(
+                target,
+                call_file,
+                span,
+                if consume {
+                    Deferral::Consumed
+                } else {
+                    Deferral::Excluded
+                },
+            );
 
             return (Reading::of_part(part), cyclic);
         }
@@ -3376,6 +3543,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.substitute_parameter_values(file, function, call_file, arguments, &mut effects);
         self.current_effects.join(&effects);
+
+        let reading = match self
+            .summaries
+            .get(&key)
+            .and_then(|id| self.latent_readings.get(id))
+            .filter(|_| consume)
+            .cloned()
+        {
+            Some(deferred) => {
+                let mut immediate = reading;
+
+                immediate
+                    .completions
+                    .retain(|channel| channel.0 != crate::cost::ExecutionPhase::Lazy);
+
+                immediate.merge(deferred, &mut self.unknowns, &mut self.traces)
+            }
+            None => reading,
+        };
 
         (reading, cyclic)
     }
@@ -3791,10 +3977,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         target: FunctionId,
         file: FileId,
         span: oxc_span::Span,
-    ) -> (Part, bool) {
+        deferral: Deferral,
+    ) -> (Reading, bool) {
         if !self.charge_work(Event::InvocationEvaluation, 1) {
             return (
-                self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             );
         }
@@ -3824,21 +4015,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             })
             .unwrap_or_default();
-        let mut joined: Option<(Part, bool)> = None;
+        let mut joined: Option<(Reading, bool)> = None;
 
         for id in observed {
-            let (part, cyclic) = self.observed_invocation_of(id, file, span);
+            let (part, cyclic) =
+                self.observed_invocation_of(id, file, span, deferral == Deferral::Consumed);
 
             joined = Some(match joined {
                 Some((known, was_cyclic)) => (
-                    known.max(part, &mut self.unknowns, &mut self.traces),
+                    known.merge(part, &mut self.unknowns, &mut self.traces),
                     was_cyclic || cyclic,
                 ),
                 None => (part, cyclic),
             });
         }
 
-        match joined {
+        let (reading, cyclic) = match joined {
             Some((part, cyclic)) if incomplete => {
                 let unknown = self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion);
                 let part = part.retaining(unknown.unknowns, &mut self.unknowns);
@@ -3847,10 +4039,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             Some(joined) => joined,
             None => (
-                self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             ),
-        }
+        };
+
+        (self.called_phases_of(reading, deferral, file, span), cyclic)
     }
 
     fn observed_invocation_of(
@@ -3858,18 +4056,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
         id: TaskId,
         file: FileId,
         span: oxc_span::Span,
-    ) -> (Part, bool) {
+        consume: bool,
+    ) -> (Reading, bool) {
         if self.scheduler.component.contains(&id) {
             self.current_effects.unknown_global = true;
 
-            return (
-                self.local_resource_reading(id)
-                    .total(&mut self.unknowns, &mut self.traces),
-                true,
-            );
+            let reading = self.local_resource_reading(id);
+            let deferred = self.scheduler.tasks[id.0]
+                .deferred_reading
+                .clone()
+                .filter(|_| consume);
+
+            return (self.restored_latent_reading(reading, deferred), true);
         }
 
         if let TaskState::Ready(record) = self.scheduler.tasks[id.0].state {
+            let deferred = self
+                .latent_readings
+                .get(&record)
+                .cloned()
+                .filter(|_| consume);
             let record = self.summaries_arena[record.0 as usize].clone();
 
             self.current_effects.join(&record.effects);
@@ -3881,15 +4087,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
             });
 
             return (
-                record.reading.total(&mut self.unknowns, &mut self.traces),
+                self.restored_latent_reading(record.reading, deferred),
                 cyclic,
             );
         }
 
         (
-            self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion),
+            Reading::of_part(self.deferred_unknown(file, span, UnknownReason::ResourceExhaustion)),
             false,
         )
+    }
+
+    fn restored_latent_reading(
+        &mut self,
+        mut reading: Reading,
+        deferred: Option<Reading>,
+    ) -> Reading {
+        if let Some(deferred) = deferred {
+            reading
+                .completions
+                .retain(|channel| channel.0 != crate::cost::ExecutionPhase::Lazy);
+
+            reading = reading.merge(deferred, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
     }
 
     fn closed_function(&self, target: FunctionId) -> bool {
@@ -4238,7 +4460,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for returned in self.returned_expressions_of(target) {
             match self.latent_of(file, returned) {
-                Some(latent) => found = Some(self.joined_latent_of(found, latent)),
+                Some(latent) => {
+                    found = Some(self.joined_latent_of(
+                        found,
+                        latent,
+                        self.source_span(file, returned.span()),
+                    ))
+                }
                 None => mixed = true,
             }
         }
@@ -4251,6 +4479,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             latent.yields = None;
         }
 
+        self.deferred_reading = Some(self.reading_of_latent(&latent));
         self.produced = Some(Produced {
             count: latent.yields,
             yielded: true,
@@ -4281,15 +4510,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn joined_latent_of(&mut self, held: Option<Latent>, latent: Latent) -> Latent {
+    fn joined_latent_of(
+        &mut self,
+        held: Option<Latent>,
+        latent: Latent,
+        origin: crate::unknowns::SourceSpan,
+    ) -> Latent {
         let Some(held) = held else {
             return latent;
         };
+        let deferred = self.reading_of_latent(&held).merge(
+            self.reading_of_latent(&latent),
+            &mut self.unknowns,
+            &mut self.traces,
+        );
         let mut effects = held.effects;
 
         effects.join(&latent.effects);
 
-        Latent {
+        let mut result = Latent {
             work: held
                 .work
                 .max(latent.work, &mut self.unknowns, &mut self.traces),
@@ -4299,7 +4538,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
             effects,
             record: None,
-        }
+            deferred: Some(deferred.clone()),
+        };
+
+        result.record = self.store_latent_record(result.clone(), deferred, origin);
+
+        result
     }
 
     pub(crate) fn latent_of(
@@ -4382,7 +4626,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
 
             match latent {
-                Some(latent) => found = Some(self.joined_latent_of(found, latent)),
+                Some(latent) => {
+                    found = Some(self.joined_latent_of(
+                        found,
+                        latent,
+                        self.source_span(file, alternative.span()),
+                    ))
+                }
                 None => mixed = true,
             }
         }
@@ -4417,7 +4667,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for target in targets.known {
             match self.invocation_latent_of(target, file, call) {
-                Some(latent) => found = Some(self.joined_latent_of(found, latent)),
+                Some(latent) => {
+                    found = Some(self.joined_latent_of(
+                        found,
+                        latent,
+                        self.source_span(file, call.span),
+                    ))
+                }
                 None => missing = true,
             }
         }
@@ -4523,6 +4779,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             yields,
             effects,
             record: Some(id),
+            deferred: self.latent_readings.get(&id).cloned(),
         }
     }
 
@@ -4535,6 +4792,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Some(record);
         }
 
+        let reading = self.reading_of_latent(&latent);
+
+        self.store_latent_record(latent, reading, origin)
+    }
+
+    fn store_latent_record(
+        &mut self,
+        latent: Latent,
+        deferred: Reading,
+        origin: crate::unknowns::SourceSpan,
+    ) -> Option<SummaryId> {
         if !self.charge_work(Event::LatentStep, 1) {
             return None;
         }
@@ -4555,6 +4823,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             result,
             effects: latent.effects,
         });
+
+        self.latent_readings.insert(id, deferred);
 
         Some(id)
     }
@@ -4577,27 +4847,39 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         span: oxc_span::Span,
         latent: &Latent,
-    ) -> Part {
+    ) -> Reading {
         let origin = self.source_span(file, span);
 
         self.current_effects.join(&latent.effects);
 
-        let part = match latent.work.cost.is_one() {
-            true => latent.work.clone(),
-            false => latent.work.clone().explain(
-                format_args!(
-                    "call {} [lazy]",
-                    crate::bounds::short(self.text_of(file, span))
+        let part = self
+            .reading_of_latent(latent)
+            .map_parts(|part| match part.cost.is_one() {
+                true => part,
+                false => part.explain(
+                    format_args!(
+                        "call {} [lazy]",
+                        crate::bounds::short(self.text_of(file, span))
+                    ),
+                    self.project.site_of(file, span),
+                    origin,
+                    true,
+                    &mut self.traces,
+                    &mut self.unknowns,
                 ),
-                self.project.site_of(file, span),
-                origin,
-                true,
-                &mut self.traces,
-                &mut self.unknowns,
-            ),
-        };
+            });
 
         part.called(origin, &mut self.unknowns)
+            .normalized(&mut self.unknowns, &mut self.traces)
+    }
+
+    fn reading_of_latent(&self, latent: &Latent) -> Reading {
+        latent
+            .deferred
+            .as_ref()
+            .or_else(|| latent.record.and_then(|id| self.latent_readings.get(&id)))
+            .cloned()
+            .unwrap_or_else(|| Reading::of_part(latent.work.clone()))
     }
 
     pub(crate) fn untracked_latent_part_of(
@@ -4605,7 +4887,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         call: &'a CallExpression<'a>,
         targets: &TargetSet,
-    ) -> Option<Part> {
+    ) -> Option<Reading> {
         if !self.may_return_latent_targets(file, call, targets, 0)
             || self.is_tracked_consumption(file, call.node_id(), 0)
         {
@@ -4913,7 +5195,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 AstKind::YieldExpression(yielded) => return yielded.delegate,
                 AstKind::ReturnStatement(_) => return self.returns_value(file, parent),
                 AstKind::ArrowFunctionExpression(arrow) => {
-                    return arrow.get_expression().is_some() && !arrow.r#async;
+                    return arrow.get_expression().is_some();
                 }
                 AstKind::StaticMemberExpression(member) => {
                     let AstKind::CallExpression(call) = nodes.parent_kind(parent) else {
@@ -4961,8 +5243,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .nodes()
             .ancestors(statement)
             .find_map(|ancestor| match ancestor.kind() {
-                AstKind::Function(function) => Some(!function.r#async && !function.generator),
-                AstKind::ArrowFunctionExpression(arrow) => Some(!arrow.r#async),
+                AstKind::Function(function) => Some(!function.generator),
+                AstKind::ArrowFunctionExpression(_) => Some(true),
                 _ => None,
             })
             .unwrap_or(false)

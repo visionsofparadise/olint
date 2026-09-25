@@ -57,9 +57,9 @@ pub(crate) struct ImplicitSite {
 }
 
 pub(crate) struct IterationParts {
-    pub(crate) acquire: Part,
-    pub(crate) next: Part,
-    pub(crate) close: Part,
+    pub(crate) acquire: Reading,
+    pub(crate) next: Reading,
+    pub(crate) close: Reading,
     pub(crate) unresolved: bool,
 }
 
@@ -323,7 +323,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         tagged: &'a TaggedTemplateExpression<'a>,
-    ) -> Part {
+    ) -> Reading {
         let targets = self
             .resolved_expression_callee_of(file, &tagged.tag, tagged.node_id())
             .targets;
@@ -333,7 +333,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             receivers.push(member.object());
         }
 
-        self.implicit_part_of((file, tagged.span), &targets, "tag", &receivers)
+        self.implicit_call_reading_of((file, tagged.span), &targets, "tag", &receivers)
     }
 
     pub(crate) fn iteration_parts_of(
@@ -359,7 +359,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         spread: &'a SpreadElement<'a>,
-    ) -> Option<Part> {
+    ) -> Option<Reading> {
         if matches!(
             self.project
                 .file(file)
@@ -378,9 +378,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.delegated_part_of(file, spread.span, &spread.argument, false)
     }
 
-    pub(crate) fn inspected_part_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Part {
+    pub(crate) fn inspected_part_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Reading {
         if self.is_primitive_operand(file, value) || self.has_primitive_elements(file, value) {
-            return Part::none();
+            return Reading::empty();
         }
 
         self.implicit_plan_part_of((file, value.node_id()), |analysis, plan| {
@@ -397,11 +397,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         value: &'a Expression<'a>,
-    ) -> Part {
+    ) -> Reading {
         let receiver = self.storage_value_of(file, value);
         let visited = self.unknown_implicit_part(file, value.span(), &[receiver]);
 
-        self.visits_of((file, value.span()), visited, false)
+        self.visits_of((file, value.span()), Reading::of_part(visited), false)
     }
 
     fn copied_part_of(
@@ -409,7 +409,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         (node, span): (NodeId, Span),
         argument: &'a Expression<'a>,
-    ) -> Part {
+    ) -> Reading {
         self.implicit_plan_part_of((file, node), |analysis, plan| {
             let sources = Sources {
                 values: vec![(file, argument)],
@@ -420,7 +420,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
-    pub(crate) fn jsx_spread_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
+    pub(crate) fn jsx_spread_part_of(
+        &mut self,
+        file: FileId,
+        kind: AstKind<'a>,
+    ) -> Option<Reading> {
         match kind {
             AstKind::JSXSpreadAttribute(spread) if is_inlined_spread(&spread.argument) => {
                 self.lowered_jsx_getters_of(file, spread)
@@ -439,7 +443,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         spread: &'a oxc_ast::ast::JSXSpreadAttribute<'a>,
-    ) -> Option<Part> {
+    ) -> Option<Reading> {
         if !self.project.jsx_spreads_lowered(file) {
             return None;
         }
@@ -526,14 +530,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         join_jsx_getters(&mut targets, &properties, copied);
 
-        Some(self.implicit_part_of((file, spread.span), &targets, "jsx spread getter", &[]))
+        Some(self.implicit_call_reading_of((file, spread.span), &targets, "jsx spread getter", &[]))
     }
 
     fn implicit_plan_part_of(
         &mut self,
         site: (FileId, NodeId),
         build: impl FnOnce(&mut Self, &mut Vec<ImplicitSite>),
-    ) -> Part {
+    ) -> Reading {
         let plan = match self.implicit_plan(site) {
             Some(plan) => plan,
             None => {
@@ -551,12 +555,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 plan
             }
         };
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         for planned in plan.iter() {
             let found = self.planned_part_of(planned);
 
-            part = part.max(found, &mut self.unknowns, &mut self.traces);
+            part = part.merge(found, &mut self.unknowns, &mut self.traces);
         }
 
         part
@@ -568,7 +572,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         span: Span,
         iterable: &'a Expression<'a>,
         asynchronous: bool,
-    ) -> Option<Part> {
+    ) -> Option<Reading> {
         let latent = self.latent_of(file, iterable);
         let iteration = self.iteration_of(file, iterable, asynchronous);
 
@@ -576,23 +580,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let consumed = self.consumed_part_of(file, iterable.span(), &latent);
             let (acquire, next, _) = self.protocol_parts_of(file, iterable, &iteration, false);
             let visits = match (&latent.yields, iteration.next.open) {
-                (Some(count), false) if !next.holds_no_work() => crate::cost::nest(
-                    "iterator visits".to_string(),
-                    self.project.site_of(file, span),
-                    self.source_span(file, span),
-                    count.clone(),
-                    next.executed(),
-                    &mut self.unknowns,
-                    &mut self.traces,
-                ),
+                (Some(count), false) if !next.holds_no_work() => {
+                    next.executed().map_parts(|part| {
+                        crate::cost::nest(
+                            "iterator visits".to_string(),
+                            self.project.site_of(file, span),
+                            self.source_span(file, span),
+                            count.clone(),
+                            part,
+                            &mut self.unknowns,
+                            &mut self.traces,
+                        )
+                    })
+                }
                 (Some(_), false) => next,
                 _ => self.visits_of((file, span), next, true),
             };
 
             return Some(
-                consumed
-                    .max(acquire, &mut self.unknowns, &mut self.traces)
-                    .max(visits, &mut self.unknowns, &mut self.traces),
+                Reading::of_part(consumed)
+                    .merge(acquire, &mut self.unknowns, &mut self.traces)
+                    .merge(visits, &mut self.unknowns, &mut self.traces),
             );
         }
 
@@ -603,7 +611,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let (acquire, next, _) = self.protocol_parts_of(file, iterable, &iteration, false);
         let visits = self.visits_of((file, span), next, iteration.next.open);
 
-        Some(acquire.max(visits, &mut self.unknowns, &mut self.traces))
+        Some(acquire.merge(visits, &mut self.unknowns, &mut self.traces))
     }
 
     fn protocol_parts_of(
@@ -612,55 +620,68 @@ impl<'p, 'a> Analysis<'p, 'a> {
         iterable: &'a Expression<'a>,
         iteration: &Iteration,
         closes: bool,
-    ) -> (Part, Part, Part) {
+    ) -> (Reading, Reading, Reading) {
         let span = iterable.span();
-        let acquire = self.implicit_part_of(
+        let acquire = self.implicit_call_reading_of(
             (file, span),
             &iteration.acquire,
             "iterator acquisition",
             &[iterable],
         );
-        let next =
-            self.implicit_part_of((file, span), &iteration.next, "iterator next", &[iterable]);
+        let next = self.implicit_call_reading_of(
+            (file, span),
+            &iteration.next,
+            "iterator next",
+            &[iterable],
+        );
         let close = match closes {
-            true => self.implicit_part_of(
+            true => self.implicit_call_reading_of(
                 (file, span),
                 &iteration.close,
                 "iterator close",
                 &[iterable],
             ),
-            false => Part::none(),
+            false => Reading::empty(),
         };
 
         (acquire, next, close)
     }
 
-    fn visits_of(&mut self, (file, span): (FileId, Span), next: Part, unresolved: bool) -> Part {
+    fn visits_of(
+        &mut self,
+        (file, span): (FileId, Span),
+        next: Reading,
+        unresolved: bool,
+    ) -> Reading {
         let site = self.project.site_of(file, span);
         let origin = self.source_span(file, span);
 
         if unresolved {
             let bound = self.unknowns.origin(origin, UnknownReason::Bound);
 
-            self.note_unresolved_multiplicity(&next);
+            for (_, _, part) in &next.completions {
+                self.note_unresolved_multiplicity(part);
+            }
 
             return next
-                .scaled(None, &mut self.unknowns)
+                .map_parts(|part| part.scaled(None, &mut self.unknowns))
                 .retaining(Some(bound), &mut self.unknowns);
         }
 
-        crate::cost::nest(
-            "iterator visits".to_string(),
-            site,
-            origin,
-            Cost::N,
-            next.executed(),
-            &mut self.unknowns,
-            &mut self.traces,
-        )
+        next.executed().map_parts(|part| {
+            crate::cost::nest(
+                "iterator visits".to_string(),
+                site,
+                origin,
+                Cost::N,
+                part,
+                &mut self.unknowns,
+                &mut self.traces,
+            )
+        })
     }
 
-    fn implicit_parts_of(&mut self, file: FileId, kind: AstKind<'a>) -> Vec<Part> {
+    fn implicit_parts_of(&mut self, file: FileId, kind: AstKind<'a>) -> Vec<Reading> {
         let mut parts = Vec::new();
 
         if let Some(object) = accessed_object_of(kind) {
@@ -670,20 +691,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if matches!(role, Some(Role::Read | Role::Update)) {
                 let targets = self.accessor_targets_of(file, kind, false);
 
-                parts.push(self.implicit_part_of((file, span), &targets, "getter", &[object]));
+                parts.push(self.implicit_call_reading_of(
+                    (file, span),
+                    &targets,
+                    "getter",
+                    &[object],
+                ));
             }
 
             if matches!(role, Some(Role::Write | Role::Update)) {
                 let targets = self.accessor_targets_of(file, kind, true);
 
-                parts.push(self.implicit_part_of((file, span), &targets, "setter", &[object]));
+                parts.push(self.implicit_call_reading_of(
+                    (file, span),
+                    &targets,
+                    "setter",
+                    &[object],
+                ));
             }
         }
 
         for operand in self.coerced_operands_of(file, kind) {
             let targets = self.coercion_targets_of(file, operand);
 
-            parts.push(self.implicit_part_of(
+            parts.push(self.implicit_call_reading_of(
                 (file, operand.span()),
                 &targets,
                 "coercion",
@@ -709,7 +740,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some(constructor) = checked_constructor_of(kind) {
             let targets = self.has_instance_targets_of(file, constructor);
 
-            parts.push(self.implicit_part_of(
+            parts.push(self.implicit_call_reading_of(
                 (file, kind.span()),
                 &targets,
                 "instanceof",
@@ -720,7 +751,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some(operand) = awaited_operand_of(kind) {
             let targets = self.awaited_targets_of(file, operand);
 
-            parts.push(self.implicit_part_of((file, kind.span()), &targets, "await", &[operand]));
+            parts.push(self.implicit_call_reading_of(
+                (file, kind.span()),
+                &targets,
+                "await",
+                &[operand],
+            ));
         }
 
         if matches!(
@@ -779,7 +815,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.produced = Some(produced.joined(count));
     }
 
-    fn yielded_part_of(&mut self, file: FileId, yielded: &'a YieldExpression<'a>) -> Option<Part> {
+    fn yielded_part_of(
+        &mut self,
+        file: FileId,
+        yielded: &'a YieldExpression<'a>,
+    ) -> Option<Reading> {
         let argument = yielded.argument.as_ref().filter(|_| yielded.delegate)?;
         let asynchronous = self
             .project
@@ -875,14 +915,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .collect()
     }
 
-    pub(crate) fn class_key_part_of(&mut self, file: FileId, element: NodeId) -> Part {
+    pub(crate) fn class_key_part_of(&mut self, file: FileId, element: NodeId) -> Reading {
         let kind = self.kind_of_node(file, element);
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         for operand in self.coerced_operands_of(file, kind) {
             let found = self.operand_coercion_part_of(file, operand);
 
-            part = part.max(found, &mut self.unknowns, &mut self.traces);
+            part = part.merge(found, &mut self.unknowns, &mut self.traces);
         }
 
         part
@@ -993,15 +1033,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         target: &'a SimpleAssignmentTarget<'a>,
         span: Span,
-    ) -> Part {
+    ) -> Reading {
         if !self.may_implement_any(&coercion_keys()) {
-            return Part::none();
+            return Reading::empty();
         }
 
         let (sources, receivers) = match target {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(reference) => {
                 if self.is_primitive_binding(file, reference) {
-                    return Part::none();
+                    return Reading::empty();
                 }
 
                 let sources = match self.local_values_of(file, reference) {
@@ -1031,7 +1071,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             other => {
                 let Some(member) = other.as_member_expression() else {
-                    return Part::none();
+                    return Reading::empty();
                 };
                 let object = member.object();
                 let sources = match self.member_key(file, member) {
@@ -1064,21 +1104,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
             join_targets(&mut targets, found);
         }
 
-        self.implicit_part_of((file, span), &targets, "coercion", &receivers)
+        self.implicit_call_reading_of((file, span), &targets, "coercion", &receivers)
     }
 
     pub(crate) fn operand_coercion_part_of(
         &mut self,
         file: FileId,
         operand: &'a Expression<'a>,
-    ) -> Part {
+    ) -> Reading {
         if self.is_primitive_operand(file, operand) {
-            return Part::none();
+            return Reading::empty();
         }
 
         let targets = self.coercion_targets_of(file, operand);
 
-        self.implicit_part_of((file, operand.span()), &targets, "coercion", &[operand])
+        self.implicit_call_reading_of((file, operand.span()), &targets, "coercion", &[operand])
     }
 
     fn pattern_sources_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Sources<'a>> {
@@ -1167,7 +1207,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         sources
     }
 
-    fn pattern_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
+    fn pattern_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Reading> {
         let planned = self.implicit_plan_part_of((file, kind.node_id()), |analysis, plan| {
             if let Some(sources) = analysis.pattern_sources_of(file, kind) {
                 analysis.plan_pattern_of(file, kind, sources, plan);
@@ -1195,10 +1235,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
         let consumed = self.consumed_part_of(source, value.span(), &latent);
 
-        Some(planned.max(consumed, &mut self.unknowns, &mut self.traces))
+        Some(planned.merge(consumed, &mut self.unknowns, &mut self.traces))
     }
 
-    fn planned_part_of(&mut self, planned: &ImplicitSite) -> Part {
+    fn planned_part_of(&mut self, planned: &ImplicitSite) -> Reading {
         let found = self.implicit_values_part_of(
             (planned.file, planned.span),
             &planned.targets,
@@ -1630,13 +1670,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         joined
     }
 
-    pub(crate) fn implicit_part_of(
+    pub(crate) fn implicit_call_reading_of(
         &mut self,
         (file, span): (FileId, Span),
         targets: &TargetSet,
         operation: &str,
         receivers: &[&'a Expression<'a>],
-    ) -> Part {
+    ) -> Reading {
         let values: Vec<ValueId> = match targets.open {
             true => receivers
                 .iter()
@@ -1654,10 +1694,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         targets: &TargetSet,
         operation: &str,
         receivers: &[ValueId],
-    ) -> Part {
+    ) -> Reading {
         let site = self.project.site_of(file, span);
         let origin = self.source_span(file, span);
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         for known in &targets.known {
             let function = self.function_at(*known);
@@ -1665,7 +1705,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let called =
                 self.explained_call_of((known.file, function), called, (site, origin), operation);
 
-            part = part.max(called, &mut self.unknowns, &mut self.traces);
+            part = part.merge(called, &mut self.unknowns, &mut self.traces);
         }
 
         if !targets.open {
@@ -1675,7 +1715,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let unknown = self.unknown_implicit_part(file, span, receivers);
 
         match targets.known.is_empty() {
-            true => unknown,
+            true => Reading::of_part(unknown),
             false => part.retaining(unknown.unknowns, &mut self.unknowns),
         }
     }
@@ -1683,11 +1723,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
     fn explained_call_of(
         &mut self,
         (file, function): (FileId, FunctionNode<'a>),
-        (called, cyclic): (Part, bool),
+        (called, cyclic): (Reading, bool),
         (site, origin): (crate::project::Site, crate::unknowns::SourceSpan),
         operation: &str,
-    ) -> Part {
-        let called = match called.cost.is_one() {
+    ) -> Reading {
+        let called = called.map_parts(|called| match called.cost.is_one() {
             true => called,
             false => match self.trace_name_of(file, function) {
                 Ok(name) => called.explain(
@@ -1700,10 +1740,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 ),
                 Err(_) => called.explanation_failed(origin, &mut self.unknowns),
             },
-        };
+        });
         let called = called.called(origin, &mut self.unknowns);
 
-        self.called_part_of(file, function, called, cyclic)
+        self.called_reading_of(file, function, called, cyclic)
     }
 
     fn unknown_implicit_part(&mut self, file: FileId, span: Span, receivers: &[ValueId]) -> Part {
@@ -1722,11 +1762,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.unknown_part(file, span, UnknownReason::Target)
     }
 
-    pub(crate) fn jsx_factory_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
+    pub(crate) fn jsx_factory_part_of(
+        &mut self,
+        file: FileId,
+        kind: AstKind<'a>,
+    ) -> Option<Reading> {
         let (span, opening, children) = jsx_parts_of(kind)?;
         let runtime = self.project.jsx_runtime_of(file);
         let passed = self.jsx_passed_values_of(file, opening, children);
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         if let JsxRuntime::Classic { factory, fragment } = &runtime {
             let fragment = opening.is_none().then_some(fragment);
@@ -1734,14 +1778,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             for names in std::iter::once(factory).chain(fragment) {
                 let entity = self.entity_part_of(file, kind, names);
 
-                part = part.max(entity, &mut self.unknowns, &mut self.traces);
+                part = part.merge(entity, &mut self.unknowns, &mut self.traces);
             }
         }
 
         let Some(((declaration, closed), shape)) = self.jsx_factory_of(file, kind, &runtime) else {
             let unknown = self.unknown_implicit_part(file, span, &passed);
 
-            return Some(part.max(unknown, &mut self.unknowns, &mut self.traces));
+            return Some(part.merge(unknown, &mut self.unknowns, &mut self.traces));
         };
         let declaration = declaration.map(|declaration| {
             self.declarations
@@ -1752,7 +1796,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if targets.known.is_empty() {
             let unknown = self.unknown_implicit_part(file, span, &passed);
 
-            return Some(part.max(unknown, &mut self.unknowns, &mut self.traces));
+            return Some(part.merge(unknown, &mut self.unknowns, &mut self.traces));
         }
 
         let arguments = self.jsx_arguments_of(file, kind, &runtime, shape);
@@ -1770,7 +1814,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 "jsx factory",
             );
 
-            part = part.max(called, &mut self.unknowns, &mut self.traces);
+            part = part.merge(called, &mut self.unknowns, &mut self.traces);
         }
 
         let effects = std::mem::replace(&mut self.current_effects, outer);
@@ -1803,7 +1847,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         member: &'a JSXMemberExpression<'a>,
-    ) -> Option<Part> {
+    ) -> Option<Reading> {
         let nodes = self.project.file(file).semantic.nodes();
 
         if !matches!(
@@ -1856,9 +1900,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    fn entity_part_of(&mut self, file: FileId, kind: AstKind<'a>, names: &[String]) -> Part {
+    fn entity_part_of(&mut self, file: FileId, kind: AstKind<'a>, names: &[String]) -> Reading {
         let Some(root) = names.first() else {
-            return Part::none();
+            return Reading::empty();
         };
         let scope = self
             .project
@@ -1889,12 +1933,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         }
 
-        let mut part = Part::none();
+        let mut part = Reading::empty();
 
         for planned in &plan {
             let found = self.planned_part_of(planned);
 
-            part = part.max(found, &mut self.unknowns, &mut self.traces);
+            part = part.merge(found, &mut self.unknowns, &mut self.traces);
         }
 
         part

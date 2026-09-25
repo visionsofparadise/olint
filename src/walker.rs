@@ -11,7 +11,7 @@ use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
 use crate::budgets::{charge_covers, tests_after_body};
-use crate::cost::{Cost, Part, Preference, Reading};
+use crate::cost::{Cost, ExecutionPhase, Part, Preference, Reading};
 use crate::declarations::{
     function_of_initializer, parameters_of, Binding, Declaration, FunctionNode, ParameterNode,
     TargetSet,
@@ -663,86 +663,154 @@ impl<'p, 'a> Analysis<'p, 'a> {
             None => Reading::empty(),
         };
 
+        let asynchronous = statements
+            .first()
+            .is_some_and(|statement| self.is_async_context(file, statement.node_id()));
+        let mut suspended = None;
+
         for statement in statements {
             let kind = self.kind_of_node(file, statement.node_id());
             let cost = self.cost_of_node(file, kind);
+            let mut cost = self.sibling_of(file, kind, cost);
+            let contains = asynchronous && self.suspends(file, statement.node_id());
+            let definite = contains && self.direct_suspension_of(file, statement);
 
-            reading = reading.merge(
-                self.sibling_of(file, kind, cost),
-                &mut self.unknowns,
-                &mut self.traces,
-            );
+            if contains
+                && !definite
+                && cost.completions.iter().any(|channel| {
+                    channel.0 == ExecutionPhase::Immediate && !channel.2.cost.is_one()
+                })
+            {
+                cost = self.uncertain_phase_of(file, statement.node_id(), cost);
+            }
+
+            let cost = match suspended {
+                Some((node, true)) => cost
+                    .map_parts(|part| match part.cost.is_one() {
+                        true => part,
+                        false => part.explain(
+                            "continuation after await [scheduled]",
+                            self.site_of_node(file, node),
+                            self.source_span(file, self.kind_of_node(file, node).span()),
+                            false,
+                            &mut self.traces,
+                            &mut self.unknowns,
+                        ),
+                    })
+                    .in_phase(
+                        ExecutionPhase::Scheduled,
+                        &mut self.unknowns,
+                        &mut self.traces,
+                    ),
+                Some((node, false)) => self.uncertain_phase_of(file, node, cost),
+                None => cost,
+            };
+
+            reading = reading.merge(cost, &mut self.unknowns, &mut self.traces);
+
+            if contains && (definite || suspended.is_none()) {
+                suspended = Some((statement.node_id(), definite));
+            }
         }
 
         reading
     }
 
-    fn cost_of_function_statements(&mut self, file: FileId, body: &'a FunctionBody<'a>) -> Reading {
-        let asynchronous = match self
-            .project
-            .file(file)
-            .semantic
-            .nodes()
-            .parent_kind(body.node_id())
-        {
-            AstKind::Function(function) => function.r#async && !function.generator,
-            AstKind::ArrowFunctionExpression(arrow) => arrow.r#async,
-            _ => false,
-        };
-        let suspension = match asynchronous {
-            true => body
-                .statements
-                .iter()
-                .position(|statement| self.suspends(file, statement.node_id())),
-            false => None,
-        };
-        let Some(index) = suspension.filter(|index| index + 1 < body.statements.len()) else {
-            return self.cost_of_statements(file, None, &body.statements);
-        };
-        let (immediate, continuation) = body.statements.split_at(index + 1);
-        let reading = self.cost_of_statements(file, None, immediate);
-        let continued = self.cost_of_statements(file, None, continuation);
-        let main = continued.main();
-        let main = match main.cost.is_one() {
-            true => main,
-            false => {
-                let suspended = immediate[index].node_id();
-
-                main.explain(
-                    "continuation after await [scheduled]",
-                    self.site_of_node(file, suspended),
-                    self.source_span(file, self.kind_of_node(file, suspended).span()),
-                    false,
-                    &mut self.traces,
-                    &mut self.unknowns,
-                )
+    fn direct_suspension_of(&mut self, file: FileId, statement: &'a Statement<'a>) -> bool {
+        let expression = match statement {
+            Statement::ExpressionStatement(statement) => Some(&statement.expression),
+            Statement::ReturnStatement(statement) => statement.argument.as_ref(),
+            Statement::VariableDeclaration(declaration) if declaration.declarations.len() == 1 => {
+                declaration.declarations[0].init.as_ref()
             }
+            _ => None,
         };
-        let continued = continued.with_main(main).in_phase(
-            crate::cost::ExecutionPhase::Scheduled,
+
+        match expression.map(unwrap) {
+            Some(Expression::AwaitExpression(awaited)) => {
+                !self.suspends(file, awaited.argument.node_id())
+            }
+            _ => false,
+        }
+    }
+
+    fn uncertain_phase_of(&mut self, file: FileId, node: NodeId, reading: Reading) -> Reading {
+        let unknown = self.unknowns.origin(
+            self.source_span(file, self.kind_of_node(file, node).span()),
+            UnknownReason::UnsupportedModel,
+        );
+        let reading = reading.retaining(Some(unknown), &mut self.unknowns);
+        let scheduled = reading.clone().in_phase(
+            ExecutionPhase::Scheduled,
             &mut self.unknowns,
             &mut self.traces,
         );
 
-        reading.merge(continued, &mut self.unknowns, &mut self.traces)
+        reading.merge(scheduled, &mut self.unknowns, &mut self.traces)
+    }
+
+    fn cost_of_function_statements(&mut self, file: FileId, body: &'a FunctionBody<'a>) -> Reading {
+        self.cost_of_statements(file, None, &body.statements)
     }
 
     fn suspends(&mut self, file: FileId, node: NodeId) -> bool {
-        let mut pending = vec![node];
+        let mut pending = vec![(node, false)];
 
-        while let Some(node) = pending.pop() {
-            let kind = self.kind_of_node(file, node);
+        while let Some((current, visited)) = pending.pop() {
+            if self.suspensions.contains_key(&(file, current)) {
+                continue;
+            }
 
-            if is_suspension(&kind) {
+            if self.work_exhausted() {
                 return true;
             }
 
-            if !is_deferred_kind(&kind) {
-                pending.extend(self.children_of(file, node));
+            let kind = self.kind_of_node(file, current);
+
+            if is_suspension(&kind) || is_deferred_kind(&kind) {
+                self.suspensions
+                    .insert((file, current), is_suspension(&kind));
+            } else if visited {
+                let suspends = self.children_of(file, current).into_iter().any(|child| {
+                    self.suspensions
+                        .get(&(file, child))
+                        .copied()
+                        .unwrap_or(false)
+                });
+
+                if self.work_exhausted() {
+                    return true;
+                }
+
+                self.suspensions.insert((file, current), suspends);
+            } else {
+                pending.push((current, true));
+                pending.extend(
+                    self.children_of(file, current)
+                        .into_iter()
+                        .map(|child| (child, false)),
+                );
             }
         }
 
-        false
+        self.suspensions
+            .get(&(file, node))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn is_async_context(&self, file: FileId, node: NodeId) -> bool {
+        self.project
+            .file(file)
+            .semantic
+            .nodes()
+            .ancestors(node)
+            .find_map(|ancestor| match ancestor.kind() {
+                AstKind::Function(function) => Some(function.r#async && !function.generator),
+                AstKind::ArrowFunctionExpression(arrow) => Some(arrow.r#async),
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 
     fn sibling_of(&mut self, file: FileId, kind: AstKind<'a>, reading: Reading) -> Reading {
@@ -772,10 +840,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
-    fn loop_result(&mut self, sibling: Reading, escaping: Reading, main: Part) -> Reading {
-        sibling
-            .merge(escaping, &mut self.unknowns, &mut self.traces)
-            .with_main(main)
+    fn nest_reading(
+        &mut self,
+        label: String,
+        site: Site,
+        origin: crate::unknowns::SourceSpan,
+        factor: Cost,
+        reading: Reading,
+    ) -> Reading {
+        reading.map_parts(|part| self.nest_part(label.clone(), site, origin, factor.clone(), part))
     }
 
     fn absorbed_escapes_of(
@@ -783,17 +856,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         iteration: NodeId,
         reading: &mut Reading,
-    ) -> Part {
-        let mut absorbed: Option<Part> = None;
+    ) -> Reading {
+        let mut absorbed = Reading::empty();
         let mut kept = Vec::new();
 
         for (phase, completion, part) in std::mem::take(&mut reading.completions) {
             if completion != Completion::Normal && self.absorbs_escape(file, completion, iteration)
             {
-                absorbed = Some(match absorbed {
-                    Some(held) => held.max(part, &mut self.unknowns, &mut self.traces),
-                    None => part,
-                });
+                absorbed.join(
+                    phase,
+                    Completion::Normal,
+                    part,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
 
                 continue;
             }
@@ -803,7 +879,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         reading.completions = kept;
 
-        absorbed.unwrap_or_default()
+        absorbed
     }
 
     fn append_linear_operation(
@@ -829,10 +905,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading: Reading,
         target: FileId,
         function: FunctionNode<'a>,
-        part: Part,
+        part: Reading,
         cyclic: bool,
     ) -> Reading {
-        let called = self.called_part_of(target, function, part, cyclic);
+        let called = self.called_reading_of(target, function, part, cyclic);
 
         reading.merge(
             Reading::of_part(called),
@@ -1141,9 +1217,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site_node: NodeId,
     ) -> Reading {
         let reading = self.cost_of_statement(file, body);
-        let main = reading.main();
 
-        if main.cost.is_one() {
+        if reading
+            .completions
+            .iter()
+            .all(|channel| channel.2.cost.is_one())
+        {
             return reading;
         }
 
@@ -1155,27 +1234,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some((completion, escape)) = escaped else {
             return self.depth_exhausted_reading(file, site_node, reading, exhausted);
         };
-        let lifted = main.explain(
-            format_args!(
-                "[{} branch: runs once per {}]",
-                completion_word_of(completion),
-                escape_unit_of(escape)
-            ),
-            self.site_of_node(file, site_node),
-            self.source_span(file, self.kind_of_node(file, site_node).span()),
-            false,
-            &mut self.traces,
-            &mut self.unknowns,
-        );
-        let mut lifted_reading = reading.with_main(Part::none());
+        let mut lifted_reading = Reading::empty();
 
-        lifted_reading.join(
-            crate::cost::ExecutionPhase::Immediate,
-            escape,
-            lifted,
-            &mut self.unknowns,
-            &mut self.traces,
-        );
+        for (phase, channel, part) in reading.completions {
+            if channel != Completion::Normal {
+                lifted_reading.join(phase, channel, part, &mut self.unknowns, &mut self.traces);
+
+                continue;
+            }
+
+            let lifted = part.explain(
+                format_args!(
+                    "[{} branch: runs once per {}]",
+                    completion_word_of(completion),
+                    escape_unit_of(escape)
+                ),
+                self.site_of_node(file, site_node),
+                self.source_span(file, self.kind_of_node(file, site_node).span()),
+                false,
+                &mut self.traces,
+                &mut self.unknowns,
+            );
+
+            lifted_reading.join(phase, escape, lifted, &mut self.unknowns, &mut self.traces);
+        }
 
         lifted_reading
     }
@@ -1315,6 +1397,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             assumed_bound || !invalidation.bound,
         ));
 
+        let suspends =
+            self.is_async_context(file, body.node_id()) && self.suspends(file, body.node_id());
         let body_raw =
             self.cost_of_statement(file, body)
                 .merge(visit, &mut self.unknowns, &mut self.traces);
@@ -1333,59 +1417,56 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.share_bindings = shares;
         }
 
-        let hoisted = self.pending_scoped.remove(&(file, node));
-        let mut body = match hoisted {
-            Some(hoisted) => {
-                let main = body_raw
-                    .main()
-                    .max(hoisted, &mut self.unknowns, &mut self.traces);
+        let phases = [
+            ExecutionPhase::Immediate,
+            ExecutionPhase::Scheduled,
+            ExecutionPhase::Lazy,
+        ];
+        let mut body = body_raw;
 
-                body_raw.with_main(main)
+        if suspends && !factor.is_one() && !body.main().cost.is_one() {
+            let unknown = self.unknowns.origin(
+                self.source_span(file, kind.span()),
+                UnknownReason::UnsupportedModel,
+            );
+            let prefix = body.main().retaining(Some(unknown), &mut self.unknowns);
+
+            body = body.with_main(prefix.clone());
+
+            body.join(
+                ExecutionPhase::Scheduled,
+                Completion::Normal,
+                prefix,
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+        }
+
+        for phase in phases {
+            if let Some(hoisted) = self.pending_scoped.remove(&(file, node, phase)) {
+                body.join(
+                    phase,
+                    Completion::Normal,
+                    hoisted,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
             }
-            None => body_raw,
-        };
+        }
+
         let absorbed = self.absorbed_escapes_of(file, node, &mut body);
-        let body_main = body.main();
-        let escaping = body.with_main(Part::none());
-        let escaped =
-            !absorbed.is_absent() || escaping.escapes().any(|channel| !channel.2.is_absent());
+        let mut escaping = body.clone();
 
-        if invalidation.bound && !assumed_bound {
-            let origin = self.source_span(file, kind.span());
-            let reason = bound.reason().unwrap_or(UnknownReason::Bound);
-            let mut unknown = Some(self.unknowns.origin(origin, reason));
+        escaping
+            .completions
+            .retain(|channel| channel.1 != Completion::Normal);
 
-            if self.fallback_active() {
-                let resource = self
-                    .unknowns
-                    .origin(origin, UnknownReason::ResourceExhaustion);
-                unknown = self.unknowns.join(unknown, Some(resource));
-            }
-
-            let unresolved = self.unknowns.scale(unknown, None);
-
-            self.note_unresolved_multiplicity(&body_main);
-
-            let body_main = body_main
-                .scaled(None, &mut self.unknowns)
-                .retaining(unresolved, &mut self.unknowns);
-            let main = body_main.max(absorbed, &mut self.unknowns, &mut self.traces);
-            let main = sibling
-                .main()
-                .max(main, &mut self.unknowns, &mut self.traces);
-
-            return self.loop_result(sibling, escaping, main);
-        }
-
-        if factor.is_one() {
-            let main = sibling
-                .main()
-                .max(body_main, &mut self.unknowns, &mut self.traces)
-                .max(absorbed, &mut self.unknowns, &mut self.traces);
-
-            return self.loop_result(sibling, escaping, main);
-        }
-
+        let escaped = absorbed
+            .completions
+            .iter()
+            .any(|channel| !channel.2.is_absent())
+            || escaping.escapes().any(|channel| !channel.2.is_absent());
+        let mut result = sibling.merge(escaping, &mut self.unknowns, &mut self.traces);
         let scope = budget
             .as_ref()
             .and_then(|budget| budget.scope)
@@ -1436,45 +1517,100 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let site = self.site_of_node(file, node);
-        let looped = self.nest_part(
-            label,
-            site,
-            self.source_span(file, kind.span()),
-            factor,
-            body_main,
-        );
-        let looped = match escaped {
-            true => looped,
-            false => looped.executed(),
-        };
+        let origin = self.source_span(file, kind.span());
 
-        let main = sibling
-            .main()
-            .max(absorbed, &mut self.unknowns, &mut self.traces);
-        let mut result = self.loop_result(sibling, escaping, main);
+        for phase in phases {
+            let body_main = body.part_of(phase, Completion::Normal);
+            let absorbed = absorbed.part_of(phase, Completion::Normal);
 
-        if let (true, Some(scope)) = (cancels, scope) {
-            let pending = self
-                .pending_scoped
-                .remove(&(file, scope))
-                .unwrap_or_default()
-                .max(looped, &mut self.unknowns, &mut self.traces);
+            if phase != ExecutionPhase::Immediate
+                && body_main == Part::none()
+                && absorbed == Part::none()
+            {
+                continue;
+            }
 
-            self.pending_scoped.insert((file, scope), pending);
-        } else if cancels && self.inside_loop(file, node) {
+            if invalidation.bound && !assumed_bound {
+                let reason = bound.reason().unwrap_or(UnknownReason::Bound);
+                let mut unknown = Some(self.unknowns.origin(origin, reason));
+
+                if self.fallback_active() {
+                    let resource = self
+                        .unknowns
+                        .origin(origin, UnknownReason::ResourceExhaustion);
+                    unknown = self.unknowns.join(unknown, Some(resource));
+                }
+
+                let unresolved = self.unknowns.scale(unknown, None);
+
+                self.note_unresolved_multiplicity(&body_main);
+
+                let main = body_main
+                    .scaled(None, &mut self.unknowns)
+                    .retaining(unresolved, &mut self.unknowns)
+                    .max(absorbed, &mut self.unknowns, &mut self.traces);
+
+                result.join(
+                    phase,
+                    Completion::Normal,
+                    main,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
+
+                continue;
+            }
+
+            if factor.is_one() {
+                let main = body_main.max(absorbed, &mut self.unknowns, &mut self.traces);
+
+                result.join(
+                    phase,
+                    Completion::Normal,
+                    main,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
+
+                continue;
+            }
+
+            let looped = self.nest_part(label.clone(), site, origin, factor.clone(), body_main);
+            let looped = match escaped {
+                true => looped,
+                false => looped.executed(),
+            };
+
             result.join(
-                crate::cost::ExecutionPhase::Immediate,
-                Completion::Return,
-                looped,
+                phase,
+                Completion::Normal,
+                absorbed,
                 &mut self.unknowns,
                 &mut self.traces,
             );
-        } else {
-            let main = result
-                .main()
-                .max(looped, &mut self.unknowns, &mut self.traces);
 
-            result = result.with_main(main);
+            if let (true, Some(scope)) = (cancels, scope) {
+                let pending = self
+                    .pending_scoped
+                    .remove(&(file, scope, phase))
+                    .unwrap_or_default()
+                    .max(looped, &mut self.unknowns, &mut self.traces);
+
+                self.pending_scoped.insert((file, scope, phase), pending);
+            } else {
+                let completion = match cancels && self.inside_loop(file, node) {
+                    true => Completion::Return,
+                    false => Completion::Normal,
+                };
+
+                result.join(
+                    phase,
+                    completion,
+                    looped,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
+            }
         }
 
         result
@@ -1532,9 +1668,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(escape) = resolved else {
             return self.depth_exhausted_reading(file, node, inner, exhausted);
         };
-        let lifted = inner.total(&mut self.unknowns, &mut self.traces);
+        let mut reading = Reading::empty();
 
-        Reading::of_completion(crate::cost::ExecutionPhase::Immediate, escape, lifted)
+        for (phase, _, part) in inner.completions {
+            reading.join(phase, escape, part, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
     }
 
     fn is_constant_rest_expression(&mut self, file: FileId, e: &'a Expression<'a>) -> bool {
@@ -1587,7 +1727,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         (node, span): (NodeId, Span),
         argument: &'a Expression<'a>,
-        implicit: Option<Part>,
+        implicit: Option<Reading>,
     ) -> Reading {
         let inner = self.cost_of_expression(file, argument);
         let inner = match implicit {
@@ -1790,26 +1930,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for known in &targets.known {
             let function = self.function_at(*known);
             let target = known.file;
-            let (callee, cyclic) = self.call_user(target, function, file, &new.arguments, new.span);
-            let callee = if callee.cost.is_one() {
-                callee
-            } else {
-                match self.trace_name_of(target, function) {
-                    Ok(name) => {
-                        let name = name.strip_suffix(".constructor").unwrap_or(&name);
+            let (callee, cyclic) =
+                self.call_user_reading(target, function, file, &new.arguments, new.span);
+            let callee = callee.map_parts(|callee| {
+                if callee.cost.is_one() {
+                    callee
+                } else {
+                    match self.trace_name_of(target, function) {
+                        Ok(name) => {
+                            let name = name.strip_suffix(".constructor").unwrap_or(&name);
 
-                        callee.explain(
-                            format_args!("new {name}()"),
-                            site,
-                            origin,
-                            true,
-                            &mut self.traces,
-                            &mut self.unknowns,
-                        )
+                            callee.explain(
+                                format_args!("new {name}()"),
+                                site,
+                                origin,
+                                true,
+                                &mut self.traces,
+                                &mut self.unknowns,
+                            )
+                        }
+                        Err(_) => callee.explanation_failed(origin, &mut self.unknowns),
                     }
-                    Err(_) => callee.explanation_failed(origin, &mut self.unknowns),
                 }
-            };
+            });
             let part = callee.called(origin, &mut self.unknowns);
             let part = part.retaining(remainder, &mut self.unknowns);
 
@@ -1818,19 +1961,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for implicit in &construction.implicit {
             let part = self.construction_part_of((file, &new.arguments, new.span), *implicit);
-            let part = if part.cost.is_one() {
-                part
-            } else {
-                part.explain(
-                    format_args!("new {}()", short(self.text_of(file, new.callee.span()))),
-                    site,
-                    origin,
-                    true,
-                    &mut self.traces,
-                    &mut self.unknowns,
-                )
-            };
-            let part = constructed_part_of(part.called(origin, &mut self.unknowns));
+            let part = part.map_parts(|part| {
+                if part.cost.is_one() {
+                    part
+                } else {
+                    part.explain(
+                        format_args!("new {}()", short(self.text_of(file, new.callee.span()))),
+                        site,
+                        origin,
+                        true,
+                        &mut self.traces,
+                        &mut self.unknowns,
+                    )
+                }
+            });
+            let part = part
+                .called(origin, &mut self.unknowns)
+                .map_parts(constructed_part_of);
             let part = part.retaining(remainder, &mut self.unknowns);
 
             reading = reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
@@ -1963,6 +2110,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             ),
             Err(_) => called.explanation_failed(origin, &mut self.unknowns),
         }
+    }
+
+    pub(crate) fn named_reading_call_of(
+        &mut self,
+        function: (FileId, FunctionNode<'a>),
+        reading: Reading,
+        site: (Site, crate::unknowns::SourceSpan),
+    ) -> Reading {
+        reading.map_parts(|part| self.named_call_of(function, part, site))
     }
 
     fn decorated_part_of(&mut self, file: FileId, decorated: Option<NodeId>) -> Option<Part> {
@@ -2099,41 +2255,47 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         call: &'a CallExpression<'a>,
-    ) -> Part {
+    ) -> Reading {
         let Some(class) = self.enclosing_constructed_class_of(file, call.node_id()) else {
-            return self
-                .unknown_invocation(file, call.span, &call.arguments, UnknownReason::Target)
-                .main();
+            return self.unknown_invocation(
+                file,
+                call.span,
+                &call.arguments,
+                UnknownReason::Target,
+            );
         };
         let site = self.site_of_node(file, call.node_id());
         let origin = self.source_span(file, call.span);
         let base =
             self.base_construction_part_of((file, &call.arguments, call.span), (file, class));
         let fields = self.instance_fields_part_of(file, class);
-        let part = base.max(fields, &mut self.unknowns, &mut self.traces);
-        let part = if part.cost.is_one() {
-            part
-        } else {
-            part.explain(
-                "super()",
-                site,
-                origin,
-                true,
-                &mut self.traces,
-                &mut self.unknowns,
-            )
-        };
+        let part = base.merge(fields, &mut self.unknowns, &mut self.traces);
+        let part = part.map_parts(|part| {
+            if part.cost.is_one() {
+                part
+            } else {
+                part.explain(
+                    "super()",
+                    site,
+                    origin,
+                    true,
+                    &mut self.traces,
+                    &mut self.unknowns,
+                )
+            }
+        });
 
-        constructed_part_of(part.called(origin, &mut self.unknowns))
+        part.called(origin, &mut self.unknowns)
+            .map_parts(constructed_part_of)
     }
 
     pub(crate) fn construction_part_of(
         &mut self,
         (file, arguments, span): (FileId, &'a [Argument<'a>], Span),
         (target, class): (FileId, &'a Class<'a>),
-    ) -> Part {
+    ) -> Reading {
         if let Err(reason) = self.enter_construction((target, class.node_id())) {
-            return self.deferred_unknown(file, span, reason);
+            return Reading::of_part(self.deferred_unknown(file, span, reason));
         }
 
         let fields = self.instance_fields_part_of(target, class);
@@ -2141,16 +2303,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.leave_construction((target, class.node_id()));
 
-        fields.max(base, &mut self.unknowns, &mut self.traces)
+        fields.merge(base, &mut self.unknowns, &mut self.traces)
     }
 
     fn base_construction_part_of(
         &mut self,
         (file, arguments, span): (FileId, &'a [Argument<'a>], Span),
         (target, class): (FileId, &'a Class<'a>),
-    ) -> Part {
+    ) -> Reading {
         if class.heritage.is_none() {
-            return Part::none();
+            return Reading::empty();
         }
 
         let plan = self.base_plan_of(target, class);
@@ -2160,11 +2322,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for known in &plan.constructors {
             let function = self.function_at(*known);
-            let (called, cyclic) = self.call_user(known.file, function, file, arguments, span);
-            let called = self.named_call_of((known.file, function), called, (site, origin));
-            let called = self.called_part_of(known.file, function, called, cyclic);
+            let (called, cyclic) =
+                self.call_user_reading(known.file, function, file, arguments, span);
+            let called = self.named_reading_call_of((known.file, function), called, (site, origin));
+            let called = self.called_reading_of(known.file, function, called, cyclic);
 
-            part = part.max(called, &mut self.unknowns, &mut self.traces);
+            part = part.merge(called, &mut self.unknowns, &mut self.traces);
         }
 
         if plan.open {
@@ -2193,8 +2356,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn callback_part_of(&mut self, file: FileId, argument: Option<&'a Argument<'a>>) -> Part {
-        self.part_of_argument(file, argument).unwrap_or_default()
+    fn callback_part_of(&mut self, file: FileId, argument: Option<&'a Argument<'a>>) -> Reading {
+        self.reading_of_argument(file, argument).unwrap_or_default()
     }
 
     fn cost_of_call(&mut self, file: FileId, call: &'a CallExpression<'a>) -> Reading {
@@ -2268,36 +2431,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         part = part.retaining(unknown.main().unknowns, &mut self.unknowns);
                     }
 
-                    let part = if part.cost.is_one() {
-                        part
-                    } else {
-                        part.explain(
-                            format_args!("call {}() [callback parameter]", reference.name),
-                            site,
-                            self.source_span(file, call.span),
-                            true,
-                            &mut self.traces,
-                            &mut self.unknowns,
-                        )
-                    };
+                    let origin = self.source_span(file, call.span);
+                    let part = part.map_parts(|part| {
+                        let part = if part.cost.is_one() {
+                            part
+                        } else {
+                            part.explain(
+                                format_args!("call {}() [callback parameter]", reference.name),
+                                site,
+                                origin,
+                                true,
+                                &mut self.traces,
+                                &mut self.unknowns,
+                            )
+                        };
 
-                    return reading.merge(
-                        Reading::of_part(Part {
-                            cost: part.cost.clone(),
-                            origin: Some(self.source_span(file, call.span)),
-                            cost_error: part.cost_error,
-                            trace: part.trace,
-                            preference: part.preference,
-                            unknowns: self
-                                .unknowns
-                                .called(part.unknowns, self.source_span(file, call.span)),
-                            retained: self
-                                .unknowns
-                                .called(part.retained, self.source_span(file, call.span)),
-                        }),
-                        &mut self.unknowns,
-                        &mut self.traces,
-                    );
+                        part.called(origin, &mut self.unknowns)
+                    });
+
+                    return reading.merge(part, &mut self.unknowns, &mut self.traces);
                 }
 
                 let unknown = self.unknown_invocation(
@@ -2324,8 +2476,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let function = self.function_at(*target);
             let target = target.file;
             let (called, cyclic) =
-                self.call_user(target, function, file, &call.arguments, call.span);
-            let called = self.named_call_of(
+                self.call_user_reading(target, function, file, &call.arguments, call.span);
+            let called = self.named_reading_call_of(
                 (target, function),
                 called,
                 (site, self.source_span(file, call.span)),
@@ -2398,7 +2550,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .known
                 .first()
                 .map(|known| self.trace_name_of(known.file, self.function_at(*known)));
-            let part = match named {
+            let part = part.map_parts(|part| match &named {
                 _ if part.cost.is_one() => part,
                 Some(Ok(name)) => part.explain(
                     format_args!("call {name}()"),
@@ -2409,7 +2561,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     &mut self.unknowns,
                 ),
                 _ => part.explanation_failed(origin, &mut self.unknowns),
-            };
+            });
             let part = part.called(origin, &mut self.unknowns);
 
             reading = reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
@@ -2536,7 +2688,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
             let callback = match sorting || is_listed(CALLBACK_METHODS, &method) {
                 true => self.callback_part_of(file, first),
-                false => Part::none(),
+                false => Reading::empty(),
             };
             let suffix = match sorting {
                 true => " [n log n]",
@@ -2545,7 +2697,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let part = if bounded {
                 callback
             } else {
-                self.nest_part(
+                self.nest_reading(
                     label(suffix),
                     site,
                     self.source_span(file, call.span),
@@ -2553,7 +2705,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     callback.executed(),
                 )
             };
-            let part = part.max(unresolved, &mut self.unknowns, &mut self.traces);
+            let part = part.merge(unresolved, &mut self.unknowns, &mut self.traces);
 
             return reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
         }
@@ -2564,11 +2716,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let callback = if is_listed(CALLBACK_METHODS, &method) {
                 self.callback_part_of(file, first)
             } else {
-                Part::none()
+                Reading::empty()
             };
 
             return reading.merge(
-                Reading::of_part(self.nest_part(
+                Reading::of_part(self.nest_reading(
                     label(""),
                     site,
                     self.source_span(file, call.span),

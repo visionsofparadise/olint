@@ -40,30 +40,34 @@ fn retained_lazy_callbacks_cannot_alias_a_new_generation() {
 
     assert!(analysis
         .invoke_argument(&old, file, call.span, &[])
+        .total(&mut analysis.unknowns, &mut analysis.traces)
         .is_complete());
     analysis.reset_between_passes();
 
     let stale = analysis.invoke_argument(&old, file, call.span, &[]);
 
-    assert!(!stale.is_complete());
+    assert!(!stale
+        .total(&mut analysis.unknowns, &mut analysis.traces)
+        .is_complete());
 
     let fresh = analysis.argument_facts_of(file, &call.arguments[0]);
 
     assert_ne!(old.value.value, fresh.value.value);
     assert!(analysis
         .invoke_argument(&fresh, file, call.span, &[])
+        .total(&mut analysis.unknowns, &mut analysis.traces)
         .is_complete());
     assert_eq!(analysis.invoke_argument(&old, file, call.span, &[]), stale);
 }
 
 #[test]
-fn a_failed_invocation_observation_keeps_observed_work_and_marks_exhaustion() {
+fn resource_fallback_keeps_observed_scheduled_and_joined_latent_work() {
     let directory = tempfile::tempdir().unwrap();
 
     std::fs::write(directory.path().join("tsconfig.json"), "{}").unwrap();
     std::fs::write(
         directory.path().join("index.ts"),
-        "function quadratic(xs:number[]){for(const a of xs)for(const b of xs)void b} function run(f:(xs:number[])=>void,xs:number[]){f(xs)} export function root(xs:number[]){run(quadratic,xs)}",
+        "async function quadratic(xs:number[]){await 0; for(const a of xs)for(const b of xs)void b} function run(f:(xs:number[])=>void,xs:number[]){f(xs)} export function root(xs:number[]){run(quadratic,xs)}",
     )
     .unwrap();
 
@@ -149,7 +153,13 @@ fn a_failed_invocation_observation_keeps_observed_work_and_marks_exhaustion() {
     assert_eq!(observed.len(), 1);
     assert!(incomplete);
 
-    let (part, _) = analysis.fallback_invocation(target, file, call.span);
+    let (reading, _) = analysis.fallback_invocation(target, file, call.span, Deferral::Excluded);
+    let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+    assert!(reading.completions.iter().any(|channel| channel.0
+        == crate::cost::ExecutionPhase::Scheduled
+        && channel.2.cost == part.cost));
+
     let mut reasons = Vec::new();
     let mut pending: Vec<_> = part.unknowns.into_iter().collect();
 
@@ -169,4 +179,35 @@ fn a_failed_invocation_observation_keeps_observed_work_and_marks_exhaustion() {
     );
 
     analysis.scheduler.active = None;
+
+    analysis.scheduler.work =
+        WorkBudget::new(Limits::uniform(1_000_000).with(Event::LatentStep, 0));
+    let deferred = |phase| Latent {
+        work: Part::unmarked(Cost::N, None),
+        yields: Some(Cost::ONE),
+        effects: Effects::default(),
+        record: None,
+        deferred: Some(Reading::of_completion(
+            phase,
+            Completion::Return,
+            Part::unmarked(Cost::N, None),
+        )),
+    };
+    let joined = analysis.joined_latent_of(
+        Some(deferred(crate::cost::ExecutionPhase::Immediate)),
+        deferred(crate::cost::ExecutionPhase::Scheduled),
+        analysis.source_span(file, call.span),
+    );
+
+    assert_eq!(joined.record, None);
+
+    let consumed = analysis.consumed_part_of(file, call.span, &joined);
+
+    for phase in [
+        crate::cost::ExecutionPhase::Immediate,
+        crate::cost::ExecutionPhase::Scheduled,
+    ] {
+        assert_eq!(consumed.part_of(phase, Completion::Normal).cost, Cost::N);
+        assert_eq!(consumed.part_of(phase, Completion::Return), Part::none());
+    }
 }

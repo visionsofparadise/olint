@@ -1328,20 +1328,31 @@ fn a_function_returning_a_generator_on_some_paths_leaves_the_count_unresolved() 
 }
 
 #[test]
-fn work_before_the_first_await_in_its_statement_stays_immediate() {
-    let phases = phase_costs_of(
-        &format!("{LAZY_HELPERS}\nexport async function selected(xs: number[], p: Promise<number>) {{ const m = quadratic(xs) + (await p); return scan(xs) + m; }}"),
-        "selected",
-    );
+fn expression_await_keeps_known_work_and_marks_phase_placement_uncertain() {
+    let source = format!("{LAZY_HELPERS}\nexport async function selected(xs: number[], p: Promise<number>) {{ const m = quadratic(xs) + (await p); return scan(xs) + m; }}");
+    let phases = phase_costs_of(&source, "selected");
 
     assert!(
         phases.contains(&(ExecutionPhase::Immediate, Cost::parse("O(N^2)").unwrap())),
         "{phases:?}"
     );
     assert!(
-        phases.contains(&(ExecutionPhase::Scheduled, Cost::parse("O(N)").unwrap())),
+        phases.contains(&(ExecutionPhase::Scheduled, Cost::parse("O(N^2)").unwrap())),
         "{phases:?}"
     );
+
+    run_with_source(&source, |analysis, file| {
+        let function = function_of_name(analysis.project, file, "selected");
+        let reading = analysis.summarize(file, function);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, function, &part.cost),
+            Cost::parse("O(N^2)").unwrap()
+        );
+        assert!(support::unknown_reasons(analysis, part.unknowns)
+            .contains(&olint::unknowns::UnknownReason::UnsupportedModel));
+    });
 }
 
 #[test]

@@ -964,6 +964,104 @@ fn scheduled_labels_of(labels: &[String]) -> usize {
 }
 
 #[test]
+fn scheduled_channels_survive_calls_callbacks_loops_and_returns() {
+    let cases = [
+        ("scan(xs); return p.then(() => quadratic(xs));", "", "O(N)", "O(N^2)"),
+        ("scan(xs); return schedule(xs, p);", "function schedule(xs: number[], p: Promise<number>) { return p.then(() => quadratic(xs)); }", "O(N)", "O(N^2)"),
+        ("scan(xs); invoke(() => p.then(() => quadratic(xs)));", "function invoke(work: () => unknown) { return work(); }", "O(N)", "O(N^2)"),
+        ("for (const x of xs) p.then(() => quadratic(xs));", "", "O(N)", "O(N^3)"),
+        ("for (const x of xs) return p.then(() => quadratic(xs));", "", "O(1)", "O(N^2)"),
+        ("xs.forEach(() => p.then(() => quadratic(xs)));", "", "O(N)", "O(N^3)"),
+        ("const obj = { get value() { return p.then(() => quadratic(xs)); } }; scan(xs); return obj.value;", "", "O(N)", "O(N^2)"),
+        ("class Item { value = p.then(() => quadratic(xs)); } scan(xs); return new Item();", "", "O(N)", "O(N^2)"),
+        ("scan(xs); for (const value of produce(xs, p)) {}", "function* produce(xs: number[], p: Promise<number>) { p.then(() => quadratic(xs)); yield 1; }", "O(N)", "O(N^2)"),
+        ("scan(xs); return p.then(() => produce(xs));", "function* produce(xs: number[]) { cube(xs); yield 1; }", "O(N)", "O(1)"),
+        ("scan(xs); return later(xs);", "async function later(xs: number[]) { await 0; cube(xs); }", "O(N)", "O(N^3)"),
+        ("scan(xs); return later(xs);", "async function later(xs: number[]) { for (const x of xs) { await 0; cube(xs); } }", "O(N)", "O(N^4)"),
+        ("scan(xs); return later(xs);", "function* produce(xs: number[]) { cube(xs); yield 1; } async function later(xs: number[]) { await 0; return produce(xs); }", "O(N)", "O(1)"),
+        ("consume(immediate(xs, p)); consume(scheduled(xs, p));", "function* immediate(xs: number[], p: Promise<number>) { cube(xs); yield 1; } function* scheduled(xs: number[], p: Promise<number>) { p.then(() => cube(xs)); yield 1; } function consume(values: Iterable<number>) { for (const value of values) {} }", "O(N^3)", "O(N^3)"),
+        ("consume(scheduled(xs, p)); consume(immediate(xs, p));", "function* immediate(xs: number[], p: Promise<number>) { cube(xs); yield 1; } function* scheduled(xs: number[], p: Promise<number>) { p.then(() => cube(xs)); yield 1; } function consume(values: Iterable<number>) { for (const value of values) {} }", "O(N^3)", "O(N^3)"),
+        ("let i = 0; for (const x of xs) { for (const y of xs) { while (i < xs.length) { i++; p.then(() => quadratic(xs)); } } }", "", "O(N)", "O(N^3)"),
+        ("for (const x of xs) { let i = 0; for (const y of xs) { while (i < xs.length) { i++; p.then(() => quadratic(xs)); } } }", "", "O(N^2)", "O(N^4)"),
+        ("for (const x of xs) [...produce(xs, p)];", "function* produce(xs: number[], p: Promise<number>) { return cube(xs); }", "O(N^4)", "O(1)"),
+        ("for (const x of xs) [...produce(xs, p)];", "function* produce(xs: number[], p: Promise<number>) { return p.then(() => cube(xs)); }", "O(N)", "O(N^4)"),
+    ];
+
+    for (body, helper, immediate, scheduled) in cases {
+        let source = format!("{HELPERS}\n{helper}\nexport function selected(xs: number[], p: Promise<number>) {{ {body} }}");
+
+        support::run_with_source(&source, |analysis, file| {
+            let function = support::function_of_name(analysis.project, file, "selected");
+            let reading = analysis.summarize(file, function);
+
+            for (phase, expected) in [
+                (ExecutionPhase::Immediate, immediate),
+                (ExecutionPhase::Scheduled, scheduled),
+            ] {
+                let costs: Vec<_> = reading
+                    .completions
+                    .iter()
+                    .filter(|channel| channel.0 == phase)
+                    .map(|channel| channel.2.cost.clone())
+                    .collect();
+                let cost = if costs.is_empty() {
+                    Cost::ONE
+                } else {
+                    Cost::maximum(costs).unwrap()
+                };
+
+                assert_eq!(
+                    support::legacy_class_of(analysis, file, function, &cost),
+                    Cost::parse(expected).unwrap(),
+                    "{phase:?}: {body}: {reading:?}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn cold_scheduled_callbacks_keep_their_selected_work() {
+    let source = format!("{HELPERS}\nexport function selected(xs: number[]) {{ /** @perf cold */ async function later() {{ await 0; cube(xs); }} return xs.map(later); }}");
+
+    support::run_with_source(&source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "selected");
+        let reading = analysis.summarize(file, function);
+        let total = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, function, &total.cost),
+            Cost::parse("O(N^4)").unwrap(),
+            "{reading:?}"
+        );
+    });
+}
+
+#[test]
+fn uncertain_await_placement_retains_both_possible_execution_phases() {
+    for body in [
+        "if (xs.length > 1) await 0; cube(xs);",
+        "return (await 0, cube(xs));",
+        "for (const x of xs) { cube(xs); await 0; }",
+    ] {
+        let source =
+            format!("{HELPERS}\nexport async function selected(xs: number[]) {{ {body} }}");
+
+        support::run_with_source(&source, |analysis, file| {
+            let function = support::function_of_name(analysis.project, file, "selected");
+            let reading = analysis.summarize(file, function);
+
+            for phase in [ExecutionPhase::Immediate, ExecutionPhase::Scheduled] {
+                let part = reading.part_of(phase, olint::flow::Completion::Normal);
+
+                assert!(!part.cost.is_one(), "{body}: {reading:?}");
+                assert!(!part.is_complete(), "{body}: {reading:?}");
+            }
+        });
+    }
+}
+
+#[test]
 fn promise_continuations_run_once_as_scheduled_work() {
     for (body, expected, scheduled) in [
         (
