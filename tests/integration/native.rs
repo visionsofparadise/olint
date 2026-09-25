@@ -13,10 +13,12 @@ use support::{classified_result_of, legacy_result_of, SYNTACTIC};
 const HELPERS: &str = "function quadratic(xs: number[]) { let total = 0; for (const x of xs) for (const y of xs) total += x + y; return total; }\nfunction scan(xs: number[]) { let total = 0; for (const x of xs) total += x; return total; }\nfunction cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; }";
 
 fn selected_of(declarations: &str, body: &str) -> (Cost, bool, BTreeSet<UnknownReason>) {
-    legacy_result_of(
+    let (cost, complete, reasons) = legacy_result_of(
         &format!("{HELPERS}\n{declarations}\nexport function selected{body}"),
         "selected",
-    )
+    );
+
+    (support::projected_class_of(&cost), complete, reasons)
 }
 
 fn assert_selected(cases: &[(&str, &str, &str, bool)]) {
@@ -24,7 +26,11 @@ fn assert_selected(cases: &[(&str, &str, &str, bool)]) {
         let (cost, found, reasons) = selected_of(declarations, body);
         let cost = support::projected_class_of(&cost);
 
-        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse(expected).unwrap(),
+            "{body}: {reasons:?}"
+        );
         assert_eq!(found, *complete, "{body}: {reasons:?}");
     }
 }
@@ -129,7 +135,11 @@ export function selected{body}"
             "selected",
         );
 
-        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse(expected).unwrap(),
+            "{body}: {reasons:?}"
+        );
         assert_eq!(found, complete, "{body}: {reasons:?}");
     }
 }
@@ -307,7 +317,7 @@ fn unknown_callbacks_keep_known_work_and_stay_partial() {
         ),
         (
             "(xs: number[], key: (x: number) => string) { return Map.groupBy(xs, key); }",
-            "O(N)",
+            "O(1)",
         ),
         (
             "(executor: (resolve: (value: number) => void) => void) { return new Promise<number>(executor); }",
@@ -318,6 +328,9 @@ fn unknown_callbacks_keep_known_work_and_stay_partial() {
 
         assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}");
         assert!(!complete, "{body}");
+
+        if body.contains("Map.groupBy") { assert!(reasons.contains(&UnknownReason::Bound), "{reasons:?}"); }
+
         assert!(reasons.contains(&UnknownReason::Target), "{body}: {reasons:?}");
     }
 }
@@ -490,7 +503,7 @@ fn surfaced_objects_passed_to_reading_natives_keep_public_coverage() {
         ("JSON.stringify(api)", true),
         ("Object.keys(api)", true),
         ("Object.assign(api, other)", false),
-        ("Object.fromEntries(api as any)", false),
+        ("Object.fromEntries(api as any)", true),
         ("JSON.stringify(api, (key, value) => value)", false),
         ("Array.from([1], (x) => x, api)", false),
         ("api.run.call(api)", false),
@@ -945,7 +958,7 @@ fn traced_selected_of(declarations: &str, body: &str) -> (Cost, bool, Vec<String
         let function = support::function_of_name(analysis.project, file, "selected");
         let reading = analysis.summarize(file, function);
         let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
-        let cost = support::legacy_class_of(analysis, file, function, &part.cost);
+        let cost = support::projected_class_of(&part.cost);
         let labels = support::trace_nodes(&analysis.traces, part.trace)
             .into_iter()
             .map(|node| node.label.clone())
@@ -1111,7 +1124,6 @@ fn an_awaited_continuation_is_attributed_once() {
     );
 
     support::run_with_source(&source, |analysis, file| {
-        let function = support::function_of_name(analysis.project, file, "selected");
         let part = support::summary_of(analysis, file, "selected");
         let labels: Vec<String> = support::trace_nodes(&analysis.traces, part.trace)
             .into_iter()
@@ -1119,7 +1131,7 @@ fn an_awaited_continuation_is_attributed_once() {
             .collect();
 
         assert_eq!(
-            support::legacy_class_of(analysis, file, function, &part.cost),
+            support::projected_class_of(&part.cost),
             Cost::parse("O(N^2)").unwrap()
         );
         assert!(!part.is_complete(), "{labels:?}");
@@ -1306,5 +1318,298 @@ fn promise_async_generator_results_retain_known_work_with_protocol_uncertainty()
                 true,
             ),
         ]);
+    }
+}
+
+#[test]
+fn custom_iterator_visits_require_source_evidence() {
+    for body in [
+        "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; for (const value of values) cube(xs); }",
+        "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { quadratic(xs); return { done: false, value: 1 }; } }; } }; for (const value of values) cube(xs); }",
+        "(xs: number[]) { let i = 0; const values = { [Symbol.iterator]() { return { next() { return { done: i++ >= xs.length, value: i }; } }; } }; for (const value of values) cube(xs); }",
+        "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; Array.from(values, () => cube(xs)); }",
+    ] {
+        let (cost, complete, reasons) = selected_of("", body);
+
+        assert_eq!(support::projected_class_of(&cost), Cost::parse("O(N^3)").unwrap(), "{body}: {reasons:?}");
+        assert!(!complete, "{body}");
+        assert!(reasons.contains(&UnknownReason::Bound), "{body}: {reasons:?}");
+    }
+}
+
+#[test]
+fn iterator_materialization_keeps_unknown_counts_and_known_protocol_work() {
+    for expression in [
+        "[...values]",
+        "Array.from(values)",
+        "new Set(values)",
+        "new Uint8Array(values)",
+    ] {
+        let body = format!("(xs: number[]) {{ const values = {{ [Symbol.iterator]() {{ return {{ next() {{ cube(xs); return {{ done: false, value: 1 }}; }} }}; }} }}; return {expression}; }}");
+
+        assert_unknown_iteration_count(&body);
+    }
+
+    for expression in [
+        "[...values]",
+        "Array.from(values)",
+        "new Set(values)",
+        "new Uint8Array(values)",
+    ] {
+        let body = format!("(xs: number[]) {{ const values = {{ [Symbol.iterator]() {{ return {{ next() {{ return {{ done: false, value: 1 }}; }} }}; }} }}; const copied = {expression}; for (const value of copied) cube(xs); }}");
+
+        assert_unknown_iteration_count(&body);
+    }
+}
+
+#[test]
+fn iterator_getters_keep_their_once_and_per_visit_work() {
+    assert_selected(&[
+        ("", "(xs: number[]) { const values = { get [Symbol.iterator]() { cube(xs); return function () { return { next() { return { done: true }; } }; }; } }; for (const value of values) void value; }", "O(N^3)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { get next() { cube(xs); return function () { return { done: true }; }; } }; } }; for (const value of values) void value; }", "O(N^3)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { get done() { cube(xs); return true; } }; } }; } }; for (const value of values) void value; }", "O(N^3)", false),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, get value() { cube(xs); return 1; } }; } }; } }; for (const value of values) void value; }", "O(N^3)", false),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: true, get value() { cube(xs); return 1; } }; } }; } }; for (const value of values) void value; }", "O(1)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; }, get return() { cube(xs); return function () { return { done: true }; }; } }; } }; for (const value of values) break; }", "O(N^3)", true),
+    ]);
+}
+
+#[test]
+fn proven_generator_counts_reach_acquisition_and_copies() {
+    assert_selected(&[
+        ("", "(xs: number[]) { const values = { *[Symbol.iterator]() { for (const a of xs) for (const b of xs) yield a + b; } }; for (const value of values) cube(xs); }", "O(N^5)", true),
+        ("", "(xs: number[]) { function* make() { for (const a of xs) for (const b of xs) yield a + b; } const values = { [Symbol.iterator]() { return make(); } }; for (const value of values) cube(xs); }", "O(N^5)", true),
+        ("", "(xs: number[]) { const values = { *[Symbol.iterator]() { for (const a of xs) for (const b of xs) yield a + b; } }; const copied = [...values]; for (const value of copied) cube(xs); }", "O(N^5)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { quadratic(xs); return { done: true }; } }; } }; for (const value of values) void value; }", "O(N^2)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; for (const value of values) { cube(xs); break; } }", "O(N^3)", true),
+    ]);
+}
+
+#[test]
+fn asynchronous_result_resolution_cannot_prove_raw_done() {
+    for next in [
+        "next() { return { done: true, then(resolve) { resolve({ done: false, value: 1 }); } }; }",
+        "async next() { return { done: true, then(resolve) { resolve({ done: false, value: 1 }); } }; }",
+        "next() { return { done: true, get then() { cube(xs); return (resolve) => resolve({ done: false, value: 1 }); } }; }",
+    ] {
+        let source = format!("{HELPERS}\nexport async function selected(xs: number[]) {{ const values = {{ [Symbol.asyncIterator]() {{ return {{ {next} }}; }} }}; for await (const value of values) cube(xs); }}");
+        let (cost, complete, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(support::projected_class_of(&cost), Cost::parse("O(N^3)").unwrap(), "{next}: {reasons:?}");
+        assert!(!complete);
+        assert!(reasons.contains(&UnknownReason::Bound), "{next}: {reasons:?}");
+    }
+}
+
+#[test]
+fn collection_constructor_modes_preserve_native_controls() {
+    assert_selected(&[
+        ("", "() { return new Set(); }", "O(1)", true),
+        ("", "() { return new Map(null); }", "O(1)", true),
+        ("", "(xs: number[]) { return new Set(xs); }", "O(N)", true),
+        ("", "(xs: number[]) { return new Uint8Array(xs); }", "O(N)", true),
+        ("", "() { return new Uint8Array(); }", "O(1)", true),
+        ("", "() { return new Uint8Array(4); }", "O(1)", true),
+        ("", "() { return new Uint8Array('4'); }", "O(1)", true),
+        ("", "() { return new Uint8Array({ length: 2, 0: 1, 1: 2 }); }", "O(1)", true),
+        ("", "(xs: number[]) { const values = new Set(xs); return new Uint8Array(values); }", "O(N)", true),
+        ("", "(xs: number[]) { Set.prototype.add = function(value) { cube(xs); }; return new Set(xs); }", "O(N^4)", false),
+        ("", "(xs: number[]) { Object.defineProperty(Set.prototype, 'add', { get() { cube(xs); return function(value) {}; } }); return new Set(xs); }", "O(N^3)", false),
+    ]);
+}
+
+#[test]
+fn delegated_and_destructured_consumption_preserve_count_boundaries() {
+    assert_selected(&[
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { cube(xs); return { done: false, value: 1 }; } }; } }; const [first] = values; return first; }", "O(N^3)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { cube(xs); return { done: false, value: 1 }; } }; } }; const [...rest] = values; return rest; }", "O(N^3)", false),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; function* forwarded() { yield* values; } for (const value of forwarded()) cube(xs); }", "O(N^3)", false),
+        ("", "(xs: number[], stop: boolean) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; for (const value of values) { cube(xs); if (stop) break; } }", "O(N^3)", false),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; for (const value of values) { cube(xs); continue; } }", "O(N^3)", false),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; } }; } }; for (const value of values) { cube(xs); return 1; } return 0; }", "O(N^3)", true),
+    ]);
+}
+
+#[test]
+fn native_iterables_retain_their_declared_acquisition_contract() {
+    assert_selected(&[
+        ("", "(xs: number[], text: string) { for (const value of text) cube(xs); }", "O(N^4)", true),
+        ("", "(xs: number[], values: Set<number>) { for (const value of values) cube(xs); }", "O(N^4)", true),
+        ("", "(xs: number[], values: Map<number, number>) { for (const value of values) cube(xs); }", "O(N^4)", true),
+        ("", "(xs: number[], values: Uint8Array) { for (const value of values) cube(xs); }", "O(N^4)", true),
+        ("", "(xs: number[]) { for (const value of xs.values()) cube(xs); }", "O(N^4)", false),
+        ("", "(xs: number[]) { for (const value of xs.entries()) cube(xs); }", "O(N^4)", false),
+        ("", "(xs: number[]) { Array.prototype[Symbol.iterator] = function() { return { next() { return { done: false, value: 1 }; } }; }; for (const value of xs) cube(xs); }", "O(1)", false),
+    ]);
+}
+
+#[test]
+fn collection_adders_and_entry_accessors_retain_source_work() {
+    assert_selected(&[
+        ("", "(xs: number[]) { Map.prototype.set = function(key, value) { cube(xs); }; return new Map(xs.map(x => [x, x])); }", "O(N^4)", false),
+        ("", "(xs: number[]) { const entries = [{ get 0() { cube(xs); return 1; }, 1: 2 }]; return new Map(entries); }", "O(N^3)", true),
+        ("", "(xs: number[]) { const entries = { [Symbol.iterator]() { return { next() { return { done: false, value: { get 0() { cube(xs); return 1; }, 1: 2 } }; } }; } }; return new Map(entries); }", "O(N^3)", false),
+        ("", "(xs: number[]) { const entries = new Set([1]); Set.prototype.add = function(value) { entries.add(value + 1); cube(xs); }; return new Set(entries); }", "O(N^3)", false),
+    ]);
+}
+
+#[test]
+fn constructor_adders_receive_elements_and_entry_fields() {
+    assert_selected(&[
+        ("", "(xs: number[]) { Set.prototype.add = function(value: number[]) { for (const a of value) for (const b of value) void b; }; return new Set([xs]); }", "O(N^2)", true),
+        ("", "(xs: number[]) { Set.prototype.add = function(value: number[]) { cube(value); }; return new Set([xs.flatMap(() => xs)]); }", "O(N^6)", true),
+        ("", "(xs: number[], ys: number[]) { Map.prototype.set = function(key: number[], value: number[]) { for (const a of key) for (const b of value) void b; }; return new Map([[xs, ys]]); }", "O(N^2)", true),
+    ]);
+}
+
+#[test]
+fn typed_iterable_conversion_retains_known_element_work() {
+    assert_selected(&[
+        ("", "(xs: number[]) { return new Uint8Array([{ valueOf() { cube(xs); return 1; } }]); }", "O(N^3)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { return { done: false, value: { valueOf() { cube(xs); return 1; } } }; } }; } }; return new Uint8Array(values); }", "O(N^3)", false),
+    ]);
+}
+
+#[test]
+fn arraylike_typed_construction_and_entry_consumption_retain_getters() {
+    assert_selected(&[
+        ("", "(xs: number[]) { return new Uint8Array({ length: 1, get 0() { cube(xs); return 1; } }); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Uint8Array({ get length() { cube(xs); return 1; }, 0: 1 }); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return Object.fromEntries([[1, 2], [3, 4]]); }", "O(1)", true),
+        ("", "(xs: number[]) { const values = { [Symbol.iterator]() { return { next() { cube(xs); return { done: false, value: [1, 2] }; } }; } }; return Object.fromEntries(values); }", "O(N^3)", false),
+        ("", "(xs: number[]) { return Object.fromEntries([{ get 0() { cube(xs); return 1; }, 1: 2 }]); }", "O(N^3)", true),
+    ]);
+}
+
+#[test]
+fn returned_iterable_factories_preserve_acquisition_captures() {
+    assert_selected(&[
+        ("function make(values: number[]) { return { *[Symbol.iterator]() { for (const a of values) for (const b of values) yield a; } }; }", "(xs: number[], ys: number[]) { for (const value of make(ys)) cube(xs); }", "O(N^5)", true),
+        ("function make(values: number[]) { return { *[Symbol.iterator]() { for (const a of values) for (const b of values) yield a; } }; }", "(xs: number[]) { for (const value of make([1])) cube(xs); }", "O(N^3)", true),
+    ]);
+}
+
+#[test]
+fn entry_key_conversion_is_specific_to_object_construction() {
+    assert_selected(&[
+        ("", "(xs: number[]) { return Object.fromEntries([[{toString(){cube(xs);return 'x';}},1]]); }", "O(N^3)", true),
+        ("", "(xs: number[]) { return new Map([[{toString(){cube(xs);return 'x';}},1]]); }", "O(1)", true),
+    ]);
+}
+
+#[test]
+fn constructor_adder_sizes_keep_independent_dimensions() {
+    let body = "(xs: number[], ys: number[]) { Map.prototype.set = function(key: number[], value: number[]) { for (const a of key) for (const b of value) void b; }; return new Map([[xs,ys]]); }";
+
+    assert_eq!(bound_result_of(body, "O(xs * ys)"), (true, true));
+    assert_eq!(bound_result_of(body, "O(xs^2)"), (false, true));
+}
+
+#[test]
+fn supplied_iterable_identity_survives_exports_without_certifying_other_actuals() {
+    let source = format!("{HELPERS} export function consume(value, xs:number[]){{for(const item of value)cube(xs);}} export function forward(value,xs:number[]){{const same=value;consume(same,xs);}} export function array(xs:number[]){{forward(xs,xs);}} export function custom(xs:number[]){{forward({{[Symbol.iterator](){{return {{next(){{return {{done:false,value:1}};}}}};}}}},xs);}}");
+
+    for order in [["array", "custom"], ["custom", "array"]] {
+        support::run_with_source(&source, |analysis, file| {
+            for _ in 0..2 {
+                for name in order {
+                    let part = support::summary_of(analysis, file, name);
+                    let expected = if name == "array" { "O(N^4)" } else { "O(N^3)" };
+
+                    assert_eq!(
+                        support::projected_class_of(&part.cost),
+                        Cost::parse(expected).unwrap(),
+                        "{order:?}: {name}"
+                    );
+                    assert_eq!(part.is_complete(), name == "array", "{order:?}: {name}");
+                }
+
+                analysis.reset_between_passes();
+            }
+        });
+    }
+}
+
+#[test]
+fn contextual_produced_iterables_keep_their_unproved_count_in_both_orders() {
+    let source = format!("{HELPERS} export function consume(value,xs:number[]){{for(const item of value)cube(xs);}} export function forward(value,xs:number[]){{const produced=value.slice();consume(produced,xs);}} export function array(xs:number[]){{forward(xs,xs);}} export function custom(xs:number[]){{forward({{slice(){{return {{[Symbol.iterator](){{return {{next(){{return {{done:false,value:1}};}}}};}}}};}}}},xs);}}");
+
+    for order in [["array", "custom"], ["custom", "array"]] {
+        support::run_with_source(&source, |analysis, file| {
+            for name in order {
+                let part = support::summary_of(analysis, file, name);
+
+                assert_eq!(
+                    support::projected_class_of(&part.cost),
+                    Cost::parse("O(N^3)").unwrap(),
+                    "{order:?}: {name}"
+                );
+                assert!(!part.is_complete(), "{order:?}: {name}");
+            }
+        });
+    }
+}
+
+#[test]
+fn array_from_arraylike_mode_retains_length_index_and_mapping_work() {
+    assert_selected(&[
+        ("", "(xs:number[]){return Array.from({get length(){cube(xs);return 2;}, get 0(){cube(xs);return 1;}});}", "O(N^3)", true),
+        ("", "(xs:number[],n:number){return Array.from({get length(){cube(xs);return n;}, get 0(){cube(xs);return 1;}});}", "O(N^4)", true),
+        ("", "(xs:number[],n:number){return Array.from({length:n},()=>cube(xs));}", "O(N^4)", true),
+        ("declare function lengthOf():number;", "(xs:number[]){return Array.from({get length(){cube(xs);return lengthOf();},get 0(){cube(xs);return 1;}});}", "O(N^3)", false),
+    ]);
+}
+
+#[test]
+fn declared_array_elements_require_numeric_property_keys() {
+    assert_selected(&[
+        ("", "(xs:number[],rows:number[][]){const index=0;for(const value of rows[index])cube(xs);}", "O(N^4)", true),
+        ("", "(xs:number[]){const rows:number[][]=[];(rows as any).custom={[Symbol.iterator](){return {next(){return {done:false,value:1};}};}};for(const value of rows['custom'])cube(xs);}", "O(N^3)", false),
+    ]);
+}
+
+fn assert_unknown_iteration_count(body: &str) {
+    let (cost, complete, reasons) = selected_of("", body);
+
+    assert_eq!(
+        support::projected_class_of(&cost),
+        Cost::parse("O(N^3)").unwrap(),
+        "{body}: {reasons:?}"
+    );
+    assert!(!complete);
+    assert!(
+        reasons.contains(&UnknownReason::Bound),
+        "{body}: {reasons:?}"
+    );
+}
+
+#[test]
+fn supplied_nested_array_wrappers_preserve_outer_iteration_bounds() {
+    for mark in ["", "cold", "O(N)", "ignore"] {
+        let directive = if mark.is_empty() {
+            String::new()
+        } else {
+            format!("/** @perf {mark} */\n")
+        };
+        let source = format!("{directive}function work(values:number[][]){{for(const row of values)for(const value of row)void value;}} export function selected(xs:number[][]){{for(const row of xs)work([row]);for(const a of xs)for(const b of xs)for(const c of xs)void c;}}");
+
+        support::run_with_source(&source, |analysis, file| {
+            let part = support::summary_of(analysis, file, "selected");
+            let reasons = support::unknown_reasons(analysis, part.unknowns);
+
+            assert_eq!(
+                part.is_complete(),
+                mark.is_empty() || mark == "cold",
+                "{mark}: {reasons:?}"
+            );
+            assert_eq!(
+                reasons.contains(&UnknownReason::Bound),
+                mark == "O(N)" || mark == "ignore"
+            );
+            assert_eq!(
+                support::projected_class_of(&part.cost),
+                Cost::parse("O(N^3)").unwrap()
+            );
+        });
     }
 }

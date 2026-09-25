@@ -23,7 +23,7 @@ use crate::recurrences::{
     solution_of, weaker_relation_of, ArgumentBounds, ArgumentRelation, CallStep, RecurrenceEdge,
     RecurrenceEquation, RecurrenceSolution, MAXIMUM_RECURRENCE_MEMBERS,
 };
-use crate::syntax::unwrap;
+use crate::syntax::{member_expression_of, unwrap};
 use crate::tsc::{Query, TscError, TscReply};
 use crate::types::TscPass;
 use crate::unknowns::UnknownReason;
@@ -2790,6 +2790,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.expression_facts_of(file, argument.span(), argument.as_expression())
     }
 
+    pub(crate) fn supplied_value_facts_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> (ArgumentFacts, bool) {
+        let mut facts = self.expression_facts_of(file, expression.span(), Some(expression));
+
+        if !self.is_primitive_operand(file, expression) {
+            if let Some(size) = self.produced_size_of(file, expression) {
+                if !size.length_resolved {
+                    facts.value.size = None;
+
+                    return (facts, false);
+                }
+
+                facts.value.size = Some(size.length);
+            }
+        }
+
+        (facts, true)
+    }
+
     pub(crate) fn expression_facts_of(
         &mut self,
         file: FileId,
@@ -2801,10 +2823,77 @@ impl<'p, 'a> Analysis<'p, 'a> {
             None => Definedness::Unknown,
         };
 
-        ArgumentFacts {
-            definedness,
-            ..self.expression_value_facts_of(file, span, expression)
+        let facts = expression
+            .and_then(|expression| self.aliased_parameter_facts_of(file, expression, 0))
+            .unwrap_or_else(|| ArgumentFacts {
+                definedness,
+                ..self.expression_value_facts_of(file, span, expression)
+            });
+
+        if let Some(expression) = expression {
+            let mut kind = self.declared_kind_of(file, expression);
+
+            if matches!(
+                kind,
+                crate::declared_types::Kind::Other | crate::declared_types::Kind::Unknown
+            ) {
+                if let Expression::CallExpression(call) = unwrap(expression) {
+                    if let Some(member) = member_expression_of(unwrap(&call.callee)) {
+                        let receiver = self.declared_kind_of(file, member.object());
+
+                        if !matches!(
+                            receiver,
+                            crate::declared_types::Kind::Other
+                                | crate::declared_types::Kind::Unknown
+                        ) {
+                            kind = self.iteration_kind_of(file, expression, 0);
+                        }
+                    }
+                }
+            }
+
+            if !matches!(
+                kind,
+                crate::declared_types::Kind::Other | crate::declared_types::Kind::Unknown
+            ) && self.charge_work(Event::CaptureEdge, 1)
+            {
+                self.values.remember_iteration_kind(facts.value.value, kind);
+            }
         }
+
+        facts
+    }
+
+    fn aliased_parameter_facts_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> Option<ArgumentFacts> {
+        let Expression::Identifier(reference) = unwrap(expression) else {
+            return None;
+        };
+
+        if depth > MAXIMUM_LATENT_DEPTH || !self.charge_work(Event::CaptureEdge, 1) {
+            return None;
+        }
+
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+
+        if depth > 0 {
+            if let Some(binding) = self.parameter_binding_of(declaration) {
+                return self
+                    .is_parameter_unwritten(binding)
+                    .then(|| self.current_substitutions.get(&binding).cloned())
+                    .flatten();
+            }
+        }
+
+        let (source, value) = crate::constants::constant_initializer_of(declaration)?;
+
+        self.aliased_parameter_facts_of(source, value, depth + 1)
     }
 
     fn expression_value_facts_of(
@@ -4655,6 +4744,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     pub fn reset_between_passes(&mut self) {
         self.summaries.clear();
+        self.values.forget_iteration_kinds();
 
         let generation = self
             .scheduler
@@ -5006,11 +5096,242 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
+    fn acquisition_factory_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        target: FunctionId,
+        depth: usize,
+    ) -> Option<(FunctionId, FileId, &'a CallExpression<'a>)> {
+        if depth > MAXIMUM_LATENT_DEPTH || !self.charge_work(Event::CaptureEdge, 1) {
+            return None;
+        }
+
+        if let Expression::Identifier(reference) = unwrap(expression) {
+            let declaration = self
+                .declarations
+                .of_reference(self.project, file, reference)?;
+            let (file, expression) = crate::constants::constant_initializer_of(declaration)?;
+
+            return self.acquisition_factory_of(file, expression, target, depth + 1);
+        }
+
+        let Expression::CallExpression(call) = unwrap(expression) else {
+            return None;
+        };
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        if targets.open || targets.known.len() != 1 {
+            return None;
+        }
+
+        let factory = targets.known[0];
+        let ancestors = self.enclosing_functions_of(target.file, target.node);
+
+        if !self.charge_work(Event::CaptureEdge, ancestors.len() as u64) {
+            return None;
+        }
+
+        (factory.file == target.file
+            && ancestors
+                .iter()
+                .any(|owner| owner.node_id() == factory.node))
+        .then_some((factory, file, call))
+    }
+
+    fn acquired_latent_of(
+        &mut self,
+        target: FunctionId,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+    ) -> Option<Latent> {
+        let factory = self.acquisition_factory_of(file, iterable, target, 0);
+
+        if !self.charge_work(
+            Event::CaptureEdge,
+            (self.current_substitutions.len() + self.storage_arguments.len()) as u64,
+        ) {
+            return Some(
+                self.unresolved_latent_of(
+                    (file, iterable.span()),
+                    UnknownReason::ResourceExhaustion,
+                ),
+            );
+        }
+
+        let mut substitutions = self.current_substitutions.clone();
+        let mut storage = self.storage_arguments.clone();
+        let mut resolved = true;
+
+        if let Some((factory, source, call)) = factory {
+            let function = self.function_at(factory);
+            let captured = self.inherited_substitutions_of(factory.file, function)?;
+            let mut supplied = self.invocation_substitutions_of(
+                (factory.file, function),
+                (source, &call.arguments),
+                false,
+                captured,
+            );
+
+            if let Some(parameters) = parameters_of(function) {
+                for (parameter, argument) in parameters.items.iter().zip(&call.arguments) {
+                    if !self.charge_work(Event::CaptureEdge, 1) {
+                        resolved = false;
+
+                        break;
+                    }
+
+                    let (BindingPattern::BindingIdentifier(identifier), Some(expression)) =
+                        (&parameter.pattern, argument.as_expression())
+                    else {
+                        resolved = false;
+
+                        continue;
+                    };
+
+                    if let Some(symbol) = identifier.symbol_id.get() {
+                        let (facts, known) = self.supplied_value_facts_of(source, expression);
+
+                        supplied.insert(
+                            Binding::Symbol {
+                                file: factory.file,
+                                symbol,
+                            },
+                            facts,
+                        );
+
+                        resolved &= known;
+                    }
+                }
+            }
+
+            let supplied_storage =
+                self.storage_arguments_of(factory.file, function, source, &call.arguments);
+
+            if self.charge_work(
+                Event::CaptureEdge,
+                (supplied.len() + supplied_storage.len()) as u64,
+            ) {
+                substitutions.extend(supplied);
+                storage.extend(supplied_storage);
+            } else {
+                resolved = false;
+            }
+        }
+
+        for owner in self.enclosing_functions_of(target.file, target.node) {
+            if let Some(parameters) = parameters_of(owner) {
+                for parameter in &parameters.items {
+                    for identifier in parameter.pattern.get_binding_identifiers() {
+                        if !self.charge_work(Event::CaptureEdge, 1) {
+                            resolved = false;
+
+                            break;
+                        }
+
+                        if let Some(symbol) = identifier.symbol_id.get() {
+                            resolved &= substitutions.contains_key(&Binding::Symbol {
+                                file: target.file,
+                                symbol,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let saved = std::mem::replace(&mut self.current_substitutions, substitutions);
+        let saved_storage = std::mem::replace(&mut self.storage_arguments, storage);
+        let mut latent = self.latent_invocation_of(target, file, &[], iterable.span(), true);
+        self.current_substitutions = saved;
+        self.storage_arguments = saved_storage;
+
+        if !resolved {
+            if let Some(latent) = &mut latent {
+                let reason = if self.work_exhausted() {
+                    UnknownReason::ResourceExhaustion
+                } else {
+                    UnknownReason::Target
+                };
+                let unknown = self.unknown_part(file, iterable.span(), reason);
+                let reading = self.reading_of_latent(latent).merge(
+                    unknown.clone(),
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
+
+                latent.work =
+                    latent
+                        .work
+                        .clone()
+                        .max(unknown, &mut self.unknowns, &mut self.traces);
+                latent.yields = None;
+                latent.storage = crate::effects::Storage::unresolved();
+                latent.record = None;
+                latent.deferred = Some(reading);
+            }
+        }
+
+        latent
+    }
+
+    pub(crate) fn iteration_latent_of(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &crate::values::Iteration,
+    ) -> Option<Latent> {
+        if let Some(latent) = self.latent_of(file, iterable) {
+            return Some(latent);
+        }
+
+        let mut found = None;
+        let mut missing = iteration.acquire.open;
+
+        for target in &iteration.acquire.known {
+            if !self.charge_work(Event::LatentStep, 1) {
+                missing = true;
+
+                break;
+            }
+
+            match self.acquired_latent_of(*target, file, iterable) {
+                Some(latent) => {
+                    found = Some(self.joined_latent_of(
+                        found,
+                        latent,
+                        self.source_span(file, iterable.span()),
+                    ))
+                }
+                None => missing = true,
+            }
+        }
+
+        found.map(|latent| match missing {
+            true => Latent {
+                yields: None,
+                ..latent
+            },
+            false => latent,
+        })
+    }
+
     fn invocation_latent_of(
         &mut self,
         target: FunctionId,
         file: FileId,
         call: &'a CallExpression<'a>,
+    ) -> Option<Latent> {
+        self.latent_invocation_of(target, file, &call.arguments, call.span, false)
+    }
+
+    fn latent_invocation_of(
+        &mut self,
+        target: FunctionId,
+        file: FileId,
+        arguments: &'a [Argument<'a>],
+        span: oxc_span::Span,
+        implicit: bool,
     ) -> Option<Latent> {
         let generator = self.is_generator_target(target);
 
@@ -5020,14 +5341,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let function = self.function_at(target);
-        let origin = (file, call.span);
+        let origin = (file, span);
         let Some(captured) = self.inherited_substitutions_of(target.file, function) else {
             return Some(self.unresolved_latent_of(origin, UnknownReason::ResourceExhaustion));
         };
         let substitutions = self.invocation_substitutions_of(
             (target.file, function),
-            (file, &call.arguments),
-            false,
+            (file, arguments),
+            implicit,
             captured,
         );
         let substitutions = self.function_inputs(target.file, function, substitutions);
@@ -5042,9 +5363,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let mut key = key;
-        key.interference = self.invocation_interference_of(file, call.span);
-        key.storage_arguments =
-            self.storage_arguments_of(target.file, function, file, &call.arguments);
+        key.interference = self.invocation_interference_of(file, span);
+        key.storage_arguments = self.storage_arguments_of(target.file, function, file, arguments);
         let (reading, cyclic) = self.request_reading(key.clone(), substitutions);
 
         if cyclic {

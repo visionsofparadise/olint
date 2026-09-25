@@ -675,7 +675,7 @@ fn assert_live_visits(rows: &[VisitRow<'_>]) {
 
             (
                 *label,
-                cost.text(),
+                support::projected_class_of(&cost).text(),
                 complete,
                 reasons.contains(&olint::unknowns::UnknownReason::Bound),
             )
@@ -686,7 +686,12 @@ fn assert_live_visits(rows: &[VisitRow<'_>]) {
         .map(|(label, _, _, expected, complete)| {
             let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
 
-            (*label, cost.text(), *complete, !*complete)
+            (
+                *label,
+                support::projected_class_of(&cost).text(),
+                *complete,
+                !*complete,
+            )
         })
         .collect();
 

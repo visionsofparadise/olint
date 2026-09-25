@@ -1364,7 +1364,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     sibling.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
             }
 
-            if let Some(latent) = self.latent_of(file, &statement.right) {
+            let iteration = self.iteration_of(file, &statement.right, statement.r#await);
+
+            if let Some(latent) = self.iteration_latent_of(file, &statement.right, &iteration) {
                 let consumed = self.consumed_part_of(file, statement.right.span(), &latent);
 
                 sibling = sibling.merge(

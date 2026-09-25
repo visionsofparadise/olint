@@ -1827,7 +1827,8 @@ fn implicit_counts_of(sites: usize) -> Vec<u64> {
 
         assert_terminal(stats);
         assert!(
-            part.is_complete(),
+            reasons(analysis, part.unknowns)
+                == std::collections::BTreeSet::from([UnknownReason::Bound]),
             "{sites}: {:?}",
             reasons(analysis, part.unknowns)
         );
@@ -1893,7 +1894,8 @@ fn nested_iteration_counts_of(depth: usize) -> Vec<u64> {
 
         assert_terminal(stats);
         assert!(
-            part.is_complete(),
+            reasons(analysis, part.unknowns)
+                == std::collections::BTreeSet::from([UnknownReason::Bound]),
             "{depth}: {:?}",
             reasons(analysis, part.unknowns)
         );
@@ -1988,7 +1990,7 @@ fn spread_copies_and_destructured_elements_scan_source_keys_once() {
 
         assert_eq!(
             rest_copy_steps_of(sites as usize, keys as usize),
-            29 * sites + 3 * sites * keys,
+            30 * sites + 3 * sites * keys + 3,
             "{sites} {keys}"
         );
     }
@@ -2106,7 +2108,7 @@ fn escaping_branches_scan_their_own_subtree_once() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             branch_scan_edges_of(sites as usize, true),
-            290 * sites + 170,
+            298 * sites + 203,
             "{sites}"
         );
     }
@@ -2117,7 +2119,7 @@ fn branches_that_cannot_leave_their_loop_stop_scanning_early() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             branch_scan_edges_of(sites as usize, false),
-            329 * sites + 170,
+            337 * sites + 203,
             "{sites}"
         );
     }
@@ -2155,7 +2157,7 @@ fn finalizers_scan_their_own_subtree_once_per_resolved_completion() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             finalizer_scan_edges_of(sites as usize, false),
-            273 * sites + 120,
+            291 * sites + 133,
             "{sites}"
         );
     }
@@ -2166,7 +2168,7 @@ fn overriding_finalizers_stop_their_branch_from_leaving_the_loop() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             finalizer_scan_edges_of(sites as usize, true),
-            235 * sites + 120,
+            253 * sites + 133,
             "{sites}"
         );
     }
@@ -2201,7 +2203,7 @@ fn nested_finalizers_resolve_each_completion_once_per_exit_site() {
     for depth in [4_u64, 8, 12, 16] {
         assert_eq!(
             nested_finalizer_edges_of(depth as usize, 1),
-            65 * depth + 234,
+            65 * depth + 265,
             "{depth}"
         );
     }
@@ -2240,7 +2242,7 @@ fn escape_resolution_past_its_depth_cap_stays_linear_and_partial() {
     for depth in [36_u64, 40, 44, 48] {
         assert_eq!(
             capped_finalizer_edges_of(depth as usize),
-            60 * depth + 394,
+            60 * depth + 425,
             "{depth}"
         );
     }
@@ -2251,7 +2253,7 @@ fn transfer_bearing_nested_finalizers_stay_linear_in_their_depth() {
     for depth in [4_u64, 8, 12, 16] {
         assert_eq!(
             nested_finalizer_edges_of(depth as usize, 4),
-            197 * depth + 234,
+            197 * depth + 265,
             "{depth}"
         );
     }
@@ -2372,5 +2374,60 @@ fn a_guard_past_the_recurrence_depth_cap_degrades_to_a_recurrence_result() {
             97,
             "{depth}"
         );
+    }
+}
+
+#[test]
+fn recursive_iterable_materialization_keeps_size_queries_bounded() {
+    let source = "function cube(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; } export function selected(xs: number[]) { cube(xs); const copied = Array.from(copied); return new Set(copied); }";
+
+    run_with_source(source, |analysis, file| {
+        limit_work(analysis, Event::SizeStep, 128);
+
+        let part = summary_of(analysis, file, "selected");
+
+        assert_terminal(analysis.scheduler_stats());
+        assert_eq!(
+            support::projected_class_of(&part.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+        assert!(!part.is_complete());
+        assert!(analysis.scheduler_stats().work.consumed(Event::SizeStep) <= 128);
+    });
+}
+
+#[test]
+fn cached_iterator_getter_targets_obey_traversal_limits() {
+    for count in [64, 256] {
+        let branches: String = (0..count).map(|index| format!("if (tag === {index}) return {{ get next() {{ cube(xs); return () => ({{done:true}}); }} }}; ")).collect();
+        let source = format!("function cube(xs: number[]) {{ for (const a of xs) for (const b of xs) for (const c of xs) void c; }} export function preserved(xs:number[]){{cube(xs);}} export function selected(xs: number[], tag: number) {{ const values = {{ [Symbol.iterator]() {{ {branches}return {{next() {{return {{done:true}};}}}}; }} }}; for (const value of values) void value; }}");
+
+        run_with_source(&source, |analysis, file| {
+            limit_work(analysis, Event::TraversalEdge, 64 * count as u64 + 512);
+
+            let known = summary_of(analysis, file, "preserved");
+
+            assert_eq!(
+                support::projected_class_of(&known.cost),
+                Cost::parse("O(N^3)").unwrap()
+            );
+
+            let part = summary_of(analysis, file, "selected");
+            let retained = summary_of(analysis, file, "preserved");
+
+            assert_terminal(analysis.scheduler_stats());
+            assert_eq!(
+                support::projected_class_of(&retained.cost),
+                Cost::parse("O(N^3)").unwrap()
+            );
+            assert!(reasons(analysis, part.unknowns).contains(&UnknownReason::ResourceExhaustion));
+            assert!(
+                analysis
+                    .scheduler_stats()
+                    .work
+                    .consumed(Event::TraversalEdge)
+                    <= 64 * count as u64 + 512
+            );
+        });
     }
 }

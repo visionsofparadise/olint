@@ -1221,6 +1221,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    pub(crate) fn declared_element_kind_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Kind {
+        match self.element_type_of(file, expression, 0) {
+            Some((source, element)) => self.declared_type_of_nested_type(source, element, 1).kind,
+            None => Kind::Unknown,
+        }
+    }
+
     fn element_type_of(
         &mut self,
         file: FileId,

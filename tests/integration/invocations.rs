@@ -6,7 +6,7 @@ use olint::unknowns::UnknownReason;
 
 use crate::support;
 
-use support::{assert_projected_selected, assert_selected, index_of, selected_result_in};
+use support::{assert_projected_selected, index_of, selected_result_in};
 
 const QUADRATIC: &str = "function quadratic(xs: number[]): number { let total = 0; for (const a of xs) for (const b of xs) total += a + b; return total; }";
 
@@ -16,7 +16,11 @@ fn assert_reasons(cases: &[(String, &str, UnknownReason)]) {
             let (cost, reasons): (Cost, BTreeSet<UnknownReason>) =
                 selected_result_in(&[("index.ts", source.as_str())], types);
 
-            assert_eq!(cost, Cost::parse(expected).unwrap(), "{types:?} {source}");
+            assert_eq!(
+                support::projected_class_of(&cost),
+                Cost::parse(expected).unwrap(),
+                "{types:?} {source}"
+            );
             assert!(reasons.contains(reason), "{types:?} {source}: {reasons:?}");
         }
     }
@@ -35,7 +39,7 @@ fn accessors_invoke_their_known_getters_and_setters() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const box = {{ value: 1 }}; return box.value + xs.length; }}")), "O(1)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -49,7 +53,7 @@ fn described_properties_compose_their_getters_and_values() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const o = {{}} as {{ v: number }}; Object.defineProperty(o, 'v', {{ set(n: number) {{ quadratic(xs); }} }}); o.v = 1; }}")), "O(N^2)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -65,7 +69,7 @@ fn coercions_and_tags_invoke_their_known_implementations() {
         (index_of(format!("{QUADRATIC}\nclass Named {{ toString() {{ return 'named'; }} }}\nexport function selected(xs: number[], n: number) {{ let total = 0; for (const x of xs) total += x + n; return `${{total}}` + new Named(); }}")), "O(N)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -74,22 +78,35 @@ fn iterator_protocols_charge_acquisition_each_visit_and_applicable_close() {
     let closing = "{ [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; }, return() { quadratic(xs); return { done: true, value: 0 }; } }; } }";
     let cubic = "{ [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; }, return() { for (const x of xs) quadratic(xs); return { done: true, value: 0 }; } }; } }";
     let cases = [
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; for (const value of iterable) {{}} }}")), "O(N^3)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; return [...iterable]; }}")), "O(N^3)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Walk {{ [Symbol.iterator]() {{ return this; }} next() {{ quadratic(xs); return {{ done: true, value: 0 }}; }} }} for (const v of new Walk()) {{}} }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; for (const value of iterable) {{}} }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; return [...iterable]; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Walk {{ [Symbol.iterator]() {{ return this; }} next() {{ quadratic(xs); return {{ done: true, value: 0 }}; }} }} for (const v of new Walk()) {{}} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {{ *[Symbol.iterator]() {{ yield quadratic(xs); }} }}; for (const v of iterable) {{}} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; for (const value of iterable) {{ if (value) break; }} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; for (const x of xs) {{ for (const value of iterable) {{ break; }} }} }}")), "O(N^3)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; for (const value of iterable) {{ blk: {{ break blk; }} }} }}")), "O(N)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; for (const value of iterable) {{ switch (value) {{ case 1: break; }} }} }}")), "O(N)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; outer: for (const value of iterable) {{ continue outer; }} }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; for (const value of iterable) {{ blk: {{ break blk; }} }} }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; for (const value of iterable) {{ switch (value) {{ case 1: break; }} }} }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; outer: for (const value of iterable) {{ continue outer; }} }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {cubic}; outer: for (const value of iterable) {{ for (const x of xs) {{ break outer; }} }} }}")), "O(N^3)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; const [a, b] = iterable; return a + b; }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; for (const value of iterable) {{ void value; }} }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; for (const value of iterable) {{ void value; }} }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ let total = 0; for (const x of xs) for (const y of xs) total += x + y; return total; }}")), "O(N^2)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
+    assert_iteration_bounds(
+        &cases,
+        &[
+            (0, true),
+            (1, true),
+            (2, false),
+            (3, false),
+            (6, true),
+            (7, true),
+            (8, true),
+            (11, true),
+        ],
+    );
 }
 
 #[test]
@@ -151,7 +168,7 @@ fn construction_contexts_resolve_this_and_super_members() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ m() {{ return quadratic(xs); }} n() {{ return this.m(); }} }} return new Box().n(); }}")), "O(N^2)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -162,7 +179,7 @@ fn functions_passed_as_values_receive_their_forwarded_arguments() {
         (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ t.includes = v; }}\nfunction apply(f: (t: any, v: unknown) => void, xs: number[]) {{ const g = f; g(Array.prototype, () => slow(xs)); }}\nexport function selected(xs: number[]) {{ apply(set, xs); const zs = [1]; return zs.includes(0); }}")), "O(N)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -174,7 +191,7 @@ fn reference_valued_implementations_enter_the_protocol_index() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const getV = () => quadratic(xs); const o = {{}} as {{ v: number }}; Object.defineProperty(o, 'v', {{ get: getV }}); return o.v; }}")), "O(N^2)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -192,7 +209,7 @@ fn declared_primitive_types_skip_coercion_while_values_keep_getters() {
         (index_of(format!("{QUADRATIC}\nfunction lengthOf(a: number[]) {{ return a.length; }}\nexport function selected(xs: number[]) {{ class Long {{ get length() {{ return quadratic(xs); }} }} return lengthOf(new Long() as any); }}")), "O(1)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -206,7 +223,7 @@ fn computed_definition_keys_convert_their_values() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {key} const name = 'k'; return {{ [name]: 1, [0]: 2 }}; }}")), "O(1)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -223,7 +240,7 @@ fn compound_update_key_and_membership_operands_coerce() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const unused = {box_of}; const ys = [1, 2]; const o: any = {{}}; const named = o['k']; const indexed = o[0]; return ys.length * 2; }}")), "O(1)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -242,18 +259,19 @@ fn destructuring_patterns_read_getters_and_iterate_sources() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const {{ a, b }} = {{ a: 1, b: xs }}; return a + b.length; }}")), "O(1)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
 fn delegated_yields_and_head_targets_run_the_protocol_per_visit() {
     let it = "const it = { [Symbol.iterator]() { let count = 0; return { next() { quadratic(xs); return { done: count++ >= xs.length, value: 1 }; } }; } };";
     let cases = [
-        (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {it} yield* it; }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {it} yield* it; }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const box = {{ set p(v: number) {{ quadratic(xs); }} }}; for (box.p of xs) {{}} }}")), "O(N^3)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
+    assert_iteration_bounds(&cases, &[(0, true), (1, false)]);
 }
 
 #[test]
@@ -264,13 +282,14 @@ fn iterators_close_on_every_abrupt_path_out_of_the_body() {
         (index_of(format!("{QUADRATIC}\n{thrower}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ thrower(v); }} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {closing} for (const v of it) {{ yield v; }} }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {closing} for (const v of it) {{ await v; }} }}")), "O(N^2)", true),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ switch (v) {{ case 1: break; }} }} }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ switch (v) {{ case 1: break; }} }} }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} let t = 0; for (const v of it) {{ t += v; }} return t; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} const box = {{ get bad(): number {{ throw 0; }} }}; let t = 0; for (const v of it) {{ t = box.bad; }} return t; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} const o: {{ p?: {{ q: number }} }} = {{}}; let t = 0; for (const v of it) {{ t = o.p!.q; }} return t; }}")), "O(N^2)", false),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
+    assert_iteration_bounds(&cases, &[(3, true)]);
 }
 
 #[test]
@@ -282,7 +301,7 @@ fn deferred_code_in_classes_keeps_ordinary_receiver_resolution() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Box {{ m() {{ return 1; }} v = () => this.m(); }} const b = new Box(); (b as any).m = () => quadratic(xs); return b.v(); }}")), "O(1)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 }
 
 #[test]
@@ -303,7 +322,7 @@ fn unresolved_iteration_protocols_leave_multiplicity_unproven() {
         false,
     )];
 
-    assert_selected(&controls);
+    assert_projected_selected(&controls);
 }
 
 #[test]
@@ -319,7 +338,7 @@ fn instance_checks_invoke_their_known_has_instance_implementations() {
         (index_of(format!("{QUADRATIC}\n{marker}\nexport function selected(value: unknown, constructor: Function) {{ return value instanceof constructor; }}")), "O(1)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 
     let controls = [
         (index_of(format!("{QUADRATIC}\n{marker}\nexport function selected(value: unknown) {{ class Plain {{ v = 1; }} return value instanceof Plain; }}")), "O(1)", false),
@@ -329,7 +348,7 @@ fn instance_checks_invoke_their_known_has_instance_implementations() {
         (index_of(format!("{QUADRATIC}\nexport function selected(value: unknown) {{ return value instanceof Error; }}")), "O(1)", false),
     ];
 
-    assert_selected(&controls);
+    assert_projected_selected(&controls);
 }
 
 #[test]
@@ -346,7 +365,7 @@ fn awaits_invoke_their_known_then_implementations() {
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", true),
     ];
 
-    assert_selected(&cases);
+    assert_projected_selected(&cases);
 
     let controls = [
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected() {{ return await producer(); }}")), "O(1)", true),
@@ -354,11 +373,11 @@ fn awaits_invoke_their_known_then_implementations() {
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected() {{ return await Promise.resolve(1); }}")), "O(1)", true),
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nasync function producer() {{ return 1; }}\nexport async function selected(xs: number[]) {{ let total = 0; for (const x of xs) total += await producer(); return total; }}")), "O(N)", false),
         (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(value: number) {{ return await value; }}")), "O(1)", false),
-        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(rows: AsyncIterable<number>) {{ let total = 0; for await (const row of rows) total += row; return total; }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\n{class_thenable}\nexport async function selected(rows: AsyncIterable<number>) {{ let total = 0; for await (const row of rows) total += row; return total; }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport async function selected(value: any) {{ return await value; }}")), "O(1)", true),
     ];
 
-    assert_selected(&controls);
+    assert_projected_selected(&controls);
 }
 
 const JSX_WORK: &str = "export function quadratic(xs: number[]) { let t = 0; for (const a of xs) for (const b of xs) t += a * b; return t; }\nexport function Cube(props: { xs: number[] }) { let t = 0; for (const a of props.xs) for (const b of props.xs) for (const c of props.xs) t += a * b * c; return t; }\n";
@@ -498,7 +517,8 @@ fn automatic_jsx_runtimes_resolve_through_the_runtime_graph() {
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{1}</Cube>; }", &static_calling, &[], "O(1)", false),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>\n  {1}\n</Cube>; }", &static_calling, &[], "O(1)", false),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{...[1]}</Cube>; }", &static_calling, &[], "O(N^3)", false),
-        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <>{1}</>; }", &fragment_calling, &[("node_modules/lib/work.js", library_work)], "O(N^2)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <>{1}</>; }", &fragment_calling, &[("node_modules/lib/work.js", library_work)], "O(1)", true),
+        automatic(AUTOMATIC_OPTIONS, "function Fragment(props:{xs:number[]}){return quadratic(props.xs);} export function selected(xs:number[]){return <Fragment xs={xs}/>;}", &calling, &[], "O(N^2)", false),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube {...rest} xs={xs} key=\"k\" />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N^3)", false),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube key=\"k\" {...rest} xs={xs} />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N)", false),
         automatic(r#", "jsx": "react-jsxdev", "jsxImportSource": "lib""#, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &storing, &[("node_modules/lib/jsx-dev-runtime.js", "export function jsxDEV(type, props) { return type(props); }\n")], "O(N^3)", false),
@@ -725,7 +745,7 @@ fn jsx_spread_getters_follow_the_configured_output_target() {
 
             if copied {
                 assert_eq!(
-                    cost,
+                    support::projected_class_of(&cost),
                     Cost::parse(expected).unwrap(),
                     "{types:?}: {sources:?}"
                 );
@@ -814,6 +834,20 @@ fn jsx_passed_values_escape_into_the_factory() {
                 !reasons.is_empty(),
                 *partial,
                 "{types:?} {files:?}: {reasons:?}"
+            );
+        }
+    }
+}
+
+fn assert_iteration_bounds(cases: &[support::SelectedCase<'_>], expected: &[(usize, bool)]) {
+    for types in [TypeMode::Syntactic, TypeMode::Tsc] {
+        for (index, unresolved) in expected {
+            let (_, reasons) = support::selected_case_of(&cases[*index].0, types);
+
+            assert_eq!(
+                reasons.contains(&UnknownReason::Bound),
+                *unresolved,
+                "{types:?} {index}: {reasons:?}"
             );
         }
     }

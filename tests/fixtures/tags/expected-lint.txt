@@ -1,20 +1,20 @@
 # tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 10 public functions
 
-O((xs * xs^2)) > O(N^2)  uses  src/public.ts:34  via src/index.ts
-    calls notExported()                                    src/public.ts:34  = O((xs * xs^2))
-    calls cubic()                                          src/public.ts:31  = O((xs * xs^2))
-    in loop for-of                                           src/public.ts:3  x N
+O(max(1, (xs * xs^2))) > O(N^2)  uses  src/public.ts:34  via src/index.ts
+    calls notExported()                                    src/public.ts:34  = O(max(1, (xs * xs^2)))
+    calls cubic()                                          src/public.ts:31  = O(max(1, (xs * xs^2)))
+    in loop for-of                                           src/public.ts:3  x xs
         in loop for-of                                       src/public.ts:3  x N
             in loop for-of                                   src/public.ts:3  x N
 
-O((xs * xs^2)) > O(N^2)  Engine.run  src/public.ts:21  via src/index.ts
-    calls cubic()                                          src/public.ts:22  = O((xs * xs^2))
-    in loop for-of                                           src/public.ts:3  x N
+O(max(1, (xs * xs^2))) > O(N^2)  Engine.run  src/public.ts:21  via src/index.ts
+    calls cubic()                                          src/public.ts:22  = O(max(1, (xs * xs^2)))
+    in loop for-of                                           src/public.ts:3  x xs
         in loop for-of                                       src/public.ts:3  x N
             in loop for-of                                   src/public.ts:3  x N
 
-O((xs * xs^2)) > O(N^2)  cubic  src/public.ts:1  via src/index.ts
-    in loop for-of                                           src/public.ts:3  x N
+O(max(1, (xs * xs^2))) > O(N^2)  cubic  src/public.ts:1  via src/index.ts
+    in loop for-of                                           src/public.ts:3  x xs
         in loop for-of                                       src/public.ts:3  x N
             in loop for-of                                   src/public.ts:3  x N
 

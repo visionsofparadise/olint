@@ -809,7 +809,7 @@ fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential(
         (
             "a counter the enclosing loop resets",
             reset_halving_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(max(1,step * log(N)) * N)",
+            "O(max(1,step * log(N)) * ys)",
             true,
         ),
         (
@@ -821,7 +821,7 @@ fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential(
         (
             "a counter the enclosing unresolved loop resets",
             reset_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(step * N)",
+            "O(step * ys)",
             false,
         ),
     ];
@@ -901,7 +901,12 @@ fn unbounded_number_inputs_and_stalled_updates_supply_no_iteration_proof() {
 fn unresolved_repetition_retains_proven_local_collection_work() {
     let source = "export function f(n:number,xs:number[]){for(let i=0;i<n;i++){for(const x of xs)for(const y of xs)void y;}}";
 
-    assert_eq!(legacy_cost_of(source, "f"), (cost("O(N^2)"), false));
+    let (known, complete) = legacy_cost_of(source, "f");
+
+    assert_eq!(
+        (support::projected_class_of(&known), complete),
+        (cost("O(N^2)"), false)
+    );
     assert!(bound_is_unknown(source, "f"));
 }
 

@@ -66,25 +66,41 @@ fn duplicate_function_declarations_bind_the_runtime_winner() {
     }
 
     for (source, expected, partial) in cases {
-        let files = [
-            (
-                "tsconfig.json",
-                r#"{"compilerOptions":{"allowJs":true},"files":["index.js"]}"#,
-            ),
-            ("index.js", source.as_str()),
-        ];
-        let (cost, reasons) = selected_result_in(&files, "index.js");
-        let expected_reasons = match partial {
-            true => vec![olint::unknowns::UnknownReason::Target],
-            false => Vec::new(),
-        };
+        for explicit in [false, true] {
+            let source = if explicit {
+                source.replace(cubic, &format!("\n/** @perf O(N^3) */\n{cubic}"))
+            } else {
+                source.clone()
+            };
+            let files = [
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions":{"allowJs":true},"files":["index.js"]}"#,
+                ),
+                ("index.js", source.as_str()),
+            ];
+            let (cost, reasons) = selected_result_in(&files, "index.js");
+            let mut expected_reasons = match partial {
+                true => vec![olint::unknowns::UnknownReason::Target],
+                false => Vec::new(),
+            };
 
-        assert_eq!(cost, Cost::parse(expected).unwrap(), "{source}");
-        assert_eq!(
-            reasons.into_iter().collect::<Vec<_>>(),
-            expected_reasons,
-            "{source}"
-        );
+            if !explicit && expected == "O(N^3)" {
+                expected_reasons.push(olint::unknowns::UnknownReason::Bound);
+                expected_reasons.sort();
+            }
+
+            assert_eq!(
+                cost,
+                Cost::parse(if explicit { expected } else { "O(1)" }).unwrap(),
+                "{source}"
+            );
+            assert_eq!(
+                reasons.into_iter().collect::<Vec<_>>(),
+                expected_reasons,
+                "{source}"
+            );
+        }
     }
 
     let (cost, reasons) = selected_result(&format!("function work(xs:number[]):number; function work(xs:number[]):number; function work(xs:number[]){{{cubic} return 0;}} export function selected(xs:number[]){{return work(xs);}}"));
@@ -455,7 +471,7 @@ fn a_costed_callback_multiplies_inside_its_caller() {
 
             let actual = first.total(&mut analysis.unknowns, &mut analysis.traces).cost;
 
-            assert_eq!(support::legacy_class_of(analysis, file, f, &actual), Cost::parse("O(N^2)").unwrap());
+            assert_eq!(support::projected_class_of(&support::legacy_class_of(analysis, file, f, &actual)), Cost::parse("O(N^2)").unwrap());
             assert_eq!(first, second);
             assert_eq!(labels_of(&analysis.traces,first.main().trace), vec!["call each()"]);
         },
@@ -996,7 +1012,11 @@ fn assert_lazy_selected(cases: &[(&str, &str, &str, bool)]) {
     for (declarations, body, expected, partial) in cases {
         let (cost, reasons) = lazy_selected_of(declarations, body);
 
-        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse(expected).unwrap(),
+            "{body}: {reasons:?}"
+        );
         assert_eq!(!reasons.is_empty(), *partial, "{body}: {reasons:?}");
     }
 }
@@ -1011,7 +1031,7 @@ fn phase_costs_of(source: &str, name: &str) -> Vec<(ExecutionPhase, Cost)> {
         for (phase, _, part) in &reading.completions {
             let cost = support::legacy_class_of(analysis, file, function, &part.cost);
 
-            found.push((*phase, cost));
+            found.push((*phase, support::projected_class_of(&cost)));
         }
     });
 
@@ -1166,7 +1186,7 @@ fn unknown_consumption_and_yield_counts_stay_incomplete() {
         "{unresolved:?}"
     );
     assert_eq!(
-        unresolved.0,
+        support::projected_class_of(&unresolved.0),
         Cost::parse("O(N^2)").unwrap(),
         "{unresolved:?}"
     );
@@ -1354,7 +1374,7 @@ fn expression_await_keeps_known_work_and_marks_phase_placement_uncertain() {
         let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
 
         assert_eq!(
-            support::legacy_class_of(analysis, file, function, &part.cost),
+            support::projected_class_of(&part.cost),
             Cost::parse("O(N^2)").unwrap()
         );
         assert!(support::unknown_reasons(analysis, part.unknowns)

@@ -201,8 +201,6 @@ fn executed_constant_statements_still_outrank_a_cold_contribution() {
 
 #[test]
 fn an_open_call_target_stays_partial_beside_every_known_mark() {
-    use olint::unknowns::UnknownReason;
-
     for (body, expected) in [
         (
             "(xs: number[], flag: boolean, f: (xs: number[]) => number) {\n\tconst g = flag ? coldQuadratic : f;\n\n\treturn g(xs);\n}",
@@ -221,10 +219,7 @@ fn an_open_call_target_stays_partial_beside_every_known_mark() {
             "O(N^2)",
         ),
     ] {
-        let (cost, reasons) = selected_result_of(body);
-
-        assert_eq!(cost, olint::cost::Cost::parse(expected).unwrap(), "{body}");
-        assert!(reasons.contains(&UnknownReason::Target), "{body} {reasons:?}");
+        assert_target_cost(body, expected, selected_result_of(body));
     }
 }
 
@@ -234,8 +229,6 @@ const HOLDERS: &str = "function quadratic(xs: number[]) {\n\tlet total = 0;\n\tf
 
 #[test]
 fn an_open_target_marks_a_known_cold_contribution_without_cancelling_it() {
-    use olint::unknowns::UnknownReason;
-
     for (prefix, body, expected) in [
         (
             ENGINE,
@@ -253,10 +246,7 @@ fn an_open_target_marks_a_known_cold_contribution_without_cancelling_it() {
             "O(1)",
         ),
     ] {
-        let (cost, reasons) = selected_result_with(prefix, body);
-
-        assert_eq!(cost, olint::cost::Cost::parse(expected).unwrap(), "{body}");
-        assert!(reasons.contains(&UnknownReason::Target), "{body} {reasons:?}");
+        assert_target_cost(body, expected, selected_result_with(prefix, body));
     }
 }
 
@@ -377,10 +367,22 @@ fn an_unresolved_target_retains_a_proved_cold_cost_as_a_partial_result() {
         let (cost, reasons) = selected_result_with(COLD_CUBE, body);
 
         assert_eq!(
-            cost,
+            support::projected_class_of(&cost),
             olint::cost::Cost::parse(expected).unwrap(),
             "{body} {reasons:?}"
         );
         assert_eq!(reasons, unknown.into_iter().collect(), "{body}");
     }
+}
+
+fn assert_target_cost(body: &str, expected: &str, (cost, reasons): support::SelectedResult) {
+    assert_eq!(
+        support::projected_class_of(&cost),
+        olint::cost::Cost::parse(expected).unwrap(),
+        "{body}"
+    );
+    assert!(
+        reasons.contains(&olint::unknowns::UnknownReason::Target),
+        "{body} {reasons:?}"
+    );
 }

@@ -142,6 +142,7 @@ struct Buckets {
 #[derive(Clone, Default)]
 struct WideSummary {
     replaced: bool,
+    callables_open: bool,
     known: Vec<FunctionId>,
     getters: Vec<FunctionId>,
     setters: Vec<FunctionId>,
@@ -284,6 +285,8 @@ pub(crate) struct Construction<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Iteration {
+    pub(crate) native: bool,
+    pub(crate) asynchronous: bool,
     pub(crate) acquire: TargetSet,
     pub(crate) next: TargetSet,
     pub(crate) close: TargetSet,
@@ -711,6 +714,184 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
+    pub(crate) fn merge_iterator_targets(
+        &mut self,
+        found: &mut TargetSet,
+        incoming: TargetSet,
+    ) -> bool {
+        found.open |= incoming.open;
+
+        if !self.charge_work(
+            crate::analysis::work::Event::TraversalEdge,
+            (found.known.len() + incoming.known.len()) as u64,
+        ) {
+            found.open = true;
+
+            return false;
+        }
+
+        let mut seen: HashSet<FunctionId> = found.known.iter().copied().collect();
+
+        found.known.extend(
+            incoming
+                .known
+                .into_iter()
+                .filter(|target| seen.insert(*target)),
+        );
+
+        true
+    }
+
+    pub(crate) fn iterator_accessors_on(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        key: MemberKey,
+    ) -> TargetSet {
+        let kind = self.iteration_kind_of(file, expression, 0);
+
+        if is_builtin(kind)
+            || self.is_intrinsic_iterator(file, expression)
+            || self.is_generator_call(file, expression)
+        {
+            self.index_targets();
+
+            if !self.may_access(Some(&key)) {
+                return closed_targets_of();
+            }
+
+            let keyed = self.wide_summary_of(Some(key), kind, false, true);
+            let any = self.wide_summary_of(None, kind, false, true);
+
+            return TargetSet {
+                known: keyed.getters,
+                open: keyed.accessors_open || any.accessors_open,
+            };
+        }
+
+        self.property_accessors_of((file, expression), key, false)
+    }
+
+    pub(crate) fn iterable_elements_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> (Vec<Valued<'a>>, bool) {
+        if depth > MAXIMUM_ALIAS_DEPTH || !self.charge_dispatch() {
+            return (Vec::new(), true);
+        }
+
+        if let Expression::ArrayExpression(array) = unwrap(expression) {
+            if !self.charge_targets(array.elements.len() as u64) {
+                return (Vec::new(), true);
+            }
+
+            let mut values = Vec::new();
+            let mut open = false;
+
+            for element in &array.elements {
+                match element {
+                    ArrayExpressionElement::SpreadElement(spread) => {
+                        let (found, unresolved) =
+                            self.iterable_elements_of(file, &spread.argument, depth + 1);
+
+                        values.extend(found);
+
+                        open |= unresolved;
+                    }
+                    _ => values.extend(element.as_expression().map(|value| (file, value))),
+                }
+            }
+
+            return (values, open);
+        }
+
+        if let Some((source, value)) = self.constant_source_of(file, expression) {
+            return self.iterable_elements_of(source, value, depth + 1);
+        }
+
+        self.property_values_of((file, expression), &MemberKey::Index)
+    }
+
+    pub(crate) fn entry_values_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        index: usize,
+    ) -> (Vec<Valued<'a>>, bool) {
+        if matches!(unwrap(expression), Expression::ArrayExpression(_)) {
+            let found = self.literal_element_values_of(file, expression, index, 0);
+
+            return (found.values, found.replaced || found.accessors_open);
+        }
+
+        self.property_values_of((file, expression), &MemberKey::Name(index.to_string()))
+    }
+
+    fn iterator_methods_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        keys: &[MemberKey],
+    ) -> TargetSet {
+        let kind = self.iteration_kind_of(file, expression, 0);
+        let mut found = if is_builtin(kind) && !is_builtin(self.declared_kind_of(file, expression))
+        {
+            let mut found = closed_targets_of();
+
+            for key in keys {
+                let targets = self.wide_protocol_of(key, kind);
+
+                if !self.merge_iterator_targets(&mut found, targets) {
+                    break;
+                }
+            }
+
+            found
+        } else {
+            self.protocol_targets_of(file, expression, keys)
+        };
+        let mut visited = HashSet::new();
+
+        for key in keys {
+            let getters = self.iterator_accessors_on(file, expression, key.clone());
+
+            found.open |= getters.open;
+
+            if !self.charge_work(
+                crate::analysis::work::Event::TraversalEdge,
+                (found.known.len() + getters.known.len()) as u64,
+            ) {
+                found.open = true;
+
+                return found;
+            }
+
+            let excluded: HashSet<FunctionId> = getters.known.iter().copied().collect();
+
+            found.known.retain(|target| !excluded.contains(target));
+
+            for getter in getters.known {
+                let returned = self.returned_expressions_of(getter);
+
+                for value in returned {
+                    if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                        found.open = true;
+
+                        return found;
+                    }
+
+                    if !self.is_primitive_operand(getter.file, value) {
+                        self.collect_callable_targets(getter.file, value, &mut visited, &mut found);
+                    }
+                }
+            }
+        }
+
+        found
+    }
+
     pub(crate) fn iteration_of(
         &mut self,
         file: FileId,
@@ -728,11 +909,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.index_targets();
 
+        let native = self.is_intrinsic_iterator(file, iterable)
+            || is_builtin(self.iteration_kind_of(file, iterable, 0));
+
         if !["@@iterator", "@@asyncIterator", "next", "return"]
             .iter()
             .any(|name| self.may_implement(&protocol_key_of(name)))
         {
             return Iteration {
+                native,
+                asynchronous,
                 acquire: closed_targets_of(),
                 next: closed_targets_of(),
                 close: closed_targets_of(),
@@ -741,16 +927,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if self.is_generator_call(file, iterable) || self.is_intrinsic_iterator(file, iterable) {
             return Iteration {
+                native,
+                asynchronous,
                 acquire: closed_targets_of(),
                 next: self.intrinsic_protocol_of(site, "next"),
                 close: self.intrinsic_protocol_of(site, "return"),
             };
         }
 
-        let acquire = self.protocol_targets_of(file, iterable, &acquire_keys);
+        let acquire = self.iterator_methods_of(file, iterable, &acquire_keys);
 
         if acquire.open {
             return Iteration {
+                native: false,
+                asynchronous,
                 next: acquire.clone(),
                 close: acquire.clone(),
                 acquire,
@@ -758,10 +948,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if acquire.known.is_empty() {
-            let kind = self.declared_kind_of(file, iterable);
+            let kind = self.iteration_kind_of(file, iterable, 0);
 
             if !is_builtin(kind) {
                 return Iteration {
+                    native,
+                    asynchronous,
                     acquire,
                     next: closed_targets_of(),
                     close: closed_targets_of(),
@@ -769,6 +961,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             return Iteration {
+                native,
+                asynchronous,
                 acquire,
                 next: self.intrinsic_protocol_of(site, "next"),
                 close: self.intrinsic_protocol_of(site, "return"),
@@ -797,6 +991,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         });
 
         Iteration {
+            native: false,
+            asynchronous,
             acquire,
             next,
             close,
@@ -1256,8 +1452,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Expression::ThisExpression(_) => (file, iterable),
                 _ => (function.file, returned),
             };
-            let targets =
-                self.protocol_targets_within(source, expression, std::slice::from_ref(key));
+            let targets = self.iterator_methods_of(source, expression, std::slice::from_ref(key));
 
             found.open |= targets.open;
 
@@ -1267,6 +1462,140 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         found
+    }
+
+    pub(crate) fn intrinsic_member_targets_of(
+        &mut self,
+        kind: Kind,
+        name: &str,
+    ) -> (TargetSet, TargetSet) {
+        let key = protocol_key_of(name);
+
+        self.index_targets();
+
+        let mut methods = closed_targets_of();
+
+        if self.may_implement(&key) {
+            let keyed = self.wide_summary_of(Some(key.clone()), kind, false, true);
+            let any = self.wide_summary_of(None, kind, false, true);
+
+            methods.known = keyed.known;
+            methods.open = keyed.callables_open || any.replaced || any.callables_open;
+        }
+
+        let accessors = if self.may_access(Some(&key)) {
+            let keyed = self.wide_summary_of(Some(key), kind, false, true);
+            let any = self.wide_summary_of(None, kind, false, true);
+
+            TargetSet {
+                known: keyed.getters,
+                open: keyed.accessors_open || any.accessors_open,
+            }
+        } else {
+            closed_targets_of()
+        };
+
+        (methods, accessors)
+    }
+
+    fn indexed_accessor_keys(&mut self) -> Vec<MemberKey> {
+        self.index_targets();
+
+        if !self.charge_targets(self.values.targets.accessor_keys.len() as u64) {
+            return vec![MemberKey::Index];
+        }
+
+        let mut keys: Vec<_> = self
+            .values
+            .targets
+            .accessor_keys
+            .iter()
+            .filter_map(|key| match key {
+                Some(MemberKey::Index) => Some(MemberKey::Index),
+                Some(MemberKey::Name(name)) if is_index_name(name) => {
+                    Some(MemberKey::Name(name.clone()))
+                }
+                None => Some(MemberKey::Index),
+                _ => None,
+            })
+            .collect();
+
+        keys.sort_by(|left, right| match (left, right) {
+            (MemberKey::Name(left), MemberKey::Name(right)) => left.cmp(right),
+            (MemberKey::Index, MemberKey::Name(_)) => std::cmp::Ordering::Less,
+            (MemberKey::Name(_), MemberKey::Index) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        });
+        keys.dedup();
+
+        keys
+    }
+
+    pub(crate) fn has_indexed_accessors(&mut self) -> bool {
+        !self.indexed_accessor_keys().is_empty() || self.work_exhausted()
+    }
+
+    pub(crate) fn indexed_accessors_of(&mut self) -> TargetSet {
+        let keys = self.indexed_accessor_keys();
+        let mut found = closed_targets_of();
+
+        for key in keys {
+            let keyed = self.wide_summary_of(Some(key), Kind::Other, false, true);
+            let any = self.wide_summary_of(None, Kind::Other, false, true);
+
+            if !self.merge_iterator_targets(
+                &mut found,
+                TargetSet {
+                    known: keyed.getters,
+                    open: keyed.accessors_open || any.accessors_open,
+                },
+            ) {
+                break;
+            }
+        }
+
+        found.open |= self.work_exhausted();
+
+        found
+    }
+
+    pub(crate) fn indexed_accessors_on(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> TargetSet {
+        let keys = self.indexed_accessor_keys();
+        let mut found = closed_targets_of();
+
+        for key in keys {
+            let targets = self.property_accessors_of((file, expression), key, false);
+
+            if !self.merge_iterator_targets(&mut found, targets) {
+                break;
+            }
+        }
+
+        found.open |= self.work_exhausted();
+
+        found
+    }
+
+    pub(crate) fn intrinsic_iterator_accessors_of(&mut self, name: &str) -> TargetSet {
+        let key = MemberKey::Name(name.to_string());
+
+        self.index_targets();
+
+        if !self.may_access(Some(&key)) {
+            return closed_targets_of();
+        }
+
+        let keyed = self.wide_summary_of(Some(key), Kind::Other, false, true);
+        let any = self.wide_summary_of(None, Kind::Other, false, true);
+
+        TargetSet {
+            known: keyed.getters,
+            open: keyed.accessors_open || any.accessors_open,
+        }
     }
 
     pub(crate) fn intrinsic_protocol_of(&mut self, site: Site, name: &str) -> TargetSet {
@@ -1375,6 +1704,228 @@ impl<'p, 'a> Analysis<'p, 'a> {
             })
     }
 
+    pub(crate) fn iteration_kind_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> Kind {
+        let site = (file, expression.node_id());
+
+        if let Some(kind) = self.values.iteration_static.get(&site).copied() {
+            return match self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                true => kind,
+                false => Kind::Unknown,
+            };
+        }
+
+        if depth > MAXIMUM_ALIAS_DEPTH || !self.charge_dispatch() {
+            return Kind::Unknown;
+        }
+
+        let declared = match unwrap(expression) {
+            Expression::ComputedMemberExpression(member)
+                if self.is_numeric_key(file, &member.expression, 0) =>
+            {
+                self.declared_element_kind_of(file, &member.object)
+            }
+            _ => self.declared_kind_of(file, expression),
+        };
+
+        if is_builtin(declared) {
+            self.values.iteration_static.insert(site, declared);
+
+            return declared;
+        }
+
+        if matches!(unwrap(expression), Expression::ObjectExpression(_)) {
+            self.values.iteration_static.insert(site, Kind::Other);
+
+            return Kind::Other;
+        }
+
+        if matches!(unwrap(expression), Expression::ArrayExpression(_)) {
+            self.values.iteration_static.insert(site, Kind::Array);
+
+            return Kind::Array;
+        }
+
+        match unwrap(expression) {
+            Expression::Identifier(reference) => {
+                let declaration = self
+                    .declarations
+                    .of_reference(self.project, file, reference);
+
+                if let Some((source, value)) =
+                    declaration.and_then(crate::constants::constant_initializer_of)
+                {
+                    let kind = self.iteration_kind_of(source, value, depth + 1);
+
+                    if self
+                        .values
+                        .iteration_static
+                        .contains_key(&(source, value.node_id()))
+                        && !self.work_exhausted()
+                    {
+                        self.values.iteration_static.insert(site, kind);
+                    }
+
+                    return kind;
+                }
+
+                let values = match declaration {
+                    Some(
+                        declaration @ Declaration::Parameter {
+                            file: target,
+                            function,
+                            parameter: crate::declarations::ParameterNode::Formal(parameter),
+                            ..
+                        },
+                    ) => {
+                        let Some(binding) = self.parameter_binding_of(declaration) else {
+                            return Kind::Unknown;
+                        };
+
+                        if !self.is_parameter_unwritten(binding) {
+                            return Kind::Unknown;
+                        }
+
+                        if let Some(kind) = self
+                            .current_substitutions
+                            .get(&binding)
+                            .and_then(|facts| self.values.iteration_kinds.get(&facts.value.value))
+                            .copied()
+                        {
+                            return kind;
+                        }
+
+                        let Some(arguments) = self.call_arguments_of(target, function, parameter)
+                        else {
+                            return Kind::Unknown;
+                        };
+
+                        if !self.charge_targets(arguments.len() as u64) {
+                            return Kind::Unknown;
+                        }
+
+                        let Some(values) = arguments.into_iter().collect::<Option<Vec<_>>>() else {
+                            return Kind::Unknown;
+                        };
+
+                        values
+                    }
+                    _ => self.local_values_of(file, reference).unwrap_or_default(),
+                };
+
+                if !self.charge_targets(values.len() as u64) {
+                    return Kind::Unknown;
+                }
+
+                let mut known = None;
+
+                for (source, value) in values {
+                    let kind = self.iteration_kind_of(source, value, depth + 1);
+
+                    if !is_builtin(kind) || known.is_some_and(|previous| previous != kind) {
+                        return Kind::Unknown;
+                    }
+
+                    known = Some(kind);
+                }
+
+                known.unwrap_or(Kind::Unknown)
+            }
+            Expression::CallExpression(call) => {
+                let Some(member) = member_expression_of(unwrap(&call.callee)) else {
+                    return self.returned_iteration_kind_of(file, call, depth + 1);
+                };
+                let Some(MemberKey::Name(name)) = self.member_key_of(file, member) else {
+                    return Kind::Unknown;
+                };
+                let kind = self.iteration_kind_of(file, member.object(), depth + 1);
+                let returned = match (kind, name.as_str()) {
+                    (
+                        Kind::Array,
+                        "slice" | "subarray" | "map" | "filter" | "flat" | "flatMap" | "concat"
+                        | "toSorted" | "toReversed" | "toSpliced" | "with",
+                    ) => Kind::Array,
+                    (
+                        Kind::String,
+                        "slice" | "substring" | "substr" | "repeat" | "padStart" | "padEnd"
+                        | "concat" | "replace" | "replaceAll" | "trim" | "trimStart" | "trimEnd"
+                        | "toLowerCase" | "toUpperCase",
+                    ) => Kind::String,
+                    (Kind::String, "split") => Kind::Array,
+                    _ => Kind::Unknown,
+                };
+
+                if !is_builtin(returned) {
+                    return Kind::Unknown;
+                }
+
+                let dispatch = self.member_dispatch_of(file, member);
+
+                match dispatch.known.is_empty()
+                    && !dispatch.replaced
+                    && !self.intrinsic_replaced_of(file, &call.callee)
+                {
+                    true => returned,
+                    false => Kind::Unknown,
+                }
+            }
+            _ => self.proven_kind_of(file, expression, depth + 1),
+        }
+    }
+
+    fn returned_iteration_kind_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        depth: usize,
+    ) -> Kind {
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        if targets.open
+            || targets.known.is_empty()
+            || !self.charge_targets(targets.known.len() as u64)
+        {
+            return Kind::Unknown;
+        }
+
+        let mut known = None;
+
+        for target in targets.known {
+            if self.is_deferred_function(target) {
+                return Kind::Unknown;
+            }
+
+            let returned = self.returned_expressions_of(target);
+
+            if returned.is_empty() || !self.charge_targets(returned.len() as u64) {
+                return Kind::Unknown;
+            }
+
+            for expression in returned {
+                let kind = self.iteration_kind_of(target.file, expression, depth + 1);
+
+                if !is_builtin(kind)
+                    || self
+                        .values
+                        .iteration_static
+                        .get(&(target.file, expression.node_id()))
+                        != Some(&kind)
+                    || known.is_some_and(|previous| previous != kind)
+                {
+                    return Kind::Unknown;
+                }
+
+                known = Some(kind);
+            }
+        }
+
+        known.unwrap_or(Kind::Unknown)
+    }
+
     fn is_intrinsic_iterator(&mut self, file: FileId, expression: &'a Expression<'a>) -> bool {
         let Some(call) = call_of(unwrap(expression)) else {
             return false;
@@ -1397,6 +1948,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let dispatch = self.member_dispatch_of(file, member);
 
         dispatch.known.is_empty() && !dispatch.replaced
+    }
+
+    pub(crate) fn intrinsic_iteration_source_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Option<&'a Expression<'a>> {
+        if !self.is_intrinsic_iterator(file, expression) {
+            return None;
+        }
+
+        member_expression_of(unwrap(&call_of(unwrap(expression))?.callee))
+            .map(|member| member.object())
     }
 
     fn construction_dispatch_within(
@@ -5543,6 +6107,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for index in indices {
             if !self.charge_dispatch() {
                 summary.replaced = true;
+                summary.callables_open = true;
 
                 break;
             }
@@ -5572,6 +6137,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if self.values.targets.writes[index].kind == WriteKind::Prototype {
                 summary.replaced = true;
+                summary.callables_open = true;
 
                 summary.prototypes.push(index);
 
@@ -5579,6 +6145,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             summary.replaced |= callable;
+
+            if callable && written.is_some() {
+                let site = self.values.targets.writes[index].site;
+                let supplied = self
+                    .write_parts_of(site)
+                    .is_some_and(|(_, value)| value.is_some());
+                let getter = matches!(
+                    self.descriptor_of(site),
+                    Descriptor::Known {
+                        getter: Some(_),
+                        ..
+                    }
+                );
+
+                summary.callables_open |= !supplied && !getter;
+            }
 
             if written.is_some() {
                 self.apply_write(index, &mut found);
@@ -5598,7 +6180,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let mut targets = TargetSet {
             known: found.functions,
-            open: true,
+            open: summary.callables_open || summary.accessors_open,
         };
         let mut visited = HashSet::new();
 
@@ -5606,6 +6188,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.collect_callable_targets(target, value, &mut visited, &mut targets);
         }
 
+        summary.callables_open |= targets.open;
         summary.known = targets.known;
 
         self.values.targets.summaries.insert(cache, summary.clone());

@@ -1,15 +1,15 @@
 public coverage [partial]
 # tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 135 public functions
 
-O((xs * xs^2)) > O(N^2)  coldFunctionTagged  src/branches.ts:53  via src/index.ts
-    in loop for-of                                           src/branches.ts:55  x N
+O(max(1, (xs * xs^2))) > O(N^2)  coldFunctionTagged  src/branches.ts:53  via src/index.ts
+    in loop for-of                                           src/branches.ts:55  x xs
         in loop for-of                                       src/branches.ts:55  x N
             in loop for-of                                   src/branches.ts:55  x N
 
-O((matrix * matrix^2)) > O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src/index.ts
-    in loop for-of                                           src/types.ts:72  x N
+O(max(1, (matrix * matrix^2))) > O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src/index.ts
+    in loop for-of                                           src/types.ts:72  x matrix
         in loop for-of                                       src/types.ts:72  x N
             in loop for-of                                   src/types.ts:72  x N
 
 2 over limit
-59 partial results
+58 partial results

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use oxc_ast::ast::{
     Argument, CallExpression, Expression, MemberExpression, NewExpression, ObjectPropertyKind,
     RegExpFlags,
@@ -14,9 +16,9 @@ use crate::declared_types::Kind;
 use crate::invocations::{coercion_keys, iteration_keys};
 use crate::project::FileId;
 use crate::syntax::{body_root_of, identifier_of, member_expression_of, unwrap};
-use crate::tables::STRING_LINEAR;
+use crate::tables::{STRING_LINEAR, TYPED_ARRAYS};
 use crate::unknowns::UnknownReason;
-use crate::values::{protocol_key_of, MemberKey, Size};
+use crate::values::{protocol_key_of, ArgumentFacts, MemberKey, Size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Identity {
@@ -185,6 +187,26 @@ const fn writing(model: NativeModel, receiver: Role) -> NativeModel {
 pub static MODELS: &[NativeModel] = &[
     producing(
         model_of(
+            Identity::Constructor,
+            TYPED_ARRAYS,
+            Work::Linear(Operand::First),
+            &[Role::Iterated],
+            Role::Read,
+        ),
+        Output::Copied,
+    ),
+    producing(
+        model_of(
+            Identity::Constructor,
+            &["Set", "Map"],
+            Work::Linear(Operand::First),
+            &[Role::Iterated],
+            Role::Read,
+        ),
+        Output::Copied,
+    ),
+    producing(
+        model_of(
             Identity::Namespace("Array"),
             &["from"],
             Work::Linear(Operand::First),
@@ -225,12 +247,15 @@ pub static MODELS: &[NativeModel] = &[
         &[Role::Written],
         Role::Inspected,
     ),
-    model_of(
-        Identity::Namespace("Object"),
-        &["fromEntries"],
-        Work::Linear(Operand::First),
-        &[Role::Opaque],
-        Role::Read,
+    producing(
+        model_of(
+            Identity::Namespace("Object"),
+            &["fromEntries"],
+            Work::Linear(Operand::First),
+            &[Role::Iterated],
+            Role::Read,
+        ),
+        Output::Copied,
     ),
     model_of(
         Identity::Namespace("Object"),
@@ -709,7 +734,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub(crate) fn construction_model_of(
-        &self,
+        &mut self,
         file: FileId,
         new: &'a NewExpression<'a>,
     ) -> Option<&'static NativeModel> {
@@ -717,6 +742,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if !self.is_intrinsic_reference(file, reference) {
             return None;
+        }
+
+        if TYPED_ARRAYS.contains(&reference.name.as_str()) {
+            let source = new.arguments.first()?.as_expression()?;
+
+            if self.is_primitive_operand(file, source) {
+                return None;
+            }
+
+            if let Expression::NewExpression(buffer) = unwrap(source) {
+                if let Some(name) = identifier_of(unwrap(&buffer.callee)) {
+                    if matches!(name.name.as_str(), "ArrayBuffer" | "SharedArrayBuffer")
+                        && self.is_intrinsic_reference(file, name)
+                        && !self.intrinsic_replaced_of(file, &buffer.callee)
+                    {
+                        return None;
+                    }
+                }
+            }
         }
 
         native_model_of(Identity::Constructor, reference.name.as_str())
@@ -797,7 +841,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let unresolved = visits == Some(Visits::Unresolved);
+        let unresolved = visits == Some(Visits::Unresolved)
+            || (model.arguments.first() == Some(&Role::Iterated) && !charge.length_resolved);
         let bounded = charge.length.is_one() || unresolved;
         let mut inner = Reading::empty();
         let mut beside = match model.receiver {
@@ -810,10 +855,76 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => Reading::empty(),
         };
 
+        if let Some((methods, accessors)) = self.constructor_adder_of(site, model) {
+            let getter = self.implicit_call_reading_of(
+                (file, site.span),
+                &accessors,
+                "collection adder getter",
+                &[],
+            );
+            let adder = self.constructor_adder_reading_of(site, &methods);
+
+            beside = beside.merge(getter, &mut self.unknowns, &mut self.traces);
+            inner = inner.merge(adder, &mut self.unknowns, &mut self.traces);
+        }
+
+        let entries = self.constructor_entry_reading_of(site, model);
+
+        inner = inner.merge(entries, &mut self.unknowns, &mut self.traces);
+
+        if let Some(source) = site.expression_at(0) {
+            if (model.identity == Identity::Constructor
+                && TYPED_ARRAYS.contains(&site.name.as_str()))
+                || (model.identity == Identity::Namespace("Array") && site.name == "from")
+            {
+                let iteration = self.iteration_of(file, source, false);
+
+                if iteration.acquire.open || iteration.acquire.known.is_empty() {
+                    let length = self.property_accessors_of(
+                        (file, source),
+                        MemberKey::Name("length".to_string()),
+                        false,
+                    );
+                    let indexed = self.indexed_accessors_on(file, source);
+                    let length = self.implicit_call_reading_of(
+                        (file, site.span),
+                        &length,
+                        "arraylike length getter",
+                        &[source],
+                    );
+                    let indexed = self.implicit_call_reading_of(
+                        (file, site.span),
+                        &indexed,
+                        "arraylike index getter",
+                        &[source],
+                    );
+
+                    beside = beside.merge(length, &mut self.unknowns, &mut self.traces);
+                    inner = inner.merge(indexed, &mut self.unknowns, &mut self.traces);
+
+                    let (lengths, _) = self
+                        .property_values_of((file, source), &MemberKey::Name("length".to_string()));
+
+                    for (source_file, length) in lengths {
+                        if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                            break;
+                        }
+
+                        let converted = self.operand_coercion_part_of(source_file, length);
+
+                        beside = beside.merge(converted, &mut self.unknowns, &mut self.traces);
+                    }
+                }
+            }
+        }
+
+        let conversions = self.constructor_conversion_reading_of(site, model);
+
+        inner = inner.merge(conversions, &mut self.unknowns, &mut self.traces);
+
         for (index, argument) in site.arguments.iter().enumerate() {
             let role = site.role_of(model, index);
-            let (part, count) =
-                self.argument_part_of(site, argument, role, model.identity == Identity::Promise);
+            let (part, count) = self.argument_part_of(site, argument, role, model);
             let count = match (role, model.arguments.first(), site.expression_at(0)) {
                 (Role::Callback(_), Some(Role::Pattern(_)), Some(pattern))
                     if self.is_matched_once_pattern(pattern) =>
@@ -990,6 +1101,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Some(format!("{owner}.{}({argument})", site.name))
             }
             Identity::Function => Some(format!("{}()", site.name)),
+            Identity::Constructor => Some(format!("new {}()", site.name)),
             Identity::Receiver(Kind::Array | Kind::Set | Kind::Map) => {
                 let receiver = site
                     .receiver
@@ -1029,7 +1141,145 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    fn arraylike_input_of(&mut self, site: &NativeSite<'a>, model: &NativeModel) -> bool {
+        if !((model.identity == Identity::Constructor
+            && TYPED_ARRAYS.contains(&site.name.as_str()))
+            || (model.identity == Identity::Namespace("Array") && site.name == "from"))
+        {
+            return false;
+        }
+
+        let Some(source) = site.expression_at(0) else {
+            return false;
+        };
+
+        if !matches!(unwrap(source), Expression::ObjectExpression(_)) {
+            return false;
+        }
+
+        let iteration = self.iteration_of(site.file, source, false);
+        let getter = self.property_accessors_of(
+            (site.file, source),
+            MemberKey::WellKnown("iterator".to_string()),
+            false,
+        );
+
+        !iteration.acquire.open
+            && iteration.acquire.known.is_empty()
+            && !getter.open
+            && getter.known.is_empty()
+    }
+
+    fn arraylike_size_of(&mut self, file: FileId, source: &'a Expression<'a>) -> Size {
+        let (values, open) =
+            self.property_values_of((file, source), &MemberKey::Name("length".to_string()));
+
+        if open {
+            return Size::unresolved();
+        }
+
+        let mut counts = Vec::new();
+
+        for (file, value) in values {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                return Size::unresolved();
+            }
+
+            if matches!(self.known_value(file, value).value.as_deref(), Ok(crate::values::Primitive::Number(length)) if length.is_finite())
+            {
+                counts.push(Cost::ONE);
+
+                continue;
+            }
+
+            let Some(count) = self.count_of(file, value) else {
+                return Size::unresolved();
+            };
+
+            counts.push(count);
+        }
+
+        if counts.is_empty() {
+            return Size::constant();
+        }
+
+        match Cost::maximum(counts) {
+            Ok(length) => Size {
+                exceeds: true,
+                ..Size::sized(length)
+            },
+            Err(_) => Size::unresolved(),
+        }
+    }
+
+    fn iterates_argument_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+        source: &'a Expression<'a>,
+    ) -> bool {
+        if model.identity == Identity::Constructor
+            && matches!(site.name.as_str(), "Set" | "Map")
+            && matches!(
+                self.known_value(site.file, source).value.as_deref(),
+                Ok(crate::values::Primitive::Null | crate::values::Primitive::Undefined)
+            )
+        {
+            return false;
+        }
+
+        if self.arraylike_input_of(site, model) {
+            return false;
+        }
+
+        true
+    }
+
+    fn iterated_size_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+        depth: usize,
+    ) -> Option<Size> {
+        if model.arguments.first() != Some(&Role::Iterated) {
+            return None;
+        }
+
+        let Some(source) = site.expression_at(0) else {
+            return Some(Size::constant());
+        };
+
+        if self.arraylike_input_of(site, model) {
+            return Some(self.arraylike_size_of(site.file, source));
+        }
+
+        let mut size = match self.iterates_argument_of(site, model, source) {
+            true => self.iterable_size_at(site.file, source, depth + 1),
+            false => return Some(Size::constant()),
+        };
+
+        match self.traversal_visits_of(site, model) {
+            Some(Visits::Unresolved) => size.length_resolved = false,
+            Some(Visits::Budgeted(budget)) => {
+                match Cost::maximum(vec![size.length.clone(), budget.cost]) {
+                    Ok(length) => {
+                        size.length = length;
+                        size.exceeds = true;
+                    }
+                    Err(_) => size.length_resolved = false,
+                }
+            }
+            _ => {}
+        }
+
+        Some(size)
+    }
+
     fn native_charge_of(&mut self, site: &NativeSite<'a>, model: &NativeModel) -> Size {
+        if let Some(size) = self.iterated_size_of(site, model, 0) {
+            return size;
+        }
+
         let file = site.file;
 
         match model.work {
@@ -1126,7 +1376,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site: &NativeSite<'a>,
         argument: &'a Argument<'a>,
         role: Role,
-        promise_handler: bool,
+        model: &NativeModel,
     ) -> (Reading, Count) {
         let file = site.file;
         let Some(expression) = argument.as_expression() else {
@@ -1144,11 +1394,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.searched_part_of(file, expression, pattern.keys),
                 Count::Once,
             ),
-            Role::Iterated => (
-                self.delegated_part_of(file, expression.span(), expression, false)
-                    .unwrap_or_default(),
-                Count::Once,
-            ),
+            Role::Iterated => {
+                let reading = match self.iterates_argument_of(site, model, expression) {
+                    true => self
+                        .delegated_part_of(file, expression.span(), expression, false)
+                        .unwrap_or_default(),
+                    false => Reading::empty(),
+                };
+
+                (reading, Count::Once)
+            }
             Role::Inspected => (self.inspected_part_of(file, expression), Count::Once),
             Role::Serialized => (self.serialized_part_of(file, expression), Count::Once),
             Role::Written | Role::Grown | Role::Shrunk => {
@@ -1166,7 +1421,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
 
                 let facts = self.argument_facts_of(file, argument);
-                let part = match promise_handler {
+                let part = match model.identity == Identity::Promise {
                     true => self.invoke_promise_handler(&facts, file, argument.span()),
                     false => self.invoke_callback(&facts, file, argument.span(), &[]),
                 };
@@ -1289,31 +1544,429 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    fn constructor_elements_of(
+        &mut self,
+        site: &NativeSite<'a>,
+    ) -> (Vec<(FileId, &'a Expression<'a>)>, bool) {
+        let Some(source) = site.expression_at(0) else {
+            return (Vec::new(), false);
+        };
+        let (mut elements, mut open) = self.iterable_elements_of(site.file, source, 0);
+
+        if !self.charge_work(
+            crate::analysis::work::Event::TraversalEdge,
+            elements.len() as u64,
+        ) {
+            return (elements, true);
+        }
+
+        let mut seen: HashSet<_> = elements
+            .iter()
+            .map(|(file, value)| (*file, value.node_id()))
+            .collect();
+        let iteration = self.iteration_of(site.file, source, false);
+
+        open |= iteration.acquire.open || iteration.next.open;
+
+        for target in iteration.next.known {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                return (elements, true);
+            }
+
+            for returned in self.returned_expressions_of(target) {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    return (elements, true);
+                }
+
+                let (values, unresolved) = self.property_values_of(
+                    (target.file, returned),
+                    &MemberKey::Name("value".to_string()),
+                );
+
+                open |= unresolved;
+
+                if !self.charge_work(
+                    crate::analysis::work::Event::TraversalEdge,
+                    values.len() as u64,
+                ) {
+                    return (elements, true);
+                }
+
+                elements.extend(
+                    values
+                        .into_iter()
+                        .filter(|(file, value)| seen.insert((*file, value.node_id()))),
+                );
+            }
+        }
+
+        (elements, open)
+    }
+
+    fn constructor_conversion_reading_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+    ) -> Reading {
+        if model.identity != Identity::Constructor || !TYPED_ARRAYS.contains(&site.name.as_str()) {
+            return Reading::empty();
+        }
+
+        if !self.may_implement_any(&coercion_keys()) {
+            return Reading::empty();
+        }
+
+        let (elements, open) = self.constructor_elements_of(site);
+
+        let mut reading = Reading::empty();
+
+        if open || elements.is_empty() {
+            for name in ["@@toPrimitive", "valueOf", "toString"] {
+                let (mut methods, accessors) = self.intrinsic_member_targets_of(Kind::Other, name);
+
+                self.merge_iterator_targets(&mut methods, accessors);
+
+                methods.open = true;
+
+                let found = self.implicit_call_reading_of(
+                    (site.file, site.span),
+                    &methods,
+                    "typed array element conversion",
+                    &[],
+                );
+
+                reading = reading.merge(found, &mut self.unknowns, &mut self.traces);
+            }
+        }
+
+        for (file, element) in elements {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                return self.unresolved_native_reading_of(site, reading);
+            }
+
+            let found = self.operand_coercion_part_of(file, element);
+
+            reading = reading.merge(found, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn constructor_adder_arguments_of(
+        &mut self,
+        site: &NativeSite<'a>,
+    ) -> (Vec<Vec<Option<ArgumentFacts>>>, bool) {
+        let (elements, mut open) = self.constructor_elements_of(site);
+
+        let mut arguments = Vec::new();
+
+        for (file, element) in elements {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                return (arguments, true);
+            }
+
+            if site.name == "Set" {
+                if !self.charge_work(crate::analysis::work::Event::CallbackDescriptor, 1) {
+                    open = true;
+
+                    break;
+                }
+
+                let (facts, resolved) = self.supplied_value_facts_of(file, element);
+
+                open |= !resolved;
+
+                arguments.push(vec![Some(facts)]);
+
+                continue;
+            }
+
+            let (keys, keys_open) = self.entry_values_of(file, element, 0);
+            let (values, values_open) = self.entry_values_of(file, element, 1);
+
+            open |= keys_open || values_open || keys.is_empty() || values.is_empty();
+
+            for (key_file, key) in keys {
+                for (value_file, value) in &values {
+                    if !self.charge_work(crate::analysis::work::Event::CallbackDescriptor, 1) {
+                        return (arguments, true);
+                    }
+
+                    let (key, key_resolved) = self.supplied_value_facts_of(key_file, key);
+                    let (value, value_resolved) = self.supplied_value_facts_of(*value_file, value);
+
+                    open |= !key_resolved || !value_resolved;
+
+                    arguments.push(vec![Some(key), Some(value)]);
+                }
+            }
+        }
+
+        open |= arguments.is_empty();
+
+        if open {
+            arguments.push(vec![None; if site.name == "Set" { 1 } else { 2 }]);
+        }
+
+        (arguments, open)
+    }
+
+    fn constructor_adder_reading_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        targets: &TargetSet,
+    ) -> Reading {
+        if targets.known.is_empty() && !targets.open {
+            return Reading::empty();
+        }
+
+        let (arguments, open) = self.constructor_adder_arguments_of(site);
+        let mut reading = Reading::empty();
+        let origin = self.source_span(site.file, site.span);
+
+        for target in &targets.known {
+            for supplied in &arguments {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    return self.unresolved_native_reading_of(site, reading);
+                }
+
+                let (called, cyclic) =
+                    self.call_supplied(*target, (site.file, site.span), (supplied.clone(), None));
+                let called = called.called(origin, &mut self.unknowns);
+                let called =
+                    self.called_reading_of(target.file, self.function_at(*target), called, cyclic);
+
+                reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+            }
+        }
+
+        if targets.open || open {
+            reading = self.unresolved_native_reading_of(site, reading);
+        }
+
+        reading
+    }
+
+    fn constructor_entry_reading_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+    ) -> Reading {
+        if !((model.identity == Identity::Constructor && site.name == "Map")
+            || (model.identity == Identity::Namespace("Object") && site.name == "fromEntries"))
+        {
+            return Reading::empty();
+        }
+
+        let Some(source) = site.expression_at(0) else {
+            return Reading::empty();
+        };
+
+        if !self.iterates_argument_of(site, model, source) {
+            return Reading::empty();
+        }
+
+        let indexed = self.indexed_accessors_of();
+
+        if !self.has_indexed_accessors() && site.name != "fromEntries" {
+            return Reading::empty();
+        }
+
+        let (entries, open) = self.constructor_elements_of(site);
+
+        let mut reading = Reading::empty();
+
+        if open || entries.is_empty() {
+            let unresolved = TargetSet {
+                known: indexed.known,
+                open: true,
+            };
+
+            reading = self.implicit_call_reading_of(
+                (site.file, site.span),
+                &unresolved,
+                "map entry getter",
+                &[],
+            );
+        }
+
+        for (file, entry) in entries {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                return self.unresolved_native_reading_of(site, reading);
+            }
+
+            for name in ["0", "1"] {
+                let getters = self.property_accessors_of(
+                    (file, entry),
+                    MemberKey::Name(name.to_string()),
+                    false,
+                );
+                let found = self.implicit_call_reading_of(
+                    (site.file, site.span),
+                    &getters,
+                    "map entry getter",
+                    &[entry],
+                );
+
+                reading = reading.merge(found, &mut self.unknowns, &mut self.traces);
+            }
+
+            if site.name == "fromEntries" {
+                let (keys, open) = self.entry_values_of(file, entry, 0);
+
+                for (key_file, key) in keys {
+                    if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                        break;
+                    }
+
+                    let found = self.operand_coercion_part_of(key_file, key);
+
+                    reading = reading.merge(found, &mut self.unknowns, &mut self.traces);
+                }
+
+                if open || self.work_exhausted() {
+                    reading = self.unresolved_native_reading_of(site, reading);
+                }
+            }
+        }
+
+        reading
+    }
+
+    fn unresolved_native_reading_of(&mut self, site: &NativeSite<'a>, reading: Reading) -> Reading {
+        let reason = match self.work_exhausted() {
+            true => UnknownReason::ResourceExhaustion,
+            false => UnknownReason::Target,
+        };
+        let unknown = self.unknown_part(site.file, site.span, reason);
+
+        reading.merge(unknown, &mut self.unknowns, &mut self.traces)
+    }
+
+    fn constructor_adder_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        model: &NativeModel,
+    ) -> Option<(TargetSet, TargetSet)> {
+        if model.identity != Identity::Constructor {
+            return None;
+        }
+
+        let (kind, name) = match site.name.as_str() {
+            "Set" => (Kind::Set, "add"),
+            "Map" => (Kind::Map, "set"),
+            _ => return None,
+        };
+        let source = site.expression_at(0)?;
+
+        if !self.iterates_argument_of(site, model, source) {
+            return None;
+        }
+
+        let (mut methods, accessors) = self.intrinsic_member_targets_of(kind, name);
+
+        if !self.charge_work(
+            crate::analysis::work::Event::TraversalEdge,
+            (methods.known.len() + accessors.known.len()) as u64,
+        ) {
+            methods.open = true;
+
+            return Some((methods, accessors));
+        }
+
+        let excluded: HashSet<_> = accessors.known.iter().copied().collect();
+
+        methods.known.retain(|target| !excluded.contains(target));
+
+        for accessor in &accessors.known {
+            let returned = self.returned_expressions_of(*accessor);
+
+            if returned.is_empty() {
+                methods.open = true;
+            }
+
+            for value in returned {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    methods.open = true;
+
+                    return Some((methods, accessors));
+                }
+
+                let target = self.callee_targets_of_expression(accessor.file, value);
+
+                if !self.merge_iterator_targets(&mut methods, target) {
+                    return Some((methods, accessors));
+                }
+            }
+        }
+
+        methods.open |= accessors.open;
+
+        Some((methods, accessors))
+    }
+
     fn traversal_visits_of(
         &mut self,
         site: &NativeSite<'a>,
         model: &NativeModel,
     ) -> Option<Visits> {
         let file = site.file;
-        let index = (0..site.arguments.len())
-            .find(|index| site.role_of(model, *index) == Role::Callback(Count::PerVisit))?;
-        let receiver = site.receiver?;
-        let argument = &site.arguments[index];
-        let callback = argument.as_expression()?;
+        let iterated = model.arguments.first() == Some(&Role::Iterated);
+        let index = (0..site.arguments.len()).find(|index| {
+            matches!(site.role_of(model, *index), Role::Callback(Count::PerVisit))
+                || (iterated
+                    && matches!(
+                        site.role_of(model, *index),
+                        Role::Callback(Count::PerElement) | Role::Grouping
+                    ))
+        });
+        let receiver = match iterated {
+            true => site.expression_at(0)?,
+            false => site.receiver?,
+        };
+        let mut targets = TargetSet {
+            known: Vec::new(),
+            open: false,
+        };
 
-        if self.is_non_callable_argument(file, callback) {
-            return None;
+        if let Some(index) = index {
+            let argument = &site.arguments[index];
+            let callback = argument.as_expression()?;
+
+            if !self.is_non_callable_argument(file, callback) {
+                targets = self.argument_facts_of(file, argument).value.targets;
+                targets.open |= targets.known.is_empty();
+            }
         }
 
-        let targets = self.argument_facts_of(file, argument).value.targets;
+        if let Some((methods, accessors)) = self.constructor_adder_of(site, model) {
+            self.merge_iterator_targets(&mut targets, methods);
+            self.merge_iterator_targets(&mut targets, accessors);
+        }
 
-        if targets.open || targets.known.is_empty() {
+        if (model.identity == Identity::Constructor && site.name == "Map")
+            || (model.identity == Identity::Namespace("Object") && site.name == "fromEntries")
+        {
+            let indexed = self.indexed_accessors_of();
+
+            self.merge_iterator_targets(&mut targets, indexed);
+        }
+
+        if targets.open {
             return Some(Visits::Unresolved);
+        }
+
+        if targets.known.is_empty() {
+            return None;
         }
 
         let mut bodies = Vec::new();
 
         for target in targets.known {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                return Some(Visits::Unresolved);
+            }
+
             match body_root_of(self.function_at(target)) {
                 Some(body) => bodies.push((target.file, body)),
                 None => return Some(Visits::Unresolved),
@@ -1615,10 +2268,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
         match model.output {
             Output::Unrelated => None,
             Output::Copied => {
-                let source = match site.expression_at(0) {
-                    Some(source) => self.collection_size_at(file, source, next),
-                    None => Size::unresolved(),
+                let mut source = match self.iterated_size_of(site, model, next) {
+                    Some(source) => source,
+                    None => match site.expression_at(0) {
+                        Some(source) => self.collection_size_at(file, source, next),
+                        None => Size::unresolved(),
+                    },
                 };
+
+                if model.identity == Identity::Constructor {
+                    source.exceeds = true;
+
+                    if let Some((methods, accessors)) = self.constructor_adder_of(site, model) {
+                        if methods.open
+                            || accessors.open
+                            || !methods.known.is_empty()
+                            || !accessors.known.is_empty()
+                        {
+                            source.length_resolved = false;
+                        }
+                    }
+
+                    return Some(source);
+                }
 
                 match site.arguments.get(1) {
                     Some(callback) => {

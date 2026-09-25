@@ -97,7 +97,7 @@ fn c7_scan_per_depth_charges_the_scan_at_every_level() {
         assert!(part.is_complete());
         assert_eq!(
             text_of(analysis, &part.cost),
-            "O(max(n, values, (n * max(1, n, values))))"
+            "O(max(values, (n * max(1, values))))"
         );
     });
 }
@@ -193,10 +193,7 @@ fn mixed_inputs_keep_every_independent_dimension() {
     run_with_source(source, |analysis, file| {
         let part = summary_of(analysis, file, "f");
 
-        assert_eq!(
-            text_of(analysis, &part.cost),
-            "O(max(n, values, ys, (n * max(1, n, values, ys))))"
-        );
+        assert_eq!(text_of(analysis, &part.cost), "O((n * max(1, values, ys)))");
         assert!(part.is_complete());
     });
 }
@@ -386,31 +383,31 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
             "an array passed through",
             "f",
             "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
-            "O(max(n, xs, (n * max(1, n, xs))))",
+            "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "two arrays swapped between parameters",
             "f",
             "export function f(n: number, xs: number[], ys: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ys, xs); }",
-            "O(max(n, xs, ys, (n * max(1, n, xs, ys))))",
+            "O((n * max(1, xs, ys)))",
         ),
         (
             "a constant number",
             "f",
             "export function f(n: number, xs: number[], k: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; for (let i = 0; i < k && k >= 0 && k <= 1000000000; i++) t += i; return t + f(n - 1, xs, 3); }",
-            "O(max(n, xs, k, (n * max(1, n, xs, k))))",
+            "O(max(xs, k, (n * max(1, xs))))",
         ),
         (
             "a constant string",
             "f",
             "export function f(n: number, s: string): number { if (n <= 0) return 0; let t = 0; for (const c of s) t += c.length; return t + f(n - 1, \"ab\"); }",
-            "O(max(n, s, (n * max(1, n, s))))",
+            "O(max(n, s))",
         ),
         (
             "an omitted optional argument",
             "f",
             "export function f(n: number, xs: number[], k?: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
-            "O(max(n, xs, k, (n * max(1, n, xs, k))))",
+            "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "a constant alias of a parameter",
@@ -428,7 +425,7 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
             "a module function passed as its callback",
             "run",
             "function inc(x: number): number { return x + 1; }\nfunction f(n: number, xs: number[], g: (x: number) => number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += g(x); return t + f(n - 1, xs, inc); }\nexport function run(n: number, xs: number[]): number { return f(n, xs, inc); }",
-            "O(max(n, xs, (n * max(1, n, xs))))",
+            "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "a second number decremented under its guard",

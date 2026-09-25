@@ -964,13 +964,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Invalidation::default();
         }
 
-        let header = match loop_kind {
-            AstKind::ForOfStatement(statement) => match self.latent_of(file, &statement.right) {
-                Some(latent) => latent.storage,
-                None => self.header_storage_of(file, loop_kind, false),
-            },
-            _ => self.header_storage_of(file, loop_kind, false),
-        };
+        let header = self.iteration_storage_of(file, loop_kind);
         let mut header = self.interference_storage_of(header);
 
         header.bindings.retain(|binding| {
@@ -996,6 +990,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Invalidation { bound, budget }
     }
 
+    fn iteration_storage_of(&mut self, file: FileId, kind: AstKind<'a>) -> Storage {
+        if let AstKind::ForOfStatement(statement) = kind {
+            let iteration = self.iteration_of(file, &statement.right, statement.r#await);
+
+            if let Some(latent) = self.iteration_latent_of(file, &statement.right, &iteration) {
+                return latent.storage;
+            }
+        }
+
+        self.header_storage_of(file, kind, false)
+    }
+
     pub(crate) fn generator_storage_of(
         &mut self,
         file: FileId,
@@ -1009,13 +1015,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for kind in kinds {
             if loop_body_of(kind).is_some() {
-                storage.extend(self.header_storage_of(file, kind, false));
+                let header = self.iteration_storage_of(file, kind);
+
+                storage.extend(header);
             }
 
             if let AstKind::YieldExpression(yielded) = kind {
                 if yielded.delegate {
                     if let Some(argument) = &yielded.argument {
-                        let delegated = match self.latent_of(file, argument) {
+                        let asynchronous = matches!(function, crate::declarations::FunctionNode::Function(function) if function.r#async);
+                        let iteration = self.iteration_of(file, argument, asynchronous);
+                        let delegated = match self.iteration_latent_of(file, argument, &iteration) {
                             Some(latent) => latent.storage,
                             None => {
                                 let mut found = Storage::default();
@@ -1223,28 +1233,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut consumed = Vec::new();
 
         match kind {
-            AstKind::ForOfStatement(statement) => consumed.push(&statement.right),
-            AstKind::SpreadElement(spread) => consumed.push(&spread.argument),
+            AstKind::ForOfStatement(statement) => {
+                consumed.push((&statement.right, statement.r#await))
+            }
+            AstKind::SpreadElement(spread) => consumed.push((&spread.argument, false)),
             AstKind::CallExpression(call) => {
                 if let Some((site, model)) = self.modelled_call_of(file, call) {
                     if model.receiver == crate::native::Role::Iterated {
-                        consumed.extend(site.receiver);
+                        consumed.extend(site.receiver.map(|value| (value, false)));
                     }
 
-                    for (index, argument) in site.arguments.iter().enumerate() {
-                        if model.arguments.get(index).copied().unwrap_or(model.rest)
-                            == crate::native::Role::Iterated
-                        {
-                            consumed.extend(argument.as_expression());
-                        }
-                    }
+                    extend_iterated_arguments(&mut consumed, site.arguments, model);
+                }
+            }
+            AstKind::NewExpression(new) => {
+                if let Some(model) = self.construction_model_of(file, new) {
+                    extend_iterated_arguments(&mut consumed, &new.arguments, model);
                 }
             }
             _ => {}
         }
 
-        for expression in consumed {
-            if let Some(latent) = self.latent_of(file, expression) {
+        for (expression, asynchronous) in consumed {
+            let iteration = self.iteration_of(file, expression, asynchronous);
+
+            if let Some(latent) = self.iteration_latent_of(file, expression, &iteration) {
                 if !self.charge_work(
                     Event::EffectPrepassNode,
                     latent
@@ -1278,6 +1291,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     ) && self.is_intrinsic_reference(file, reference)
                     {
                         if self.intrinsic_replaced_of(file, &new.callee)
+                            || (reference.name.as_str().contains("Map")
+                                && self.has_indexed_accessors())
                             || self.may_implement_any(&[crate::values::MemberKey::Name(
                                 if reference.name.as_str().contains("Map") {
                                     "set"
@@ -1314,6 +1329,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 };
 
                 if self.intrinsic_replaced_of(file, &new.callee) {
+                    return true;
+                }
+
+                if self.has_indexed_accessors()
+                    || self.may_access(Some(&crate::values::MemberKey::Name("length".to_string())))
+                    || self.may_implement_any(&crate::invocations::coercion_keys())
+                {
                     return true;
                 }
 
@@ -1367,16 +1389,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         active: &mut Scheduling,
     ) -> bool {
         let saved = std::mem::replace(&mut self.collecting_pending, true);
-        let latent = self.latent_of(file, value);
+        let iteration = self.iteration_of(file, value, asynchronous);
+        let latent = self.iteration_latent_of(file, value, &iteration);
         self.collecting_pending = saved;
 
         if latent.is_some_and(|latent| self.latent_may_schedule(&latent)) {
             return true;
         }
 
-        let iteration = self.iteration_of(file, value, asynchronous);
-
-        [iteration.acquire, iteration.next, iteration.close]
+        self.iteration_effect_targets_of(file, value, &iteration)
             .into_iter()
             .any(|targets| {
                 targets.open
@@ -1399,6 +1420,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some((site, model)) = self.modelled_call_of(file, call) {
             if model.phase == crate::cost::ExecutionPhase::Scheduled {
+                return true;
+            }
+
+            if model.identity == crate::native::Identity::Namespace("Array")
+                && site.name == "from"
+                && (self.has_indexed_accessors()
+                    || self.may_access(Some(&crate::values::MemberKey::Name("length".to_string())))
+                    || self.may_implement_any(&crate::invocations::coercion_keys()))
+            {
+                return true;
+            }
+
+            if model.identity == crate::native::Identity::Namespace("Object")
+                && site.name == "fromEntries"
+                && (self.has_indexed_accessors()
+                    || self.may_implement_any(&crate::invocations::coercion_keys()))
+            {
                 return true;
             }
 
@@ -2371,3 +2409,17 @@ fn advancing_statements_of<'a>(body: &'a Statement<'a>) -> Vec<&'a Statement<'a>
 #[cfg(test)]
 #[path = "effects.test.rs"]
 mod tests;
+
+fn extend_iterated_arguments<'a>(
+    consumed: &mut Vec<(&'a Expression<'a>, bool)>,
+    arguments: &'a [Argument<'a>],
+    model: &crate::native::NativeModel,
+) {
+    for (index, argument) in arguments.iter().enumerate() {
+        if model.arguments.get(index).copied().unwrap_or(model.rest)
+            == crate::native::Role::Iterated
+        {
+            consumed.extend(argument.as_expression().map(|value| (value, false)));
+        }
+    }
+}

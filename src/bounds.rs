@@ -280,13 +280,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match loop_kind {
             AstKind::ForOfStatement(statement) => {
-                if let Some(latent) = self.latent_of(file, &statement.right) {
-                    return match latent.yields {
-                        Some(factor) => Bound::Proven {
-                            factor,
-                            proof: Some("generator yields"),
-                        },
-                        None => unresolved_bound_of(),
+                let iteration = self.iteration_of(file, &statement.right, statement.r#await);
+                let Some(count) = self.iteration_count_of(file, &statement.right, &iteration)
+                else {
+                    return unresolved_bound_of();
+                };
+
+                if !iteration.native {
+                    return Bound::Proven {
+                        factor: count,
+                        proof: Some("iterator visits"),
                     };
                 }
 
@@ -309,7 +312,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 } else if self.is_share_sized(file, &statement.right) {
                     constant_bound_of("share of budget")
                 } else {
-                    linear_bound_of()
+                    Bound::Proven {
+                        factor: count,
+                        proof: None,
+                    }
                 }
             }
             AstKind::ForInStatement(statement) => {

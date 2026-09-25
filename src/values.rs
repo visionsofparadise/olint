@@ -241,6 +241,8 @@ pub struct Values {
     primitive_files: HashMap<FileId, PrimitiveFile>,
     targets: targets::TargetIndex,
     sizes: sizes::SizeMemory,
+    iteration_kinds: HashMap<ValueId, crate::declared_types::Kind>,
+    iteration_static: HashMap<(FileId, NodeId), crate::declared_types::Kind>,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +273,26 @@ impl Failure {
 }
 
 impl Values {
+    pub(crate) fn remember_iteration_kind(
+        &mut self,
+        value: ValueId,
+        kind: crate::declared_types::Kind,
+    ) {
+        self.iteration_kinds
+            .entry(value)
+            .and_modify(|known| {
+                if *known != kind {
+                    *known = crate::declared_types::Kind::Unknown;
+                }
+            })
+            .or_insert(kind);
+    }
+
+    pub(crate) fn forget_iteration_kinds(&mut self) {
+        self.iteration_kinds.clear();
+        self.iteration_static.clear();
+    }
+
     pub fn set_primitive_limits(&mut self, limits: Limits) -> bool {
         if !self.primitive_files.is_empty() {
             return false;
@@ -948,6 +970,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.collection_size_at(file, e, 0)
     }
 
+    pub(crate) fn iterable_size_at(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> Size {
+        if depth > MAXIMUM_PRODUCED_DEPTH || !self.charge_work(Event::SizeStep, 1) {
+            return Size::unresolved();
+        }
+
+        let iteration = self.iteration_of(file, expression, false);
+
+        if self.has_native_iteration(file, expression, &iteration) {
+            return self.collection_size_at(file, expression, depth + 1);
+        }
+
+        match self.iteration_count_at(file, expression, &iteration, depth + 1) {
+            Some(count) => Size {
+                exceeds: true,
+                element_resolved: false,
+                ..Size::sized(count)
+            },
+            None => Size::unresolved(),
+        }
+    }
+
     pub(crate) fn produced_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Option<Size> {
         self.produced_size_at(file, e, 0)
     }
@@ -1011,6 +1059,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 Some(consequent.combined(&alternate))
             }
+            Expression::NewExpression(new) => {
+                if self.intrinsic_replaced_of(file, &new.callee) {
+                    return None;
+                }
+
+                let model = self.construction_model_of(file, new)?;
+                let site = self.construction_site_of(file, new);
+
+                self.output_size_of(&site, model, depth)
+            }
             Expression::CallExpression(call) => self.call_size_of(file, call, depth),
             Expression::Identifier(reference) => self.holder_size_of(file, reference, depth),
             _ => None,
@@ -1028,7 +1086,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for element in &array.elements {
             let part = match element {
                 ArrayExpressionElement::SpreadElement(spread) => {
-                    self.collection_size_at(file, &spread.argument, depth + 1)
+                    self.iterable_size_at(file, &spread.argument, depth + 1)
                 }
                 ArrayExpressionElement::Elision(_) => continue,
                 element => self.element_size_of(file, element.as_expression(), depth),
@@ -1108,7 +1166,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for argument in &call.arguments {
             let part = match argument {
                 Argument::SpreadElement(spread) => {
-                    self.collection_size_at(file, &spread.argument, depth + 1)
+                    self.iterable_size_at(file, &spread.argument, depth + 1)
                 }
                 argument => self.element_size_of(file, argument.as_expression(), depth),
             };
@@ -1148,7 +1206,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let factor = self.bound_of(file, ancestor.kind()).factor()?.clone();
             let produced = match ancestor.kind() {
-                AstKind::ForOfStatement(statement) if factor == Cost::N => {
+                AstKind::ForOfStatement(statement) => {
                     self.produced_size_at(file, &statement.right, depth + 1)
                 }
                 _ => None,
@@ -1283,7 +1341,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 for argument in call.arguments.iter().skip(2) {
                     let part = match argument {
                         Argument::SpreadElement(spread) => {
-                            self.collection_size_at(file, &spread.argument, depth + 1)
+                            self.iterable_size_at(file, &spread.argument, depth + 1)
                         }
                         _ => Size::constant(),
                     };

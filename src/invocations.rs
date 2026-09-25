@@ -53,7 +53,7 @@ pub(crate) struct ImplicitSite {
     targets: TargetSet,
     operation: &'static str,
     receivers: Vec<ValueId>,
-    visits: Option<bool>,
+    visits: Option<Option<Cost>>,
 }
 
 pub(crate) struct IterationParts {
@@ -280,7 +280,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let iteration = self.iteration_of(file, &statement.right, statement.r#await);
         let span = statement.right.span();
 
-        for targets in [iteration.acquire, iteration.next, iteration.close] {
+        for targets in self.iteration_effect_targets_of(file, &statement.right, &iteration) {
             for known in targets.known {
                 self.call_implicit(known, file, span);
             }
@@ -401,7 +401,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let receiver = self.storage_value_of(file, value);
         let visited = self.unknown_implicit_part(file, value.span(), &[receiver]);
 
-        self.visits_of((file, value.span()), Reading::of_part(visited), false)
+        self.visits_of(
+            (file, value.span()),
+            Reading::of_part(visited),
+            Some(Cost::N),
+        )
     }
 
     fn copied_part_of(
@@ -573,45 +577,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
         iterable: &'a Expression<'a>,
         asynchronous: bool,
     ) -> Option<Reading> {
-        let latent = self.latent_of(file, iterable);
         let iteration = self.iteration_of(file, iterable, asynchronous);
+        let count = self.iteration_count_of(file, iterable, &iteration);
+        let latent = self.iteration_latent_of(file, iterable, &iteration);
 
-        if let Some(latent) = latent {
-            let consumed = self.consumed_part_of(file, iterable.span(), &latent);
-            let (acquire, next, _) = self.protocol_parts_of(file, iterable, &iteration, false);
-            let visits = match (&latent.yields, iteration.next.open) {
-                (Some(count), false) if !next.holds_no_work() => {
-                    next.executed().map_parts(|part| {
-                        crate::cost::nest(
-                            "iterator visits".to_string(),
-                            self.project.site_of(file, span),
-                            self.source_span(file, span),
-                            count.clone(),
-                            part,
-                            &mut self.unknowns,
-                            &mut self.traces,
-                        )
-                    })
-                }
-                (Some(_), false) => next,
-                _ => self.visits_of((file, span), next, true),
-            };
-
-            return Some(
-                Reading::of_part(consumed)
-                    .merge(acquire, &mut self.unknowns, &mut self.traces)
-                    .merge(visits, &mut self.unknowns, &mut self.traces),
-            );
-        }
-
-        if is_inert(&iteration) {
+        if latent.is_none() && count.is_some() && is_inert(&iteration) {
             return None;
         }
 
         let (acquire, next, _) = self.protocol_parts_of(file, iterable, &iteration, false);
-        let visits = self.visits_of((file, span), next, iteration.next.open);
+        let visits = self.visits_of((file, span), next, count);
+        let mut reading = acquire.merge(visits, &mut self.unknowns, &mut self.traces);
 
-        Some(acquire.merge(visits, &mut self.unknowns, &mut self.traces))
+        if let Some(latent) = latent {
+            let consumed = self.consumed_part_of(file, iterable.span(), &latent);
+
+            reading = reading.merge(consumed, &mut self.unknowns, &mut self.traces);
+        }
+
+        (!reading.holds_no_work()).then_some(reading)
     }
 
     fn protocol_parts_of(
@@ -622,18 +606,105 @@ impl<'p, 'a> Analysis<'p, 'a> {
         closes: bool,
     ) -> (Reading, Reading, Reading) {
         let span = iterable.span();
+        let [acquired, advanced, closed] = self.iteration_accessors_of(file, iterable, iteration);
+        let results = self.iteration_result_accessors_of(iteration);
+        let acquisition_getters = self.implicit_call_reading_of(
+            (file, span),
+            &acquired,
+            "iterator acquisition getter",
+            &[iterable],
+        );
+        let next_getters = self.implicit_call_reading_of(
+            (file, span),
+            &advanced,
+            "iterator next getter",
+            &[iterable],
+        );
         let acquire = self.implicit_call_reading_of(
             (file, span),
             &iteration.acquire,
             "iterator acquisition",
             &[iterable],
         );
+        let acquire = acquire
+            .merge(acquisition_getters, &mut self.unknowns, &mut self.traces)
+            .merge(next_getters, &mut self.unknowns, &mut self.traces);
         let next = self.implicit_call_reading_of(
             (file, span),
             &iteration.next,
             "iterator next",
             &[iterable],
         );
+        let result_getters = self.implicit_call_reading_of(
+            (file, span),
+            &results,
+            "iterator result getter",
+            &[iterable],
+        );
+        let result_getters = match iteration.asynchronous {
+            true => result_getters.in_phase(
+                ExecutionPhase::Scheduled,
+                &mut self.unknowns,
+                &mut self.traces,
+            ),
+            false => result_getters,
+        };
+        let mut next = next.merge(result_getters, &mut self.unknowns, &mut self.traces);
+
+        if iteration.asynchronous {
+            for target in &iteration.next.known {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    let unknown = self.unknown_part(file, span, UnknownReason::ResourceExhaustion);
+
+                    next = next.merge(unknown, &mut self.unknowns, &mut self.traces);
+
+                    break;
+                }
+
+                let asynchronous = match self.function_at(*target) {
+                    FunctionNode::Function(function) => function.r#async,
+                    FunctionNode::Arrow(arrow) => arrow.r#async,
+                    FunctionNode::Construction(_) => false,
+                };
+
+                let returned = self.returned_expressions_of(*target);
+
+                if !self.charge_work(
+                    crate::analysis::work::Event::TraversalEdge,
+                    returned.len() as u64,
+                ) {
+                    let unknown = self.unknown_part(file, span, UnknownReason::ResourceExhaustion);
+
+                    next = next.merge(unknown, &mut self.unknowns, &mut self.traces);
+
+                    break;
+                }
+
+                for returned in returned {
+                    let key = MemberKey::Name("then".to_string());
+                    let accessors =
+                        self.property_accessors_of((target.file, returned), key.clone(), false);
+                    let methods = self.protocol_targets_of(target.file, returned, &[key]);
+
+                    if accessors.open
+                        || methods.open
+                        || !accessors.known.is_empty()
+                        || !methods.known.is_empty()
+                    {
+                        if !asynchronous {
+                            let resolution = self.assimilated_reading_of(target.file, returned);
+
+                            next = next.merge(resolution, &mut self.unknowns, &mut self.traces);
+                        }
+
+                        let unknown = self.unknown_part(file, span, UnknownReason::Target);
+
+                        next = next.merge(unknown, &mut self.unknowns, &mut self.traces);
+                    }
+                }
+            }
+        }
+
         let close = match closes {
             true => self.implicit_call_reading_of(
                 (file, span),
@@ -644,6 +715,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
             false => Reading::empty(),
         };
 
+        let close = if closes {
+            let getter = self.implicit_call_reading_of(
+                (file, span),
+                &closed,
+                "iterator close getter",
+                &[iterable],
+            );
+            let close = close.merge(getter, &mut self.unknowns, &mut self.traces);
+
+            match iteration.asynchronous {
+                true => close.in_phase(
+                    ExecutionPhase::Scheduled,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                ),
+                false => close,
+            }
+        } else {
+            close
+        };
+
         (acquire, next, close)
     }
 
@@ -651,12 +743,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         (file, span): (FileId, Span),
         next: Reading,
-        unresolved: bool,
+        count: Option<Cost>,
     ) -> Reading {
         let site = self.project.site_of(file, span);
         let origin = self.source_span(file, span);
 
-        if unresolved {
+        let Some(count) = count else {
             let bound = self.unknowns.origin(origin, UnknownReason::Bound);
 
             for (_, _, part) in &next.completions {
@@ -666,14 +758,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return next
                 .map_parts(|part| part.scaled(None, &mut self.unknowns))
                 .retaining(Some(bound), &mut self.unknowns);
-        }
+        };
 
         next.executed().map_parts(|part| {
             crate::cost::nest(
                 "iterator visits".to_string(),
                 site,
                 origin,
-                Cost::N,
+                count.clone(),
                 part,
                 &mut self.unknowns,
                 &mut self.traces,
@@ -789,15 +881,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let (Some(argument), true) = (&yielded.argument, yielded.delegate) {
-            let delegated = match self.latent_of(file, argument) {
-                Some(latent) => latent.yields,
-                None if self.is_constant_sized(file, argument) => Some(Cost::ONE),
-                None => match self.produced_size_of(file, argument) {
-                    Some(size) if !size.length_resolved => None,
-                    Some(size) if size.exceeds => Some(size.length),
-                    _ => Some(Cost::N),
-                },
-            };
+            let asynchronous = self.delegation_is_async(file, yielded);
+            let iteration = self.iteration_of(file, argument, asynchronous);
+            let delegated = self.iteration_count_of(file, argument, &iteration);
 
             count = match (count, delegated) {
                 (Some(count), Some(delegated)) => count.multiply(&delegated).ok(),
@@ -808,14 +894,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.produced = Some(produced.joined(count));
     }
 
-    fn yielded_part_of(
-        &mut self,
-        file: FileId,
-        yielded: &'a YieldExpression<'a>,
-    ) -> Option<Reading> {
-        let argument = yielded.argument.as_ref().filter(|_| yielded.delegate)?;
-        let asynchronous = self
-            .project
+    fn delegation_is_async(&self, file: FileId, yielded: &YieldExpression<'_>) -> bool {
+        self.project
             .file(file)
             .semantic
             .nodes()
@@ -824,7 +904,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 AstKind::Function(function) => Some(function.r#async),
                 _ => None,
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+    }
+
+    fn yielded_part_of(
+        &mut self,
+        file: FileId,
+        yielded: &'a YieldExpression<'a>,
+    ) -> Option<Reading> {
+        let argument = yielded.argument.as_ref().filter(|_| yielded.delegate)?;
+        let asynchronous = self.delegation_is_async(file, yielded);
 
         self.delegated_part_of(file, yielded.span, argument, asynchronous)
     }
@@ -994,7 +1083,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .all(|returned| self.is_primitive_operand(target.file, returned))
     }
 
-    fn is_deferred_function(&self, target: FunctionId) -> bool {
+    pub(crate) fn is_deferred_function(&self, target: FunctionId) -> bool {
         match self.function_at(target) {
             FunctionNode::Function(function) => function.r#async || function.generator,
             FunctionNode::Arrow(arrow) => arrow.r#async,
@@ -1227,7 +1316,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let [(source, value)] = values[..] else {
             return Some(planned);
         };
-        let Some(latent) = self.latent_of(source, value) else {
+        let iteration = self.iteration_of(source, value, false);
+        let Some(latent) = self.iteration_latent_of(source, value, &iteration) else {
             return Some(planned);
         };
         let consumed = self.consumed_part_of(source, value.span(), &latent);
@@ -1243,8 +1333,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             &planned.receivers,
         );
 
-        match planned.visits {
-            Some(unresolved) => self.visits_of((planned.file, planned.span), found, unresolved),
+        match &planned.visits {
+            Some(count) => self.visits_of((planned.file, planned.span), found, count.clone()),
             None => found,
         }
     }
@@ -1420,7 +1510,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
             operation: "getter",
             receivers,
-            visits: (!constant).then_some(false),
+            visits: (!constant).then_some(Some(Cost::N)),
         });
     }
 
@@ -1622,7 +1712,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for (source, value) in sources.values.iter().copied() {
             let iteration = self.iteration_of(source, value, false);
 
-            if !is_inert(&iteration) {
+            let visits = self.iteration_count_of(source, value, &iteration);
+            let [acquired, advanced, closed] =
+                self.iteration_accessors_of(source, value, &iteration);
+            let results = self.iteration_result_accessors_of(&iteration);
+            let reads = [&acquired, &advanced, &closed, &results]
+                .iter()
+                .any(|targets| targets.open || !targets.known.is_empty());
+
+            if !is_inert(&iteration) || reads || (!closes && visits.is_none()) {
                 let receivers = vec![self.storage_value_of(source, value)];
                 let span = value.span();
 
@@ -1640,10 +1738,33 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     targets: iteration.next.clone(),
                     operation: "iterator next",
                     receivers: receivers.clone(),
-                    visits: (!closes).then_some(iteration.next.open),
+                    visits: (!closes).then_some(visits.clone()),
                 });
 
+                for (targets, operation, repeated) in [
+                    (acquired, "iterator acquisition getter", false),
+                    (advanced, "iterator next getter", false),
+                    (results, "iterator result getter", !closes),
+                ] {
+                    plan.push(ImplicitSite {
+                        file: source,
+                        span,
+                        targets,
+                        operation,
+                        receivers: receivers.clone(),
+                        visits: repeated.then_some(visits.clone()),
+                    });
+                }
+
                 if closes {
+                    plan.push(ImplicitSite {
+                        file: source,
+                        span,
+                        targets: closed,
+                        operation: "iterator close getter",
+                        receivers: receivers.clone(),
+                        visits: None,
+                    });
                     plan.push(ImplicitSite {
                         file: source,
                         span,
@@ -2522,5 +2643,324 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.leave_promise_assimilation(file, expression.node_id());
 
         reading
+    }
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn has_native_iteration(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+    ) -> bool {
+        if !iteration.native
+            || iteration.acquire.open
+            || iteration.next.open
+            || !iteration.acquire.known.is_empty()
+            || !iteration.next.known.is_empty()
+        {
+            return false;
+        }
+
+        let [acquired, advanced, _] = self.iteration_accessors_of(file, iterable, iteration);
+
+        !acquired.open && !advanced.open && acquired.known.is_empty() && advanced.known.is_empty()
+    }
+
+    pub(crate) fn iteration_count_of(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+    ) -> Option<Cost> {
+        self.iteration_count_at(file, iterable, iteration, 0)
+    }
+
+    pub(crate) fn iteration_count_at(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+        depth: usize,
+    ) -> Option<Cost> {
+        if depth > 32 || !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+            return None;
+        }
+
+        if iteration.acquire.open || iteration.next.open {
+            return None;
+        }
+
+        let [acquired, advanced, _] = self.iteration_accessors_of(file, iterable, iteration);
+
+        if acquired.open
+            || advanced.open
+            || (!acquired.known.is_empty() && iteration.acquire.known.is_empty())
+            || (!advanced.known.is_empty() && iteration.next.known.is_empty())
+        {
+            return None;
+        }
+
+        if let Some(latent) = self.iteration_latent_of(file, iterable, iteration) {
+            return match iteration.next.known.is_empty() {
+                true => latent.yields,
+                false => None,
+            };
+        }
+
+        if iteration.next.known.is_empty() && !iteration.acquire.known.is_empty() {
+            let mut counts = Vec::new();
+
+            for target in &iteration.acquire.known {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    return None;
+                }
+
+                let returned = self.returned_expressions_of(*target);
+
+                if returned.is_empty() {
+                    return None;
+                }
+
+                for expression in returned {
+                    if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                        return None;
+                    }
+
+                    let source = self.intrinsic_iteration_source_of(target.file, expression)?;
+                    let source_iteration = self.iteration_of(target.file, source, false);
+
+                    counts.push(self.iteration_count_at(
+                        target.file,
+                        source,
+                        &source_iteration,
+                        depth + 1,
+                    )?);
+                }
+            }
+
+            return Cost::maximum(counts).ok();
+        }
+
+        if iteration.native && iteration.next.known.is_empty() {
+            let size = self.collection_size_at(file, iterable, depth + 1);
+
+            if !size.length_resolved {
+                return None;
+            }
+
+            if size.exceeds {
+                return Some(size.length);
+            }
+
+            if self.is_constant_sized(file, iterable) || self.is_share_sized(file, iterable) {
+                return Some(Cost::ONE);
+            }
+
+            return Some(match size.length.is_one() {
+                true => self.count_of(file, iterable).unwrap_or(Cost::N),
+                false => size.length,
+            });
+        }
+
+        if iteration.next.known.is_empty() {
+            return None;
+        }
+
+        iteration
+            .next
+            .known
+            .iter()
+            .all(|target| self.finishes_iteration_of(*target, iteration.asynchronous))
+            .then_some(Cost::ONE)
+    }
+
+    fn finishes_iteration_of(&mut self, target: FunctionId, asynchronous: bool) -> bool {
+        if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+            return false;
+        }
+
+        match self.function_at(target) {
+            FunctionNode::Function(function)
+                if function.generator || (function.r#async && !asynchronous) =>
+            {
+                return false
+            }
+            FunctionNode::Arrow(arrow) if arrow.r#async && !asynchronous => return false,
+            _ => {}
+        }
+
+        let returned = self.returned_expressions_of(target);
+
+        !returned.is_empty() && returned.into_iter().all(|expression| {
+            let Expression::ObjectExpression(object) = unwrap(expression) else {
+                return false;
+            };
+
+            if asynchronous {
+                let key = MemberKey::Name("then".to_string());
+                let accessors = self.property_accessors_of((target.file, expression), key.clone(), false);
+                let then = self.protocol_targets_of(target.file, expression, &[key]);
+
+                if accessors.open || !accessors.known.is_empty() || then.open || !then.known.is_empty() {
+                    return false;
+                }
+            }
+
+            for property in object.properties.iter().rev() {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    return false;
+                }
+
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    return false;
+                };
+
+                if property.computed {
+                    return false;
+                }
+
+                if property.key.static_name().as_deref() == Some("done") {
+                    return property.kind == PropertyKind::Init
+                        && matches!(unwrap(&property.value), Expression::BooleanLiteral(value) if value.value);
+                }
+            }
+
+            false
+        })
+    }
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    pub(crate) fn iteration_effect_targets_of(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+    ) -> Vec<TargetSet> {
+        let [acquired, advanced, closed] = self.iteration_accessors_of(file, iterable, iteration);
+        let results = self.iteration_result_accessors_of(iteration);
+
+        vec![
+            iteration.acquire.clone(),
+            iteration.next.clone(),
+            iteration.close.clone(),
+            acquired,
+            advanced,
+            closed,
+            results,
+        ]
+    }
+
+    fn iteration_accessors_of(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+    ) -> [TargetSet; 3] {
+        let mut found = std::array::from_fn(|_| TargetSet {
+            known: Vec::new(),
+            open: false,
+        });
+        let keys: &[&str] = match iteration.asynchronous {
+            true => &["asyncIterator", "iterator"],
+            false => &["iterator"],
+        };
+
+        for key in keys {
+            let accessors = self.iterator_accessors_on(
+                file,
+                iterable,
+                MemberKey::WellKnown((*key).to_string()),
+            );
+
+            self.merge_iterator_targets(&mut found[0], accessors);
+        }
+
+        for target in &iteration.acquire.known {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                for targets in &mut found {
+                    targets.open = true;
+                }
+
+                return found;
+            }
+
+            if matches!(self.function_at(*target), FunctionNode::Function(function) if function.generator)
+            {
+                continue;
+            }
+
+            for returned in self.returned_expressions_of(*target) {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    for targets in &mut found {
+                        targets.open = true;
+                    }
+
+                    return found;
+                }
+
+                for (index, key) in [(1, "next"), (2, "return")] {
+                    let accessors = self.property_accessors_of(
+                        (target.file, returned),
+                        MemberKey::Name(key.to_string()),
+                        false,
+                    );
+
+                    self.merge_iterator_targets(&mut found[index], accessors);
+                }
+            }
+        }
+
+        if iteration.acquire.known.is_empty() && !iteration.acquire.open {
+            for (index, key) in [(1, "next"), (2, "return")] {
+                let accessors = self.intrinsic_iterator_accessors_of(key);
+
+                self.merge_iterator_targets(&mut found[index], accessors);
+            }
+        }
+
+        found
+    }
+
+    fn iteration_result_accessors_of(&mut self, iteration: &Iteration) -> TargetSet {
+        let mut found = TargetSet {
+            known: Vec::new(),
+            open: false,
+        };
+
+        for target in &iteration.next.known {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                found.open = true;
+
+                return found;
+            }
+
+            let finished = self.finishes_iteration_of(*target, iteration.asynchronous);
+
+            for returned in self.returned_expressions_of(*target) {
+                if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                    found.open = true;
+
+                    return found;
+                }
+
+                for key in ["done", "value"] {
+                    if key == "value" && finished {
+                        continue;
+                    }
+
+                    let accessors = self.property_accessors_of(
+                        (target.file, returned),
+                        MemberKey::Name(key.to_string()),
+                        false,
+                    );
+
+                    self.merge_iterator_targets(&mut found, accessors);
+                }
+            }
+        }
+
+        found
     }
 }

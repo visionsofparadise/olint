@@ -272,6 +272,8 @@ pub fn legacy_class_of<'a>(
         "O(N^2 log N)",
         "O(N^3)",
         "O(N^4)",
+        "O(N^5)",
+        "O(N^6)",
     ] {
         let legacy = Cost::parse(text).unwrap();
         let expected = analysis
@@ -519,6 +521,8 @@ pub fn projected_class_of(cost: &olint::cost::Cost) -> olint::cost::Cost {
         "O(N^2 log N)",
         "O(N^3)",
         "O(N^4)",
+        "O(N^5)",
+        "O(N^6)",
     ] {
         let legacy = Cost::parse(text).unwrap();
         let expected = legacy.bind(&|_| None, &roots).unwrap();

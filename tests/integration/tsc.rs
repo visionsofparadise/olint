@@ -345,7 +345,10 @@ fn compiler_type_descriptions_create_no_constant_collection_sizes() {
 
     for types in [TypeMode::Tsc, TypeMode::Syntactic] {
         assert_eq!(
-            legacy_classes_of(DESCRIBED_SIZES, types, &names),
+            legacy_classes_of(DESCRIBED_SIZES, types, &names)
+                .iter()
+                .map(support::projected_class_of)
+                .collect::<Vec<_>>(),
             expected,
             "{types:?}"
         );
@@ -359,7 +362,10 @@ fn union_and_overload_candidates_contribute_their_implementation_work() {
     let quadratic = Cost::parse("O(N^2)").unwrap();
 
     assert_eq!(
-        legacy_classes_of(UNION_MEMBERS, TypeMode::Tsc, &["union", "overload"]),
+        legacy_classes_of(UNION_MEMBERS, TypeMode::Tsc, &["union", "overload"])
+            .iter()
+            .map(support::projected_class_of)
+            .collect::<Vec<_>>(),
         vec![quadratic.clone(), quadratic]
     );
 }

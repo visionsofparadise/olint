@@ -346,7 +346,7 @@ fn suspended_live_iteration_accounts_for_outstanding_collection_writes() {
             let (cost, _, reasons) = support::legacy_result_of(&source, "selected");
 
             assert_eq!(reasons.contains(&olint::unknowns::UnknownReason::Bound), unresolved, "{source}: {reasons:?}");
-            assert_eq!(support::projected_class_of(&cost), cost_of_pending(unresolved), "{source}: {cost:?}");
+            assert_eq!(support::projected_class_of(&cost), if setup.is_empty() || setup.starts_with("const other") { Cost::parse("O(N^3)").unwrap() } else { cost_of_pending(unresolved) }, "{source}: {cost:?}");
         }
     }
 }
@@ -481,7 +481,7 @@ fn implicit_native_and_consumed_generator_work_can_schedule_writers() {
         let unresolved=unresolved && shared;
         let source=format!("{helpers}export async function selected(xs:number[],p:Promise<number>){{const values=new Set([0]),other=new Set([0]);{producer}for(const value of values){{await 0;cube(xs);}}}}");
 
-        assert_pending_cost(&source, unresolved, cost_of_pending(unresolved));
+        assert_pending_cost(&source, unresolved, if producer.ends_with("start();") && written == "values" { cost("O(N^4)") } else { cost("O(N^3)") });
         }
     }
 }
@@ -585,11 +585,7 @@ fn scheduling_cycles_keep_late_producers_and_ignore_pure_backedges() {
             };
             let source=format!("function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c;}}export async function selected(xs:number[],p:Promise<number>){{const values=new Set([0]);{functions}a(3);b(3);for(const value of values){{await 0;cube(xs);}}}}");
 
-            assert_pending_cost(
-                &source,
-                !scheduler.is_empty(),
-                cost_of_pending(!scheduler.is_empty()),
-            );
+            assert_pending_cost(&source, !scheduler.is_empty(), cost("O(N^3)"));
         }
     }
 }
@@ -628,7 +624,7 @@ fn decorated_constructors_keep_pending_interference_explicit() {
                 let source=format!("declare function decorate(value:any,context:any):any;function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c;}}{outer}export async function selected(xs:number[]){{const values=new Set([0]);{inner}new Holder();for(const value of values){{await 0;cube(xs);}}}}");
                 let unresolved = decorated || (shape == 1 && constructor.is_empty());
 
-                assert_pending_cost(&source, unresolved, cost_of_pending(unresolved));
+                assert_pending_cost(&source, unresolved, cost("O(N^3)"));
               }
             }
         }
@@ -799,5 +795,57 @@ fn pending_steps_of(source: &str) -> u64 {
 fn assert_pending_growth(counts: &[u64]) {
     for pair in counts.windows(2) {
         assert!(pair[1] <= 3 * pair[0], "{counts:?}");
+    }
+}
+
+#[test]
+fn acquired_generator_storage_reaches_pending_consumers_and_delegation() {
+    for (setup, delegated, unresolved) in [
+        ("grow(values);", false, true),
+        ("grow(other);", false, false),
+        ("grow(values);", true, true),
+        ("grow(other);", true, false),
+    ] {
+        let consumed = if delegated { "forwarded()" } else { "iterable" };
+        let source = format!("function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c;}} async function grow(values:Set<number>){{await 0;values.delete(0);values.add(0);}} export async function selected(xs:number[]){{const values=new Set([0]),other=new Set([0]);const iterable={{*[Symbol.iterator](){{for(const value of values)yield value;}}}};function* forwarded(){{yield* iterable;}}{setup}for(const value of {consumed}){{await 0;cube(xs);}}}}");
+        let (known, _, reasons) = support::legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            reasons.contains(&UnknownReason::Bound),
+            unresolved,
+            "{source}: {reasons:?}"
+        );
+        assert_eq!(
+            support::projected_class_of(&known),
+            Cost::parse("O(N^3)").unwrap()
+        );
+    }
+}
+
+#[test]
+fn iterator_getter_scheduling_reaches_later_suspension() {
+    for (destination, unresolved) in [("values", true), ("other", false)] {
+        let source = format!("function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c;}} async function grow(values:Set<number>){{await 0;values.delete(0);values.add(0);}} export async function selected(xs:number[]){{const values=new Set([0]),other=new Set([0]);const trigger={{[Symbol.iterator](){{return {{get next(){{grow({destination});return ()=>({{done:true}});}}}};}}}};const ignored=[...trigger];for(const value of values){{await 0;cube(xs);}}}}");
+        let (_, _, reasons) = support::legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            reasons.contains(&UnknownReason::Bound),
+            unresolved,
+            "{source}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn entry_key_conversion_scheduling_reaches_later_suspension() {
+    for (destination, unresolved) in [("values", true), ("other", false)] {
+        let source = format!("function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c;}} async function grow(values:Set<number>){{await 0;values.delete(0);values.add(0);}} export async function selected(xs:number[]){{const values=new Set([0]),other=new Set([0]);Object.fromEntries([[{{toString(){{grow({destination});return 'x';}}}},1]]);for(const value of values){{await 0;cube(xs);}}}}");
+        let (_, _, reasons) = support::legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            reasons.contains(&UnknownReason::Bound),
+            unresolved,
+            "{source}: {reasons:?}"
+        );
     }
 }

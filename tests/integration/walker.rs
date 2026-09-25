@@ -233,7 +233,7 @@ fn a_set_of_a_parameter_is_linear() {
     );
 
     assert_eq!(reading.total().cost, Cost::N);
-    assert_eq!(labels, vec!["new Set(xs)"]);
+    assert_eq!(labels, vec!["new Set()"]);
 }
 
 #[test]
@@ -293,7 +293,7 @@ fn an_all_cold_block_cascades_its_cold_maximum() {
     );
 
     assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap());
-    assert_eq!(labels, vec!["for-of", "for-of"]);
+    assert_eq!(labels, vec!["for-of", "for-of", "for-of"]);
 }
 
 #[test]
@@ -545,7 +545,11 @@ fn runtime_dispatch_includes_known_expensive_bodies_in_both_type_modes() {
         for (source, expected) in &cases {
             let (cost, reasons) = dispatched_result_of(source, types);
 
-            assert_eq!(cost, Cost::parse(expected).unwrap(), "{types:?} {source}");
+            assert_eq!(
+                support::projected_class_of(&cost),
+                Cost::parse(expected).unwrap(),
+                "{types:?} {source}"
+            );
             assert!(
                 reasons.contains(&olint::unknowns::UnknownReason::Target),
                 "{types:?} {source}: {reasons:?}"
@@ -671,10 +675,26 @@ fn statically_typed_object_owners_may_hold_any_builtin_kind() {
         (index_of(format!("{slow}\nfunction set(target: Record<string, unknown>, key: string, value: unknown) {{ target[key] = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
         (index_of(format!("{slow}\nfunction set(target: object, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(xs, () => slow(xs)); return xs.includes(0); }}")), "O(N^3)", true),
         (index_of(format!("{slow}\nfunction set(target: any, key: string, value: unknown) {{ const t: object = target; (t as any)[key] = value; }}\n{call}")), "O(N)", true),
-        (index_of(format!("{slow}\nfunction set(target: Set<number>, key: string, value: unknown) {{ (target as any)[key] = value; }}\nexport function selected(xs: number[]) {{ set(new Set(xs), 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", false),
+        (index_of(format!("{slow}\nfunction set(target: Set<number>, key: string, value: unknown) {{ (target as any)[key] = value; }}\nexport function selected(xs: number[]) {{ set(new Set(xs), 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
+        (index_of(format!("{slow}\nfunction set(target: Set<number>, key: string, value: unknown) {{ (target as any)[key] = value; }}\nexport function selected(xs: number[]) {{ set(new Set(), 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
     ];
 
     assert_dispatched(&cases);
+
+    for (index, iterated) in [(5, true), (6, false)] {
+        let (_, reasons) =
+            support::selected_case_of(&cases[index].0, olint::analysis::TypeMode::Syntactic);
+
+        assert!(reasons.contains(&olint::unknowns::UnknownReason::Target));
+        assert_eq!(
+            reasons.contains(&olint::unknowns::UnknownReason::Bound),
+            iterated
+        );
+        assert_eq!(
+            reasons.contains(&olint::unknowns::UnknownReason::SizeRelation),
+            iterated
+        );
+    }
 }
 
 #[test]
@@ -1069,7 +1089,7 @@ fn replacement_writes_join_the_values_supplied_to_their_parameters() {
         (index_of(format!("{slow}\nfunction set(v: unknown, t: any = Array.prototype) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(() => slow(xs)); set(null, new Set<number>()); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
         (index_of(format!("{slow}\nfunction set([t]: any[], v: unknown) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set([Array.prototype], () => slow(xs)); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
         (index_of(format!("{slow}\nexport function set(t: any, v: unknown) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(new Set<number>(), () => slow(xs)); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
-        (index_of(format!("{slow}\nfunction set(t: any, v: unknown = () => slow([])) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(Array.prototype); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nfunction set(t: any, v: unknown = () => slow([])) {{ t.includes = v; }}\nexport function selected(xs: number[]) {{ set(Array.prototype); const zs = [1]; return zs.includes(0); }}")), "O(N)", true),
         (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ v = null; t.includes = v; }}\nexport function selected(xs: number[]) {{ set(Array.prototype, () => slow(xs)); const zs = [1]; return zs.includes(0) && xs.includes(0); }}")), "O(N)", true),
     ];
 
@@ -1159,7 +1179,7 @@ fn collected_rest_arguments_specialize_their_length() {
 
 #[test]
 fn sloppy_arguments_writes_rebind_their_parameters() {
-    let helpers = format!("function quadratic(xs) {{ var t = 0; if (xs.length >= 0 && xs.length <= 4294967295) {{ for (var i = 0; i < xs.length; i++) for (var j = 0; j < xs.length; j++) t += i + j; }} return t; }}\nfunction cube(xs) {{ {CUBIC} }}\nfunction cheap(xs) {{ return xs; }}\nfunction h(xs, n = quadratic(xs)) {{ return n; }}");
+    let helpers = format!("function quadratic(xs) {{ var t = 0; if (xs.length >= 0 && xs.length <= 4294967295) {{ for (var i = 0; i < xs.length; i++) for (var j = 0; j < xs.length; j++) t += i + j; }} return t; }}\nfunction cube(xs) {{ {INDEXED_CUBIC} }}\nfunction cheap(xs) {{ return xs; }}\nfunction h(xs, n = quadratic(xs)) {{ return n; }}");
     let script = |name: &'static str, source: String| vec![(name, source)];
     let cases = [
         (script("cases.js", format!("{helpers}\nfunction alias(xs, d) {{ arguments[1] = undefined; return h(xs, d); }}\nfunction selected(xs) {{ return alias(xs, 1); }}")), "O(N^2)", false),
@@ -1171,6 +1191,12 @@ fn sloppy_arguments_writes_rebind_their_parameters() {
         (script("cases.js", format!("{helpers}\nfunction retControl(g) {{ return g; }}\nfunction selected(xs) {{ return retControl(cube)(xs); }}")), "O(N^3)", false),
         (script("cases.js", format!("{helpers}\nfunction set(t, v) {{ arguments[1] = null; t.includes = v; }}\nfunction selected(xs) {{ set(Array.prototype, () => cube(xs)); return xs.includes(0); }}")), "O(1)", true),
     ];
+
+    let original = format!("function cube(xs) {{ {CUBIC} }} function retControl(g) {{ return g; }} function selected(xs) {{ return retControl(cube)(xs); }}");
+    let (known, reasons) = dispatched_result_of(&original, olint::analysis::TypeMode::Syntactic);
+
+    assert_eq!(known, Cost::ONE);
+    assert!(reasons.contains(&olint::unknowns::UnknownReason::Bound));
 
     assert_dispatched(&cases);
 }
@@ -1795,12 +1821,7 @@ fn an_escaping_branch_is_charged_at_the_loop_its_completion_targets() {
     assert_eq!(outer_break, quadratic);
     assert_eq!(
         outer_break_labels,
-        vec![
-            "[break branch: runs once per loop]",
-            "call quadratic()",
-            "for-of",
-            "for-of"
-        ]
+        vec!["[break branch: runs once per loop]", "call quadratic()"]
     );
     assert_ne!(inner_break, quadratic);
     assert_eq!(
@@ -1808,8 +1829,7 @@ fn an_escaping_branch_is_charged_at_the_loop_its_completion_targets() {
         vec![
             "for-of",
             "[break branch: runs once per loop]",
-            "call quadratic()",
-            "for-of"
+            "call quadratic()"
         ]
     );
     assert_ne!(outer_continue, quadratic);
@@ -1818,8 +1838,7 @@ fn an_escaping_branch_is_charged_at_the_loop_its_completion_targets() {
         vec![
             "for-of",
             "[continue branch: runs once per loop]",
-            "call quadratic()",
-            "for-of"
+            "call quadratic()"
         ]
     );
 }
@@ -1831,16 +1850,7 @@ fn a_transfer_leaving_three_loops_is_charged_once_per_call() {
     ));
 
     assert_eq!(cost, Cost::parse("O(N^3)").unwrap());
-    assert_eq!(
-        labels,
-        vec![
-            "[break branch: runs once per loop]",
-            "call quadratic()",
-            "for-of",
-            "for-of",
-            "for-of"
-        ]
-    );
+    assert_eq!(labels, vec!["for-of", "for-of", "for-of"]);
 }
 
 #[test]
@@ -1873,7 +1883,7 @@ fn a_caught_throw_is_charged_at_the_loop_its_handler_sits_outside() {
     ));
 
     assert_eq!(outside, Cost::parse("O(N^2)").unwrap());
-    assert_eq!(outside_labels, vec!["call quadratic()", "for-of", "for-of"]);
+    assert_eq!(outside_labels, vec!["call quadratic()"]);
     assert_eq!(inside, Cost::parse("O(N^4)").unwrap());
     assert_eq!(inside_labels, vec!["for-of", "for-of", "call quadratic()"]);
 }

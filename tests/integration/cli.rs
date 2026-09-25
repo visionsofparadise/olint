@@ -433,7 +433,7 @@ fn an_absorbed_escape_beside_its_own_loop_stays_comparable_against_the_limit() {
 
     let (row, _) = reported_row_of(directory.path(), "continueOuter");
 
-    assert!(row.starts_with("O(max(1, (xs * xs^2)))"), "{row}");
+    assert!(row.starts_with("O((xs * xs^2))"), "{row}");
 }
 
 #[test]
@@ -472,7 +472,7 @@ fn reports_show_scheduled_and_lazy_work_without_charging_unconsumed_generators()
     );
     assert!(stdout.contains("calls rows(xs) [lazy]"), "{stdout}");
     assert!(
-        stdout.contains("in loop for-of [generator yields]"),
+        stdout.contains("in loop for-of [iterator visits]"),
         "{stdout}"
     );
     assert!(
