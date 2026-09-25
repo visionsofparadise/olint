@@ -1,6 +1,6 @@
 use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::read_config;
-use olint::cost::{Cost, CostComparison};
+use olint::cost::{Cost, CostComparison, ExecutionPhase};
 use olint::public::public_functions;
 use std::path::Path;
 
@@ -972,5 +972,532 @@ fn derived_constructor_summaries_include_base_construction_at_super() {
             [Cost::parse("O(N^2)").unwrap()]
         );
         support::assert_scheduler_terminal(analysis.scheduler_stats());
+    });
+}
+
+const LAZY_HELPERS: &str = "function quadratic(xs: number[]) { let total = 0; for (const x of xs) for (const y of xs) total += x + y; return total; }\nfunction scan(xs: number[]) { let total = 0; for (const x of xs) total += x; return total; }\nfunction* single(xs: number[]) { for (const x of xs) yield x; }\nfunction* square(xs: number[]) { for (const x of xs) for (const y of xs) yield x + y; }\nfunction* heavy(xs: number[]) { for (const x of xs) { quadratic(xs); yield x; } }";
+
+type LazyResult = (
+    Cost,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+);
+
+fn lazy_selected_of(declarations: &str, body: &str) -> LazyResult {
+    selected_result(&format!(
+        "{LAZY_HELPERS}\n{declarations}\nexport function selected{body}"
+    ))
+}
+
+fn assert_lazy_selected(cases: &[(&str, &str, &str, bool)]) {
+    for (declarations, body, expected, partial) in cases {
+        let (cost, reasons) = lazy_selected_of(declarations, body);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert_eq!(!reasons.is_empty(), *partial, "{body}: {reasons:?}");
+    }
+}
+
+fn phase_costs_of(source: &str, name: &str) -> Vec<(ExecutionPhase, Cost)> {
+    let mut found = Vec::new();
+
+    run_with_source(source, |analysis, file| {
+        let function = function_of_name(analysis.project, file, name);
+        let reading = analysis.summarize(file, function);
+
+        for (phase, _, part) in &reading.completions {
+            let cost = support::legacy_class_of(analysis, file, function, &part.cost);
+
+            found.push((*phase, cost));
+        }
+    });
+
+    found
+}
+
+#[test]
+fn async_continuations_after_an_await_are_scheduled() {
+    let phases = phase_costs_of(
+        &format!("{LAZY_HELPERS}\nexport async function selected(xs: number[], p: Promise<number>) {{ const n = scan(xs); await p; return quadratic(xs) + n; }}"),
+        "selected",
+    );
+
+    assert!(
+        phases.contains(&(ExecutionPhase::Immediate, Cost::parse("O(N)").unwrap())),
+        "{phases:?}"
+    );
+    assert!(
+        phases.contains(&(ExecutionPhase::Scheduled, Cost::parse("O(N^2)").unwrap())),
+        "{phases:?}"
+    );
+
+    let unsuspended = phase_costs_of(
+        &format!("{LAZY_HELPERS}\nexport async function selected(xs: number[]) {{ return quadratic(xs); }}"),
+        "selected",
+    );
+
+    assert!(
+        unsuspended
+            .iter()
+            .all(|(phase, _)| *phase == ExecutionPhase::Immediate),
+        "{unsuspended:?}"
+    );
+
+    let (cost, reasons) = selected_result(&format!("{LAZY_HELPERS}\nasync function work(xs: number[]) {{ await 0; return quadratic(xs); }}\nexport async function selected(xs: number[]) {{ return await work(xs); }}"));
+
+    assert_eq!(cost, Cost::parse("O(N^2)").unwrap(), "{reasons:?}");
+    assert!(reasons.is_empty(), "{reasons:?}");
+}
+
+#[test]
+fn generator_functions_defer_their_body_to_the_lazy_channel() {
+    run_with_source(LAZY_HELPERS, |analysis, file| {
+        let function = function_of_name(analysis.project, file, "square");
+        let reading = analysis.summarize(file, function);
+        let total = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+        let latent = reading.latent(&mut analysis.unknowns, &mut analysis.traces);
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, function, &total.cost),
+            Cost::ONE
+        );
+        assert_eq!(
+            support::legacy_class_of(analysis, file, function, &latent.cost),
+            Cost::parse("O(N^2)").unwrap()
+        );
+        assert!(total.is_complete() && latent.is_complete());
+    });
+}
+
+#[test]
+fn generator_creation_differs_from_zero_partial_and_full_consumption() {
+    assert_lazy_selected(&[
+        ("", "(xs: number[]) { return single(xs); }", "O(1)", false),
+        ("", "(xs: number[]) { single(xs); return 0; }", "O(1)", false),
+        ("", "(xs: number[]) { return single(xs).next(); }", "O(N)", false),
+        (
+            "",
+            "(xs: number[]) { let t = 0; for (const v of single(xs)) t += quadratic(xs); return t; }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { let t = 0; for (const v of square(xs)) t += quadratic(xs); return t; }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { let t = 0; for (const v of square(xs)) t += v; return t; }",
+            "O(N^2)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { for (const v of single(xs)) { if (v > 3) break; } }",
+            "O(N)",
+            false,
+        ),
+        ("", "(xs: number[]) { return [...square(xs)]; }", "O(N^2)", false),
+        (
+            "function* outer(xs: number[]) { yield* square(xs); }",
+            "(xs: number[]) { let t = 0; for (const v of outer(xs)) t += quadratic(xs); return t; }",
+            "O(N^4)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn repeated_consumer_calls_multiply_proven_resume_work() {
+    assert_lazy_selected(&[
+        (
+            "function take(it: Iterator<number>) { return it.next(); }",
+            "(xs: number[]) { const it = heavy(xs); for (const x of xs) take(it); }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            "function consume(it: Iterable<number>) { let t = 0; for (const v of it) t += v; return t; }",
+            "(xs: number[]) { for (const x of xs) consume(heavy(xs)); }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { const it = heavy(xs); it.next(); it.next(); }",
+            "O(N^3)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn unknown_consumption_and_yield_counts_stay_incomplete() {
+    let escaped = lazy_selected_of(
+        "const hold: unknown[] = [];",
+        "(xs: number[]) { hold.push(heavy(xs)); }",
+    );
+
+    assert_eq!(escaped.0, Cost::parse("O(N^3)").unwrap(), "{escaped:?}");
+    assert!(
+        escaped
+            .1
+            .contains(&olint::unknowns::UnknownReason::Multiplicity),
+        "{escaped:?}"
+    );
+
+    let unresolved = lazy_selected_of(
+        "function* grown(set: Set<number>) { for (const v of set) { set.add(v + 1); yield v; } }",
+        "(set: Set<number>, xs: number[]) { let t = 0; for (const v of grown(set)) t += quadratic(xs); return t; }",
+    );
+
+    assert!(
+        unresolved
+            .1
+            .contains(&olint::unknowns::UnknownReason::Bound),
+        "{unresolved:?}"
+    );
+    assert_eq!(
+        unresolved.0,
+        Cost::parse("O(N^2)").unwrap(),
+        "{unresolved:?}"
+    );
+
+    let called = lazy_selected_of(
+        "function run(make: (xs: number[]) => Iterable<number>, xs: number[]) { return make(xs); }",
+        "(xs: number[]) { return run(heavy, xs); }",
+    );
+
+    assert_eq!(called.0, Cost::parse("O(N^3)").unwrap(), "{called:?}");
+    assert!(
+        called
+            .1
+            .contains(&olint::unknowns::UnknownReason::Multiplicity),
+        "{called:?}"
+    );
+}
+
+#[test]
+fn returned_aliased_and_passed_generators_keep_latent_work_until_consumed() {
+    let make = "function make(xs: number[]) { return square(xs); }";
+
+    assert_lazy_selected(&[
+        (make, "(xs: number[]) { return make(xs); }", "O(1)", false),
+        (
+            make,
+            "(xs: number[]) { let t = 0; for (const v of make(xs)) t += quadratic(xs); return t; }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            make,
+            "(xs: number[]) { const it = make(xs); const other = it; let t = 0; for (const v of other) t += quadratic(xs); return t; }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            "function consume(it: Iterable<number>, xs: number[]) { let t = 0; for (const v of it) t += quadratic(xs); return t; }",
+            "(xs: number[]) { return consume(square(xs), xs); }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            "function pass(it: Iterable<number>) { return it; }",
+            "(xs: number[]) { let t = 0; for (const v of pass(square(xs))) t += quadratic(xs); return t; }",
+            "O(N^4)",
+            false,
+        ),
+    ]);
+
+    run_with_source(&format!("{LAZY_HELPERS}\n{make}"), |analysis, file| {
+        let function = function_of_name(analysis.project, file, "make");
+        let reading = analysis.summarize(file, function);
+        let latent = reading.latent(&mut analysis.unknowns, &mut analysis.traces);
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, function, &latent.cost),
+            Cost::parse("O(N^2)").unwrap()
+        );
+    });
+}
+
+#[test]
+fn every_consumer_charges_the_lazy_body_it_runs() {
+    assert_lazy_selected(&[
+        (
+            "",
+            "(xs: number[]) { for (const v of heavy(xs)) void v; }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { for (const v of heavy(xs)) { if (v > 3) break; } }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { return [...heavy(xs)]; }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { const [first] = heavy(xs); return first; }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { let first = 0; [first] = heavy(xs); return first; }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "function* outer(xs: number[]) { yield* heavy(xs); }",
+            "(xs: number[]) { for (const v of outer(xs)) void v; }",
+            "O(N^3)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn a_generator_with_any_untracked_use_is_charged_where_it_is_created() {
+    assert_lazy_selected(&[
+        (
+            "",
+            "(xs: number[]) { const it = heavy(xs); for (const v of it) void v; return { it }; }",
+            "O(N^3)",
+            true,
+        ),
+        (
+            "function keep(it: Iterable<number>) { return { it }; }",
+            "(xs: number[]) { return keep(heavy(xs)); }",
+            "O(N^3)",
+            true,
+        ),
+        (
+            "function keep(it: Iterable<number>) { return { it }; }\nfunction drain(it: Iterable<number>) { for (const v of it) void v; return { it: [0] }; }",
+            "(xs: number[], flag: boolean) { const use = flag ? drain : keep; return use(heavy(xs)); }",
+            "O(N^3)",
+            true,
+        ),
+        (
+            "function drain(it: Iterable<number>) { for (const v of it) void v; }",
+            "(xs: number[]) { drain(heavy(xs)); }",
+            "O(N^3)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn distinct_latent_arguments_keep_distinct_specializations() {
+    let consume = "function consume(it: Iterable<number>, xs: number[]) { let t = 0; for (const v of it) t += quadratic(xs); return t; }";
+
+    assert_lazy_selected(&[
+        (
+            consume,
+            "(xs: number[]) { return consume(single(xs), xs) + consume(square(xs), xs); }",
+            "O(N^4)",
+            false,
+        ),
+        (
+            consume,
+            "(xs: number[], flag: boolean) { return consume(flag ? square(xs) : square(xs), xs); }",
+            "O(N^4)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn a_function_returning_a_generator_on_some_paths_leaves_the_count_unresolved() {
+    let (cost, reasons) = lazy_selected_of(
+        "function pick(flag: boolean, xs: number[]): Iterable<number> { if (flag) return square(xs); return xs; }",
+        "(xs: number[], flag: boolean) { let t = 0; for (const v of pick(flag, xs)) t += quadratic(xs); return t; }",
+    );
+
+    assert!(
+        reasons.contains(&olint::unknowns::UnknownReason::Bound),
+        "{cost:?} {reasons:?}"
+    );
+}
+
+#[test]
+fn work_before_the_first_await_in_its_statement_stays_immediate() {
+    let phases = phase_costs_of(
+        &format!("{LAZY_HELPERS}\nexport async function selected(xs: number[], p: Promise<number>) {{ const m = quadratic(xs) + (await p); return scan(xs) + m; }}"),
+        "selected",
+    );
+
+    assert!(
+        phases.contains(&(ExecutionPhase::Immediate, Cost::parse("O(N^2)").unwrap())),
+        "{phases:?}"
+    );
+    assert!(
+        phases.contains(&(ExecutionPhase::Scheduled, Cost::parse("O(N)").unwrap())),
+        "{phases:?}"
+    );
+}
+
+#[test]
+fn a_possible_non_generator_alternative_leaves_the_count_unresolved() {
+    for (declarations, body) in [
+        (
+            "",
+            "(xs: number[], flag: boolean) { let t = 0; for (const v of flag ? square(xs) : xs) t += quadratic(xs); return t; }",
+        ),
+        (
+            "",
+            "(xs: number[], flag: boolean) { const make = flag ? square : (ys: number[]) => ys; let t = 0; for (const v of make(xs)) t += quadratic(xs); return t; }",
+        ),
+    ] {
+        let (cost, reasons) = lazy_selected_of(declarations, body);
+
+        assert!(
+            reasons.contains(&olint::unknowns::UnknownReason::Bound),
+            "{body}: {cost:?} {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn a_resumption_that_may_reach_analysed_methods_is_not_a_tracked_consumer() {
+    let (cost, reasons) = lazy_selected_of(
+        "class Other { next() { return 0; } }",
+        "(xs: number[]) { const it: Other = heavy(xs) as any; it.next(); return it; }",
+    );
+
+    assert_eq!(cost, Cost::parse("O(N^3)").unwrap(), "{reasons:?}");
+    assert!(
+        reasons.contains(&olint::unknowns::UnknownReason::Multiplicity),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn one_latent_argument_site_specializes_on_its_latent_work() {
+    assert_lazy_selected(&[(
+        "function consume(it: Iterable<number>) { let t = 0; for (const v of it) t += v; return t; }
+function make(a: number[]) { return consume(square(a)); }",
+        "(xs: number[]) { return make([1, 2, 3]) + make(xs); }",
+        "O(N^2)",
+        false,
+    ), (
+        "function consume(it: Iterable<number>) { let t = 0; for (const v of it) t += v; return t; }
+function make(a: number[]) { return consume(square(a)); }",
+        "(xs: number[]) { return make(xs) + make([1, 2, 3]); }",
+        "O(N^2)",
+        false,
+    ), (
+        "function consume(it: Iterable<number>) { let t = 0; for (const v of it) t += v; return t; }
+function make(a: number[]) { return consume(square(a)); }
+function first() { return make([1, 2, 3]); }",
+        "(xs: number[]) { first(); return make(xs); }",
+        "O(N^2)",
+        false,
+    )]);
+}
+
+#[test]
+fn latent_arguments_with_equal_effects_but_different_work_keep_distinct_keys() {
+    run_with_source(
+        "function consume(it: Iterable<number>) { let t = 0; for (const v of it) t += v; return t; }",
+        |analysis, file| {
+            let function = function_of_name(analysis.project, file, "consume");
+            let olint::declarations::FunctionNode::Function(inner) = function else {
+                panic!("ordinary function")
+            };
+            let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) =
+                &inner.params.items[0].pattern
+            else {
+                panic!("plain parameter")
+            };
+            let binding = olint::declarations::Binding::Symbol {
+                file,
+                symbol: identifier.symbol_id.get().unwrap(),
+            };
+            let origin = olint::unknowns::SourceSpan {
+                file,
+                start: identifier.span.start,
+                end: identifier.span.end,
+            };
+            let value = analysis.values.at(origin);
+            let yields = Cost::dimension(7, olint::cost::Domain::Size);
+            let mut costs = Vec::new();
+
+            for (work, count) in [(Cost::ONE, Cost::ONE), (yields.clone(), yields.clone())] {
+                let id = olint::summaries::SummaryId(analysis.summaries_arena.len() as u32);
+                let mut result = value.clone();
+
+                result.latent = Some(id);
+                result.size = Some(count);
+
+                analysis
+                    .summaries_arena
+                    .push(olint::summaries::SummaryRecord {
+                        reading: olint::cost::Reading::of_completion(
+                            ExecutionPhase::Lazy,
+                            olint::flow::Completion::Normal,
+                            olint::cost::Part::unmarked(work, None),
+                        ),
+                        result,
+                        effects: olint::effects::Effects::default(),
+                    });
+
+                let mut argument = value.clone();
+
+                argument.latent = Some(id);
+
+                let facts = olint::values::ArgumentFacts {
+                    value: argument,
+                    callback: None,
+                    preference: olint::cost::Preference::Absent,
+                    definedness: olint::values::Definedness::Unknown,
+                };
+                let reading = analysis.summarize_with(
+                    file,
+                    function,
+                    olint::summaries::Substitutions::from([(binding, facts)]),
+                    false,
+                );
+
+                costs.push(
+                    reading
+                        .total(&mut analysis.unknowns, &mut analysis.traces)
+                        .cost,
+                );
+            }
+
+            assert_ne!(costs[0], costs[1], "{costs:?}");
+        },
+    );
+}
+
+#[test]
+fn a_recursive_generator_keeps_its_solved_lazy_work_while_its_count_stays_unresolved() {
+    let source = "export function* walk(n: number, xs: number[]): Generator<number> { if (n <= 0) return; for (const x of xs) yield x; yield* walk(n - 1, xs); }\nexport function drain(n: number, xs: number[]): number { let t = 0; for (const v of walk(n, xs)) t += v; return t; }";
+
+    run_with_source(source, |analysis, file| {
+        let drain = function_of_name(analysis.project, file, "drain");
+        let part = support::summary_of(analysis, file, "drain");
+        let linear = analysis
+            .bind_function_cost(file, drain, &Cost::parse("O(N)").unwrap())
+            .unwrap();
+        let reasons = support::unknown_reasons(analysis, part.unknowns);
+
+        assert_ne!(
+            part.cost.compare(&linear),
+            CostComparison::Within,
+            "{part:?}"
+        );
+        assert!(
+            reasons.contains(&olint::unknowns::UnknownReason::Bound),
+            "{reasons:?}"
+        );
     });
 }

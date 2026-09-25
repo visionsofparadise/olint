@@ -2043,11 +2043,43 @@ impl Reading {
     pub fn total(&self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
         let mut total = self.main();
 
-        for channel in self.beside_main() {
+        for channel in self
+            .beside_main()
+            .filter(|channel| channel.0 != ExecutionPhase::Lazy)
+        {
             total = total.max(channel.2.clone(), unknowns, traces);
         }
 
         total
+    }
+
+    pub fn latent(&self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
+        let mut latent = Part::none();
+
+        for channel in self
+            .completions
+            .iter()
+            .filter(|channel| channel.0 == ExecutionPhase::Lazy)
+        {
+            latent = latent.max(channel.2.clone(), unknowns, traces);
+        }
+
+        latent
+    }
+
+    pub fn in_phase(
+        self,
+        phase: ExecutionPhase,
+        unknowns: &mut Unknowns,
+        traces: &mut TraceArena,
+    ) -> Reading {
+        let mut reading = Reading::empty();
+
+        for (_, completion, part) in self.completions {
+            reading.join(phase, completion, part, unknowns, traces);
+        }
+
+        reading
     }
 }
 

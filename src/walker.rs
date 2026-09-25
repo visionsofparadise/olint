@@ -1,7 +1,7 @@
 use oxc_ast::ast::{
     Argument, AssignmentTarget, AssignmentTargetRest, BindingPattern, BindingRestElement,
-    CallExpression, Class, Expression, FormalParameterRest, IdentifierReference, MemberExpression,
-    MethodDefinitionKind, NewExpression, SpreadElement, Statement,
+    CallExpression, Class, Expression, FormalParameterRest, FunctionBody, IdentifierReference,
+    MemberExpression, MethodDefinitionKind, NewExpression, SpreadElement, Statement,
 };
 use oxc_ast::{AstKind, AstType};
 use oxc_semantic::NodeId;
@@ -19,8 +19,8 @@ use crate::declarations::{
 use crate::declared_types::Kind;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::flow::{
-    class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, loop_phases_of,
-    Completion, Resumption,
+    class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, is_suspension,
+    loop_phases_of, Completion, Resumption,
 };
 use crate::native::{Matching, Native, Pattern};
 use crate::project::{FileId, Site};
@@ -564,7 +564,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 None => Reading::empty(),
             },
             AstKind::Class(class) => self.cost_of_class_definition(file, class),
-            AstKind::FunctionBody(body) => self.cost_of_statements(file, None, &body.statements),
+            AstKind::FunctionBody(body) => self.cost_of_function_statements(file, body),
             AstKind::TSModuleBlock(block) => self.cost_of_statements(file, None, &block.body),
             AstKind::SwitchCase(case) => {
                 self.cost_of_statements(file, case.test.as_ref(), &case.consequent)
@@ -601,6 +601,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 reading.merge(Reading::of_part(tag), &mut self.unknowns, &mut self.traces)
             }
             _ => {
+                if let AstKind::YieldExpression(yielded) = kind {
+                    self.count_yield(file, yielded);
+                }
+
                 let mut reading = Reading::empty();
 
                 for child in self.children_of(file, kind.node_id()) {
@@ -640,6 +644,74 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         reading
+    }
+
+    fn cost_of_function_statements(&mut self, file: FileId, body: &'a FunctionBody<'a>) -> Reading {
+        let asynchronous = match self
+            .project
+            .file(file)
+            .semantic
+            .nodes()
+            .parent_kind(body.node_id())
+        {
+            AstKind::Function(function) => function.r#async && !function.generator,
+            AstKind::ArrowFunctionExpression(arrow) => arrow.r#async,
+            _ => false,
+        };
+        let suspension = match asynchronous {
+            true => body
+                .statements
+                .iter()
+                .position(|statement| self.suspends(file, statement.node_id())),
+            false => None,
+        };
+        let Some(index) = suspension.filter(|index| index + 1 < body.statements.len()) else {
+            return self.cost_of_statements(file, None, &body.statements);
+        };
+        let (immediate, continuation) = body.statements.split_at(index + 1);
+        let reading = self.cost_of_statements(file, None, immediate);
+        let continued = self.cost_of_statements(file, None, continuation);
+        let main = continued.main();
+        let main = match main.cost.is_one() {
+            true => main,
+            false => {
+                let suspended = immediate[index].node_id();
+
+                main.explain(
+                    "continuation after await [scheduled]",
+                    self.site_of_node(file, suspended),
+                    self.source_span(file, self.kind_of_node(file, suspended).span()),
+                    false,
+                    &mut self.traces,
+                    &mut self.unknowns,
+                )
+            }
+        };
+        let continued = continued.with_main(main).in_phase(
+            crate::cost::ExecutionPhase::Scheduled,
+            &mut self.unknowns,
+            &mut self.traces,
+        );
+
+        reading.merge(continued, &mut self.unknowns, &mut self.traces)
+    }
+
+    fn suspends(&mut self, file: FileId, node: NodeId) -> bool {
+        let mut pending = vec![node];
+
+        while let Some(node) = pending.pop() {
+            let kind = self.kind_of_node(file, node);
+
+            if is_suspension(&kind) {
+                return true;
+            }
+
+            if !is_deferred_kind(&kind) {
+                pending.extend(self.children_of(file, node));
+            }
+        }
+
+        false
     }
 
     fn sibling_of(&mut self, file: FileId, kind: AstKind<'a>, reading: Reading) -> Reading {
@@ -1136,6 +1208,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 sibling =
                     sibling.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
             }
+
+            if let Some(latent) = self.latent_of(file, &statement.right) {
+                let consumed = self.consumed_part_of(file, statement.right.span(), &latent);
+
+                sibling = sibling.merge(
+                    Reading::of_part(consumed),
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
+            }
         }
 
         let mut invalidation = self.loop_invalidation_of(file, kind);
@@ -1195,7 +1277,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.share_bindings.push(share);
         }
 
-        self.enclosing_factors.push((file, node, factor.clone()));
+        self.enclosing_factors.push((
+            file,
+            node,
+            factor.clone(),
+            assumed_bound || !invalidation.bound,
+        ));
 
         let body_raw =
             self.cost_of_statement(file, body)
@@ -1367,7 +1454,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Some(scope) => {
                 self.enclosing_factors
                     .iter()
-                    .position(|(held, node, _)| *held == file && *node == scope)?
+                    .position(|(held, node, _, _)| *held == file && *node == scope)?
                     + 1
             }
             None => 0,
@@ -1375,7 +1462,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.enclosing_factors[start..]
             .iter()
-            .try_fold(Cost::ONE, |visits, (_, _, factor)| {
+            .try_fold(Cost::ONE, |visits, (_, _, factor, _)| {
                 visits.multiply(factor).ok()
             })
     }
@@ -1468,7 +1555,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return inner;
         }
 
-        let produced = self.produced_size_of(file, &spread.argument);
+        let produced = match self.latent_of(file, &spread.argument) {
+            Some(latent) => Some(self.latent_size_of(&latent)),
+            None => self.produced_size_of(file, &spread.argument),
+        };
         let factor = match &produced {
             Some(size) if size.exceeds => size.length.clone(),
             _ => Cost::N,
@@ -2203,6 +2293,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if !targets.known.is_empty() {
+            if let Some(part) = self.untracked_latent_part_of(file, call, &targets) {
+                reading =
+                    reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
+            }
+
             if self.intrinsic_replaced_of(file, callee) {
                 let native = self.native_of(file, call, member, true);
 

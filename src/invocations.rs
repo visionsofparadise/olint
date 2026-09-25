@@ -443,7 +443,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         iterable: &'a Expression<'a>,
         asynchronous: bool,
     ) -> Option<Part> {
+        let latent = self.latent_of(file, iterable);
         let iteration = self.iteration_of(file, iterable, asynchronous);
+
+        if let Some(latent) = latent {
+            let consumed = self.consumed_part_of(file, iterable.span(), &latent);
+            let (acquire, next, _) = self.protocol_parts_of(file, iterable, &iteration, false);
+            let visits = match (&latent.yields, iteration.next.open) {
+                (Some(count), false) if !next.holds_no_work() => crate::cost::nest(
+                    "iterator visits".to_string(),
+                    self.project.site_of(file, span),
+                    self.source_span(file, span),
+                    count.clone(),
+                    next.executed(),
+                    &mut self.unknowns,
+                    &mut self.traces,
+                ),
+                (Some(_), false) => next,
+                _ => self.visits_of((file, span), next, true),
+            };
+
+            return Some(
+                consumed
+                    .max(acquire, &mut self.unknowns, &mut self.traces)
+                    .max(visits, &mut self.unknowns, &mut self.traces),
+            );
+        }
 
         if is_inert(&iteration) {
             return None;
@@ -587,6 +612,39 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         parts
+    }
+
+    pub(crate) fn count_yield(&mut self, file: FileId, yielded: &'a YieldExpression<'a>) {
+        let Some(produced) = self.produced.take() else {
+            return;
+        };
+        let mut count = Some(Cost::ONE);
+
+        for (_, _, factor, resolved) in &self.enclosing_factors {
+            count = match (count, resolved) {
+                (Some(count), true) => count.multiply(factor).ok(),
+                _ => None,
+            };
+        }
+
+        if let (Some(argument), true) = (&yielded.argument, yielded.delegate) {
+            let delegated = match self.latent_of(file, argument) {
+                Some(latent) => latent.yields,
+                None if self.is_constant_sized(file, argument) => Some(Cost::ONE),
+                None => match self.produced_size_of(file, argument) {
+                    Some(size) if !size.length_resolved => None,
+                    Some(size) if size.exceeds => Some(size.length),
+                    _ => Some(Cost::N),
+                },
+            };
+
+            count = match (count, delegated) {
+                (Some(count), Some(delegated)) => count.multiply(&delegated).ok(),
+                _ => None,
+            };
+        }
+
+        self.produced = Some(produced.joined(count));
     }
 
     fn yielded_part_of(&mut self, file: FileId, yielded: &'a YieldExpression<'a>) -> Option<Part> {
@@ -978,13 +1036,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn pattern_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
-        Some(
-            self.implicit_plan_part_of((file, kind.node_id()), |analysis, plan| {
-                if let Some(sources) = analysis.pattern_sources_of(file, kind) {
-                    analysis.plan_pattern_of(file, kind, sources, plan);
-                }
-            }),
-        )
+        let planned = self.implicit_plan_part_of((file, kind.node_id()), |analysis, plan| {
+            if let Some(sources) = analysis.pattern_sources_of(file, kind) {
+                analysis.plan_pattern_of(file, kind, sources, plan);
+            }
+        });
+        let destructured = match kind {
+            AstKind::ArrayPattern(_) | AstKind::ArrayAssignmentTarget(_) => {
+                self.pattern_sources_of(file, kind)
+            }
+            _ => None,
+        };
+
+        let Some(Sources {
+            values,
+            open: false,
+        }) = destructured
+        else {
+            return Some(planned);
+        };
+        let [(source, value)] = values[..] else {
+            return Some(planned);
+        };
+        let Some(latent) = self.latent_of(source, value) else {
+            return Some(planned);
+        };
+        let consumed = self.consumed_part_of(source, value.span(), &latent);
+
+        Some(planned.max(consumed, &mut self.unknowns, &mut self.traces))
     }
 
     fn planned_part_of(&mut self, planned: &ImplicitSite) -> Part {

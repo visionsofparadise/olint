@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use olint::analysis::Analysis;
 use olint::config::read_config;
-use olint::cost::{Cost, CostComparison};
+use olint::cost::{Cost, CostComparison, ExecutionPhase, Reading};
 use olint::public::public_functions;
 use olint::unknowns::UnknownReason;
 
@@ -934,4 +934,167 @@ fn array_for_each_keeps_its_snapshot_length() {
             "{body}: {reasons:?}"
         );
     }
+}
+
+fn traced_selected_of(declarations: &str, body: &str) -> (Cost, bool, Vec<String>, Reading) {
+    let source = format!("{HELPERS}\n{declarations}\nexport function selected{body}");
+    let mut found = None;
+
+    support::run_with_source(&source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "selected");
+        let reading = analysis.summarize(file, function);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+        let cost = support::legacy_class_of(analysis, file, function, &part.cost);
+        let labels = support::trace_nodes(&analysis.traces, part.trace)
+            .into_iter()
+            .map(|node| node.label.clone())
+            .collect();
+
+        found = Some((cost, part.is_complete(), labels, reading));
+    });
+
+    found.expect("the source declares selected")
+}
+
+fn scheduled_labels_of(labels: &[String]) -> usize {
+    labels
+        .iter()
+        .filter(|label| label.ends_with("callback [scheduled]"))
+        .count()
+}
+
+#[test]
+fn promise_continuations_run_once_as_scheduled_work() {
+    for (body, expected, scheduled) in [
+        (
+            "(xs: number[], p: Promise<number>) { return p.then(() => quadratic(xs)); }",
+            "O(N^2)",
+            1,
+        ),
+        (
+            "(xs: number[], p: Promise<number>) { return p.then(() => scan(xs), () => cube(xs)); }",
+            "O(N^3)",
+            1,
+        ),
+        (
+            "(xs: number[], p: Promise<number>) { for (const x of xs) p.then(() => quadratic(xs)); }",
+            "O(N^3)",
+            1,
+        ),
+        (
+            "(xs: number[], p: Promise<number>) { return p.catch(() => scan(xs)).finally(() => quadratic(xs)); }",
+            "O(N^2)",
+            1,
+        ),
+        (
+            "(xs: number[]) { return new Promise<number>((resolve) => resolve(1)).then(() => quadratic(xs)); }",
+            "O(N^2)",
+            1,
+        ),
+    ] {
+        let (cost, complete, labels, _) = traced_selected_of("", body);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {labels:?}");
+        assert!(complete, "{body}: {labels:?}");
+        assert_eq!(scheduled_labels_of(&labels), scheduled, "{body}: {labels:?}");
+    }
+}
+
+#[test]
+fn an_awaited_continuation_is_attributed_once() {
+    let source = format!(
+        "{HELPERS}\nexport async function selected(xs: number[], p: Promise<number>) {{ return await p.then(() => quadratic(xs)); }}"
+    );
+
+    support::run_with_source(&source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, "selected");
+        let part = support::summary_of(analysis, file, "selected");
+        let labels: Vec<String> = support::trace_nodes(&analysis.traces, part.trace)
+            .into_iter()
+            .map(|node| node.label.clone())
+            .collect();
+
+        assert_eq!(
+            support::legacy_class_of(analysis, file, function, &part.cost),
+            Cost::parse("O(N^2)").unwrap()
+        );
+        assert!(part.is_complete(), "{labels:?}");
+        assert_eq!(scheduled_labels_of(&labels), 1, "{labels:?}");
+    });
+}
+
+#[test]
+fn the_promise_executor_stays_immediate() {
+    let (cost, complete, labels, reading) = traced_selected_of(
+        "",
+        "(xs: number[]) { return new Promise<number>((resolve) => resolve(quadratic(xs))); }",
+    );
+
+    assert_eq!(cost, Cost::parse("O(N^2)").unwrap());
+    assert!(complete);
+    assert_eq!(scheduled_labels_of(&labels), 0, "{labels:?}");
+    assert!(reading
+        .completions
+        .iter()
+        .all(|channel| channel.0 == ExecutionPhase::Immediate));
+}
+
+#[test]
+fn unknown_scheduling_keeps_known_work_and_stays_partial() {
+    for (declarations, body) in [
+        (
+            "",
+            "(xs: number[], t: { then(callback: () => void): void }) { t.then(() => quadratic(xs)); }",
+        ),
+        (
+            "",
+            "(xs: number[], p: any) { p.then(() => quadratic(xs)); }",
+        ),
+        (
+            "(Promise.prototype as any).then = function () { return 0; };",
+            "(xs: number[], p: Promise<number>) { p.then(() => quadratic(xs)); }",
+        ),
+    ] {
+        let (_, complete, reasons) = selected_of(declarations, body);
+
+        assert!(!complete, "{body}: {reasons:?}");
+    }
+}
+
+#[test]
+fn generator_resumption_and_iterated_consumers_charge_lazy_work() {
+    let generators = "function* single(xs: number[]) { for (const x of xs) yield x; }\nfunction* square(xs: number[]) { for (const x of xs) for (const y of xs) yield x + y; }";
+
+    assert_selected(&[
+        (
+            generators,
+            "(xs: number[]) { return single(xs).next(); }",
+            "O(N)",
+            true,
+        ),
+        (
+            generators,
+            "(xs: number[]) { return square(xs).return(0); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            generators,
+            "(xs: number[]) { return Array.from(square(xs), () => quadratic(xs)); }",
+            "O(N^4)",
+            true,
+        ),
+        (
+            generators,
+            "(xs: number[]) { return Array.from(single(xs), () => quadratic(xs)); }",
+            "O(N^3)",
+            true,
+        ),
+        (
+            generators,
+            "(xs: number[]) { return [...square(xs)]; }",
+            "O(N^2)",
+            true,
+        ),
+    ]);
 }

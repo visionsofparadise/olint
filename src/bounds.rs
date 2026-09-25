@@ -247,6 +247,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match loop_kind {
             AstKind::ForOfStatement(statement) => {
+                if let Some(latent) = self.latent_of(file, &statement.right) {
+                    return match latent.yields {
+                        Some(factor) => Bound::Proven {
+                            factor,
+                            proof: Some("generator yields"),
+                        },
+                        None => unresolved_bound_of(),
+                    };
+                }
+
                 match self.live_iteration_of(file, statement) {
                     Some(Visits::Budgeted(budget)) => {
                         return match Cost::maximum(vec![Cost::N, budget.cost]) {

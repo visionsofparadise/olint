@@ -433,3 +433,63 @@ fn an_absorbed_escape_beside_its_own_loop_stays_comparable_against_the_limit() {
 
     assert!(row.starts_with("O(max(1, (xs * xs^2)))"), "{row}");
 }
+
+#[test]
+fn reports_show_scheduled_and_lazy_work_without_charging_unconsumed_generators() {
+    let source = "function quadratic(xs: number[]): number {\n\tlet total = 0;\n\tfor (const a of xs) for (const b of xs) total += a + b;\n\treturn total;\n}\n\nexport function* rows(xs: number[]) {\n\tfor (const a of xs) for (const b of xs) yield a + b;\n}\n\nexport function consume(xs: number[]): number {\n\tlet total = 0;\n\tfor (const row of rows(xs)) total += quadratic(xs);\n\treturn total;\n}\n\nexport function first(xs: number[]) {\n\treturn rows(xs).next();\n}\n\nexport function later(xs: number[], ready: Promise<number>) {\n\treturn ready.then(() => quadratic(xs));\n}\n";
+    let directory = support::project_of(&[
+        (
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"strict\":true},\"files\":[\"index.ts\"]}",
+        ),
+        ("index.ts", source),
+        (
+            "olint.config.json",
+            "{\"entrypoints\":[\"index.ts\"],\"max\":\"O(N^3)\"}",
+        ),
+    ]);
+    let (code, stdout, stderr) = captured(
+        Command::new(env!("CARGO_BIN_EXE_olint"))
+            .args(["--types", "syntactic", "--report", "--min", "0"])
+            .current_dir(directory.path()),
+    );
+
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let generator = lines
+        .iter()
+        .position(|line| line.contains(" rows  index.ts:"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+
+    assert!(lines[generator].starts_with("O(1) "), "{stdout}");
+    assert_eq!(
+        lines[generator + 1].trim(),
+        "lazy O(xs^2) when consumed",
+        "{stdout}"
+    );
+    assert!(stdout.contains("calls rows(xs) [lazy]"), "{stdout}");
+    assert!(
+        stdout.contains("in loop for-of [generator yields]"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("calls ready.then() callback [scheduled]"),
+        "{stdout}"
+    );
+
+    let (row, _) = reported_row_of(directory.path(), "consume");
+
+    assert!(!row.contains("[partial]"), "{row}");
+
+    let (code, stdout, stderr) = captured(
+        Command::new(env!("CARGO_BIN_EXE_olint"))
+            .args(["--types", "syntactic"])
+            .current_dir(directory.path()),
+    );
+
+    assert_eq!(code, Some(1), "{stdout}{stderr}");
+    assert!(stdout.contains("  consume  index.ts:"), "{stdout}");
+    assert!(!stdout.contains("  rows  index.ts:"), "{stdout}");
+    assert!(stdout.contains("1 over limit"), "{stdout}");
+}

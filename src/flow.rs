@@ -1165,6 +1165,14 @@ fn enclosing_of(
     None
 }
 
+pub fn is_suspension(kind: &AstKind<'_>) -> bool {
+    match kind {
+        AstKind::AwaitExpression(_) => true,
+        AstKind::ForOfStatement(statement) => statement.r#await,
+        _ => false,
+    }
+}
+
 pub fn enclosing_iteration_of(semantic: &Semantic<'_>, node: NodeId) -> Option<NodeId> {
     enclosing_of(semantic, node, |ancestor, kind| {
         is_iteration_kind(&kind).then_some(Some(ancestor))

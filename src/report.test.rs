@@ -92,6 +92,7 @@ fn row_of(cost: Cost, name: &str, file: u32, line: u32) -> ReportRow {
         ),
         unknowns: None,
         cost,
+        latent: None,
         name: name.to_string(),
         mark: None,
         site: Site {

@@ -26,6 +26,8 @@ pub enum Identity {
     Constructor,
     Receiver(Kind),
     Callable,
+    Promise,
+    Generator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,6 +487,36 @@ pub static MODELS: &[NativeModel] = &[
         Role::Read,
     ),
     NativeModel {
+        phase: ExecutionPhase::Scheduled,
+        ..model_of(
+            Identity::Promise,
+            &["then"],
+            Work::Constant,
+            &[Role::Callback(Count::Once), Role::Callback(Count::Once)],
+            Role::Read,
+        )
+    },
+    NativeModel {
+        phase: ExecutionPhase::Scheduled,
+        ..model_of(
+            Identity::Promise,
+            &["catch", "finally"],
+            Work::Constant,
+            &[Role::Callback(Count::Once)],
+            Role::Read,
+        )
+    },
+    NativeModel {
+        phase: ExecutionPhase::Lazy,
+        ..model_of(
+            Identity::Generator,
+            &["next", "return", "throw"],
+            Work::Constant,
+            &[Role::Stored],
+            Role::Read,
+        )
+    },
+    NativeModel {
         identity: Identity::Callable,
         names: &["call"],
         work: Work::Constant,
@@ -565,6 +597,10 @@ impl<'a> NativeSite<'a> {
     fn expression_at(&self, index: usize) -> Option<&'a Expression<'a>> {
         self.arguments.get(index).and_then(Argument::as_expression)
     }
+
+    pub(crate) fn iterates(&self, model: &NativeModel, index: usize) -> bool {
+        self.role_of(model, index) == Role::Iterated
+    }
 }
 
 fn global_flag_of(pattern: &Expression<'_>) -> Option<bool> {
@@ -637,6 +673,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 if self.is_intrinsic_reference(file, owner) {
                     return Native::Modelled(model);
                 }
+            }
+        }
+
+        if let Some(model) = native_model_of(Identity::Promise, &method) {
+            if self.is_intrinsic_promise(file, receiver) {
+                return Native::Modelled(model);
+            }
+        }
+
+        if let Some(model) = native_model_of(Identity::Generator, &method) {
+            if self.latent_of(file, receiver).is_some() {
+                return Native::Modelled(model);
             }
         }
 
@@ -830,6 +878,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .retaining(scaled, &mut self.unknowns);
         }
 
+        if model.phase == ExecutionPhase::Lazy {
+            beside = beside.max(
+                self.resumed_part_of(site),
+                &mut self.unknowns,
+                &mut self.traces,
+            );
+        }
+
+        if model.phase == ExecutionPhase::Scheduled && !beside.cost.is_one() {
+            let receiver = site
+                .receiver
+                .map(|receiver| short(self.text_of(file, receiver.span())))
+                .unwrap_or_default();
+
+            beside = beside.explain(
+                format_args!("call {receiver}.{}() callback [scheduled]", site.name),
+                self.project.site_of(file, site.span),
+                origin,
+                true,
+                &mut self.traces,
+                &mut self.unknowns,
+            );
+        }
+
         let label = self
             .native_label_of(site, model)
             .map(|label| match &budget {
@@ -868,7 +940,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut reading = reading;
 
         reading.join(
-            model.phase,
+            ExecutionPhase::Immediate,
             Completion::Normal,
             part,
             &mut self.unknowns,
@@ -876,6 +948,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
         );
 
         reading
+    }
+
+    fn resumed_part_of(&mut self, site: &NativeSite<'a>) -> Part {
+        let Some(receiver) = site.receiver else {
+            return Part::none();
+        };
+        let Some(latent) = self.latent_of(site.file, receiver) else {
+            return Part::none();
+        };
+        let consumed = self.consumed_part_of(site.file, receiver.span(), &latent);
+        let Some(call) = site.call else {
+            return consumed;
+        };
+        let replaced = self.intrinsic_protocol_of((site.file, call.node_id()), &site.name);
+        let replaced =
+            self.implicit_part_of((site.file, site.span), &replaced, "resumption", &[receiver]);
+
+        consumed.max(replaced, &mut self.unknowns, &mut self.traces)
     }
 
     fn native_label_of(&self, site: &NativeSite<'a>, model: &NativeModel) -> Option<String> {
@@ -950,6 +1040,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Operand::Receiver => site.receiver,
                     _ => site.expression_at(0),
                 };
+
+                if let Some(latent) = measured.and_then(|measured| self.latent_of(file, measured)) {
+                    return self.latent_size_of(&latent);
+                }
+
                 let produced = measured.and_then(|measured| self.produced_size_of(file, measured));
 
                 match produced {
@@ -1374,7 +1469,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for known in &targets.known {
             let function = self.function_at(*known);
-            let (called, cyclic) = self.call_user(known.file, function, file, forwarded, site.span);
+            let (called, cyclic) = self.call_user_with(
+                (known.file, function),
+                (file, forwarded, site.span),
+                crate::summaries::Deferral::Escaped,
+            );
             let called = self.named_call_of((known.file, function), called, (site_of, origin));
             let called = called
                 .called(origin, &mut self.unknowns)

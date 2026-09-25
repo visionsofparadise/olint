@@ -249,7 +249,7 @@ fn destructuring_patterns_read_getters_and_iterate_sources() {
 fn delegated_yields_and_head_targets_run_the_protocol_per_visit() {
     let it = "const it = { [Symbol.iterator]() { let count = 0; return { next() { quadratic(xs); return { done: count++ >= xs.length, value: 1 }; } }; } };";
     let cases = [
-        (index_of(format!("{QUADRATIC}\nexport function* selected(xs: number[]) {{ {it} yield* it; }}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {it} yield* it; }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^3)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const box = {{ set p(v: number) {{ quadratic(xs); }} }}; for (box.p of xs) {{}} }}")), "O(N^3)", false),
     ];
 
@@ -262,7 +262,7 @@ fn iterators_close_on_every_abrupt_path_out_of_the_body() {
     let thrower = "function thrower(x: number): void { if (x > 1) throw 0; }";
     let cases = [
         (index_of(format!("{QUADRATIC}\n{thrower}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ thrower(v); }} }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport function* selected(xs: number[]) {{ {closing} for (const v of it) {{ yield v; }} }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {closing} for (const v of it) {{ yield v; }} }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport async function selected(xs: number[]) {{ {closing} for (const v of it) {{ await v; }} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} for (const v of it) {{ switch (v) {{ case 1: break; }} }} }}")), "O(N)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {closing} let t = 0; for (const v of it) {{ t += v; }} return t; }}")), "O(N^2)", false),

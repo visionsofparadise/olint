@@ -94,6 +94,7 @@ pub struct ReportRow {
     pub envelope: Option<Cost>,
     pub unknowns: Option<UnknownId>,
     pub cost: Cost,
+    pub latent: Option<Part>,
     pub name: String,
     pub mark: Option<String>,
     pub site: Site,
@@ -123,11 +124,12 @@ pub fn report_rows_of<'a>(
 
             text
         });
-        let mut part = match mark {
+        let reading = match mark {
             Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
             None => analysis.summarize(file, function),
-        }
-        .total(&mut analysis.unknowns, &mut analysis.traces);
+        };
+        let mut part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+        let latent = reading.latent(&mut analysis.unknowns, &mut analysis.traces);
 
         let envelope = match analysis.bind_function_cost(file, function, &Cost::N) {
             Ok(cost) => Some(cost),
@@ -147,6 +149,7 @@ pub fn report_rows_of<'a>(
             envelope,
             unknowns: part.unknowns,
             cost: part.cost,
+            latent: (!latent.is_absent()).then_some(latent),
             name: analysis.name_of(file, function),
             mark,
             site: analysis.function_site_of(file, function),
@@ -338,6 +341,13 @@ fn lines_of_report(
         } else {
             row_text
         });
+
+        if let Some(latent) = &row.latent {
+            lines.push(format!(
+                "    lazy {} when consumed",
+                partial_text(values, &latent.cost, latent.unknowns)
+            ));
+        }
 
         lines_of_chain(values, traces, row.trace, 1, &mut lines, location);
 

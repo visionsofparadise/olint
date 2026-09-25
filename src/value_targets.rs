@@ -1269,7 +1269,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         found
     }
 
-    fn intrinsic_protocol_of(&mut self, site: Site, name: &str) -> TargetSet {
+    pub(crate) fn intrinsic_protocol_of(&mut self, site: Site, name: &str) -> TargetSet {
         let key = MemberKey::Name(name.to_string());
 
         if !self.may_implement(&key) {
@@ -1304,7 +1304,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             })
     }
 
-    fn is_intrinsic_promise(&mut self, file: FileId, expression: &'a Expression<'a>) -> bool {
+    pub(crate) fn is_intrinsic_promise(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
         self.is_intrinsic_promise_at(file, expression, 0)
     }
 
@@ -1326,6 +1330,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Expression::NewExpression(new) => self.is_global_promise(file, &new.callee),
             Expression::CallExpression(call) => match member_expression_of(unwrap(&call.callee)) {
                 Some(member) if self.is_global_promise(file, member.object()) => true,
+                Some(member)
+                    if member
+                        .static_property_name()
+                        .is_some_and(|name| ["then", "catch", "finally"].contains(&name))
+                        && self.is_intrinsic_promise_at(file, member.object(), depth + 1) =>
+                {
+                    true
+                }
                 _ => self.is_asynchronous_call(file, call),
             },
             Expression::Identifier(reference) => match self.local_values_of(file, reference) {

@@ -13,7 +13,7 @@ use crate::analysis::work::{Charges, Event, FallbackCredit, Limits, Snapshot, Wo
 use crate::analysis::{Analysis, Stats};
 use crate::cost::{Cost, CostError, Part, Preference, Reading};
 use crate::declarations::{
-    parameters_of, Binding, Declaration, FunctionId, FunctionNode, TargetSet,
+    parameters_of, Binding, Declaration, FunctionId, FunctionNode, ParameterNode, TargetSet,
 };
 use crate::directives::{cost_tag_of, PerfTag};
 use crate::effects::Effects;
@@ -34,6 +34,8 @@ use crate::values::{
 use crate::walker::tagged_reading_of;
 
 const MAXIMUM_PATTERN_ALIASES: usize = 8;
+const MAXIMUM_LATENT_DEPTH: usize = 6;
+const RESUMPTIONS: [&str; 3] = ["next", "return", "throw"];
 const MAXIMUM_RECURRENCE_ROUNDS: usize = 4;
 
 #[cfg(test)]
@@ -52,6 +54,79 @@ pub struct SummaryRecord {
     pub effects: Effects,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Latent {
+    pub work: Part,
+    pub yields: Option<Cost>,
+    pub effects: Effects,
+    pub record: Option<SummaryId>,
+}
+
+impl Latent {
+    fn unresolved(work: Part) -> Latent {
+        Latent {
+            work,
+            yields: None,
+            effects: Effects::unknown(),
+            record: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deferral {
+    Excluded,
+    Consumed,
+    Escaped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Produced {
+    pub count: Option<Cost>,
+    pub yielded: bool,
+}
+
+impl Produced {
+    pub fn joined(self, count: Option<Cost>) -> Produced {
+        let count = match (self.yielded, self.count, count) {
+            (false, _, count) => count,
+            (true, Some(held), Some(count)) => Cost::maximum(vec![held, count]).ok(),
+            _ => None,
+        };
+
+        Produced {
+            count,
+            yielded: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LatentSources {
+    pub direct: bool,
+    pub parameters: Vec<usize>,
+}
+
+impl LatentSources {
+    fn join(&mut self, other: LatentSources) {
+        self.direct |= other.direct;
+
+        for index in other.parameters {
+            if !self.parameters.contains(&index) {
+                self.parameters.push(index);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LatentKey {
+    pub work: Cost,
+    pub cost_error: Option<CostError>,
+    pub unknowns: crate::unknowns::SemanticKeyId,
+    pub yields: Option<Cost>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArgumentKey {
     pub binding: Binding,
@@ -62,6 +137,7 @@ pub struct ArgumentKey {
     pub preference: Preference,
     pub definedness: Definedness,
     pub latent_effects: Option<Effects>,
+    pub latent: Option<LatentKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -136,6 +212,7 @@ struct SummaryTask {
     credit: Option<FallbackCredit>,
     fallback: bool,
     passes: u64,
+    produced: Option<Produced>,
 }
 
 #[derive(Clone)]
@@ -507,6 +584,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                         effects
                     });
+                let latent = match value
+                    .latent
+                    .and_then(|id| self.summaries_arena.get(id.0 as usize))
+                    .map(|record| (record.reading.clone(), record.result.size.clone()))
+                {
+                    Some((reading, yields)) => {
+                        let work = reading.latent(&mut self.unknowns, &mut self.traces);
+
+                        Some(LatentKey {
+                            work: work.cost,
+                            cost_error: work.cost_error,
+                            unknowns: self.unknowns.semantic_key(work.unknowns, &mut || {
+                                self.scheduler
+                                    .work
+                                    .admit(Charges::one(Event::SemanticIdentity, 1))
+                                    .is_ok()
+                            })?,
+                            yields,
+                        })
+                    }
+                    None => None,
+                };
                 value.latent = None;
 
                 Ok(ArgumentKey {
@@ -529,6 +628,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     preference: facts.preference,
                     definedness: facts.definedness,
                     latent_effects,
+                    latent,
                 })
             })
             .collect::<Result<Vec<_>, crate::unknowns::SemanticError>>()?;
@@ -554,6 +654,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         key: SummaryKey,
         reading: Reading,
         mut effects: Effects,
+        produced: Option<Produced>,
     ) -> SummaryId {
         effects
             .binding_writes
@@ -563,9 +664,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .kind_of_node(key.function.file, key.function.node)
             .span();
         let origin = self.source_span(key.function.file, span);
-        let result = self.values.at(origin);
+        let mut result = self.values.at(origin);
         let id =
             SummaryId(u32::try_from(self.summaries_arena.len()).expect("summary arena fits u32"));
+
+        if let Some(produced) = produced {
+            result.latent = Some(id);
+            result.size = produced.count;
+        }
 
         self.summaries_arena.push(SummaryRecord {
             reading,
@@ -843,6 +949,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .ok()?
             .plus(Event::InvocationEvaluation, size)
             .ok()?
+            .plus(Event::LatentStep, size.saturating_mul(2))
+            .ok()?
             .plus(Event::TraversalEdge, size.saturating_mul(2))
             .ok()?
             .plus(Event::QueuePush, 2)
@@ -881,6 +989,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             credit: Some(credit),
             fallback: false,
             passes: 0,
+            produced: None,
         });
         self.scheduler.keys.insert(key, id);
 
@@ -1041,7 +1150,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .release(&mut credit)
             .expect("task credit is owned");
 
-        let record = self.store_summary(key, reading, effects);
+        let produced = self.scheduler.tasks[id.0].produced.take();
+        let record = self.store_summary(key, reading, effects, produced);
         self.scheduler.tasks[id.0].state = TaskState::Ready(record);
 
         let task = &self.scheduler.tasks[id.0];
@@ -1104,6 +1214,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let saved_budget = self.budget_context.take();
         let saved_shares = std::mem::take(&mut self.share_bindings);
         let saved_factors = std::mem::take(&mut self.enclosing_factors);
+        let saved_produced = self.produced.take();
         let saved_scoped = std::mem::take(&mut self.pending_scoped);
         let saved_bounds = std::mem::take(&mut self.bound_seen);
         let saved_warnings = std::mem::take(&mut self.warnings);
@@ -1136,6 +1247,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             )
         };
         let reading = self.finish_reading(key.function.file, function, reading, &inputs);
+        let produced =
+            std::mem::replace(&mut self.produced, saved_produced).map(|produced| Produced {
+                count: produced
+                    .count
+                    .and_then(|count| self.bind_cost_in(&count, &inputs).ok()),
+                yielded: produced.yielded,
+            });
+
+        self.scheduler.tasks[id.0].produced = produced;
+
         let effects = std::mem::replace(&mut self.current_effects, saved_effects);
         self.current_substitutions = saved_inputs;
         self.root_sizes = saved_roots;
@@ -1729,7 +1850,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let readings: Vec<Reading> = results.into_iter().map(|(reading, _)| reading).collect();
         let member_totals: Vec<Part> = readings
             .iter()
-            .map(|reading| reading.total(&mut self.unknowns, &mut self.traces))
+            .map(|reading| {
+                let total = reading.total(&mut self.unknowns, &mut self.traces);
+                let latent = reading.latent(&mut self.unknowns, &mut self.traces);
+
+                total.max(latent, &mut self.unknowns, &mut self.traces)
+            })
             .collect();
         let equations = self.recurrence_equations_of(members, &member_totals, &markers)?;
         let RecurrenceSolution::Solved { factors, proof } = solution_of(&equations) else {
@@ -2174,7 +2300,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             }
 
+            let generator = matches!(function, FunctionNode::Function(inner) if inner.generator);
+
+            if generator {
+                self.produced = Some(Produced {
+                    count: Some(Cost::ONE),
+                    yielded: false,
+                });
+            }
+
             let body = self.cost_of_function_body(file, function);
+            let body = match generator {
+                true => body.in_phase(
+                    crate::cost::ExecutionPhase::Lazy,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                ),
+                false => self.returned_latent_reading_of(file, function, body),
+            };
 
             match parameters {
                 Some(parameters) => parameters.merge(body, &mut self.unknowns, &mut self.traces),
@@ -2591,6 +2734,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
+        if let Some(expression) = expression.filter(|expression| {
+            matches!(
+                expression,
+                Expression::CallExpression(_)
+                    | Expression::Identifier(_)
+                    | Expression::ConditionalExpression(_)
+                    | Expression::LogicalExpression(_)
+                    | Expression::SequenceExpression(_)
+            )
+        }) {
+            if let Some(latent) = self.latent_of(file, expression) {
+                value.latent = self.latent_record_of(latent, origin);
+
+                if value.latent.is_none() {
+                    self.scheduler.exhausted = true;
+                }
+            }
+        }
+
         match function {
             Some((target, function)) => {
                 self.callback_facts_of((file, span), value, (target, function), callback_open)
@@ -2877,7 +3039,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.call_with_captures(
                     (target.file, function),
                     (file, arguments, span),
-                    implicit,
+                    (implicit, Deferral::Escaped),
                     captured,
                 )
             };
@@ -2959,6 +3121,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         arguments: &'a [Argument<'a>],
         span: oxc_span::Span,
     ) -> (Part, bool) {
+        self.call_user_with(
+            (file, function),
+            (call_file, arguments, span),
+            Deferral::Excluded,
+        )
+    }
+
+    pub(crate) fn call_user_with(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        (call_file, arguments, span): (FileId, &'a [Argument<'a>], oxc_span::Span),
+        deferral: Deferral,
+    ) -> (Part, bool) {
         if self.fallback_active() {
             return self.fallback_invocation(
                 FunctionId {
@@ -2980,7 +3155,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.call_with_captures(
             (file, function),
             (call_file, arguments, span),
-            false,
+            (false, deferral),
             captured,
         )
     }
@@ -3006,30 +3181,68 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.call_with_captures(
             (target.file, function),
             (call_file, &[], span),
-            true,
+            (true, Deferral::Consumed),
             captured,
         )
     }
 
     fn call_with_captures(
         &mut self,
+        function: (FileId, FunctionNode<'a>),
+        call: (FileId, &'a [Argument<'a>], oxc_span::Span),
+        (implicit, deferral): (bool, Deferral),
+        substitutions: Substitutions,
+    ) -> (Part, bool) {
+        let (reading, cyclic) = self.invocation_reading_of(function, call, implicit, substitutions);
+        let part = reading.total(&mut self.unknowns, &mut self.traces);
+        let latent = match deferral {
+            Deferral::Excluded => return (part, cyclic),
+            Deferral::Consumed => reading.latent(&mut self.unknowns, &mut self.traces),
+            Deferral::Escaped => {
+                let latent = reading.latent(&mut self.unknowns, &mut self.traces);
+                let unknown = match latent.is_absent() {
+                    true => None,
+                    false => Some(self.unknowns.origin(
+                        self.source_span(call.0, call.2),
+                        UnknownReason::Multiplicity,
+                    )),
+                };
+
+                latent.retaining(unknown, &mut self.unknowns)
+            }
+        };
+
+        (
+            part.max(latent, &mut self.unknowns, &mut self.traces),
+            cyclic,
+        )
+    }
+
+    fn invocation_reading_of(
+        &mut self,
         (file, function): (FileId, FunctionNode<'a>),
         (call_file, arguments, span): (FileId, &'a [Argument<'a>], oxc_span::Span),
         implicit: bool,
         substitutions: Substitutions,
-    ) -> (Part, bool) {
+    ) -> (Reading, bool) {
         let target = FunctionId {
             file,
             node: function.node_id(),
         };
 
         if self.fallback_active() {
-            return self.fallback_invocation(target, call_file, span);
+            let (part, cyclic) = self.fallback_invocation(target, call_file, span);
+
+            return (Reading::of_part(part), cyclic);
         }
 
         if !self.charge_work(Event::InvocationEvaluation, 1) {
             return (
-                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    call_file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             );
         }
@@ -3040,7 +3253,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if !self.scheduler.runtime.contains(&(caller, target)) {
                 if !self.charge_work(Event::RuntimePair, 1) {
                     return (
-                        self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                        Reading::of_part(self.deferred_unknown(
+                            call_file,
+                            span,
+                            UnknownReason::ResourceExhaustion,
+                        )),
                         false,
                     );
                 }
@@ -3053,7 +3270,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if !self.scheduler.sites.contains(&site) {
                 if !self.charge_work(Event::InvocationSite, 1) {
                     return (
-                        self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                        Reading::of_part(self.deferred_unknown(
+                            call_file,
+                            span,
+                            UnknownReason::ResourceExhaustion,
+                        )),
                         false,
                     );
                 }
@@ -3073,7 +3294,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.scheduler.exhausted = true;
 
             return (
-                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                Reading::of_part(self.deferred_unknown(
+                    call_file,
+                    span,
+                    UnknownReason::ResourceExhaustion,
+                )),
                 false,
             );
         };
@@ -3096,7 +3321,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.substitute_parameter_values(file, function, call_file, arguments, &mut effects);
         self.current_effects.join(&effects);
 
-        (reading.total(&mut self.unknowns, &mut self.traces), cyclic)
+        (reading, cyclic)
     }
 
     fn invocation_substitutions_of(
@@ -3927,6 +4152,869 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.set_pass(TscPass::Answering);
 
         Ok(rounds)
+    }
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    fn returned_latent_reading_of(
+        &mut self,
+        file: FileId,
+        function: FunctionNode<'a>,
+        reading: Reading,
+    ) -> Reading {
+        let target = FunctionId {
+            file,
+            node: function.node_id(),
+        };
+
+        if self.is_asynchronous_target(target) || !self.may_return_latent(target, 0) {
+            return reading;
+        }
+
+        let mut found: Option<Latent> = None;
+        let mut mixed = false;
+
+        for returned in self.returned_expressions_of(target) {
+            match self.latent_of(file, returned) {
+                Some(latent) => found = Some(self.joined_latent_of(found, latent)),
+                None => mixed = true,
+            }
+        }
+
+        let Some(mut latent) = found else {
+            return reading;
+        };
+
+        if mixed {
+            latent.yields = None;
+        }
+
+        self.produced = Some(Produced {
+            count: latent.yields,
+            yielded: true,
+        });
+
+        let mut reading = reading;
+
+        reading.join(
+            crate::cost::ExecutionPhase::Lazy,
+            Completion::Normal,
+            latent.work,
+            &mut self.unknowns,
+            &mut self.traces,
+        );
+
+        reading
+    }
+
+    fn is_generator_target(&self, target: FunctionId) -> bool {
+        matches!(self.function_at(target), FunctionNode::Function(function) if function.generator)
+    }
+
+    fn is_asynchronous_target(&self, target: FunctionId) -> bool {
+        match self.function_at(target) {
+            FunctionNode::Function(function) => function.r#async,
+            FunctionNode::Arrow(arrow) => arrow.r#async,
+            FunctionNode::Construction(_) => false,
+        }
+    }
+
+    fn joined_latent_of(&mut self, held: Option<Latent>, latent: Latent) -> Latent {
+        let Some(held) = held else {
+            return latent;
+        };
+        let mut effects = held.effects;
+
+        effects.join(&latent.effects);
+
+        Latent {
+            work: held
+                .work
+                .max(latent.work, &mut self.unknowns, &mut self.traces),
+            yields: match (held.yields, latent.yields) {
+                (Some(left), Some(right)) => Cost::maximum(vec![left, right]).ok(),
+                _ => None,
+            },
+            effects,
+            record: None,
+        }
+    }
+
+    pub(crate) fn latent_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Option<Latent> {
+        if !self.may_be_latent(file, expression, 0) {
+            return None;
+        }
+
+        self.latent_at(file, expression, 0)
+    }
+
+    fn latent_at(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> Option<Latent> {
+        if depth > MAXIMUM_LATENT_DEPTH || !self.charge_work(Event::LatentStep, 1) {
+            return Some(self.unresolved_latent_of(
+                (file, expression.span()),
+                UnknownReason::ResourceExhaustion,
+            ));
+        }
+
+        match unwrap(expression) {
+            Expression::CallExpression(call) => self.call_latent_of(file, call),
+            Expression::Identifier(reference) => {
+                let declaration = self
+                    .declarations
+                    .of_reference(self.project, file, reference)?;
+
+                if let Some(binding) = self.parameter_binding_of(declaration) {
+                    let id = self
+                        .current_substitutions
+                        .get(&binding)
+                        .and_then(|facts| facts.value.latent)?;
+
+                    if !self.is_parameter_unwritten(binding) {
+                        return None;
+                    }
+
+                    return Some(self.record_latent_of(id, false));
+                }
+
+                let (source, initializer) = crate::constants::constant_initializer_of(declaration)?;
+
+                self.latent_at(source, initializer, depth + 1)
+            }
+            Expression::ConditionalExpression(conditional) => self.alternative_latent_of(
+                file,
+                [&conditional.consequent, &conditional.alternate],
+                depth,
+            ),
+            Expression::LogicalExpression(logical) => {
+                self.alternative_latent_of(file, [&logical.left, &logical.right], depth)
+            }
+            Expression::SequenceExpression(sequence) => {
+                self.latent_at(file, sequence.expressions.last()?, depth + 1)
+            }
+            _ => None,
+        }
+    }
+
+    fn alternative_latent_of(
+        &mut self,
+        file: FileId,
+        alternatives: [&'a Expression<'a>; 2],
+        depth: usize,
+    ) -> Option<Latent> {
+        let mut found: Option<Latent> = None;
+        let mut mixed = false;
+
+        for alternative in alternatives {
+            let latent = match self.may_be_latent(file, alternative, depth + 1) {
+                true => self.latent_at(file, alternative, depth + 1),
+                false => None,
+            };
+
+            match latent {
+                Some(latent) => found = Some(self.joined_latent_of(found, latent)),
+                None => mixed = true,
+            }
+        }
+
+        found.map(|latent| match mixed {
+            true => Latent {
+                yields: None,
+                ..latent
+            },
+            false => latent,
+        })
+    }
+
+    pub(crate) fn call_latent_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> Option<Latent> {
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        self.targets_latent_of(file, call, targets)
+    }
+
+    fn targets_latent_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        targets: TargetSet,
+    ) -> Option<Latent> {
+        let mut found: Option<Latent> = None;
+        let mut missing = targets.open;
+
+        for target in targets.known {
+            match self.invocation_latent_of(target, file, call) {
+                Some(latent) => found = Some(self.joined_latent_of(found, latent)),
+                None => missing = true,
+            }
+        }
+
+        found.map(|latent| match missing {
+            true => Latent {
+                yields: None,
+                ..latent
+            },
+            false => latent,
+        })
+    }
+
+    fn invocation_latent_of(
+        &mut self,
+        target: FunctionId,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+    ) -> Option<Latent> {
+        let generator = self.is_generator_target(target);
+
+        if !generator && (self.is_asynchronous_target(target) || !self.may_return_latent(target, 0))
+        {
+            return None;
+        }
+
+        let function = self.function_at(target);
+        let origin = (file, call.span);
+        let Some(captured) = self.inherited_substitutions_of(target.file, function) else {
+            return Some(self.unresolved_latent_of(origin, UnknownReason::ResourceExhaustion));
+        };
+        let substitutions = self.invocation_substitutions_of(
+            (target.file, function),
+            (file, &call.arguments),
+            false,
+            captured,
+        );
+        let substitutions = self.function_inputs(target.file, function, substitutions);
+        let Ok(key) = self.key_of(target.file, function, &substitutions) else {
+            self.scheduler.exhausted = true;
+
+            return Some(self.unresolved_latent_of(origin, UnknownReason::ResourceExhaustion));
+        };
+
+        if !self.charge_work(Event::LatentStep, 1) {
+            return Some(self.unresolved_latent_of(origin, UnknownReason::ResourceExhaustion));
+        }
+
+        let (reading, cyclic) = self.request_reading(key.clone(), substitutions);
+
+        if cyclic {
+            let total = reading.total(&mut self.unknowns, &mut self.traces);
+            let latent = reading.latent(&mut self.unknowns, &mut self.traces);
+
+            return Some(Latent::unresolved(total.max(
+                latent,
+                &mut self.unknowns,
+                &mut self.traces,
+            )));
+        }
+
+        let ready = self.summaries.get(&key).copied().or_else(|| {
+            self.scheduler.keys.get(&key).and_then(|task| {
+                match self.scheduler.tasks[task.0].state {
+                    TaskState::Ready(id) => Some(id),
+                    _ => None,
+                }
+            })
+        });
+
+        match ready {
+            Some(id)
+                if generator || self.summaries_arena[id.0 as usize].result.latent.is_some() =>
+            {
+                Some(self.record_latent_of(id, generator))
+            }
+            Some(_) => None,
+            None => Some(Latent::unresolved(Part::none())),
+        }
+    }
+
+    fn unresolved_latent_of(
+        &mut self,
+        (file, span): (FileId, oxc_span::Span),
+        reason: UnknownReason,
+    ) -> Latent {
+        let unknown = self.unknown_part(file, span, reason);
+
+        Latent::unresolved(unknown)
+    }
+
+    fn record_latent_of(&mut self, id: SummaryId, generator: bool) -> Latent {
+        let record = &self.summaries_arena[id.0 as usize];
+        let reading = record.reading.clone();
+        let yields = match (record.result.latent.is_some(), generator) {
+            (false, true) => None,
+            _ => record.result.size.clone(),
+        };
+        let effects = record.effects.clone();
+
+        Latent {
+            work: reading.latent(&mut self.unknowns, &mut self.traces),
+            yields,
+            effects,
+            record: Some(id),
+        }
+    }
+
+    pub(crate) fn latent_record_of(
+        &mut self,
+        latent: Latent,
+        origin: crate::unknowns::SourceSpan,
+    ) -> Option<SummaryId> {
+        if let Some(record) = latent.record {
+            return Some(record);
+        }
+
+        if !self.charge_work(Event::LatentStep, 1) {
+            return None;
+        }
+
+        let id =
+            SummaryId(u32::try_from(self.summaries_arena.len()).expect("summary arena fits u32"));
+        let mut result = self.values.at(origin);
+
+        result.latent = Some(id);
+        result.size = latent.yields;
+
+        self.summaries_arena.push(SummaryRecord {
+            reading: Reading::of_completion(
+                crate::cost::ExecutionPhase::Lazy,
+                Completion::Normal,
+                latent.work,
+            ),
+            result,
+            effects: latent.effects,
+        });
+
+        Some(id)
+    }
+
+    pub(crate) fn latent_size_of(&self, latent: &Latent) -> crate::values::Size {
+        let size = crate::values::Size {
+            exceeds: true,
+            element_resolved: false,
+            ..crate::values::Size::sized(latent.yields.clone().unwrap_or(Cost::N))
+        };
+
+        match latent.yields {
+            Some(_) => size,
+            None => size.unresolved_length(),
+        }
+    }
+
+    pub(crate) fn consumed_part_of(
+        &mut self,
+        file: FileId,
+        span: oxc_span::Span,
+        latent: &Latent,
+    ) -> Part {
+        let origin = self.source_span(file, span);
+
+        self.current_effects.join(&latent.effects);
+
+        let part = match latent.work.cost.is_one() {
+            true => latent.work.clone(),
+            false => latent.work.clone().explain(
+                format_args!(
+                    "call {} [lazy]",
+                    crate::bounds::short(self.text_of(file, span))
+                ),
+                self.project.site_of(file, span),
+                origin,
+                true,
+                &mut self.traces,
+                &mut self.unknowns,
+            ),
+        };
+
+        part.called(origin, &mut self.unknowns)
+    }
+
+    pub(crate) fn untracked_latent_part_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        targets: &TargetSet,
+    ) -> Option<Part> {
+        if !self.may_return_latent_targets(file, call, targets, 0)
+            || self.is_tracked_consumption(file, call.node_id(), 0)
+        {
+            return None;
+        }
+
+        let latent = self.targets_latent_of(file, call, targets.clone())?;
+        let part = self.consumed_part_of(file, call.span, &latent);
+        let origin = self.source_span(file, call.span);
+        let unknown = self.unknowns.origin(origin, UnknownReason::Multiplicity);
+
+        Some(part.retaining(Some(unknown), &mut self.unknowns))
+    }
+
+    fn may_be_latent(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAXIMUM_LATENT_DEPTH {
+            return true;
+        }
+
+        match unwrap(expression) {
+            Expression::CallExpression(call) => self.may_return_latent_call(file, call, depth),
+            Expression::Identifier(reference) => {
+                let Some(declaration) =
+                    self.declarations
+                        .of_reference(self.project, file, reference)
+                else {
+                    return false;
+                };
+
+                if let Some(binding) = self.parameter_binding_of(declaration) {
+                    return self
+                        .current_substitutions
+                        .get(&binding)
+                        .is_some_and(|facts| facts.value.latent.is_some());
+                }
+
+                match crate::constants::constant_initializer_of(declaration) {
+                    Some((source, initializer)) => {
+                        self.may_be_latent(source, initializer, depth + 1)
+                    }
+                    None => false,
+                }
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.may_be_latent(file, &conditional.consequent, depth + 1)
+                    || self.may_be_latent(file, &conditional.alternate, depth + 1)
+            }
+            Expression::LogicalExpression(logical) => {
+                self.may_be_latent(file, &logical.left, depth + 1)
+                    || self.may_be_latent(file, &logical.right, depth + 1)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .is_some_and(|last| self.may_be_latent(file, last, depth + 1)),
+            _ => false,
+        }
+    }
+
+    fn may_return_latent_call(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        depth: usize,
+    ) -> bool {
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        self.may_return_latent_targets(file, call, &targets, depth)
+    }
+
+    fn may_return_latent_targets(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        targets: &TargetSet,
+        depth: usize,
+    ) -> bool {
+        targets.known.iter().copied().any(|target| {
+            if self.is_generator_target(target) {
+                return true;
+            }
+
+            if self.is_asynchronous_target(target) {
+                return false;
+            }
+
+            let sources = self.target_latent_sources_of(target, depth + 1);
+
+            sources.direct
+                || sources.parameters.into_iter().any(|index| {
+                    call.arguments
+                        .get(index)
+                        .and_then(Argument::as_expression)
+                        .is_some_and(|argument| self.may_be_latent(file, argument, depth + 1))
+                })
+        })
+    }
+
+    fn may_return_latent(&mut self, target: FunctionId, depth: usize) -> bool {
+        if self.is_generator_target(target) {
+            return true;
+        }
+
+        let sources = self.target_latent_sources_of(target, depth);
+
+        sources.direct || !sources.parameters.is_empty()
+    }
+
+    fn target_latent_sources_of(&mut self, target: FunctionId, depth: usize) -> LatentSources {
+        let everything = LatentSources {
+            direct: true,
+            parameters: Vec::new(),
+        };
+
+        if depth > MAXIMUM_LATENT_DEPTH {
+            return everything;
+        }
+
+        let key = (target, self.scheduler.generation);
+
+        if let Some(found) = self.latent_returns.get(&key) {
+            return found.clone();
+        }
+
+        self.latent_returns.insert(key, LatentSources::default());
+
+        let found = match self.charge_work(Event::LatentStep, 1) {
+            true => {
+                let mut found = LatentSources::default();
+
+                for returned in self.returned_expressions_of(target) {
+                    let sources = self.latent_sources_of(target, returned, depth + 1);
+
+                    found.join(sources);
+                }
+
+                found
+            }
+            false => everything,
+        };
+
+        self.latent_returns.insert(key, found.clone());
+
+        found
+    }
+
+    fn latent_sources_of(
+        &mut self,
+        owner: FunctionId,
+        expression: &'a Expression<'a>,
+        depth: usize,
+    ) -> LatentSources {
+        let file = owner.file;
+        let mut found = LatentSources::default();
+
+        if depth > MAXIMUM_LATENT_DEPTH {
+            found.direct = true;
+
+            return found;
+        }
+
+        match unwrap(expression) {
+            Expression::CallExpression(call) => {
+                let targets = self.resolved_callee_of(file, call).targets;
+
+                for target in targets.known {
+                    if self.is_generator_target(target) {
+                        found.direct = true;
+
+                        continue;
+                    }
+
+                    if self.is_asynchronous_target(target) {
+                        continue;
+                    }
+
+                    let sources = self.target_latent_sources_of(target, depth + 1);
+
+                    found.direct |= sources.direct;
+
+                    for index in sources.parameters {
+                        if let Some(argument) =
+                            call.arguments.get(index).and_then(Argument::as_expression)
+                        {
+                            let sources = self.latent_sources_of(owner, argument, depth + 1);
+
+                            found.join(sources);
+                        }
+                    }
+                }
+            }
+            Expression::Identifier(reference) => {
+                match self
+                    .declarations
+                    .of_reference(self.project, file, reference)
+                {
+                    Some(Declaration::Parameter {
+                        parameter: ParameterNode::Formal(parameter),
+                        function,
+                        ..
+                    }) if function.node_id() == owner.node => {
+                        let index = parameters_of(function).and_then(|parameters| {
+                            parameters
+                                .items
+                                .iter()
+                                .position(|item| item.span == parameter.span)
+                        });
+
+                        match index {
+                            Some(index) => found.parameters.push(index),
+                            None => found.direct = true,
+                        }
+                    }
+                    Some(Declaration::Parameter { .. }) => found.direct = true,
+                    Some(declaration) => {
+                        if let Some((source, initializer)) =
+                            crate::constants::constant_initializer_of(declaration)
+                        {
+                            let sources = self.latent_sources_of(
+                                FunctionId {
+                                    file: source,
+                                    node: owner.node,
+                                },
+                                initializer,
+                                depth + 1,
+                            );
+
+                            found.join(sources);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            Expression::ConditionalExpression(conditional) => {
+                for branch in [&conditional.consequent, &conditional.alternate] {
+                    let sources = self.latent_sources_of(owner, branch, depth + 1);
+
+                    found.join(sources);
+                }
+            }
+            Expression::LogicalExpression(logical) => {
+                for branch in [&logical.left, &logical.right] {
+                    let sources = self.latent_sources_of(owner, branch, depth + 1);
+
+                    found.join(sources);
+                }
+            }
+            Expression::SequenceExpression(sequence) => {
+                if let Some(last) = sequence.expressions.last() {
+                    found = self.latent_sources_of(owner, last, depth + 1);
+                }
+            }
+            _ => {}
+        }
+
+        found
+    }
+
+    pub(crate) fn is_tracked_consumption(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        depth: usize,
+    ) -> bool {
+        if depth > MAXIMUM_LATENT_DEPTH || !self.charge_work(Event::LatentStep, 1) {
+            return false;
+        }
+
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let mut current = node;
+
+        loop {
+            current = crate::values::outermost_of(nodes, current);
+
+            let span = nodes.kind(current).span();
+            let parent = nodes.parent_id(current);
+
+            match nodes.kind(parent) {
+                AstKind::ConditionalExpression(conditional) if conditional.test.span() == span => {
+                    return true
+                }
+                AstKind::SequenceExpression(sequence)
+                    if sequence
+                        .expressions
+                        .last()
+                        .is_none_or(|last| last.span() != span) =>
+                {
+                    return true
+                }
+                AstKind::LogicalExpression(_)
+                | AstKind::ConditionalExpression(_)
+                | AstKind::SequenceExpression(_) => current = parent,
+                AstKind::ExpressionStatement(_) => return true,
+                AstKind::UnaryExpression(unary) => {
+                    return unary.operator == oxc_syntax::operator::UnaryOperator::Void;
+                }
+                AstKind::ForOfStatement(statement) => return statement.right.span() == span,
+                AstKind::SpreadElement(_) => return true,
+                AstKind::YieldExpression(yielded) => return yielded.delegate,
+                AstKind::ReturnStatement(_) => return self.returns_value(file, parent),
+                AstKind::ArrowFunctionExpression(arrow) => {
+                    return arrow.get_expression().is_some() && !arrow.r#async;
+                }
+                AstKind::StaticMemberExpression(member) => {
+                    let AstKind::CallExpression(call) = nodes.parent_kind(parent) else {
+                        return false;
+                    };
+
+                    return member.object.span() == span
+                        && call.callee.span() == member.span
+                        && RESUMPTIONS.contains(&member.property.name.as_str())
+                        && self.resolved_callee_of(file, call).targets.known.is_empty();
+                }
+                AstKind::CallExpression(call) => {
+                    return self.is_tracked_argument(file, call, span, depth);
+                }
+                AstKind::VariableDeclarator(declarator) => {
+                    if matches!(declarator.id, BindingPattern::ArrayPattern(_)) {
+                        return declarator
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| init.span() == span)
+                            && !matches!(
+                                nodes.parent_kind(nodes.parent_id(parent)),
+                                AstKind::ForOfStatement(_) | AstKind::ForInStatement(_)
+                            );
+                    }
+
+                    return self.is_tracked_holder(file, parent, declarator, depth);
+                }
+                AstKind::AssignmentExpression(assignment) => {
+                    return assignment.right.span() == span
+                        && matches!(
+                            assignment.left,
+                            oxc_ast::ast::AssignmentTarget::ArrayAssignmentTarget(_)
+                        );
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn returns_value(&self, file: FileId, statement: NodeId) -> bool {
+        self.project
+            .file(file)
+            .semantic
+            .nodes()
+            .ancestors(statement)
+            .find_map(|ancestor| match ancestor.kind() {
+                AstKind::Function(function) => Some(!function.r#async && !function.generator),
+                AstKind::ArrowFunctionExpression(arrow) => Some(!arrow.r#async),
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    fn is_tracked_argument(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        span: oxc_span::Span,
+        depth: usize,
+    ) -> bool {
+        if call.callee.span() == span {
+            return false;
+        }
+
+        let Some(index) = call
+            .arguments
+            .iter()
+            .position(|argument| argument.span() == span)
+        else {
+            return false;
+        };
+
+        if call.arguments[..index]
+            .iter()
+            .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+        {
+            return false;
+        }
+
+        let targets = self.resolved_callee_of(file, call).targets;
+
+        if targets.known.is_empty() {
+            let member = self.callee_member_of(file, call);
+
+            return match self.native_of(file, call, member, false) {
+                crate::native::Native::Modelled(model) => {
+                    self.call_site_of(file, call, member).iterates(model, index)
+                }
+                _ => false,
+            };
+        }
+
+        if targets.open {
+            return false;
+        }
+
+        targets.known.into_iter().all(|target| {
+            let function = self.function_at(target);
+            let Some(parameter) =
+                parameters_of(function).and_then(|parameters| parameters.items.get(index))
+            else {
+                return false;
+            };
+            let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                return false;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                return false;
+            };
+
+            parameter.initializer.is_none()
+                && self.is_parameter_unwritten(Binding::Symbol {
+                    file: target.file,
+                    symbol,
+                })
+                && self.are_references_tracked(target.file, symbol, depth)
+        })
+    }
+
+    fn is_tracked_holder(
+        &mut self,
+        file: FileId,
+        node: NodeId,
+        declarator: &'a oxc_ast::ast::VariableDeclarator<'a>,
+        depth: usize,
+    ) -> bool {
+        let project = self.project;
+        let constant = matches!(
+            project.file(file).semantic.nodes().parent_kind(node),
+            AstKind::VariableDeclaration(declaration)
+                if declaration.kind == oxc_ast::ast::VariableDeclarationKind::Const
+                    && !declaration.declare
+        );
+        let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+            return false;
+        };
+        let Some(symbol) = identifier.symbol_id.get() else {
+            return false;
+        };
+
+        constant && self.are_references_tracked(file, symbol, depth)
+    }
+
+    fn are_references_tracked(
+        &mut self,
+        file: FileId,
+        symbol: oxc_semantic::SymbolId,
+        depth: usize,
+    ) -> bool {
+        let project = self.project;
+        let references: Vec<NodeId> = project
+            .file(file)
+            .semantic
+            .scoping()
+            .get_resolved_references(symbol)
+            .filter(|reference| !reference.flags().is_type())
+            .map(oxc_semantic::Reference::node_id)
+            .collect();
+
+        references
+            .into_iter()
+            .all(|reference| self.is_tracked_consumption(file, reference, depth + 1))
     }
 }
 
