@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{Argument, CallExpression, Expression, Program, Statement, TSModuleReference};
+use oxc_ast::ast::{
+    Argument, CallExpression, Expression, JSXAttributeItem, JSXAttributeName, JSXOpeningElement,
+    ObjectPropertyKind, Program, Statement, TSModuleReference,
+};
 use oxc_ast::AstKind;
 use oxc_parser::Parser;
 use oxc_resolver::{
@@ -19,7 +22,7 @@ use crate::unknowns::UnknownReason;
 use crate::paths::{
     canonical_path_of, forward_slashes_of, relative_path_of, strip_verbatim_prefix,
 };
-use crate::tsconfig::{select_files, SelectedProject};
+use crate::tsconfig::{select_files, OutputOptions, SelectedProject};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(pub u32);
@@ -127,6 +130,7 @@ pub struct Project<'a> {
     configless_resolver: Resolver,
     runtime_resolvers: [Resolver; 2],
     counterparts: HashMap<FileId, FileId>,
+    jsx_runtimes: Vec<JsxRuntime>,
     implementation_limit: usize,
     implementation_stats: Cell<ImplementationStats>,
 }
@@ -136,6 +140,28 @@ pub enum Resolved {
     File(FileId),
     External(PathBuf),
     Unresolved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsxRuntime {
+    Classic {
+        factory: Vec<String>,
+        fragment: Vec<String>,
+    },
+    Automatic {
+        runtime: String,
+        source: String,
+        development: bool,
+    },
+    Untransformed,
+}
+
+#[derive(Default)]
+struct JsxPragmas {
+    factory: Option<String>,
+    fragment: Option<String>,
+    import_source: Option<String>,
+    runtime: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -255,6 +281,7 @@ impl<'a> Project<'a> {
                 Resolver::new(runtime_options_of(RuntimeCondition::Require)),
             ],
             counterparts: HashMap::new(),
+            jsx_runtimes: Vec::new(),
             implementation_limit,
             implementation_stats: Cell::new(ImplementationStats::default()),
         };
@@ -343,6 +370,11 @@ impl<'a> Project<'a> {
         project.counterparts = counterparts
             .into_iter()
             .filter_map(|(runtime, declared)| Some((runtime, declared?)))
+            .collect();
+        project.jsx_runtimes = project
+            .files
+            .iter()
+            .map(|file| project.jsx_runtime_in(file, &file.owners))
             .collect();
 
         Ok(project)
@@ -468,7 +500,13 @@ impl<'a> Project<'a> {
             .ok();
         let mut imports: Vec<Import> = Vec::new();
 
-        for (specifier, kind, typed) in module_requests_of(file) {
+        let mut requests = module_requests_of(file);
+
+        for specifier in jsx_requests_of(file, &self.jsx_runtime_in(file, &[owner])) {
+            requests.push((specifier, RequestKind::Static, true));
+        }
+
+        for (specifier, kind, typed) in requests {
             let mut declared = None;
 
             if typed && !file.implementation {
@@ -739,6 +777,48 @@ impl<'a> Project<'a> {
             RuntimeTarget::Boundary(path) => Resolved::External(path),
             RuntimeTarget::Unresolved => Resolved::Unresolved,
         }
+    }
+
+    pub fn jsx_runtime_of(&self, id: FileId) -> JsxRuntime {
+        self.jsx_runtimes
+            .get(id.0 as usize)
+            .cloned()
+            .unwrap_or(JsxRuntime::Untransformed)
+    }
+
+    pub(crate) fn jsx_spreads_lowered(&self, id: FileId) -> bool {
+        !matches!(self.jsx_runtime_of(id), JsxRuntime::Untransformed)
+            && self
+                .file(id)
+                .owners
+                .iter()
+                .all(|owner| lowers_object_spread(&self.configurations[*owner].output))
+    }
+
+    fn jsx_runtime_in(&self, file: &SourceFile<'a>, owners: &[usize]) -> JsxRuntime {
+        if file.implementation {
+            return JsxRuntime::Untransformed;
+        }
+
+        if let Some(first) = owners.first() {
+            if owners.iter().any(|owner| {
+                lowers_object_spread(&self.configurations[*owner].output)
+                    != lowers_object_spread(&self.configurations[*first].output)
+            }) {
+                return JsxRuntime::Untransformed;
+            }
+        }
+
+        let pragmas = jsx_pragmas_of(file);
+
+        owners
+            .iter()
+            .map(|owner| jsx_runtime_of_options(&self.configurations[*owner].output, &pragmas))
+            .reduce(|left, right| match left == right {
+                true => left,
+                false => JsxRuntime::Untransformed,
+            })
+            .unwrap_or(JsxRuntime::Untransformed)
     }
 
     pub fn counterpart_of(&self, id: FileId) -> Option<FileId> {
@@ -1109,6 +1189,204 @@ fn is_javascript_path(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         JAVASCRIPT_EXTENSIONS.contains(&extension.to_string_lossy().as_ref())
     })
+}
+
+fn lowers_object_spread(options: &OutputOptions) -> bool {
+    matches!(
+        options
+            .target
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        None | Some("es3" | "es5" | "es6" | "es2015" | "es2016" | "es2017")
+    )
+}
+
+fn jsx_runtime_of_options(options: &OutputOptions, pragmas: &JsxPragmas) -> JsxRuntime {
+    let mode = options.jsx.as_deref().map(str::to_ascii_lowercase);
+    let development = match mode.as_deref() {
+        Some("react" | "react-jsx") => false,
+        Some("react-jsxdev") => true,
+        _ => return JsxRuntime::Untransformed,
+    };
+    let configured_source = options
+        .jsx_import_source
+        .clone()
+        .filter(|source| !source.is_empty());
+    let automatic = mode.as_deref() != Some("react")
+        || configured_source.is_some()
+        || pragmas.import_source.is_some()
+        || pragmas.runtime.as_deref() == Some("automatic");
+
+    if pragmas.runtime.as_deref() != Some("classic") && automatic {
+        let source = pragmas
+            .import_source
+            .clone()
+            .or(configured_source)
+            .unwrap_or_else(|| "react".to_string());
+        let runtime = match development {
+            true => format!("{source}/jsx-dev-runtime"),
+            false => format!("{source}/jsx-runtime"),
+        };
+
+        return JsxRuntime::Automatic {
+            runtime,
+            source,
+            development,
+        };
+    }
+
+    let namespace = options
+        .react_namespace
+        .clone()
+        .unwrap_or_else(|| "React".to_string());
+    let factory = [pragmas.factory.as_deref(), options.jsx_factory.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(entity_names_of)
+        .unwrap_or_else(|| vec![namespace.clone(), "createElement".to_string()]);
+    let fragment = [
+        pragmas.fragment.as_deref(),
+        options.jsx_fragment_factory.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(entity_names_of)
+    .unwrap_or_else(|| vec![namespace, "Fragment".to_string()]);
+
+    JsxRuntime::Classic { factory, fragment }
+}
+
+fn entity_names_of(text: &str) -> Option<Vec<String>> {
+    let names: Vec<String> = text.split('.').map(str::to_string).collect();
+    let valid = names.iter().all(|name| {
+        let mut characters = name.chars();
+
+        characters
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+            && characters.all(|character| {
+                character.is_alphanumeric() || character == '_' || character == '$'
+            })
+    });
+
+    valid.then_some(names)
+}
+
+fn jsx_pragmas_of(file: &SourceFile<'_>) -> JsxPragmas {
+    let mut pragmas = JsxPragmas::default();
+    let mut position = file
+        .program
+        .hashbang
+        .as_ref()
+        .map_or(0, |hashbang| hashbang.span.end as usize);
+
+    for comment in &file.program.comments {
+        let (start, end) = (comment.span.start as usize, comment.span.end as usize);
+
+        if start < position || !file.text[position..start].trim().is_empty() {
+            break;
+        }
+
+        position = end;
+
+        if !comment.is_block() {
+            continue;
+        }
+
+        for (name, argument) in comment_pragmas_of(&file.text[start..end]) {
+            match name.as_str() {
+                "jsx" if pragmas.factory.is_none() => pragmas.factory = Some(argument),
+                "jsxfrag" if pragmas.fragment.is_none() => pragmas.fragment = Some(argument),
+                "jsximportsource" => pragmas.import_source = Some(argument),
+                "jsxruntime" => pragmas.runtime = Some(argument),
+                _ => {}
+            }
+        }
+    }
+
+    pragmas
+}
+
+fn comment_pragmas_of(text: &str) -> Vec<(String, String)> {
+    let mut pragmas = Vec::new();
+    let mut rest = text;
+
+    while let Some(at) = rest.find('@') {
+        let after = &rest[at + 1..];
+        let name_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let trimmed = after[name_end..].trim_start();
+
+        if name_end == 0 || trimmed.is_empty() {
+            rest = after;
+
+            continue;
+        }
+
+        let line_end = trimmed.find(['\n', '\r']).unwrap_or(trimmed.len());
+
+        if let Some(argument) = trimmed[..line_end].split_whitespace().next() {
+            pragmas.push((after[..name_end].to_ascii_lowercase(), argument.to_string()));
+        }
+
+        rest = &trimmed[line_end..];
+    }
+
+    pragmas
+}
+
+fn jsx_requests_of(file: &SourceFile<'_>, runtime: &JsxRuntime) -> Vec<String> {
+    let JsxRuntime::Automatic {
+        runtime, source, ..
+    } = runtime
+    else {
+        return Vec::new();
+    };
+    let mut requests = Vec::new();
+
+    for node in file.semantic.nodes().iter() {
+        match node.kind() {
+            AstKind::JSXElement(_) | AstKind::JSXFragment(_) if !requests.contains(runtime) => {
+                requests.push(runtime.clone());
+            }
+            AstKind::JSXOpeningElement(opening)
+                if has_key_after_spread(opening) && !requests.contains(source) =>
+            {
+                requests.push(source.clone());
+            }
+            _ => {}
+        }
+    }
+
+    requests
+}
+
+pub(crate) fn has_key_after_spread(opening: &JSXOpeningElement<'_>) -> bool {
+    let mut spread = false;
+
+    for attribute in &opening.attributes {
+        match attribute {
+            JSXAttributeItem::SpreadAttribute(item) => {
+                spread |= match &item.argument {
+                    Expression::ObjectExpression(object) => object
+                        .properties
+                        .iter()
+                        .any(|property| matches!(property, ObjectPropertyKind::SpreadProperty(_))),
+                    _ => true,
+                };
+            }
+            JSXAttributeItem::Attribute(item) => {
+                let keyed =
+                    matches!(&item.name, JSXAttributeName::Identifier(name) if name.name == "key");
+
+                if spread && keyed {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn module_requests_of(file: &SourceFile<'_>) -> Vec<(String, RequestKind, bool)> {

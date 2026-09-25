@@ -1879,3 +1879,77 @@ fn standard_api_callbacks_run_inside_their_native_operation() {
         assert_eq!(found, labels, "{source}");
     }
 }
+
+const JSX_WORK: &str = "export function quadratic(xs: number[]) { let t = 0; for (const a of xs) for (const b of xs) t += a * b; return t; }\n";
+const JSX_FACTORY: &str = "export function h(type: any, props: any, ...children: any[]) { return { type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
+const JSX_CLASSIC: &str = r#"{ "compilerOptions": { "strict": true, "noEmit": true, "jsx": "react", "jsxFactory": "h", "jsxFragmentFactory": "Fragment", "module": "esnext", "moduleResolution": "bundler", "target": "es2022", "types": [] }, "include": ["src"] }"#;
+const JSX_PRESERVE: &str = r#"{ "compilerOptions": { "strict": true, "noEmit": true, "jsx": "preserve", "module": "esnext", "moduleResolution": "bundler", "target": "es2022", "types": [] }, "include": ["src"] }"#;
+
+fn jsx_case(
+    tsconfig: &str,
+    body: &str,
+    expected: &'static str,
+    partial: bool,
+) -> support::ProjectCase<'static> {
+    let index = format!(
+        "import {{ h, Fragment }} from \"./h\";\nimport {{ quadratic }} from \"./work\";\n{body}\n"
+    );
+
+    (
+        vec![
+            ("tsconfig.json", tsconfig.to_string()),
+            ("src/index.tsx", index),
+            ("src/h.ts", JSX_FACTORY.to_string()),
+            ("src/work.ts", JSX_WORK.to_string()),
+        ],
+        expected,
+        partial,
+    )
+}
+
+#[test]
+fn jsx_expressions_are_evaluated_and_stay_visible() {
+    let cases = [
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <div title={quadratic(xs)} />; }", "O(N^2)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <div>{quadratic(xs)}</div>; }", "O(N^2)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(props: Record<string, number>) { return <div {...props} />; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <div>{...xs}</div>; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <div title={<span>{quadratic(xs)}</span>} />; }", "O(N^2)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <ul>{xs.map((x) => <li key={x}>{quadratic(xs)}</li>)}</ul>; }", "O(N^3)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <>{quadratic(xs)}</>; }", "O(N^2)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { const o = { get v() { return quadratic(xs); } }; return <div {...o} />; }", "O(N^2)", true),
+        jsx_case(JSX_CLASSIC, "export function selected(props: Record<string, number>) { return <div {...{ ...props }} />; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(p: object) { return <div {...{ __proto__: p, a: 1 }} />; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { const ui = { get Box() { quadratic(xs); return () => 1; } }; return <ui.Box />; }", "O(N^2)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { const ui = { inner: { get Box() { quadratic(xs); return () => 1; } } }; return <ui.inner.Box />; }", "O(N^2)", false),
+        jsx_case(JSX_PRESERVE, "export function selected(xs: number[]) { return <div>{quadratic(xs)}</div>; }", "O(N^2)", true),
+        jsx_case(JSX_PRESERVE, "export function selected(props: Record<string, number>) { return <div {...props} />; }", "O(N)", true),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+
+    let controls = [
+        jsx_case(JSX_CLASSIC, "export function selected() { return <div title=\"x\">text</div>; }", "O(1)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <div title={xs.length}>{xs[0]}</div>; }", "O(1)", false),
+        jsx_case(JSX_CLASSIC, "export function selected() { return <div {...{ a: 1 }} />; }", "O(1)", false),
+        jsx_case(JSX_CLASSIC, "const ui = { Box(props: any) { return props; } };\nexport function selected() { return <ui.Box></ui.Box>; }", "O(1)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <div {...{ get v() { return quadratic(xs); } }} />; }", "O(1)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { return <ul>{xs.map((x) => <li key={x}>{x}</li>)}</ul>; }", "O(N)", false),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &controls);
+
+    let counting = "let count = 0;\nexport function h(type: any, props: any, ...children: any[]) { count += 1; return { n: count, type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
+    let mut endpoint = jsx_case(JSX_CLASSIC, "export function selected() { let t = 0; for (let i = 0; i < (<div /> as any).n; i++) t += i; return t; }", "O(1)", true);
+
+    endpoint.0[2].1 = counting.to_string();
+
+    let flows = [
+        jsx_case(JSX_CLASSIC, "export function selected(n: number) { let t = 0; for (let i = 1; i < (<div />, n); i *= 2) t += i; return t; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(s: Set<number>) { let t = 0; for (const x of s) { const e = <div {...{ get v() { s.add(1); return 1; } }} />; t += 1; } return t; }", "O(N)", false),
+        jsx_case(JSX_CLASSIC, "export function selected(xs: number[]) { for (const x of xs) { try { const e = <div />; } catch { return quadratic(xs); } } return 0; }", "O(N^2)", false),
+        endpoint,
+    ];
+
+    support::assert_project_cases("src/index.tsx", &flows);
+}

@@ -380,15 +380,7 @@ impl<'a> Declarations<'a> {
                     Some(expression)
                         if crate::syntax::member_expression_of(expression).is_some() =>
                     {
-                        let member = crate::syntax::member_expression_of(expression).unwrap();
-
-                        break (
-                            self.member_of_receiver(project, file, member).or_else(|| {
-                                self.namespace_target_of(project, file, expression)
-                                    .and_then(|target| declaration_of_target(project, target))
-                            }),
-                            false,
-                        );
+                        break (self.member_initializer_of(project, file, expression), false);
                     }
                     _ => break (declaration, true),
                 },
@@ -408,6 +400,112 @@ impl<'a> Declarations<'a> {
         }
 
         result
+    }
+
+    pub(crate) fn scoped_entity_of(
+        &self,
+        project: &Project<'a>,
+        (file, scope): (FileId, ScopeId),
+        names: &[String],
+    ) -> (Option<Declaration<'a>>, bool) {
+        let Some((root, members)) = names.split_first() else {
+            return (None, false);
+        };
+        let found = match project
+            .file(file)
+            .semantic
+            .scoping()
+            .find_binding(scope, root.as_str().into())
+        {
+            Some(symbol) => Some((file, symbol)),
+            None => self.global_symbol_of(project, file, root),
+        };
+        let Some((file, symbol)) = found else {
+            return (None, false);
+        };
+        let mut target = self.target_of_symbol(project, file, symbol);
+
+        for member in members {
+            match self.member_target_of(project, target, member) {
+                Some(found) => target = found,
+                None => return (None, false),
+            }
+        }
+
+        self.callable_target_of(project, target)
+    }
+
+    pub(crate) fn module_export_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        (specifier, name): (&str, &str),
+    ) -> (Option<Declaration<'a>>, bool) {
+        let Resolved::File(module) =
+            self.module_target_of(project, file, specifier, RequestKind::Static)
+        else {
+            return (None, false);
+        };
+
+        match self.followed_export_of(project, module, name) {
+            Some(target) => self.callable_target_of(project, target),
+            None => (None, false),
+        }
+    }
+
+    fn member_initializer_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Option<Declaration<'a>> {
+        let member = crate::syntax::member_expression_of(expression)?;
+
+        self.member_of_receiver(project, file, member).or_else(|| {
+            self.namespace_target_of(project, file, expression)
+                .and_then(|target| declaration_of_target(project, target))
+        })
+    }
+
+    fn callable_target_of(
+        &self,
+        project: &Project<'a>,
+        target: Target,
+    ) -> (Option<Declaration<'a>>, bool) {
+        let Target::Symbol(file, symbol) = target else {
+            return (
+                declaration_of_target(project, target),
+                matches!(target, Target::Node(..)),
+            );
+        };
+
+        if !self.is_write_free(project, Binding::Symbol { file, symbol })
+            || !self.runtime_declarations_of(project, file, symbol).1
+        {
+            return (None, false);
+        }
+
+        match declaration_of_target(project, target) {
+            Some(Declaration::Variable {
+                file,
+                declarator,
+                constant: true,
+            }) if matches!(declarator.id, BindingPattern::BindingIdentifier(_)) => {
+                match declarator.init.as_ref().map(unwrap) {
+                    Some(Expression::Identifier(reference)) => {
+                        self.callable_reference(project, file, reference)
+                    }
+                    Some(expression)
+                        if crate::syntax::member_expression_of(expression).is_some() =>
+                    {
+                        (self.member_initializer_of(project, file, expression), false)
+                    }
+                    _ => (declaration_of_target(project, target), true),
+                }
+            }
+            Some(Declaration::Variable { .. }) => (None, false),
+            declaration => (declaration, true),
+        }
     }
 
     pub fn of_reference(
@@ -976,8 +1074,15 @@ impl<'a> Declarations<'a> {
             return Some((file, symbol));
         }
 
-        let name = reference.name.as_str();
+        self.global_symbol_of(project, file, reference.name.as_str())
+    }
 
+    fn global_symbol_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        name: &str,
+    ) -> Option<(FileId, SymbolId)> {
         let key = (file, name.to_string());
 
         if let Some(found) = self.globals.borrow().get(&key) {

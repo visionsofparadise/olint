@@ -22,6 +22,7 @@ use crate::flow::{
     class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, is_suspension,
     loop_phases_of, Completion, Resumption,
 };
+use crate::invocations::is_inlined_spread;
 use crate::native::{Matching, Native, Pattern};
 use crate::project::{FileId, Site};
 use crate::syntax::{
@@ -583,6 +584,36 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Completion::Throw,
             ),
             AstKind::SpreadElement(spread) => self.cost_of_spread(file, spread),
+            AstKind::JSXSpreadAttribute(spread) if is_inlined_spread(&spread.argument) => {
+                let inner = self.cost_of_expression(file, &spread.argument);
+
+                match self.jsx_spread_part_of(file, kind) {
+                    Some(part) => {
+                        inner.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces)
+                    }
+                    None => inner,
+                }
+            }
+            AstKind::JSXSpreadAttribute(spread) => {
+                let implicit = self.jsx_spread_part_of(file, kind);
+
+                self.cost_of_spread_copy(
+                    file,
+                    (spread.node_id(), spread.span),
+                    &spread.argument,
+                    implicit,
+                )
+            }
+            AstKind::JSXSpreadChild(child) => {
+                let implicit = self.jsx_spread_part_of(file, kind);
+
+                self.cost_of_spread_copy(
+                    file,
+                    (child.node_id(), child.span),
+                    &child.expression,
+                    implicit,
+                )
+            }
             AstKind::AssignmentTargetRest(rest) => self.cost_of_rest_target(file, rest),
             AstKind::BindingRestElement(rest) => self.cost_of_binding_rest(file, rest),
             AstKind::NewExpression(new) => self.cost_of_new(file, new),
@@ -1541,23 +1572,40 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn cost_of_spread(&mut self, file: FileId, spread: &'a SpreadElement<'a>) -> Reading {
-        let inner = self.cost_of_expression(file, &spread.argument);
-        let inner = match self.spread_part_of(file, spread) {
+        let implicit = self.spread_part_of(file, spread);
+
+        self.cost_of_spread_copy(
+            file,
+            (spread.node_id(), spread.span),
+            &spread.argument,
+            implicit,
+        )
+    }
+
+    fn cost_of_spread_copy(
+        &mut self,
+        file: FileId,
+        (node, span): (NodeId, Span),
+        argument: &'a Expression<'a>,
+        implicit: Option<Part>,
+    ) -> Reading {
+        let inner = self.cost_of_expression(file, argument);
+        let inner = match implicit {
             Some(part) => inner.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces),
             None => inner,
         };
 
-        if self.is_constant_rest_expression(file, &spread.argument) {
+        if self.is_constant_rest_expression(file, argument) {
             return inner;
         }
 
-        if self.is_constant_sized(file, &spread.argument) {
+        if self.is_constant_sized(file, argument) {
             return inner;
         }
 
-        let produced = match self.latent_of(file, &spread.argument) {
+        let produced = match self.latent_of(file, argument) {
             Some(latent) => Some(self.latent_size_of(&latent)),
-            None => self.produced_size_of(file, &spread.argument),
+            None => self.produced_size_of(file, argument),
         };
         let factor = match &produced {
             Some(size) if size.exceeds => size.length.clone(),
@@ -1565,7 +1613,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
         let inner = match produced.is_some_and(|size| !size.length_resolved) {
             true => {
-                let unresolved = self.unknown_part(file, spread.span, UnknownReason::SizeRelation);
+                let unresolved = self.unknown_part(file, span, UnknownReason::SizeRelation);
 
                 inner.merge(
                     Reading::of_part(unresolved),
@@ -1575,17 +1623,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             false => inner,
         };
-        let label = format!(
-            "spread ...{}",
-            short(self.text_of(file, spread.argument.span()))
-        );
-        let site = self.site_of_node(file, spread.node_id());
+        let label = format!("spread ...{}", short(self.text_of(file, argument.span())));
+        let site = self.site_of_node(file, node);
 
         inner.merge(
             Reading::of_part(self.nest_part(
                 label,
                 site,
-                self.source_span(file, spread.span),
+                self.source_span(file, span),
                 factor,
                 Part::unmarked(Cost::ONE, None),
             )),

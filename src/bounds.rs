@@ -1001,6 +1001,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 AstKind::CallExpression(_)
                 | AstKind::NewExpression(_)
                 | AstKind::TaggedTemplateExpression(_)
+                | AstKind::JSXElement(_)
+                | AstKind::JSXFragment(_)
                 | AstKind::AwaitExpression(_)
                 | AstKind::YieldExpression(_)
                 | AstKind::AssignmentExpression(_)

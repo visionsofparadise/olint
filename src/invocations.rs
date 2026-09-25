@@ -1,6 +1,8 @@
 use oxc_ast::ast::{
     ArrayExpressionElement, AssignmentTarget, AssignmentTargetMaybeDefault,
     AssignmentTargetProperty, BindingPattern, Class, Expression, ForOfStatement, FormalParameter,
+    JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElementName, JSXExpression,
+    JSXExpressionContainer, JSXMemberExpression, JSXMemberExpressionObject, JSXOpeningElement,
     MethodDefinitionKind, ObjectPropertyKind, PropertyKind, SimpleAssignmentTarget, SpreadElement,
     TaggedTemplateExpression, YieldExpression,
 };
@@ -8,16 +10,21 @@ use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, NodeId};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
+use oxc_syntax::scope::ScopeId;
 
 use crate::analysis::Analysis;
-use crate::cost::{Cost, Part, Reading};
-use crate::declarations::{FunctionId, FunctionNode, TargetSet};
+use crate::constants::constant_initializer_of;
+use crate::cost::{Cost, Part, Preference, Reading};
+use crate::declarations::{Declaration, FunctionId, FunctionNode, TargetSet};
 use crate::declared_types::{is_primitive_result, Kind};
-use crate::project::{FileId, Project};
+use crate::project::{has_key_after_spread, FileId, JsxRuntime, Project};
 use crate::receivers::Placement;
 use crate::syntax::{member_expression_of, unwrap};
 use crate::unknowns::UnknownReason;
-use crate::values::{outermost_of, protocol_key_of, Iteration, MemberKey, ValueId};
+use crate::values::{
+    outermost_of, protocol_key_of, ArgumentFacts, Definedness, Iteration, MemberKey, ValueFacts,
+    ValueId,
+};
 
 use std::rc::Rc;
 
@@ -258,6 +265,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             AstKind::SpreadElement(spread) => {
                 self.spread_part_of(file, spread);
             }
+            AstKind::JSXSpreadAttribute(_) | AstKind::JSXSpreadChild(_) => {
+                self.jsx_spread_part_of(file, kind);
+            }
             _ => {}
         }
     }
@@ -358,7 +368,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .parent_kind(spread.node_id()),
             AstKind::ObjectExpression(_)
         ) {
-            return self.copied_part_of(file, spread);
+            return Some(self.copied_part_of(
+                file,
+                (spread.node_id(), spread.span),
+                &spread.argument,
+            ));
         }
 
         self.delegated_part_of(file, spread.span, &spread.argument, false)
@@ -390,17 +404,129 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.visits_of((file, value.span()), visited, false)
     }
 
-    fn copied_part_of(&mut self, file: FileId, spread: &'a SpreadElement<'a>) -> Option<Part> {
-        Some(
-            self.implicit_plan_part_of((file, spread.node_id()), |analysis, plan| {
-                let sources = Sources {
-                    values: vec![(file, &spread.argument)],
-                    open: false,
-                };
+    fn copied_part_of(
+        &mut self,
+        file: FileId,
+        (node, span): (NodeId, Span),
+        argument: &'a Expression<'a>,
+    ) -> Part {
+        self.implicit_plan_part_of((file, node), |analysis, plan| {
+            let sources = Sources {
+                values: vec![(file, argument)],
+                open: false,
+            };
 
-                analysis.plan_rest_reads_of((file, spread.span), &sources, &[], plan);
-            }),
-        )
+            analysis.plan_rest_reads_of((file, span), &sources, &[], plan);
+        })
+    }
+
+    pub(crate) fn jsx_spread_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
+        match kind {
+            AstKind::JSXSpreadAttribute(spread) if is_inlined_spread(&spread.argument) => {
+                self.lowered_jsx_getters_of(file, spread)
+            }
+            AstKind::JSXSpreadAttribute(spread) => {
+                Some(self.copied_part_of(file, (spread.node_id(), spread.span), &spread.argument))
+            }
+            AstKind::JSXSpreadChild(child) => {
+                self.delegated_part_of(file, child.span, &child.expression, false)
+            }
+            _ => None,
+        }
+    }
+
+    fn lowered_jsx_getters_of(
+        &mut self,
+        file: FileId,
+        spread: &'a oxc_ast::ast::JSXSpreadAttribute<'a>,
+    ) -> Option<Part> {
+        if !self.project.jsx_spreads_lowered(file) {
+            return None;
+        }
+
+        let AstKind::JSXOpeningElement(opening) = self
+            .project
+            .file(file)
+            .semantic
+            .nodes()
+            .parent_kind(spread.node_id())
+        else {
+            return None;
+        };
+        let mut copied = false;
+        let mut targets = TargetSet {
+            known: Vec::new(),
+            open: false,
+        };
+        let mut properties = Vec::new();
+
+        for attribute in &opening.attributes {
+            let attribute = match attribute {
+                JSXAttributeItem::Attribute(attribute) => {
+                    let name = match &attribute.name {
+                        JSXAttributeName::Identifier(name) => name.name.to_string(),
+                        JSXAttributeName::NamespacedName(name) => {
+                            format!("{}:{}", name.namespace.name, name.name.name)
+                        }
+                    };
+
+                    properties.push(JsxProperty {
+                        key: Some(MemberKey::Name(name)),
+                        kind: PropertyKind::Init,
+                        getter: None,
+                    });
+
+                    continue;
+                }
+                JSXAttributeItem::SpreadAttribute(attribute) => attribute,
+            };
+            let current = attribute.node_id() == spread.node_id();
+
+            if !is_inlined_spread(&attribute.argument) {
+                join_jsx_getters(&mut targets, &properties, copied);
+                properties.clear();
+
+                copied = true;
+
+                continue;
+            }
+
+            if let Expression::ObjectExpression(object) = &attribute.argument {
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::SpreadProperty(_) => {
+                            join_jsx_getters(&mut targets, &properties, copied);
+                            properties.clear();
+
+                            copied = true;
+                        }
+                        ObjectPropertyKind::ObjectProperty(property) => {
+                            let getter = match &property.value {
+                                Expression::FunctionExpression(function)
+                                    if current && property.kind == PropertyKind::Get =>
+                                {
+                                    Some(FunctionId {
+                                        file,
+                                        node: function.node_id(),
+                                    })
+                                }
+                                _ => None,
+                            };
+
+                            properties.push(JsxProperty {
+                                key: self.property_key(file, &property.key, property.computed),
+                                kind: property.kind,
+                                getter,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        join_jsx_getters(&mut targets, &properties, copied);
+
+        Some(self.implicit_part_of((file, spread.span), &targets, "jsx spread getter", &[]))
     }
 
     fn implicit_plan_part_of(
@@ -609,6 +735,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let AstKind::YieldExpression(yielded) = kind {
             parts.extend(self.yielded_part_of(file, yielded));
+        }
+
+        parts.extend(self.jsx_factory_part_of(file, kind));
+
+        if let AstKind::JSXMemberExpression(member) = kind {
+            parts.extend(self.jsx_member_part_of(file, member));
         }
 
         parts
@@ -1529,23 +1661,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for known in &targets.known {
             let function = self.function_at(*known);
-            let (called, cyclic) = self.call_implicit(*known, file, span);
-            let called = match called.cost.is_one() {
-                true => called,
-                false => match self.trace_name_of(known.file, function) {
-                    Ok(name) => called.explain(
-                        format_args!("call {name}() [{operation}]"),
-                        site,
-                        origin,
-                        true,
-                        &mut self.traces,
-                        &mut self.unknowns,
-                    ),
-                    Err(_) => called.explanation_failed(origin, &mut self.unknowns),
-                },
-            };
-            let called = called.called(origin, &mut self.unknowns);
-            let called = self.called_part_of(known.file, function, called, cyclic);
+            let called = self.call_implicit(*known, file, span);
+            let called =
+                self.explained_call_of((known.file, function), called, (site, origin), operation);
 
             part = part.max(called, &mut self.unknowns, &mut self.traces);
         }
@@ -1562,6 +1680,32 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    fn explained_call_of(
+        &mut self,
+        (file, function): (FileId, FunctionNode<'a>),
+        (called, cyclic): (Part, bool),
+        (site, origin): (crate::project::Site, crate::unknowns::SourceSpan),
+        operation: &str,
+    ) -> Part {
+        let called = match called.cost.is_one() {
+            true => called,
+            false => match self.trace_name_of(file, function) {
+                Ok(name) => called.explain(
+                    format_args!("call {name}() [{operation}]"),
+                    site,
+                    origin,
+                    true,
+                    &mut self.traces,
+                    &mut self.unknowns,
+                ),
+                Err(_) => called.explanation_failed(origin, &mut self.unknowns),
+            },
+        };
+        let called = called.called(origin, &mut self.unknowns);
+
+        self.called_part_of(file, function, called, cyclic)
+    }
+
     fn unknown_implicit_part(&mut self, file: FileId, span: Span, receivers: &[ValueId]) -> Part {
         let invoked = self.values.at(self.source_span(file, span)).value;
 
@@ -1576,6 +1720,583 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.unknown_part(file, span, UnknownReason::Target)
+    }
+
+    pub(crate) fn jsx_factory_part_of(&mut self, file: FileId, kind: AstKind<'a>) -> Option<Part> {
+        let (span, opening, children) = jsx_parts_of(kind)?;
+        let runtime = self.project.jsx_runtime_of(file);
+        let passed = self.jsx_passed_values_of(file, opening, children);
+        let mut part = Part::none();
+
+        if let JsxRuntime::Classic { factory, fragment } = &runtime {
+            let fragment = opening.is_none().then_some(fragment);
+
+            for names in std::iter::once(factory).chain(fragment) {
+                let entity = self.entity_part_of(file, kind, names);
+
+                part = part.max(entity, &mut self.unknowns, &mut self.traces);
+            }
+        }
+
+        let Some(((declaration, closed), shape)) = self.jsx_factory_of(file, kind, &runtime) else {
+            let unknown = self.unknown_implicit_part(file, span, &passed);
+
+            return Some(part.max(unknown, &mut self.unknowns, &mut self.traces));
+        };
+        let declaration = declaration.map(|declaration| {
+            self.declarations
+                .executable_declaration(self.project, declaration)
+        });
+        let targets = self.resolved_of_declaration(declaration, closed).targets;
+
+        if targets.known.is_empty() {
+            let unknown = self.unknown_implicit_part(file, span, &passed);
+
+            return Some(part.max(unknown, &mut self.unknowns, &mut self.traces));
+        }
+
+        let arguments = self.jsx_arguments_of(file, kind, &runtime, shape);
+        let site = self.project.site_of(file, span);
+        let origin = self.source_span(file, span);
+        let outer = std::mem::take(&mut self.current_effects);
+
+        for known in &targets.known {
+            let function = self.function_at(*known);
+            let called = self.call_supplied(*known, (file, span), arguments.clone());
+            let called = self.explained_call_of(
+                (known.file, function),
+                called,
+                (site, origin),
+                "jsx factory",
+            );
+
+            part = part.max(called, &mut self.unknowns, &mut self.traces);
+        }
+
+        let effects = std::mem::replace(&mut self.current_effects, outer);
+        let reached = effects.unknown_global
+            || !effects.member_writes.is_empty()
+            || !effects.unknown_reachable.is_empty();
+
+        self.current_effects.join(&effects);
+
+        for value in &passed {
+            if !self.current_effects.escapes.contains(value) {
+                self.current_effects.escapes.push(*value);
+            }
+
+            if reached && !self.current_effects.unknown_reachable.contains(value) {
+                self.current_effects.unknown_reachable.push(*value);
+            }
+        }
+
+        if !targets.open {
+            return Some(part);
+        }
+
+        let unknown = self.unknown_implicit_part(file, span, &passed);
+
+        Some(part.retaining(unknown.unknowns, &mut self.unknowns))
+    }
+
+    fn jsx_member_part_of(
+        &mut self,
+        file: FileId,
+        member: &'a JSXMemberExpression<'a>,
+    ) -> Option<Part> {
+        let nodes = self.project.file(file).semantic.nodes();
+
+        if !matches!(
+            nodes.parent_kind(member.node_id()),
+            AstKind::JSXOpeningElement(_)
+        ) {
+            return None;
+        }
+
+        let mut members = vec![(
+            member.span,
+            MemberKey::Name(member.property.name.to_string()),
+        )];
+        let mut object = &member.object;
+        let sources = loop {
+            match object {
+                JSXMemberExpressionObject::IdentifierReference(reference) => {
+                    let source = self
+                        .declarations
+                        .of_reference(self.project, file, reference)
+                        .and_then(constant_initializer_of);
+
+                    break Sources {
+                        open: source.is_none(),
+                        values: source.into_iter().collect(),
+                    };
+                }
+                JSXMemberExpressionObject::MemberExpression(inner) => {
+                    members.push((inner.span, MemberKey::Name(inner.property.name.to_string())));
+
+                    object = &inner.object;
+                }
+                JSXMemberExpressionObject::ThisExpression(_) => {
+                    break Sources {
+                        values: Vec::new(),
+                        open: true,
+                    }
+                }
+            }
+        };
+
+        Some(
+            self.implicit_plan_part_of((file, member.node_id()), |analysis, plan| {
+                let mut sources = sources;
+
+                for (span, key) in members.into_iter().rev() {
+                    sources = analysis.plan_property_read_of(file, span, Some(key), &sources, plan);
+                }
+            }),
+        )
+    }
+
+    fn entity_part_of(&mut self, file: FileId, kind: AstKind<'a>, names: &[String]) -> Part {
+        let Some(root) = names.first() else {
+            return Part::none();
+        };
+        let scope = self
+            .project
+            .file(file)
+            .semantic
+            .nodes()
+            .get_node(kind.node_id())
+            .scope_id();
+        let (declaration, _) = self.declarations.scoped_entity_of(
+            self.project,
+            (file, scope),
+            std::slice::from_ref(root),
+        );
+        let source = declaration.and_then(constant_initializer_of);
+        let mut sources = Sources {
+            open: source.is_none(),
+            values: source.into_iter().collect(),
+        };
+        let mut plan = Vec::new();
+
+        for name in names.iter().skip(1) {
+            sources = self.plan_property_read_of(
+                file,
+                kind.span(),
+                Some(MemberKey::Name(name.clone())),
+                &sources,
+                &mut plan,
+            );
+        }
+
+        let mut part = Part::none();
+
+        for planned in &plan {
+            let found = self.planned_part_of(planned);
+
+            part = part.max(found, &mut self.unknowns, &mut self.traces);
+        }
+
+        part
+    }
+
+    fn jsx_factory_of(
+        &mut self,
+        file: FileId,
+        kind: AstKind<'a>,
+        runtime: &JsxRuntime,
+    ) -> Option<((Option<Declaration<'a>>, bool), JsxShape)> {
+        let (_, opening, children) = jsx_parts_of(kind)?;
+
+        match runtime {
+            JsxRuntime::Untransformed => None,
+            JsxRuntime::Classic { factory, .. } => {
+                let scope = self
+                    .project
+                    .file(file)
+                    .semantic
+                    .nodes()
+                    .get_node(kind.node_id())
+                    .scope_id();
+
+                Some((
+                    self.declarations
+                        .scoped_entity_of(self.project, (file, scope), factory),
+                    JsxShape::Positional,
+                ))
+            }
+            JsxRuntime::Automatic { source, .. } if opening.is_some_and(has_key_after_spread) => {
+                Some((
+                    self.declarations.module_export_of(
+                        self.project,
+                        file,
+                        (source, "createElement"),
+                    ),
+                    JsxShape::Positional,
+                ))
+            }
+            JsxRuntime::Automatic {
+                runtime,
+                development,
+                ..
+            } => {
+                let name = match (*development, has_static_children(children)) {
+                    (true, _) => "jsxDEV",
+                    (false, true) => "jsxs",
+                    (false, false) => "jsx",
+                };
+
+                Some((
+                    self.declarations
+                        .module_export_of(self.project, file, (runtime, name)),
+                    JsxShape::Properties,
+                ))
+            }
+        }
+    }
+
+    fn jsx_arguments_of(
+        &mut self,
+        file: FileId,
+        kind: AstKind<'a>,
+        runtime: &JsxRuntime,
+        shape: JsxShape,
+    ) -> (Vec<Option<ArgumentFacts>>, Option<ArgumentFacts>) {
+        let Some((span, opening, children)) = jsx_parts_of(kind) else {
+            return (Vec::new(), None);
+        };
+        let scope = self
+            .project
+            .file(file)
+            .semantic
+            .nodes()
+            .get_node(kind.node_id())
+            .scope_id();
+        let tag = self.jsx_tag_facts_of((file, scope), (span, opening), runtime);
+        let spread = opening.is_some_and(|opening| {
+            opening.attributes.iter().any(|attribute| match attribute {
+                JSXAttributeItem::SpreadAttribute(spread) => !is_constant_spread(&spread.argument),
+                JSXAttributeItem::Attribute(_) => false,
+            })
+        });
+        let mut properties = self
+            .values
+            .allocation(self.source_span(file, opening.map_or(span, |opening| opening.span)));
+
+        properties.size = (!spread).then_some(Cost::ONE);
+
+        let mut supplied = vec![Some(tag), Some(defined_facts_of(properties))];
+        let mut constant = true;
+
+        match shape {
+            JsxShape::Properties => supplied.push(Some(self.jsx_key_facts_of(file, opening))),
+            JsxShape::Positional => {
+                for child in children.iter().filter(|child| is_semantic_child(child)) {
+                    if let JSXChild::Spread(_) = child {
+                        constant = false;
+
+                        break;
+                    }
+
+                    supplied.push(Some(self.jsx_child_facts_of(file, child)));
+                }
+            }
+        }
+
+        let mut collected = self.values.allocation(self.source_span(file, span));
+
+        collected.size = constant.then_some(Cost::ONE);
+
+        (supplied, Some(defined_facts_of(collected)))
+    }
+
+    fn jsx_tag_facts_of(
+        &mut self,
+        (file, scope): (FileId, ScopeId),
+        (span, opening): (Span, Option<&'a JSXOpeningElement<'a>>),
+        runtime: &JsxRuntime,
+    ) -> ArgumentFacts {
+        let span = opening.map_or(span, |opening| opening.name.span());
+        let value = self.values.at(self.source_span(file, span));
+        let unknown = ArgumentFacts {
+            value: value.clone(),
+            callback: None,
+            preference: Preference::Absent,
+            definedness: Definedness::Unknown,
+        };
+        let (declaration, closed) = match opening.map(|opening| &opening.name) {
+            Some(JSXElementName::IdentifierReference(reference)) => self
+                .declarations
+                .callable_reference(self.project, file, reference),
+            Some(JSXElementName::Identifier(_) | JSXElementName::NamespacedName(_)) => {
+                return ArgumentFacts {
+                    definedness: Definedness::Defined,
+                    ..unknown
+                }
+            }
+            Some(_) => return unknown,
+            None => match runtime {
+                JsxRuntime::Classic { fragment, .. } => {
+                    self.declarations
+                        .scoped_entity_of(self.project, (file, scope), fragment)
+                }
+                JsxRuntime::Automatic { runtime, .. } => {
+                    self.declarations
+                        .module_export_of(self.project, file, (runtime, "Fragment"))
+                }
+                JsxRuntime::Untransformed => return unknown,
+            },
+        };
+        let function = declaration
+            .map(|declaration| {
+                self.declarations
+                    .executable_declaration(self.project, declaration)
+            })
+            .and_then(|declaration| self.declarations.function_of(declaration));
+
+        match function {
+            Some((target, function)) => {
+                self.callback_facts_of((file, span), value, (target, function), !closed)
+            }
+            None => unknown,
+        }
+    }
+
+    fn jsx_key_facts_of(
+        &mut self,
+        file: FileId,
+        opening: Option<&'a JSXOpeningElement<'a>>,
+    ) -> ArgumentFacts {
+        let key = opening.and_then(|opening| {
+            opening
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    JSXAttributeItem::Attribute(attribute) if attribute.is_key() => Some(attribute),
+                    _ => None,
+                })
+        });
+
+        match key.map(|key| (key.span, key.value.as_ref())) {
+            None => ArgumentFacts {
+                value: self.values.undefined(),
+                callback: None,
+                preference: Preference::Unmarked,
+                definedness: Definedness::Undefined,
+            },
+            Some((_, Some(JSXAttributeValue::ExpressionContainer(container)))) => {
+                self.container_facts_of(file, container)
+            }
+            Some((span, _)) => defined_facts_of(self.values.at(self.source_span(file, span))),
+        }
+    }
+
+    fn container_facts_of(
+        &mut self,
+        file: FileId,
+        container: &'a JSXExpressionContainer<'a>,
+    ) -> ArgumentFacts {
+        match container.expression.as_expression() {
+            Some(expression) => self.expression_facts_of(file, expression.span(), Some(expression)),
+            None => defined_facts_of(self.values.at(self.source_span(file, container.span))),
+        }
+    }
+
+    fn jsx_child_facts_of(&mut self, file: FileId, child: &'a JSXChild<'a>) -> ArgumentFacts {
+        match child {
+            JSXChild::ExpressionContainer(container) => self.container_facts_of(file, container),
+            JSXChild::Element(element) => {
+                defined_facts_of(self.values.allocation(self.source_span(file, element.span)))
+            }
+            JSXChild::Fragment(fragment) => defined_facts_of(
+                self.values
+                    .allocation(self.source_span(file, fragment.span)),
+            ),
+            other => defined_facts_of(self.values.at(self.source_span(file, other.span()))),
+        }
+    }
+
+    fn jsx_passed_values_of(
+        &mut self,
+        file: FileId,
+        opening: Option<&'a JSXOpeningElement<'a>>,
+        children: &'a [JSXChild<'a>],
+    ) -> Vec<ValueId> {
+        let mut expressions: Vec<&'a Expression<'a>> = Vec::new();
+        let mut values = Vec::new();
+
+        if let Some(opening) = opening {
+            let reference = match &opening.name {
+                JSXElementName::IdentifierReference(reference) => Some(&**reference),
+                JSXElementName::MemberExpression(member) => {
+                    let mut object = &member.object;
+
+                    loop {
+                        match object {
+                            JSXMemberExpressionObject::IdentifierReference(reference) => {
+                                break Some(&**reference)
+                            }
+                            JSXMemberExpressionObject::MemberExpression(inner) => {
+                                object = &inner.object
+                            }
+                            JSXMemberExpressionObject::ThisExpression(_) => break None,
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(reference) = reference {
+                values.push(self.reference_storage_value_of(file, reference));
+            }
+
+            for attribute in &opening.attributes {
+                match attribute {
+                    JSXAttributeItem::SpreadAttribute(spread) => expressions.push(&spread.argument),
+                    JSXAttributeItem::Attribute(attribute) => {
+                        if let Some(JSXAttributeValue::ExpressionContainer(container)) =
+                            &attribute.value
+                        {
+                            expressions.extend(container.expression.as_expression());
+                        }
+                    }
+                }
+            }
+        }
+
+        for child in children {
+            match child {
+                JSXChild::ExpressionContainer(container) => {
+                    expressions.extend(container.expression.as_expression());
+                }
+                JSXChild::Spread(spread) => expressions.push(&spread.expression),
+                _ => {}
+            }
+        }
+
+        for expression in expressions {
+            let value = self.storage_value_of(file, expression);
+
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+
+        values
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsxShape {
+    Positional,
+    Properties,
+}
+
+type JsxParts<'a> = (Span, Option<&'a JSXOpeningElement<'a>>, &'a [JSXChild<'a>]);
+
+struct JsxProperty {
+    key: Option<MemberKey>,
+    kind: PropertyKind,
+    getter: Option<FunctionId>,
+}
+
+fn join_jsx_getters(targets: &mut TargetSet, properties: &[JsxProperty], copied: bool) {
+    if !copied {
+        return;
+    }
+
+    for (index, property) in properties.iter().enumerate() {
+        let Some(getter) = property.getter else {
+            continue;
+        };
+        let later: Vec<_> = properties[index + 1..]
+            .iter()
+            .filter(|later| later.kind != PropertyKind::Set)
+            .collect();
+
+        if property.key.is_some() && later.iter().any(|later| later.key == property.key) {
+            continue;
+        }
+
+        if property.key.is_none() && !later.is_empty()
+            || later.iter().any(|later| later.key.is_none())
+        {
+            targets.open = true;
+        }
+
+        targets.known.push(getter);
+    }
+}
+
+fn jsx_parts_of<'a>(kind: AstKind<'a>) -> Option<JsxParts<'a>> {
+    match kind {
+        AstKind::JSXElement(element) => Some((
+            element.span,
+            Some(&*element.opening_element),
+            &element.children,
+        )),
+        AstKind::JSXFragment(fragment) => Some((fragment.span, None, &fragment.children)),
+        _ => None,
+    }
+}
+
+fn is_semantic_child(child: &JSXChild<'_>) -> bool {
+    match child {
+        JSXChild::Text(text) => {
+            !(text.value.trim().is_empty() && text.value.contains(['\n', '\r']))
+        }
+        JSXChild::ExpressionContainer(container) => {
+            !matches!(container.expression, JSXExpression::EmptyExpression(_))
+        }
+        _ => true,
+    }
+}
+
+pub(crate) fn is_inlined_spread(argument: &Expression<'_>) -> bool {
+    let Expression::ObjectExpression(object) = argument else {
+        return false;
+    };
+
+    !object.properties.iter().any(|property| match property {
+        ObjectPropertyKind::ObjectProperty(property) => {
+            !property.computed
+                && !property.shorthand
+                && !property.method
+                && property.kind == PropertyKind::Init
+                && property.key.static_name().as_deref() == Some("__proto__")
+        }
+        ObjectPropertyKind::SpreadProperty(_) => false,
+    })
+}
+
+fn is_constant_spread(argument: &Expression<'_>) -> bool {
+    match argument {
+        Expression::ObjectExpression(object) => {
+            is_inlined_spread(argument)
+                && !object
+                    .properties
+                    .iter()
+                    .any(|property| matches!(property, ObjectPropertyKind::SpreadProperty(_)))
+        }
+        _ => false,
+    }
+}
+
+fn has_static_children(children: &[JSXChild<'_>]) -> bool {
+    let mut semantic = children.iter().filter(|child| is_semantic_child(child));
+
+    matches!(
+        (semantic.next(), semantic.next()),
+        (Some(_), Some(_)) | (Some(JSXChild::Spread(_)), None)
+    )
+}
+
+fn defined_facts_of(value: ValueFacts) -> ArgumentFacts {
+    ArgumentFacts {
+        value,
+        callback: None,
+        preference: Preference::Absent,
+        definedness: Definedness::Defined,
     }
 }
 

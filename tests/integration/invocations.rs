@@ -360,3 +360,442 @@ fn awaits_invoke_their_known_then_implementations() {
 
     assert_selected(&controls);
 }
+
+const JSX_WORK: &str = "export function quadratic(xs: number[]) { let t = 0; for (const a of xs) for (const b of xs) t += a * b; return t; }\nexport function Cube(props: { xs: number[] }) { let t = 0; for (const a of props.xs) for (const b of props.xs) for (const c of props.xs) t += a * b * c; return t; }\n";
+const STORING_FACTORY: &str = "export function h(type: any, props: any, ...children: any[]) { return { type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
+const CALLING_FACTORY: &str = "export function h(type: any, props: any, ...children: any[]) { return typeof type === \"function\" ? type(props) : { type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
+const STORING_RUNTIME: &str =
+    "export function jsx(type, props, key) { return { type, props, key }; }\n";
+const CALLING_RUNTIME: &str = "export function jsx(type, props, key) { return typeof type === \"function\" ? type(props) : { type, props, key }; }\n";
+const RUNTIME_FRAGMENT: &str = "export function Fragment(props) { return props; }\n";
+const LIBRARY_PACKAGE: &str = r#"{ "name": "lib", "type": "module", "exports": { ".": "./index.js", "./jsx-runtime": "./jsx-runtime.js", "./jsx-dev-runtime": "./jsx-dev-runtime.js" } }"#;
+const CLASSIC_OPTIONS: &str =
+    r#", "jsx": "react", "jsxFactory": "h", "jsxFragmentFactory": "Fragment""#;
+const AUTOMATIC_OPTIONS: &str = r#", "jsx": "react-jsx", "jsxImportSource": "lib""#;
+const CLASSIC_IMPORTS: &str =
+    "import { h, Fragment } from \"./h\";\nimport { quadratic, Cube } from \"./work\";\n";
+const AUTOMATIC_IMPORTS: &str = "import { quadratic, Cube } from \"./work\";\n";
+
+fn jsx_options_of(options: &str) -> String {
+    format!(
+        r#"{{ "compilerOptions": {{ "strict": true, "noEmit": true, "module": "esnext", "moduleResolution": "bundler", "target": "es2022", "types": []{options} }}, "include": ["src"] }}"#
+    )
+}
+
+fn jsx_project_of(
+    options: &str,
+    index: &str,
+    extra: &[(&'static str, &str)],
+) -> Vec<(&'static str, String)> {
+    let mut files = vec![
+        ("tsconfig.json", jsx_options_of(options)),
+        ("src/index.tsx", index.to_string()),
+        ("src/work.ts", JSX_WORK.to_string()),
+    ];
+
+    for (name, source) in extra {
+        files.retain(|(existing, _)| existing != name);
+        files.push((name, source.to_string()));
+    }
+
+    files
+}
+
+fn jsx_library_of(jsx: &str, jsxs: &str, fragment: &str) -> String {
+    format!("{jsx}{jsxs}{fragment}")
+}
+
+#[test]
+fn classic_jsx_factories_resolve_through_their_scope() {
+    let classic = |body: &str, factory: &str, expected: &'static str, partial: bool| {
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{body}\n"),
+                &[("src/h.ts", factory)],
+            ),
+            expected,
+            partial,
+        )
+    };
+    let fragment_factory = CALLING_FACTORY.replace(
+        "export function Fragment(props: any) { return props; }",
+        "import { quadratic } from \"./work\";\nexport function Fragment(props: any) { return quadratic(props.xs); }",
+    );
+    let cases = [
+        classic("export function selected() { return <div />; }", STORING_FACTORY, "O(1)", false),
+        classic("export function selected(xs: number[]) { return <Cube xs={xs} />; }", CALLING_FACTORY, "O(N^3)", false),
+        classic("export function selected(xs: number[]) { return <Cube xs={xs} />; }", STORING_FACTORY, "O(1)", false),
+        classic("export function selected() { return <div />; }", CALLING_FACTORY, "O(1)", true),
+        classic("export function selected(xs: number[]) { return <>{1}</>; }", &fragment_factory, "O(N^2)", false),
+        classic("export function selected(xs: number[]) { return xs.map(() => <Cube xs={xs} />); }", CALLING_FACTORY, "O(N^4)", false),
+        (jsx_project_of(r#", "jsx": "react""#, &format!("/** @jsx h */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", false),
+        (jsx_project_of(r#", "jsx": "react""#, &format!("{CLASSIC_IMPORTS}/** @jsx h */\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{quadratic(xs)}}</div>; }}\n"), &[]), "O(N^2)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export const lens = {{ get h() {{ return 1; }} }};\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("{AUTOMATIC_IMPORTS}let h = (type: any, props: any) => type(props);\nexport function swap() {{ h = () => 0; }}\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("/**\n * @jsxRuntime classic\n * @jsx h\n */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", false),
+        (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("/** @jsxRuntime classic @jsx h */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+}
+
+#[test]
+fn automatic_jsx_runtimes_resolve_through_the_runtime_graph() {
+    let automatic = |options: &str,
+                     body: &str,
+                     runtime: &str,
+                     extra: &[(&'static str, &str)],
+                     expected: &'static str,
+                     partial: bool| {
+        let mut files = jsx_project_of(options, &format!("{AUTOMATIC_IMPORTS}{body}\n"), extra);
+
+        files.push(("node_modules/lib/package.json", LIBRARY_PACKAGE.to_string()));
+        files.push(("node_modules/lib/jsx-runtime.js", runtime.to_string()));
+
+        (files, expected, partial)
+    };
+    let calling = jsx_library_of(
+        CALLING_RUNTIME,
+        "export const jsxs = jsx;\n",
+        RUNTIME_FRAGMENT,
+    );
+    let storing = jsx_library_of(
+        STORING_RUNTIME,
+        "export const jsxs = jsx;\n",
+        RUNTIME_FRAGMENT,
+    );
+    let static_calling = jsx_library_of(
+        STORING_RUNTIME,
+        "export function jsxs(type, props, key) { return type(props); }\n",
+        RUNTIME_FRAGMENT,
+    );
+    let fragment_calling = jsx_library_of(
+        CALLING_RUNTIME,
+        "export const jsxs = jsx;\n",
+        "import { quadratic } from \"./work.js\";\nexport function Fragment(props) { return quadratic(props.xs); }\n",
+    );
+    let library_work = "export function quadratic(xs) { let t = 0; for (const a of xs) for (const b of xs) t += a * b; return t; }\n";
+    let create =
+        "export function createElement(type, props, ...children) { return type(props); }\n";
+    let render = [
+        (
+            "node_modules/dom/package.json",
+            r#"{ "name": "dom", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/dom/index.d.ts",
+            "export declare function render(element: unknown): void;\n",
+        ),
+    ];
+    let pragma = "/** @jsxImportSource lib */\nimport { Cube } from \"./work\";\nexport function selected(xs: number[]) { return <Cube xs={xs} />; }\n";
+    let cases = [
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &calling, &[], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &storing, &[], "O(1)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{1}{2}</Cube>; }", &static_calling, &[], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{1}</Cube>; }", &static_calling, &[], "O(1)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>\n  {1}\n</Cube>; }", &static_calling, &[], "O(1)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{...[1]}</Cube>; }", &static_calling, &[], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <>{1}</>; }", &fragment_calling, &[("node_modules/lib/work.js", library_work)], "O(N^2)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube {...rest} xs={xs} key=\"k\" />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube key=\"k\" {...rest} xs={xs} />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N)", false),
+        automatic(r#", "jsx": "react-jsxdev", "jsxImportSource": "lib""#, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &storing, &[("node_modules/lib/jsx-dev-runtime.js", "export function jsxDEV(type, props) { return type(props); }\n")], "O(N^3)", false),
+        automatic(r#", "jsx": "react""#, "", &calling, &[("src/index.tsx", pragma)], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "import { render } from \"dom\";\nexport function selected(xs: number[]) { render(<Cube xs={xs} />); }", &storing, &render, "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{quadratic(xs)}}</div>; }}\n"), &[]), "O(N^2)", true),
+        (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("node_modules/react/package.json", r#"{ "name": "react", "exports": { ".": "./index.js", "./jsx-runtime": "./jsx-runtime.js" } }"#), ("node_modules/react/jsx-runtime.js", "'use strict';\nif (process.env.NODE_ENV === 'production') { module.exports = require('./production.js'); } else { module.exports = require('./development.js'); }\n"), ("node_modules/react/production.js", "exports.jsx = function (type, props) { return type(props); };\n"), ("node_modules/react/development.js", "exports.jsx = function (type, props) { return type(props); };\n")]), "O(1)", true),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+}
+
+#[test]
+fn untransformed_jsx_keeps_element_creation_unknown() {
+    let cases = [
+        (jsx_project_of(r#", "jsx": "preserve""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[]), "O(1)", true),
+        (jsx_project_of("", &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{quadratic(xs)}}</div>; }}\n"), &[]), "O(N^2)", true),
+        (jsx_project_of(r#", "jsx": "react-native""#, &format!("{AUTOMATIC_IMPORTS}export function selected() {{ return <div />; }}\n"), &[]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "preserve""#, &format!("/** @jsx h */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+
+    let owned = |second: &str| {
+        let runtime = jsx_library_of(
+            CALLING_RUNTIME,
+            "export const jsxs = jsx;\n",
+            RUNTIME_FRAGMENT,
+        );
+        let owner = |options: &str| {
+            format!(
+                r#"{{ "compilerOptions": {{ "strict": true, "noEmit": true, "composite": true, "module": "esnext", "moduleResolution": "bundler"{options} }}, "include": ["../src"] }}"#
+            )
+        };
+
+        vec![
+            ("tsconfig.json", r#"{ "files": [], "references": [{ "path": "./a" }, { "path": "./b" }] }"#.to_string()),
+            ("a/tsconfig.json", owner(AUTOMATIC_OPTIONS)),
+            ("b/tsconfig.json", owner(second)),
+            ("src/index.tsx", format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n")),
+            ("src/work.ts", JSX_WORK.to_string()),
+            ("node_modules/lib/package.json", LIBRARY_PACKAGE.to_string()),
+            ("node_modules/lib/jsx-runtime.js", runtime),
+        ]
+    };
+    let owners = [
+        (owned(r#", "jsx": "preserve""#), "O(1)", true),
+        (owned(AUTOMATIC_OPTIONS), "O(N^3)", false),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &owners);
+}
+
+#[test]
+fn jsx_factory_invocations_carry_their_effects() {
+    let writing = "export function h(type: any, props: any, ...children: any[]) { props.items.add(props.items.size); return { type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
+    let passing = "export function selected(s: Set<number>) { let t = 0; for (const x of s) { const e = <li items={s}>{x}</li>; t += 1; } return t; }";
+    let plain = "export function selected(s: Set<number>) { let t = 0; for (const x of s) { const e = <li>{x}</li>; t += 1; } return t; }";
+    let cases = [
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{passing}\n"),
+                &[("src/h.ts", STORING_FACTORY)],
+            ),
+            "O(N)",
+            false,
+        ),
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{plain}\n"),
+                &[("src/h.ts", STORING_FACTORY)],
+            ),
+            "O(N)",
+            false,
+        ),
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{passing}\n"),
+                &[("src/h.ts", writing)],
+            ),
+            "O(1)",
+            true,
+        ),
+        (
+            jsx_project_of(
+                r#", "jsx": "preserve""#,
+                &format!("{AUTOMATIC_IMPORTS}{passing}\n"),
+                &[],
+            ),
+            "O(1)",
+            true,
+        ),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+}
+
+#[test]
+fn jsx_components_run_once_through_the_factory_and_runtimes_never_execute() {
+    let files = jsx_project_of(
+        AUTOMATIC_OPTIONS,
+        &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"),
+        &[],
+    );
+    let runtime = format!(
+        "import {{ writeFileSync }} from \"node:fs\";\nwriteFileSync(new URL(\"./executed.txt\", import.meta.url), \"runtime\");\nthrow new Error(\"executed\");\n{}",
+        jsx_library_of(CALLING_RUNTIME, "export const jsxs = jsx;\n", RUNTIME_FRAGMENT)
+    );
+    let mut sources: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, source)| (*name, source.as_str()))
+        .collect();
+
+    sources.push(("node_modules/lib/package.json", LIBRARY_PACKAGE));
+    sources.push(("node_modules/lib/jsx-runtime.js", runtime.as_str()));
+
+    let directory = support::project_of(&sources);
+
+    for types in [TypeMode::Syntactic, TypeMode::Tsc] {
+        let (cost, reasons, labels) =
+            support::project_result_in(directory.path(), "src/index.tsx", types);
+        let factories = labels
+            .iter()
+            .filter(|label| label.contains("[jsx factory]"))
+            .count();
+        let components = labels
+            .iter()
+            .filter(|label| label.contains("[callback parameter]"))
+            .count();
+
+        assert_eq!(cost, Cost::parse("O(N^3)").unwrap(), "{types:?}");
+        assert!(reasons.is_empty(), "{types:?}: {reasons:?}");
+        assert_eq!((factories, components), (1, 1), "{types:?}: {labels:?}");
+    }
+
+    assert!(!directory
+        .path()
+        .join("node_modules/lib/executed.txt")
+        .exists());
+}
+
+#[test]
+fn jsx_factory_arguments_follow_the_emitted_call() {
+    let cases = [
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("{AUTOMATIC_IMPORTS}function h(type: any, props: any) {{ return props.work(); }}\nexport function selected(xs: number[]) {{ return <div work={{() => quadratic(xs)}} />; }}\n"), &[]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ const R = {{ get h() {{ quadratic(xs); return (type: any, props: any) => props; }} }}; return <div />; }}\n"), &[]), "O(N^2)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h", "jsxFragmentFactory": "R.Fragment""#, &format!("{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ const R = {{ get Fragment() {{ quadratic(xs); return () => 1; }} }}; return <>{{1}}</>; }}\n"), &[("src/h.ts", STORING_FACTORY)]), "O(N^2)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}const h = R.h;\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", true),
+        (jsx_project_of(r#", "jsx": "react""#, &format!("/**\n * @jsx h\n * @jsx g\n */\nimport {{ h, g }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", &format!("{CALLING_FACTORY}export function g(type: any, props: any) {{ return {{ type, props }}; }}\n"))]), "O(N^3)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h", "jsxFragmentFactory": "R.Fragment""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export const lens = {{ get Fragment() {{ return 1; }} }};\nexport function selected(xs: number[]) {{ return <>{{1}}</>; }}\n"), &[("src/h.ts", STORING_FACTORY)]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("{AUTOMATIC_IMPORTS}function h(type: any, props: any) {{ return type(props); }}\nexport function swap() {{ (h as any) = () => 0; }}\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "k""#, &format!("import {{ k }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{1}}{{() => quadratic(xs)}}</div>; }}\n"), &[("src/h.ts", "export function k(type: any, props: any, first: any, second: any) { return typeof second === \"function\" ? second() : 0; }\n")]), "O(N^2)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "nest""#, &format!("import {{ nest }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{...xs}}</div>; }}\n"), &[("src/h.ts", "export function nest(type: any, props: any, ...children: any[]) { let t = 0; for (const c of children) for (const d of children) t += 1; return t; }\n")]), "O(N^2)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "keys""#, &format!("import {{ keys }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(o: Record<string, number>) {{ return <div {{...o}} />; }}\n"), &[("src/h.ts", "export function keys(type: any, props: any, ...children: any[]) { let t = 0; for (const a in props) for (const b in props) t += 1; return t; }\n")]), "O(N^2)", false),
+        (jsx_project_of(AUTOMATIC_OPTIONS, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}}>{{/* note */}}{{1}}</Cube>; }}\n"), &[("node_modules/lib/package.json", LIBRARY_PACKAGE), ("node_modules/lib/jsx-runtime.js", "export function jsx(type, props) { return { type, props }; }\nexport function jsxs(type, props) { return type(props); }\n")]), "O(1)", false),
+        (jsx_project_of(r#", "jsx": "preserve""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{...xs}}</div>; }}\n"), &[]), "O(N)", true),
+        (jsx_project_of(r#", "jsx": "preserve""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("node_modules/react/package.json", r#"{ "name": "react", "type": "module", "exports": { "./jsx-runtime": "./jsx-runtime.js" } }"#), ("node_modules/react/jsx-runtime.js", "export function jsx(type, props) { return type(props); }\nexport const jsxs = jsx;\n")]), "O(1)", true),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+}
+
+#[test]
+fn jsx_spread_getters_follow_the_configured_output_target() {
+    let mut cases = Vec::new();
+
+    for (target, copied) in [("es2017", "O(N^2)"), ("es2018", "O(1)")] {
+        for (attributes, expected) in [
+            (
+                "{...other} {...{get value() { quadratic(xs); return 0; }}}",
+                copied,
+            ),
+            (
+                "{...{...other, get value() { quadratic(xs); return 0; }}}",
+                copied,
+            ),
+            (
+                "a={1} {...other} z={2} {...{get value() { quadratic(xs); return 0; }}}",
+                copied,
+            ),
+            (
+                "{...{get value() { quadratic(xs); return 0; }}} {...other}",
+                "O(1)",
+            ),
+            (
+                "{...{get value() { quadratic(xs); return 0; }, ...other}}",
+                "O(1)",
+            ),
+            ("{...other} {...{get value() { quadratic(xs); return 0; }}} value={0}", "O(1)"),
+            ("{...other} {...{get value() { quadratic(xs); return 0; }}} {...{get value() { return 0; }}}", "O(1)"),
+            ("{...other} {...{get value() { quadratic(xs); return 0; }, value: 0}}", "O(1)"),
+            ("{...other} {...{get value() { quadratic(xs); return 0; }, set value(next: number) {}}}", copied),
+            ("{...other} {...{get value() { quadratic(xs); return 0; }, [key]: 0}}", copied),
+            ("{...other} {...{get [key]() { quadratic(xs); return 0; }, value: 0}}", copied),
+        ] {
+            let mut files = jsx_project_of(CLASSIC_OPTIONS, &format!("{CLASSIC_IMPORTS}export function selected(xs: number[], key: string) {{ const other = {{}}; return <div {attributes} />; }}\n"), &[("src/h.ts", STORING_FACTORY)]);
+
+            files[0].1 = files[0].1.replace("es2022", target);
+
+            cases.push((files, expected, false));
+        }
+    }
+
+    for (files, expected, _) in cases {
+        let sources: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, text)| (*name, text.as_str()))
+            .collect();
+
+        for types in [TypeMode::Syntactic, TypeMode::Tsc] {
+            let (cost, _, labels) = support::project_result_of(&sources, "src/index.tsx", types);
+            let copied = expected == "O(N^2)";
+
+            assert_eq!(
+                labels
+                    .iter()
+                    .any(|label| label.contains("[jsx spread getter]")),
+                copied,
+                "{types:?}: {sources:?}: {labels:?}"
+            );
+
+            if copied {
+                assert_eq!(
+                    cost,
+                    Cost::parse(expected).unwrap(),
+                    "{types:?}: {sources:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn jsx_passed_values_escape_into_the_factory() {
+    let extending = "export function h(type: any, props: any, ...children: any[]) { props.extra = 1; return { type, props, children }; }\nexport function Fragment(props: any) { return props; }\n";
+    let attribute = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n) { const e = <li a={1} items={ys}>{i}</li>; i++; } return i; }";
+    let child = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n) { const e = <li>{i}{ys}</li>; i++; } return i; }";
+    let plain = "export function selected(n: number) { const ys: number[] = []; let i = 0; while (i < ys.length + n) { const e = <li>{i}</li>; i++; } return i; }";
+    let cases = [
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{attribute}\n"),
+                &[("src/h.ts", STORING_FACTORY)],
+            ),
+            "O(N)",
+            false,
+        ),
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{attribute}\n"),
+                &[("src/h.ts", extending)],
+            ),
+            "O(1)",
+            true,
+        ),
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{child}\n"),
+                &[("src/h.ts", extending)],
+            ),
+            "O(1)",
+            true,
+        ),
+        (
+            jsx_project_of(
+                CLASSIC_OPTIONS,
+                &format!("{CLASSIC_IMPORTS}{plain}\n"),
+                &[("src/h.ts", extending)],
+            ),
+            "O(N)",
+            false,
+        ),
+        (
+            jsx_project_of(
+                r#", "jsx": "preserve""#,
+                &format!("{AUTOMATIC_IMPORTS}{attribute}\n"),
+                &[],
+            ),
+            "O(1)",
+            true,
+        ),
+        (
+            jsx_project_of(
+                r#", "jsx": "preserve""#,
+                &format!("{AUTOMATIC_IMPORTS}{plain}\n"),
+                &[],
+            ),
+            "O(N)",
+            true,
+        ),
+    ];
+
+    support::assert_project_cases("src/index.tsx", &cases);
+}

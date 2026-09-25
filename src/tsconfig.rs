@@ -35,7 +35,12 @@ pub struct OutputOptions {
     pub no_emit: Option<bool>,
     pub emit_declaration_only: Option<bool>,
     pub jsx: Option<String>,
+    pub jsx_factory: Option<String>,
+    pub jsx_fragment_factory: Option<String>,
+    pub jsx_import_source: Option<String>,
+    pub react_namespace: Option<String>,
     pub module: Option<String>,
+    pub target: Option<String>,
 }
 
 impl OutputOptions {
@@ -54,6 +59,11 @@ impl OutputOptions {
             no_emit,
             emit_declaration_only,
             jsx,
+            jsx_factory,
+            jsx_fragment_factory,
+            target,
+            jsx_import_source,
+            react_namespace,
             module
         );
     }

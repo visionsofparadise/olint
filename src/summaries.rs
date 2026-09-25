@@ -2596,7 +2596,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.expression_facts_of(file, argument.span(), argument.as_expression())
     }
 
-    fn expression_facts_of(
+    pub(crate) fn expression_facts_of(
         &mut self,
         file: FileId,
         span: oxc_span::Span,
@@ -2766,7 +2766,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn callback_facts_of(
+    pub(crate) fn callback_facts_of(
         &mut self,
         origin: (FileId, oxc_span::Span),
         value: ValueFacts,
@@ -3186,6 +3186,62 @@ impl<'p, 'a> Analysis<'p, 'a> {
         )
     }
 
+    pub(crate) fn call_supplied(
+        &mut self,
+        target: FunctionId,
+        (call_file, span): (FileId, oxc_span::Span),
+        (supplied, rest): (Vec<Option<ArgumentFacts>>, Option<ArgumentFacts>),
+    ) -> (Part, bool) {
+        if self.fallback_active() {
+            return self.fallback_invocation(target, call_file, span);
+        }
+
+        let function = self.function_at(target);
+        let Some(mut captured) = self.inherited_substitutions_of(target.file, function) else {
+            return (
+                self.deferred_unknown(call_file, span, UnknownReason::ResourceExhaustion),
+                false,
+            );
+        };
+
+        if let Some(parameters) = parameters_of(function) {
+            let rest = parameters
+                .rest
+                .as_ref()
+                .map(|parameter| (&parameter.rest.argument, rest));
+            let items = parameters
+                .items
+                .iter()
+                .map(|parameter| &parameter.pattern)
+                .zip(supplied)
+                .chain(rest);
+
+            for (pattern, facts) in items {
+                let (BindingPattern::BindingIdentifier(identifier), Some(facts)) = (pattern, facts)
+                else {
+                    continue;
+                };
+
+                if let Some(symbol) = identifier.symbol_id.get() {
+                    captured.insert(
+                        Binding::Symbol {
+                            file: target.file,
+                            symbol,
+                        },
+                        facts,
+                    );
+                }
+            }
+        }
+
+        self.call_with_captures(
+            (target.file, function),
+            (call_file, &[], span),
+            (true, Deferral::Excluded),
+            captured,
+        )
+    }
+
     fn call_with_captures(
         &mut self,
         function: (FileId, FunctionNode<'a>),
@@ -3411,7 +3467,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(rest) = parameters.rest.as_ref() {
             if let BindingPattern::BindingIdentifier(identifier) = &rest.rest.argument {
-                if let Some(symbol) = identifier.symbol_id.get() {
+                if let Some(symbol) = identifier.symbol_id.get().filter(|symbol| {
+                    !(implicit
+                        && substitutions.contains_key(&Binding::Symbol {
+                            file,
+                            symbol: *symbol,
+                        }))
+                }) {
                     let origin = self.source_span(file, identifier.span);
                     let mut value = self.values.at(origin);
 

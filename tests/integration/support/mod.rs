@@ -352,42 +352,104 @@ pub fn selected_result_in(
 
     files.extend_from_slice(sources);
 
-    let mut result = (olint::cost::Cost::ONE, std::collections::BTreeSet::new());
+    let (cost, reasons, _) = project_result_of(&files, entry, types);
 
-    run_in_project(&files, |project, root| {
-        let file = file_of(project, root, entry);
-        let mut analysis = olint::analysis::Analysis::new(
-            project,
-            olint::analysis::Options {
-                minimum_exponent: 2,
-                types,
-            },
-        );
+    (cost, reasons)
+}
 
-        if types == olint::analysis::TypeMode::Tsc {
-            let functions = analysis.reportable();
-            let tsconfig = root.join("tsconfig.json");
+pub type ProjectResult = (
+    olint::cost::Cost,
+    std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+    Vec<String>,
+);
 
-            analysis
-                .gather_answers(&functions, |queries| {
-                    olint::tsc::ask(
-                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
-                        &tsconfig,
-                        queries,
-                    )
-                })
-                .expect("the compiler helper answers");
+pub fn project_result_of(
+    files: &[(&str, &str)],
+    entry: &str,
+    types: olint::analysis::TypeMode,
+) -> ProjectResult {
+    let directory = project_of(files);
+
+    project_result_in(directory.path(), entry, types)
+}
+
+pub fn project_result_in(
+    root: &Path,
+    entry: &str,
+    types: olint::analysis::TypeMode,
+) -> ProjectResult {
+    let allocator = Allocator::default();
+    let project = Project::load(&allocator, &root.join("tsconfig.json")).expect("project loads");
+    let file = file_of(&project, root, entry);
+    let mut analysis = olint::analysis::Analysis::new(
+        &project,
+        olint::analysis::Options {
+            minimum_exponent: 2,
+            types,
+        },
+    );
+
+    if types == olint::analysis::TypeMode::Tsc {
+        let functions = analysis.reportable();
+        let tsconfig = root.join("tsconfig.json");
+
+        analysis
+            .gather_answers(&functions, |queries| {
+                olint::tsc::ask(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+                    &tsconfig,
+                    queries,
+                )
+            })
+            .expect("the compiler helper answers");
+    }
+
+    let part = summary_of(&mut analysis, file, "selected");
+    let reasons = unknown_reasons(&analysis, part.unknowns);
+    let selected = function_of_name(analysis.project, file, "selected");
+    let cost = legacy_class_of(&mut analysis, file, selected, &part.cost);
+    let mut labels = Vec::new();
+    let mut pending: Vec<_> = part.trace.into_iter().collect();
+
+    while let Some(id) = pending.pop() {
+        let node = analysis.traces.node(id).unwrap();
+
+        if let Ok(olint::trace::TraceLayout::Factor { .. }) = analysis.traces.layout(id) {
+            labels.push(node.label.clone());
         }
 
-        let part = summary_of(&mut analysis, file, "selected");
-        let reasons = unknown_reasons(&analysis, part.unknowns);
-        let selected = function_of_name(analysis.project, file, "selected");
-        let cost = legacy_class_of(&mut analysis, file, selected, &part.cost);
+        pending.extend(node.children.iter().rev().copied());
+    }
 
-        result = (cost, reasons);
-    });
+    (cost, reasons, labels)
+}
 
-    result
+pub type ProjectCase<'s> = (Vec<(&'s str, String)>, &'s str, bool);
+
+pub fn assert_project_cases(entry: &str, cases: &[ProjectCase<'_>]) {
+    for types in [
+        olint::analysis::TypeMode::Syntactic,
+        olint::analysis::TypeMode::Tsc,
+    ] {
+        for (files, expected, partial) in cases {
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(name, source)| (*name, source.as_str()))
+                .collect();
+            let (cost, reasons, _) = project_result_of(&files, entry, types);
+
+            assert_eq!(
+                cost,
+                olint::cost::Cost::parse(expected).unwrap(),
+                "{types:?} {files:?}"
+            );
+            assert_eq!(
+                !reasons.is_empty(),
+                *partial,
+                "{types:?} {files:?}: {reasons:?}"
+            );
+        }
+    }
 }
 
 pub type SelectedCase<'s> = (Vec<(&'s str, String)>, &'s str, bool);

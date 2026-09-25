@@ -1,7 +1,8 @@
 use oxc_ast::ast::{
     Argument, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
-    CallExpression, ClassElement, Expression, ForOfStatement, ForStatementLeft, MemberExpression,
-    MethodDefinitionKind, NewExpression, SimpleAssignmentTarget, Statement,
+    CallExpression, ClassElement, Expression, ForOfStatement, ForStatementLeft,
+    IdentifierReference, MemberExpression, MethodDefinitionKind, NewExpression,
+    SimpleAssignmentTarget, Statement,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, NodeId};
@@ -407,6 +408,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.values
             .at(self.source_span(file, expression.span()))
             .value
+    }
+
+    pub(crate) fn reference_storage_value_of(
+        &mut self,
+        file: FileId,
+        reference: &'a IdentifierReference<'a>,
+    ) -> ValueId {
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference);
+
+        match declaration.map(|declaration| (declaration, constant_initializer_of(declaration))) {
+            Some((_, Some((target, initializer)))) => self.storage_value_of(target, initializer),
+            Some((declaration, None)) => self.declared_value_of(declaration, file, reference.span),
+            None => self.values.at(self.source_span(file, reference.span)).value,
+        }
     }
 
     fn is_fresh_construction(&mut self, file: FileId, new: &'a NewExpression<'a>) -> bool {
@@ -1260,7 +1277,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 AstKind::ThisExpression(_) | AstKind::Super(_) => storage.unresolved = true,
                 AstKind::CallExpression(_)
                 | AstKind::NewExpression(_)
-                | AstKind::TaggedTemplateExpression(_) => storage.calls = true,
+                | AstKind::TaggedTemplateExpression(_)
+                | AstKind::JSXElement(_)
+                | AstKind::JSXFragment(_) => storage.calls = true,
                 _ => {}
             }
 
