@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{
     Argument, AssignmentTarget, Class, ClassElement, Expression, ForStatementLeft, Function,
-    IdentifierReference, ImportOrExportKind, ObjectPropertyKind, PropertyKey, PropertyKind,
-    Statement, TSAccessibility, TSNamespaceDeclarationBody,
+    IdentifierReference, ObjectPropertyKind, PropertyKey, PropertyKind, Statement, TSAccessibility,
+    TSNamespaceDeclarationBody,
 };
 use oxc_ast::AstKind;
 use oxc_semantic::NodeId;
@@ -19,7 +19,7 @@ use crate::declarations::{
 use crate::directives::PerfTag;
 use crate::effects::{value_flow_of, ValueFlow};
 use crate::paths::relative_path_of;
-use crate::project::{FileId, Resolved};
+use crate::project::FileId;
 use crate::receivers::{this_owner_of, Placement, ThisOwner};
 use crate::syntax::{member_expression_of, unwrap};
 use crate::unknowns::{SourceSpan, UnknownReason};
@@ -297,28 +297,22 @@ impl<'a> Walk<'_, '_, 'a> {
             .surface_exports(self.analysis.project, file);
         let site = self.site(file, self.analysis.project.file(file).program.node_id());
 
-        for (_, targets) in exports.into_iter().rev() {
+        for (_, targets) in exports.members.into_iter().rev() {
             for target in targets.into_iter().rev() {
                 self.push(target, site);
             }
         }
 
+        for (source, span) in exports.unresolved {
+            self.issue(
+                self.analysis.source_span(source, span),
+                UnknownReason::Target,
+            );
+        }
+
         for statement in self.analysis.project.file(file).program.body.iter().rev() {
             if let Statement::TSExportAssignment(export) = statement {
                 self.node(file, export.expression.node_id());
-            }
-
-            if let Statement::ExportAllDeclaration(export) = statement {
-                if export.export_kind == ImportOrExportKind::Value
-                    && !matches!(
-                        self.analysis
-                            .project
-                            .resolve(file, export.source.value.as_str()),
-                        Resolved::File(_)
-                    )
-                {
-                    self.issue(self.site(file, export.node_id()), UnknownReason::Target);
-                }
             }
         }
 

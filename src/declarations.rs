@@ -158,6 +158,11 @@ pub(crate) enum SurfaceTarget {
     Unresolved,
 }
 
+pub(crate) struct SurfaceExports {
+    pub(crate) members: Vec<(String, Vec<SurfaceTarget>)>,
+    pub(crate) unresolved: Vec<(FileId, Span)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TargetSet {
     pub known: Vec<FunctionId>,
@@ -175,6 +180,7 @@ impl Default for TargetSet {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
+    Ambiguous,
     Symbol(FileId, SymbolId),
     OpenSymbol(FileId, SymbolId),
     Node(FileId, NodeId),
@@ -237,7 +243,17 @@ enum ResolutionStep<'a> {
     Open,
 }
 
+#[derive(Default)]
+struct StarExports {
+    providers: HashMap<String, Vec<FileId>>,
+    parents: HashMap<FileId, Vec<FileId>>,
+    explicit: HashMap<FileId, HashSet<String>>,
+    open: Vec<FileId>,
+    commonjs: Vec<FileId>,
+}
+
 pub struct Declarations<'a> {
+    stars: RefCell<HashMap<FileId, std::rc::Rc<StarExports>>>,
     followed: RefCell<HashMap<(FileId, String), Option<Target>>>,
     globals: RefCell<GlobalBindings>,
     resolving: RefCell<HashSet<(FileId, SymbolId)>>,
@@ -261,6 +277,7 @@ pub struct Declarations<'a> {
 impl<'a> Declarations<'a> {
     pub fn new(project: &Project<'a>) -> Self {
         Declarations {
+            stars: RefCell::new(HashMap::new()),
             followed: RefCell::new(HashMap::new()),
             globals: RefCell::new(HashMap::new()),
             resolving: RefCell::new(HashSet::new()),
@@ -755,8 +772,8 @@ impl<'a> Declarations<'a> {
 
         names
             .into_iter()
-            .filter_map(|(name, provider)| {
-                let target = self.followed_export_of(project, provider, &name)?;
+            .filter_map(|(name, _)| {
+                let target = self.followed_export_of(project, file, &name)?;
 
                 let declarations = declarations_of_target(project, target);
 
@@ -765,12 +782,9 @@ impl<'a> Declarations<'a> {
             .collect()
     }
 
-    pub(crate) fn surface_exports(
-        &self,
-        project: &Project<'a>,
-        file: FileId,
-    ) -> Vec<(String, Vec<SurfaceTarget>)> {
+    pub(crate) fn surface_exports(&self, project: &Project<'a>, file: FileId) -> SurfaceExports {
         let mut names = Vec::new();
+        let mut unresolved = Vec::new();
         let mut pending = vec![(file, true)];
         let mut visited = HashSet::new();
         let mut seen = HashSet::new();
@@ -831,19 +845,20 @@ impl<'a> Declarations<'a> {
                 .filter(|entry| !entry.is_type)
             {
                 if let Some(request) = &entry.module_request {
-                    if let Resolved::File(target) = self.module_target_of(
+                    match self.module_target_of(
                         project,
                         file,
                         request.name.as_str(),
                         RequestKind::Static,
                     ) {
-                        pending.push((target, false));
+                        Resolved::File(target) => pending.push((target, false)),
+                        _ => unresolved.push((file, entry.statement_span)),
                     }
                 }
             }
         }
 
-        names
+        let members = names
             .into_iter()
             .map(|(name, provider)| {
                 if name == "default" {
@@ -864,12 +879,17 @@ impl<'a> Declarations<'a> {
                     }
                 }
 
-                let targets = self
-                    .surface_targets(project, self.followed_export_of(project, provider, &name));
+                let targets =
+                    self.surface_targets(project, self.followed_export_of(project, file, &name));
 
                 (name, targets)
             })
-            .collect()
+            .collect();
+
+        SurfaceExports {
+            members,
+            unresolved,
+        }
     }
 
     pub(crate) fn surface_reference(
@@ -1792,9 +1812,208 @@ impl<'a> Declarations<'a> {
             return None;
         }
 
-        self.star_targets_of(project, module_record, file)
+        let stars = self.star_exports_of(project, file);
+        let mut found = None;
+
+        let providers = stars
+            .providers
+            .get(name)
             .into_iter()
-            .find_map(|target| self.export_target_of(project, target, name, visited))
+            .flatten()
+            .map(|provider| (provider, false))
+            .chain(stars.commonjs.iter().map(|provider| (provider, true)));
+
+        for (provider, fallback) in providers {
+            let mut stats = self.resolution_stats.get();
+            stats.helper_visits = stats.helper_visits.saturating_add(1);
+
+            self.resolution_stats.set(stats);
+
+            if fallback && !self.star_reaches(file, *provider, name, false, &stars) {
+                continue;
+            }
+
+            let Some(target) = self.export_target_of(project, *provider, name, visited) else {
+                continue;
+            };
+
+            if target == Target::Ambiguous || found.is_some_and(|found| found != target) {
+                return Some(Target::Ambiguous);
+            }
+
+            found = Some(target);
+        }
+
+        if stars
+            .open
+            .iter()
+            .any(|provider| self.star_reaches(file, *provider, name, true, &stars))
+        {
+            return Some(Target::External);
+        }
+
+        found
+    }
+
+    fn star_reaches(
+        &self,
+        root: FileId,
+        provider: FileId,
+        name: &str,
+        shadowed: bool,
+        stars: &StarExports,
+    ) -> bool {
+        let mut pending = vec![(provider, shadowed)];
+        let mut visited = HashSet::new();
+
+        while let Some((file, shadowed)) = pending.pop() {
+            let mut stats = self.resolution_stats.get();
+            stats.helper_visits = stats.helper_visits.saturating_add(1);
+
+            self.resolution_stats.set(stats);
+
+            if !visited.insert(file)
+                || (shadowed
+                    && stars
+                        .explicit
+                        .get(&file)
+                        .is_some_and(|names| names.contains(name)))
+            {
+                continue;
+            }
+
+            if file == root {
+                return true;
+            }
+
+            pending.extend(
+                stars
+                    .parents
+                    .get(&file)
+                    .into_iter()
+                    .flatten()
+                    .map(|parent| (*parent, true)),
+            );
+        }
+
+        false
+    }
+
+    fn star_exports_of(&self, project: &Project<'a>, root: FileId) -> std::rc::Rc<StarExports> {
+        if let Some(found) = self.stars.borrow().get(&root) {
+            return found.clone();
+        }
+
+        let mut stars = StarExports::default();
+        let mut pending = vec![root];
+        let mut visited = HashSet::new();
+        let mut candidates = Vec::new();
+
+        while let Some(file) = pending.pop() {
+            if !visited.insert(file) {
+                continue;
+            }
+
+            let record = self.module_records[file.0 as usize];
+            let mut names: HashSet<String> = record
+                .local_export_entries
+                .iter()
+                .chain(&record.indirect_export_entries)
+                .filter_map(export_name_of)
+                .map(str::to_string)
+                .collect();
+
+            if is_commonjs_file(project.file(file)) {
+                let exports = self.commonjs_exports_of(project, file);
+
+                names.extend(exports.names.keys().cloned());
+
+                if exports.open || self.patched_of(project).contains(&file) {
+                    stars.commonjs.push(file);
+                } else if let Some(replaced) = exports.replaced {
+                    match commonjs_expression_of(project, file, replaced).map(unwrap) {
+                        Some(Expression::ObjectExpression(object)) => {
+                            let mut opaque = false;
+
+                            for property in &object.properties {
+                                let mut stats = self.resolution_stats.get();
+                                stats.helper_visits = stats.helper_visits.saturating_add(1);
+
+                                self.resolution_stats.set(stats);
+
+                                match property {
+                                    ObjectPropertyKind::ObjectProperty(property)
+                                        if !property.computed =>
+                                    {
+                                        if let Some(name) = property.key.static_name() {
+                                            names.insert(name.into_owned());
+                                        } else {
+                                            opaque = true;
+                                        }
+                                    }
+                                    _ => opaque = true,
+                                }
+                            }
+
+                            if opaque {
+                                stars.commonjs.push(file);
+                            }
+                        }
+                        _ => stars.commonjs.push(file),
+                    }
+                }
+            }
+
+            candidates.extend(names.iter().map(|name| (name.clone(), file)));
+            stars.explicit.insert(file, names);
+
+            for entry in record
+                .star_export_entries
+                .iter()
+                .filter(|entry| !entry.is_type)
+            {
+                let Some(request) = &entry.module_request else {
+                    continue;
+                };
+
+                match self.module_target_of(
+                    project,
+                    file,
+                    request.name.as_str(),
+                    RequestKind::Static,
+                ) {
+                    Resolved::File(target) => {
+                        stars.parents.entry(target).or_default().push(file);
+                        pending.push(target);
+                    }
+                    _ => stars.open.push(file),
+                }
+            }
+        }
+
+        let mut grouped: HashMap<String, Vec<FileId>> = HashMap::new();
+
+        for (name, provider) in candidates {
+            grouped.entry(name).or_default().push(provider);
+        }
+
+        for (name, providers) in grouped {
+            let unique = providers.len() == 1;
+            let retained = providers
+                .into_iter()
+                .filter(|provider| {
+                    unique || self.star_reaches(root, *provider, &name, false, &stars)
+                })
+                .collect();
+
+            stars.providers.insert(name, retained);
+        }
+
+        let stars = std::rc::Rc::new(stars);
+
+        self.stars.borrow_mut().insert(root, stars.clone());
+
+        stars
     }
 
     fn star_targets_of(
@@ -1948,7 +2167,7 @@ impl<'a> Declarations<'a> {
         let exports = self.commonjs_exports_of(project, file);
 
         if exports.open || self.patched_of(project).contains(&file) {
-            return None;
+            return Some(Target::External);
         }
 
         if name == "default" && !exports.es_module {
@@ -1974,6 +2193,7 @@ impl<'a> Declarations<'a> {
             }
             Some(replaced) => match self.commonjs_value_of(project, file, replaced, visited) {
                 Target::Namespace(target) => self.export_target_of(project, target, name, visited),
+                owner @ (Target::External | Target::Ambiguous) => Some(owner),
                 owner => self.member_target_of(project, owner, name),
             },
             None => None,
@@ -2835,7 +3055,7 @@ fn declaration_of_target<'a>(project: &Project<'a>, target: Target) -> Option<De
         }
         Target::Node(file, node) => declaration_of_node(project, file, node),
         Target::Namespace(file) => Some(Declaration::Namespace { file }),
-        Target::External => Some(Declaration::External),
+        Target::External | Target::Ambiguous => Some(Declaration::External),
     }
 }
 

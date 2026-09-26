@@ -497,3 +497,374 @@ fn model_includes_namespace_and_class_expression_implementations() {
 
     assert_eq!(coverage.functions.len(), 135);
 }
+
+#[test]
+fn star_collisions_are_order_independent_and_explicit_exports_win() {
+    for order in [
+        "export * from './a';export * from './b';",
+        "export * from './b';export * from './a';",
+    ] {
+        for (extra, shared, unresolved) in [
+            ("", false, true),
+            ("export {selected} from './b';", false, false),
+            ("", true, false),
+        ] {
+            let bridge = format!("{order}{extra}");
+            let a = if shared {
+                "export {selected} from './shared';"
+            } else {
+                "export function selected(xs:number[]){for(const a of xs)void a;}"
+            };
+            let b = if shared {
+                "export {selected} from './shared';"
+            } else {
+                "export function selected(xs:number[]){for(const a of xs)for(const b of xs)void b;}"
+            };
+
+            support::run_in_project(&[
+                ("tsconfig.json", "{}"),
+                ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+                ("index.ts", "import {selected} from './bridge';export function run(xs:number[]){return selected(xs)}"),
+                ("bridge.ts", &bridge),
+                ("a.ts", a), ("b.ts", b),
+                ("shared.ts", "export function selected(xs:number[]){for(const a of xs)for(const b of xs)void b;}"),
+            ], |project, _| {
+                let mut analysis = Analysis::new(project, SYNTACTIC);
+                let file = project.file_by_path(&project.root.join("index.ts")).unwrap();
+                let part = support::summary_of(&mut analysis, file, "run");
+
+                assert_eq!(!part.is_complete(), unresolved, "{bridge}, shared={shared}");
+
+                if !unresolved {
+                    assert_eq!(support::projected_class_of(&part.cost), olint::cost::Cost::parse("O(N^2)").unwrap());
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn star_surface_resolves_names_from_the_entry_module() {
+    for order in [
+        "export * from './a';export * from './b';",
+        "export * from './b';export * from './a';",
+    ] {
+        for explicit in [false, true] {
+            let source = format!(
+                "{order}{}",
+                if explicit {
+                    "export {selected} from './b';"
+                } else {
+                    ""
+                }
+            );
+
+            support::run_in_project(
+                &[
+                    ("tsconfig.json", "{}"),
+                    ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+                    ("index.ts", &source),
+                    (
+                        "a.ts",
+                        "export function selected(){}export function stable(){}",
+                    ),
+                    ("b.ts", "export function selected(){}"),
+                ],
+                |project, _| {
+                    let mut analysis = Analysis::new(project, SYNTACTIC);
+                    let coverage = final_coverage(&mut analysis);
+
+                    assert_eq!(coverage.unknowns.is_some(), !explicit, "{source}");
+                    assert_eq!(
+                        coverage.functions.len(),
+                        if explicit { 2 } else { 1 },
+                        "{source}"
+                    );
+
+                    if explicit {
+                        assert!(coverage
+                            .functions
+                            .iter()
+                            .any(|function| project.file(function.file).path.ends_with("b.ts")));
+                    }
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_missing_stars_retain_uncertainty_beside_known_exports() {
+    for bridge in [
+        "export * from './missing';",
+        "export * from './cycle';export * from './missing';",
+        "export type * from './missing';",
+    ] {
+        support::run_in_project(
+            &[
+                ("tsconfig.json", "{}"),
+                ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+                (
+                    "index.ts",
+                    "export * from './bridge';export function stable(){}",
+                ),
+                ("bridge.ts", bridge),
+                ("cycle.ts", "export * from './bridge';"),
+            ],
+            |project, _| {
+                let mut analysis = Analysis::new(project, SYNTACTIC);
+                let coverage = final_coverage(&mut analysis);
+
+                assert_eq!(coverage.functions.len(), 1, "{bridge}");
+                assert_eq!(
+                    coverage.unknowns.is_some(),
+                    !bridge.starts_with("export type"),
+                    "{bridge}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn intermediate_named_exports_override_deeper_star_collisions() {
+    support::run_in_project(
+        &[
+            ("tsconfig.json", "{}"),
+            ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+            ("index.ts", "export * from './bridge';"),
+            (
+                "bridge.ts",
+                "export * from './a';export * from './b';export {selected} from './b';",
+            ),
+            ("a.ts", "export function selected(){}"),
+            ("b.ts", "export function selected(){}"),
+        ],
+        |project, _| {
+            let mut analysis = Analysis::new(project, SYNTACTIC);
+            let coverage = closed_coverage(&mut analysis, 1);
+
+            assert!(project
+                .file(coverage.functions[0].file)
+                .path
+                .ends_with("b.ts"));
+        },
+    );
+}
+
+#[test]
+fn open_commonjs_star_branches_cannot_disappear_beside_known_bindings() {
+    for bridge in [
+        "export * from './known';export * from './open.cjs';",
+        "export * from './open.cjs';export * from './known';",
+    ] {
+        support::run_in_project(
+            &[
+                ("tsconfig.json", r#"{"compilerOptions":{"allowJs":true}}"#),
+                ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+                (
+                    "index.ts",
+                    "import {selected} from './bridge';export function run(){return selected()}",
+                ),
+                ("bridge.ts", bridge),
+                ("known.ts", "export function selected(){}"),
+                ("open.cjs", "module.exports=unknown;"),
+            ],
+            |project, root| {
+                let mut analysis = Analysis::new(project, SYNTACTIC);
+                let file = support::file_of(project, root, "index.ts");
+
+                assert!(
+                    !support::summary_of(&mut analysis, file, "run").is_complete(),
+                    "{bridge}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn star_surface_resolution_scales_with_wide_and_deep_graphs() {
+    for (count, deep) in [
+        (32, false),
+        (64, false),
+        (128, false),
+        (32, true),
+        (64, true),
+        (128, true),
+        (1024, true),
+    ] {
+        let mut owned = vec![
+            ("tsconfig.json".to_string(), "{}".to_string()),
+            (
+                "olint.config.json".to_string(),
+                r#"{"entrypoints":["index.ts"]}"#.to_string(),
+            ),
+        ];
+        let root = if deep {
+            "export * from './leaf0';".to_string()
+        } else {
+            (0..count)
+                .map(|index| format!("export * from './leaf{index}';"))
+                .collect()
+        };
+
+        owned.push(("index.ts".to_string(), root));
+
+        for index in 0..count {
+            let mut source = format!("export function selected{index}(){{}}");
+
+            if deep && index + 1 < count {
+                source.push_str(&format!("export * from './leaf{}';", index + 1));
+            }
+
+            owned.push((format!("leaf{index}.ts"), source));
+        }
+
+        with_owned_project(&owned, |project| {
+            let mut analysis = Analysis::new(project, SYNTACTIC);
+
+            closed_coverage(&mut analysis, count);
+
+            let stats = analysis.declarations.resolution_stats();
+
+            assert!(
+                stats.implementation_visits <= 12 * count,
+                "{count}, deep={deep}: {stats:?}"
+            );
+            assert!(
+                stats.helper_visits <= 12 * count,
+                "{count}, deep={deep}: {stats:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn mixed_commonjs_star_names_share_the_closed_provider_index() {
+    for count in [32, 64, 128] {
+        let mut owned = vec![(
+            "tsconfig.json".to_string(),
+            r#"{"compilerOptions":{"allowJs":true,"module":"esnext"},"files":["index.ts"]}"#
+                .to_string(),
+        )];
+
+        owned.push((
+            "index.ts".to_string(),
+            (0..count)
+                .map(|index| format!("export * from './leaf{index}.js';"))
+                .collect(),
+        ));
+
+        for index in 0..count {
+            let source = match index % 3 {
+                0 => format!("export function selected{index}(){{}}"),
+                1 => format!("exports.selected{index} = function(){{}};"),
+                _ => format!("module.exports = {{selected{index}: function(){{}}}};"),
+            };
+
+            owned.push((format!("leaf{index}.js"), source));
+        }
+
+        with_owned_project(&owned, |project| {
+            let analysis = Analysis::new(project, SYNTACTIC);
+            let file = project
+                .file_by_path(&project.root.join("index.ts"))
+                .unwrap();
+
+            for index in 0..count {
+                let declarations =
+                    analysis
+                        .declarations
+                        .of_export(project, file, &format!("selected{index}"));
+
+                assert!(
+                    declarations.into_iter().any(|declaration| analysis
+                        .declarations
+                        .function_of(declaration)
+                        .is_some()),
+                    "{index}"
+                );
+            }
+
+            let stats = analysis.declarations.resolution_stats();
+
+            assert!(
+                stats.implementation_visits <= 40 * count,
+                "{count}: {stats:?}"
+            );
+            assert!(stats.helper_visits <= 12 * count, "{count}: {stats:?}");
+        });
+    }
+}
+
+#[test]
+fn forwarded_commonjs_and_unknown_stars_respect_intermediate_overrides() {
+    for bridge in [
+        "module.exports = require('./leaf.js');",
+        "module.exports = {selected: require('./leaf.js').selected};",
+    ] {
+        support::run_in_project(
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions":{"allowJs":true},"files":["index.ts","leaf.js"]}"#,
+                ),
+                ("index.ts", "export * from './bridge.js';"),
+                ("bridge.js", bridge),
+                ("leaf.js", "exports.selected = function(){};"),
+            ],
+            |project, _| assert_exported_function(project, "selected"),
+        );
+    }
+
+    support::run_in_project(
+        &[
+            ("tsconfig.json", "{}"),
+            ("index.ts", "export * from './bridge';"),
+            (
+                "bridge.ts",
+                "export * from './missing'; export {selected} from './leaf';",
+            ),
+            ("leaf.ts", "export function selected(){}"),
+        ],
+        |project, _| assert_exported_function(project, "selected"),
+    );
+}
+
+fn closed_coverage<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    count: usize,
+) -> olint::public::PublicCoverage<'a> {
+    let coverage = final_coverage(analysis);
+
+    assert!(coverage.unknowns.is_none());
+    assert_eq!(coverage.functions.len(), count);
+
+    coverage
+}
+
+fn with_owned_project(files: &[(String, String)], body: impl for<'a> FnOnce(&Project<'a>)) {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(name, source)| (name.as_str(), source.as_str()))
+        .collect();
+
+    support::run_in_project(&files, |project, _| body(project));
+}
+
+fn assert_exported_function(project: &Project<'_>, name: &str) {
+    let analysis = Analysis::new(project, SYNTACTIC);
+    let file = project
+        .file_by_path(&project.root.join("index.ts"))
+        .unwrap();
+
+    assert!(
+        analysis
+            .declarations
+            .of_export(project, file, name)
+            .into_iter()
+            .any(|declaration| analysis.declarations.function_of(declaration).is_some()),
+        "{name}"
+    );
+}
