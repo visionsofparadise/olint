@@ -1222,7 +1222,7 @@ fn promise_resolution_retains_known_thenable_work() {
         ("", "(xs: number[]) { return new Promise(resolve => resolve({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
         ("", "(xs: number[]) { return new Promise(resolve => { const done = resolve; done({ then(settle) { cube(xs); settle(1); } }); }); }", "O(N^3)", true),
         ("function settle(done, xs) { done({ then(resolve) { cube(xs); resolve(1); } }); }", "(xs: number[]) { return new Promise(resolve => settle(resolve, xs)); }", "O(N^3)", true),
-        ("function settle(done, value) { done(value); }", "(xs: number[]) { cube(xs); return new Promise(resolve => settle(resolve, { then(done) { cube(xs); done(1); } })); }", "O(N^3)", false),
+        ("function settle(done, value) { done(value); }", "(xs: number[]) { return new Promise(resolve => settle(resolve, { then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
         ("", "(xs: number[]) { return new Promise(resolve => resolve(1)).then(() => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
         ("", "(xs: number[]) { return new Promise((resolve, reject) => reject(1)).catch(() => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
         ("", "(xs: number[]) { return new Promise(resolve => resolve(1)).finally(() => ({ then(done) { cube(xs); done(1); } })); }", "O(N^3)", true),
@@ -1611,5 +1611,119 @@ fn supplied_nested_array_wrappers_preserve_outer_iteration_bounds() {
                 Cost::parse("O(N^3)").unwrap()
             );
         });
+    }
+}
+
+#[test]
+fn native_assign_retains_known_property_work() {
+    for (body, expected) in [
+        (
+            r#"(xs: number[]) {const target={slow(value:number[]){cube(value)},set x(value:number[]){this.slow(value)}};return Object.assign(target,{x:xs});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={slow(value:number[]){cube(value)},set x(value:number[]){this.slow(value)}};target.x=xs;return target;}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {class Base{slow(value:number[]){cube(value)}set x(value:number[]){this.slow(value)}}class Child extends Base{}return Object.assign(new Child(),{x:xs});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {class Base{slow(value:number[]){cube(value)}set x(value:number[]){this.slow(value)}}class Child extends Base{}const target=new Child();target.x=xs;return target;}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {class Base{slow(value:number[]){quadratic(value)}set x(value:number[]){this.slow(value)}}class Child extends Base{slow(value:number[]){cube(value)}}return Object.assign(new Child(),{x:xs});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {class Base{slow(value:number[]){quadratic(value)}set x(value:number[]){this.slow(value)}}class Child extends Base{slow(value:number[]){cube(value)}}const target=new Child();target.x=xs;return target;}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set __proto__(value:number[]){cube(value)}};return Object.assign(target,{get __proto__(){return xs}});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set __proto__(value:unknown){cube(xs)}};return Object.assign(target,{__proto__(){return 0}});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const __proto__=xs;const target={set __proto__(value:number[]){cube(value)}};return Object.assign(target,{__proto__});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set __proto__(value:unknown){cube(xs)}};return Object.assign(target,{__proto__:null});}"#,
+            "O(N)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set x(value:number){cube(xs)}}; return Object.assign(target,{x:1});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set x(value:number[]){cube(value)}}; return Object.assign(target,{x:xs});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set x(value:number[]){cube(value)}}; return Object.assign(target,{x:xs.flatMap(()=>xs)});}"#,
+            "O(N^6)",
+        ),
+        (
+            r#"(xs: number[]) {class Base{set x(value:number[]){cube(value)}} class Child extends Base{}; return Object.assign(new Child(),{x:xs});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {class Target{static set x(value:number[]){cube(value)}} return Object.assign(Target,{x:xs});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const target={set x(value:number[]){cube(value)}}; return Object.assign(target,{get x(){return xs}});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {return Object.assign({x:0},{x:1});}"#,
+            "O(1)",
+        ),
+    ] {
+        let (cost, _, reasons) = selected_of("", body);
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse(expected).unwrap(),
+            "{body}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn assignment_setter_supplied_owner_reaches_pending_effects() {
+    for (supplied, affected) in [("values", true), ("other", false)] {
+        let source = format!("{HELPERS} export async function selected(xs:number[]){{const values=new Set([0]);const other=new Set([0]);const target={{set x(v:Set<number>){{Promise.resolve().then(()=>{{v.delete(0);v.add(0)}})}}}};Object.assign(target,{{x:{supplied}}});for(const value of values){{await 0;cube(xs)}}}}");
+        let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            reasons.contains(&UnknownReason::Bound),
+            affected,
+            "{supplied}: {reasons:?}"
+        );
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+    }
+}
+
+#[test]
+fn native_property_parameter_sources_keep_both_call_orders() {
+    for calls in ["copy(first);copy(second)", "copy(second);copy(first)"] {
+        let source = format!("{HELPERS} function copy(target:object){{return Object.assign(target,{{x:1}})}} export function selected(xs:number[]){{const first={{set x(value:number){{cube(xs)}}}};const second={{set x(value:number){{quadratic(xs)}}}};{calls};}}");
+        let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse("O(N^3)").unwrap(),
+            "{calls}: {reasons:?}"
+        );
     }
 }

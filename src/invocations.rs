@@ -1788,6 +1788,62 @@ impl<'p, 'a> Analysis<'p, 'a> {
         joined
     }
 
+    pub(crate) fn supplied_implicit_reading_of(
+        &mut self,
+        (file, span): (FileId, Span),
+        targets: &TargetSet,
+        operation: &str,
+        supplied: Option<ArgumentFacts>,
+        receivers: &[&'a Expression<'a>],
+    ) -> Reading {
+        let mut reading = Reading::empty();
+        let site = self.project.site_of(file, span);
+        let origin = self.source_span(file, span);
+
+        for target in &targets.known {
+            let copies = supplied
+                .as_ref()
+                .map_or(0, |facts| facts.value.targets.known.len()) as u64;
+
+            if !self.charge_targets(1 + copies) {
+                let unknown = self.unknown_part(
+                    file,
+                    span,
+                    crate::unknowns::UnknownReason::ResourceExhaustion,
+                );
+
+                return match !reading.completions.is_empty() {
+                    true => reading.retaining(unknown.unknowns, &mut self.unknowns),
+                    false => Reading::of_part(unknown),
+                };
+            }
+
+            let function = self.function_at(*target);
+            let called = self.call_supplied(*target, (file, span), (vec![supplied.clone()], None));
+            let called =
+                self.explained_call_of((target.file, function), called, (site, origin), operation);
+            reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+        }
+
+        if targets.open {
+            let unknown = self.implicit_call_reading_of(
+                (file, span),
+                &TargetSet {
+                    known: Vec::new(),
+                    open: true,
+                },
+                operation,
+                receivers,
+            );
+            reading = match targets.known.is_empty() {
+                true => unknown,
+                false => reading.retaining(unknown.main().unknowns, &mut self.unknowns),
+            };
+        }
+
+        reading
+    }
+
     pub(crate) fn implicit_call_reading_of(
         &mut self,
         (file, span): (FileId, Span),

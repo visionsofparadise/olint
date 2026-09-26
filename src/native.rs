@@ -924,7 +924,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         for (index, argument) in site.arguments.iter().enumerate() {
             let role = site.role_of(model, index);
-            let (part, count) = self.argument_part_of(site, argument, role, model);
+            let (part, count) = if model.identity == Identity::Namespace("Object")
+                && site.name == "assign"
+                && index == 0
+            {
+                (self.assigned_part_of(site), Count::Once)
+            } else {
+                self.argument_part_of(site, argument, role, model)
+            };
             let count = match (role, model.arguments.first(), site.expression_at(0)) {
                 (Role::Callback(_), Some(Role::Pattern(_)), Some(pattern))
                     if self.is_matched_once_pattern(pattern) =>
@@ -1974,6 +1981,89 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         Some(self.live_visits_of(file, receiver, &bodies))
+    }
+
+    fn assigned_part_of(&mut self, site: &NativeSite<'a>) -> Reading {
+        let Some(target) = site.expression_at(0) else {
+            return Reading::of_part(self.unknown_part(
+                site.file,
+                site.span,
+                UnknownReason::UnsupportedModel,
+            ));
+        };
+        let owner = self.storage_value_of(site.file, target);
+
+        if !self.current_effects.member_writes.contains(&owner) {
+            self.current_effects.member_writes.push(owner);
+        }
+
+        let mut reading = Reading::empty();
+        let mut open = false;
+
+        for source in site.arguments.iter().skip(1) {
+            let Some(source) = source.as_expression() else {
+                open = true;
+
+                continue;
+            };
+            let (keys, unresolved) = self.own_property_keys_of(site.file, source, 0);
+            open |= unresolved;
+
+            for key in keys {
+                let targets = self.property_accessors_of((site.file, target), key.clone(), true);
+                let (mut values, unresolved) = self.property_values_of((site.file, source), &key);
+                let getters = self.property_accessors_of((site.file, source), key, false);
+
+                for getter in getters.known {
+                    for returned in self.returned_expressions_of(getter) {
+                        if !self.charge_targets(1) {
+                            open = true;
+
+                            break;
+                        }
+
+                        values.push((getter.file, returned));
+                    }
+                }
+
+                if values.is_empty() || unresolved || getters.open {
+                    let called = self.supplied_implicit_reading_of(
+                        (site.file, site.span),
+                        &targets,
+                        "assign setter",
+                        None,
+                        &[target],
+                    );
+                    reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+                }
+
+                for (file, value) in values {
+                    if !self.charge_targets(1) {
+                        open = true;
+
+                        break;
+                    }
+
+                    let (facts, resolved) = self.supplied_value_facts_of(file, value);
+                    open |= !resolved;
+                    let called = self.supplied_implicit_reading_of(
+                        (site.file, site.span),
+                        &targets,
+                        "assign setter",
+                        Some(facts),
+                        &[target],
+                    );
+                    reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+                }
+            }
+        }
+
+        if open {
+            let unknown = self.written_part_of(site.file, target);
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
     }
 
     fn written_part_of(&mut self, file: FileId, target: &'a Expression<'a>) -> Reading {

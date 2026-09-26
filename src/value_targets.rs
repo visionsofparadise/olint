@@ -131,6 +131,7 @@ enum Owner {
 
 #[derive(Default)]
 struct Buckets {
+    enumerated: HashMap<ValueId, Vec<Option<MemberKey>>>,
     values: HashMap<(Option<MemberKey>, ValueId), Vec<usize>>,
     classes: HashMap<(Site, Option<MemberKey>), Vec<usize>>,
     objects: HashMap<(Site, Option<MemberKey>), Vec<usize>>,
@@ -151,7 +152,14 @@ struct WideSummary {
 }
 
 #[derive(Default)]
+struct ObjectProperties {
+    keys: HashMap<MemberKey, Vec<usize>>,
+    shared: Vec<usize>,
+}
+
+#[derive(Default)]
 pub(crate) struct TargetIndex {
+    object_properties: HashMap<Site, ObjectProperties>,
     indexed: bool,
     writes: Vec<Write>,
     owners: Vec<(Owner, bool)>,
@@ -1289,6 +1297,143 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.implicit_targets_of((file, object.node_id()), implicit, |analysis| {
             analysis.accessors_on(file, object, Some(key), setter)
         })
+    }
+
+    pub(crate) fn own_property_keys_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        depth: usize,
+    ) -> (Vec<MemberKey>, bool) {
+        if depth >= 32 || !self.charge_targets(1) {
+            return (Vec::new(), true);
+        }
+
+        let receiver = self.implicit_receiver_of(file, value);
+        let mut open = receiver.constrained || receiver.origins.is_empty();
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+
+        for value in &receiver.values {
+            let count = self
+                .values
+                .targets
+                .buckets
+                .enumerated
+                .get(value)
+                .map_or(0, Vec::len);
+
+            if !self.charge_targets(count as u64) {
+                open = true;
+
+                break;
+            }
+
+            for key in self
+                .values
+                .targets
+                .buckets
+                .enumerated
+                .get(value)
+                .into_iter()
+                .flatten()
+            {
+                match key {
+                    Some(key) if seen.insert(key.clone()) => keys.push(key.clone()),
+                    None => open = true,
+                    _ => {}
+                }
+            }
+        }
+
+        for origin in receiver.origins {
+            match origin {
+                Origin::Object { file, object } | Origin::HomeObject { file, object } => {
+                    if !self.charge_targets(object.properties.len() as u64) {
+                        open = true;
+
+                        break;
+                    }
+
+                    for property in &object.properties {
+                        match property {
+                            ObjectPropertyKind::ObjectProperty(property) => {
+                                match self.property_key_of(file, property) {
+                                    Some(MemberKey::Name(name))
+                                        if name == "__proto__"
+                                            && is_prototype_property(property) => {}
+                                    Some(key) => {
+                                        if seen.insert(key.clone()) {
+                                            keys.push(key);
+                                        }
+                                    }
+                                    None => open = true,
+                                }
+                            }
+                            ObjectPropertyKind::SpreadProperty(spread) => {
+                                let (copied, unresolved) =
+                                    self.own_property_keys_of(file, &spread.argument, depth + 1);
+
+                                if !self.charge_targets(copied.len() as u64) {
+                                    open = true;
+
+                                    break;
+                                }
+
+                                for key in copied {
+                                    if seen.insert(key.clone()) {
+                                        keys.push(key);
+                                    }
+                                }
+
+                                open |= unresolved;
+                            }
+                        }
+                    }
+                }
+                Origin::Instance { file, class, exact }
+                | Origin::Constructor { file, class, exact } => {
+                    let static_ = matches!(origin, Origin::Constructor { .. });
+                    let classes = if static_ {
+                        vec![(file, class)]
+                    } else {
+                        self.lineage_of(file, class)
+                    };
+                    open |= !exact;
+
+                    for (file, class) in classes {
+                        if !self.charge_targets(class.body.body.len() as u64) {
+                            open = true;
+
+                            break;
+                        }
+
+                        for element in &class.body.body {
+                            if let ClassElement::PropertyDefinition(property) = element {
+                                if property.r#static == static_ {
+                                    match self.defined_key_of(
+                                        file,
+                                        &property.key,
+                                        property.computed,
+                                    ) {
+                                        Some(MemberKey::Name(name)) if name.starts_with('#') => {}
+                                        Some(key) => {
+                                            if seen.insert(key.clone()) {
+                                                keys.push(key);
+                                            }
+                                        }
+                                        None => open = true,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => open = true,
+            }
+        }
+
+        (keys, open)
     }
 
     pub(crate) fn property_values_of(
@@ -2954,11 +3099,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 (AstKind::ObjectProperty(property), Some(MemberKey::Name(name)))
                     if name == "__proto__" =>
                 {
-                    if !property.computed {
+                    if is_prototype_property(property) {
                         continue;
                     }
 
-                    WriteKind::Prototype
+                    kind
                 }
                 _ => kind,
             };
@@ -3103,6 +3248,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     shared,
                     ..
                 } => {
+                    buckets
+                        .enumerated
+                        .entry(*value)
+                        .or_default()
+                        .push(key.clone());
                     buckets
                         .values
                         .entry((key.clone(), *value))
@@ -4390,6 +4540,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return;
         };
 
+        if let Declaration::Parameter {
+            file: target,
+            function,
+            parameter: ParameterNode::Formal(parameter),
+        } = declaration
+        {
+            let binding = self
+                .declarations
+                .binding_of_reference(project, file, reference);
+
+            if binding.is_some_and(|binding| self.is_parameter_unwritten(binding)) {
+                receiver.constrained |= self
+                    .call_arguments_of(target, function, parameter)
+                    .is_none();
+
+                for (source, value) in self.parameter_sources_of((target, function), parameter) {
+                    if !self.charge_targets(1) {
+                        receiver.constrained = true;
+
+                        break;
+                    }
+
+                    self.collect_receiver(source, value, visited, receiver);
+                }
+
+                return;
+            }
+
+            receiver.constrained = true;
+        }
+
         if let Declaration::Class { file, class } = declaration {
             return receiver.origins.push(Origin::Constructor {
                 file,
@@ -4611,6 +4792,71 @@ impl<'p, 'a> Analysis<'p, 'a> {
         found
     }
 
+    fn object_property_indices_of(
+        &mut self,
+        file: FileId,
+        object: &'a ObjectExpression<'a>,
+        key: &MemberKey,
+    ) -> Option<Vec<usize>> {
+        let site = (file, object.node_id());
+
+        if !self.values.targets.object_properties.contains_key(&site) {
+            if !self.charge_targets(object.properties.len() as u64) {
+                return None;
+            }
+
+            let mut properties = ObjectProperties::default();
+
+            for (index, property) in object.properties.iter().enumerate() {
+                match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        if property.computed {
+                            properties.shared.push(index);
+
+                            continue;
+                        }
+
+                        let key = self.property_key_of(file, property);
+
+                        if is_prototype_property(property)
+                            && key == Some(MemberKey::Name("__proto__".to_string()))
+                        {
+                            properties.shared.push(index);
+                        } else if let Some(key) = key {
+                            properties.keys.entry(key).or_default().push(index);
+                        }
+                    }
+                    ObjectPropertyKind::SpreadProperty(_) => properties.shared.push(index),
+                }
+            }
+
+            self.values
+                .targets
+                .object_properties
+                .insert(site, properties);
+        }
+
+        let properties = self.values.targets.object_properties.get(&site)?;
+        let count = properties.shared.len() + properties.keys.get(key).map_or(0, Vec::len);
+        let count = count as u64;
+
+        if !self.charge_targets(
+            count
+                .saturating_mul(64 - count.leading_zeros() as u64)
+                .max(1),
+        ) {
+            return None;
+        }
+
+        let properties = self.values.targets.object_properties.get(&site)?;
+        let mut indices = properties.shared.clone();
+
+        indices.extend(properties.keys.get(key).into_iter().flatten().copied());
+        indices.sort_unstable();
+
+        Some(indices)
+    }
+
     fn object_values_of(
         &mut self,
         file: FileId,
@@ -4622,13 +4868,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut prototype = None;
         let mut copied = Vec::new();
 
-        if !self.charge_targets(object.properties.len() as u64) {
+        let Some(indices) = self.object_property_indices_of(file, object, key) else {
             found.replaced = true;
 
             return;
-        }
+        };
 
-        for property in &object.properties {
+        for index in indices {
+            let property = &object.properties[index];
             let ObjectPropertyKind::ObjectProperty(property) = property else {
                 if let ObjectPropertyKind::SpreadProperty(spread) = property {
                     copied.push(&spread.argument);
@@ -4638,7 +4885,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
             let property_key = self.property_key_of(file, property);
 
-            if !property.computed && property_key == Some(MemberKey::Name("__proto__".to_string()))
+            if is_prototype_property(property)
+                && property_key == Some(MemberKey::Name("__proto__".to_string()))
             {
                 prototype = Some(&property.value);
 
@@ -4751,7 +4999,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             };
 
-            if !property.computed
+            if is_prototype_property(property)
                 && self.property_key_of(file, property)
                     == Some(MemberKey::Name("__proto__".to_string()))
             {
@@ -6637,4 +6885,11 @@ fn completes_normally(scoping: &oxc_semantic::Scoping, kind: &AstKind<'_>) -> bo
         }
         _ => false,
     }
+}
+
+fn is_prototype_property(property: &oxc_ast::ast::ObjectProperty<'_>) -> bool {
+    !property.computed
+        && !property.shorthand
+        && !property.method
+        && property.kind == PropertyKind::Init
 }

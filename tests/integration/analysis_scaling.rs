@@ -1990,7 +1990,7 @@ fn spread_copies_and_destructured_elements_scan_source_keys_once() {
 
         assert_eq!(
             rest_copy_steps_of(sites as usize, keys as usize),
-            30 * sites + 3 * sites * keys + 3,
+            29 * sites + sites * keys + keys + 5,
             "{sites} {keys}"
         );
     }
