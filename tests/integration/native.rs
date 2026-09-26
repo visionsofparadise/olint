@@ -1616,7 +1616,7 @@ fn supplied_nested_array_wrappers_preserve_outer_iteration_bounds() {
 
 #[test]
 fn native_assign_retains_known_property_work() {
-    for (body, expected) in [
+    assert_native_property_work(&[
         (
             r#"(xs: number[]) {const target={slow(value:number[]){cube(value)},set x(value:number[]){this.slow(value)}};return Object.assign(target,{x:xs});}"#,
             "O(N^3)",
@@ -1685,15 +1685,7 @@ fn native_assign_retains_known_property_work() {
             r#"(xs: number[]) {return Object.assign({x:0},{x:1});}"#,
             "O(1)",
         ),
-    ] {
-        let (cost, _, reasons) = selected_of("", body);
-
-        assert_eq!(
-            support::projected_class_of(&cost),
-            Cost::parse(expected).unwrap(),
-            "{body}: {reasons:?}"
-        );
-    }
+    ]);
 }
 
 #[test]
@@ -1724,6 +1716,107 @@ fn native_property_parameter_sources_keep_both_call_orders() {
             support::projected_class_of(&cost),
             Cost::parse("O(N^3)").unwrap(),
             "{calls}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn native_concat_retains_known_property_work() {
+    assert_native_property_work(&[
+        (
+            r#"(xs: number[]) {const items=[0];Object.defineProperty(items,"constructor",{get(){cube(xs);return Array}});return items.concat([]);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const item={length:{valueOf(){cube(xs);return 1}},[Symbol.isConcatSpreadable]:true,0:1};return [].concat(item as any);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const item={get length(){return {valueOf(){cube(xs);return 1}}},[Symbol.isConcatSpreadable]:true,0:1};return [].concat(item as any);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const item={length:1,[Symbol.isConcatSpreadable]:true,get 0(){cube(xs);return 0}};return [].concat(item as any);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const item={length:1,get [Symbol.isConcatSpreadable](){cube(xs);return true},0:1};return [].concat(item as any);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const item={get length(){cube(xs);return 1},[Symbol.isConcatSpreadable]:true,0:1};return [].concat(item as any);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const item={length:1,[Symbol.isConcatSpreadable]:false,get 0(){cube(xs);return 0}};return [].concat(item as any);}"#,
+            "O(N)",
+        ),
+        (r#"(xs: number[]) {return [1].concat([2]);}"#, "O(1)"),
+        (
+            r#"(xs: number[]) {const prototype={get 0(){cube(xs);return 0}};const item={__proto__:prototype,length:1,[Symbol.isConcatSpreadable]:true};return [].concat(item as any);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const items=[0];Object.defineProperty(items,"constructor",{value:{get [Symbol.species](){cube(xs);return Array}}});return items.concat([]);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const items=[0];Object.defineProperty(items,"constructor",{value:{[Symbol.species]:class Result{constructor(){cube(xs)}}}});return items.concat([]);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const items=[0];Object.defineProperty(items,"0",{get(){cube(xs);return 0}});return items.concat([]);}"#,
+            "O(N^3)",
+        ),
+    ]);
+}
+
+#[test]
+fn concat_length_coercion_preserves_pending_owner_effects() {
+    for (written, affected) in [("values", true), ("other", false)] {
+        let source = format!("{HELPERS} export async function selected(xs:number[]){{const values=new Set([0]);const other=new Set([0]);const item={{[Symbol.isConcatSpreadable]:true,length:{{valueOf(){{Promise.resolve().then(()=>{{{written}.delete(0);{written}.add(0)}});return 1}}}},0:0}};[].concat(item as any);for(const value of values){{await 0;cube(xs)}}}}");
+        let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            reasons.contains(&UnknownReason::Bound),
+            affected,
+            "{written}: {reasons:?}"
+        );
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+    }
+}
+
+#[test]
+fn concat_unknown_spreadability_retains_possible_length_coercion() {
+    for fields in [
+        "const item={ [key]:true,length:{valueOf(){cube(xs);return 1}},0:0};",
+        "const item:any={length:{valueOf(){cube(xs);return 1}},0:0};item[key]=true;",
+        "const item={ [Symbol.isConcatSpreadable]:false,[key]:true,length:{valueOf(){cube(xs);return 1}},0:0};",
+        "const item:any={ [Symbol.isConcatSpreadable]:false,length:{valueOf(){cube(xs);return 1}},0:0};item[key]=true;",
+        "const item:any=[0];item[Symbol.isConcatSpreadable]=false;Object.defineProperty(item,'0',{get(){cube(xs);return 0}});item[key]=true;",
+    ] {
+        let source = format!("{HELPERS} export function selected(xs:number[],key:symbol){{{fields}return [].concat(item as any)}}");
+        let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse("O(N^3)").unwrap(),
+            "{fields}: {reasons:?}"
+        );
+    }
+}
+
+fn assert_native_property_work(cases: &[(&str, &str)]) {
+    for (body, expected) in cases {
+        let (cost, _, reasons) = selected_of("", body);
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse(expected).unwrap(),
+            "{body}: {reasons:?}"
         );
     }
 }

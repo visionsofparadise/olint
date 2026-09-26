@@ -1299,6 +1299,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
+    pub(crate) fn indexed_property_keys_of(&mut self) -> (Vec<MemberKey>, bool) {
+        let keys = self.indexed_accessor_keys();
+        let open = self.work_exhausted();
+
+        (keys, open)
+    }
+
     pub(crate) fn own_property_keys_of(
         &mut self,
         file: FileId,
@@ -1486,12 +1493,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
             _ => false,
         };
 
-        if own && matches!(kind, Kind::Array | Kind::String) {
+        let receiver = self.implicit_receiver_of(file, object);
+        let values = self.member_candidates_of(file, object, &receiver, &key);
+
+        if own
+            && matches!(kind, Kind::Array | Kind::String)
+            && values.getters.is_empty()
+            && values.setters.is_empty()
+            && !values.accessors_open
+            && !self.builtin_accessors_defined(kind, None)
+        {
             return closed_targets_of();
         }
 
-        let receiver = self.implicit_receiver_of(file, object);
-        let values = self.member_candidates_of(file, object, &receiver, &key);
         let unresolved = receiver.origins.is_empty() || receiver.constrained;
 
         TargetSet {
@@ -3233,6 +3247,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 (WriteKind::Defined | WriteKind::Prototype, _) => true,
             };
 
+            if let Owner::Value { value, .. } = &owner {
+                buckets
+                    .enumerated
+                    .entry(*value)
+                    .or_default()
+                    .push(write.key.clone());
+            }
+
             if write.key.is_none() && !callable {
                 owners.push((owner, false));
 
@@ -3248,11 +3270,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     shared,
                     ..
                 } => {
-                    buckets
-                        .enumerated
-                        .entry(*value)
-                        .or_default()
-                        .push(key.clone());
                     buckets
                         .values
                         .entry((key.clone(), *value))

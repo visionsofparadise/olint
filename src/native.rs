@@ -922,6 +922,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         inner = inner.merge(conversions, &mut self.unknowns, &mut self.traces);
 
+        if model.identity == Identity::Receiver(Kind::Array) && site.name == "concat" {
+            let copied = self.concat_reading_of(site);
+            beside = beside.merge(copied, &mut self.unknowns, &mut self.traces);
+        }
+
         for (index, argument) in site.arguments.iter().enumerate() {
             let role = site.role_of(model, index);
             let (part, count) = if model.identity == Identity::Namespace("Object")
@@ -1981,6 +1986,303 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         Some(self.live_visits_of(file, receiver, &bodies))
+    }
+
+    fn concat_species_reading_of(&mut self, site: &NativeSite<'a>) -> Reading {
+        let Some(receiver) = site.receiver else {
+            return Reading::empty();
+        };
+        let key = protocol_key_of("@@species");
+        let constructor = MemberKey::Name("constructor".to_string());
+        let accessors =
+            self.property_accessors_of((site.file, receiver), constructor.clone(), false);
+        let mut reading = self.implicit_call_reading_of(
+            (site.file, site.span),
+            &accessors,
+            "concat constructor getter",
+            &[receiver],
+        );
+        let (mut values, mut open) = self.property_values_of((site.file, receiver), &constructor);
+
+        if values.is_empty()
+            && accessors.known.is_empty()
+            && !self.may_implement_any(std::slice::from_ref(&key))
+            && !self.builtin_members_replaced(Kind::Array, &["constructor", "@@species"])
+        {
+            return reading;
+        }
+
+        open |= accessors.open;
+
+        for getter in accessors.known {
+            for returned in self.returned_expressions_of(getter) {
+                if !self.charge_targets(1) {
+                    open = true;
+
+                    break;
+                }
+
+                values.push((getter.file, returned));
+            }
+        }
+
+        for (file, constructor) in values {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let getters = self.property_accessors_of((file, constructor), key.clone(), false);
+            let called = self.implicit_call_reading_of(
+                (file, constructor.span()),
+                &getters,
+                "concat species getter",
+                &[constructor],
+            );
+            reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+            let (mut species, unresolved) = self.property_values_of((file, constructor), &key);
+            open |= unresolved || getters.open;
+
+            for getter in getters.known {
+                for returned in self.returned_expressions_of(getter) {
+                    if !self.charge_targets(1) {
+                        open = true;
+
+                        break;
+                    }
+
+                    species.push((getter.file, returned));
+                }
+            }
+
+            for (source, species) in species {
+                if !self.charge_targets(1) {
+                    open = true;
+
+                    break;
+                }
+
+                if matches!(unwrap(species), Expression::NullLiteral(_)) {
+                    continue;
+                }
+
+                let construction = self.construction_of(source, species);
+                let called = self.supplied_implicit_reading_of(
+                    (site.file, site.span),
+                    &construction.targets,
+                    "concat species constructor",
+                    None,
+                    &[receiver],
+                );
+                reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+
+                for implicit in construction.implicit {
+                    let called = self.construction_part_of((site.file, &[], site.span), implicit);
+                    reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+                }
+
+                open |= construction.targets.open;
+            }
+        }
+
+        if open {
+            let unknown = self.unknown_visits_part_of(site.file, receiver);
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn concat_reading_of(&mut self, site: &NativeSite<'a>) -> Reading {
+        let mut reading = self.concat_species_reading_of(site);
+
+        if !self.charge_targets(site.arguments.len() as u64 + 1) {
+            let unknown = Reading::of_part(self.unknown_part(
+                site.file,
+                site.span,
+                UnknownReason::ResourceExhaustion,
+            ));
+
+            return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        for value in site
+            .receiver
+            .into_iter()
+            .chain(site.arguments.iter().filter_map(Argument::as_expression))
+        {
+            let copied = self.concat_value_reading_of(site.file, value);
+            reading = reading.merge(copied, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn append_getter_returns(
+        &mut self,
+        getters: &TargetSet,
+        values: &mut Vec<(FileId, &'a Expression<'a>)>,
+    ) -> bool {
+        for getter in &getters.known {
+            if !self.charge_targets(1) {
+                return false;
+            }
+
+            for returned in self.returned_expressions_of(*getter) {
+                if !self.charge_targets(1) {
+                    return false;
+                }
+
+                values.push((getter.file, returned));
+            }
+        }
+
+        true
+    }
+
+    fn concat_value_reading_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Reading {
+        if self.is_primitive_operand(file, value) {
+            return Reading::empty();
+        }
+
+        let key = protocol_key_of("@@isConcatSpreadable");
+        let (mut flags, mut open) = self.property_values_of((file, value), &key);
+        let (mut keys, mut keys_open) = self.own_property_keys_of(file, value, 0);
+        let native_array = self.proven_kind(file, value) == Kind::Array
+            || self.declared_kind_of(file, value) == Kind::Array;
+
+        if flags.is_empty()
+            && (native_array || !keys_open)
+            && !self.may_implement_any(std::slice::from_ref(&key))
+            && !self.may_access(Some(&MemberKey::Name("length".to_string())))
+            && !self.has_indexed_accessors()
+        {
+            return Reading::empty();
+        }
+
+        let getters = self.property_accessors_of((file, value), key.clone(), false);
+        let mut reading = self.implicit_call_reading_of(
+            (file, value.span()),
+            &getters,
+            "concat spreadability",
+            &[value],
+        );
+        open |= getters.open;
+
+        open |= !self.append_getter_returns(&getters, &mut flags);
+
+        if !self.charge_targets((flags.len() as u64).saturating_mul(2)) {
+            let unknown = Reading::of_part(self.unknown_part(
+                file,
+                value.span(),
+                UnknownReason::ResourceExhaustion,
+            ));
+
+            return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        open |= keys_open;
+
+        if !open
+            && !flags.is_empty()
+            && flags.iter().all(
+                |(_, flag)| matches!(unwrap(flag), Expression::BooleanLiteral(flag) if !flag.value),
+            )
+        {
+            return reading;
+        }
+
+        let spreadable = flags.iter().any(
+            |(_, flag)| matches!(unwrap(flag), Expression::BooleanLiteral(flag) if flag.value),
+        );
+
+        if !open && flags.is_empty() && !native_array {
+            return reading;
+        }
+
+        let length_key = MemberKey::Name("length".to_string());
+        let getters = self.property_accessors_of((file, value), length_key.clone(), false);
+        let length = self.implicit_call_reading_of(
+            (file, value.span()),
+            &getters,
+            "concat length",
+            &[value],
+        );
+        reading = reading.merge(length, &mut self.unknowns, &mut self.traces);
+        let (mut lengths, unresolved) = self.property_values_of((file, value), &length_key);
+        open |= unresolved || getters.open;
+
+        open |= !self.append_getter_returns(&getters, &mut lengths);
+
+        for (source, length) in lengths {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let converted = self.operand_coercion_part_of(source, length);
+            reading = reading.merge(converted, &mut self.unknowns, &mut self.traces);
+        }
+
+        let indexes = self.property_accessors_of((file, value), MemberKey::Index, false);
+        let indexed =
+            self.implicit_call_reading_of((file, value.span()), &indexes, "concat index", &[value]);
+        let size = self.collection_size_of(file, value);
+        let indexed = indexed.map_parts(|part| {
+            part.scaled(
+                size.length_resolved.then_some(size.length.clone()),
+                &mut self.unknowns,
+            )
+        });
+        reading = reading.merge(indexed, &mut self.unknowns, &mut self.traces);
+        let (inherited, unresolved) = self.indexed_property_keys_of();
+        keys_open |= unresolved;
+
+        if self.charge_targets(keys.len() as u64 + inherited.len() as u64) {
+            let mut seen: std::collections::HashSet<MemberKey> = keys.iter().cloned().collect();
+
+            for key in inherited {
+                if seen.insert(key.clone()) {
+                    keys.push(key);
+                }
+            }
+        } else {
+            keys_open = true;
+        }
+
+        for key in keys {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let MemberKey::Name(name) = &key else {
+                continue;
+            };
+
+            if name.parse::<u64>().is_err() {
+                continue;
+            }
+
+            let targets = self.property_accessors_of((file, value), key, false);
+            let indexed = self.implicit_call_reading_of(
+                (file, value.span()),
+                &targets,
+                "concat index",
+                &[value],
+            );
+            reading = reading.merge(indexed, &mut self.unknowns, &mut self.traces);
+        }
+
+        if open || (!size.length_resolved && (spreadable || keys_open)) {
+            let unknown = self.unknown_visits_part_of(file, value);
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
     }
 
     fn assigned_part_of(&mut self, site: &NativeSite<'a>) -> Reading {

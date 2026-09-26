@@ -1419,6 +1419,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let Some((site, model)) = self.modelled_call_of(file, call) {
+            if model.identity
+                == crate::native::Identity::Receiver(crate::declared_types::Kind::Array)
+                && site.name == "concat"
+            {
+                return true;
+            }
+
             if model.phase == crate::cost::ExecutionPhase::Scheduled {
                 return true;
             }
