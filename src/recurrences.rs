@@ -73,6 +73,46 @@ pub enum RecurrenceSolution {
     },
 }
 
+#[derive(Clone, Copy, Default)]
+struct NumericGuards {
+    lower: Option<f64>,
+    upper: Option<f64>,
+    ordered: bool,
+    finite: bool,
+}
+
+impl NumericGuards {
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            lower: stronger_bound_of(self.lower, other.lower),
+            upper: match (self.upper, other.upper) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (found, None) | (None, found) => found,
+            },
+            ordered: self.ordered || other.ordered,
+            finite: self.finite || other.finite,
+        }
+    }
+
+    fn admits(self, relation: ArgumentRelation) -> bool {
+        let finite = self.finite || (self.ordered && self.lower.is_some() && self.upper.is_some());
+
+        match relation {
+            ArgumentRelation::Unchanged => true,
+            ArgumentRelation::Division { .. } => finite,
+            ArgumentRelation::Decrement { .. } => {
+                finite
+                    && self
+                        .lower
+                        .is_some_and(|lower| lower >= -9_007_199_254_740_991.0)
+                    && self
+                        .upper
+                        .is_some_and(|upper| upper <= 9_007_199_254_740_991.0)
+            }
+        }
+    }
+}
+
 pub fn weaker_relation_of(left: ArgumentRelation, right: ArgumentRelation) -> ArgumentRelation {
     match (left, right) {
         (ArgumentRelation::Unchanged, _) | (_, ArgumentRelation::Unchanged) => {
@@ -282,7 +322,7 @@ fn branching_solution_of(equations: &[RecurrenceEquation]) -> RecurrenceSolution
                 _ => {
                     return RecurrenceSolution::Unsupported {
                         reason: "branching without a uniform decrement",
-                    }
+                    };
                 }
             }
         }
@@ -467,7 +507,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let Some(caller_position) = self.caller_position_of(caller_file, caller, source) else {
                 continue;
             };
-            let lower_bound = self.lower_bound_of(call_file, argument.node_id(), source);
+            let guards = self.numeric_guards_of(call_file, argument.node_id(), source);
+            let coercing = matches!(relation, ArgumentRelation::Division { .. })
+                && matches!(unwrap(argument), Expression::BinaryExpression(binary) if matches!(binary.operator, BinaryOperator::ShiftRight | BinaryOperator::ShiftRightZeroFill | BinaryOperator::BitwiseOR));
+
+            if !self.is_parameter_unwritten(source) || (!coercing && !guards.admits(relation)) {
+                continue;
+            }
+
+            let lower_bound = guards.lower;
 
             steps.push(CallStep {
                 callee_position: position,
@@ -602,9 +650,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Option<usize> {
         let parameters = parameters_of(caller)?;
 
-        (0..parameters.items.len()).find(|position| {
-            self.numeric_parameter_binding_of(caller_file, caller, *position) == Some(binding)
-        })
+        for position in 0..parameters.items.len() {
+            if !self.charge_work(Event::RecurrenceStep, 1) {
+                return None;
+            }
+
+            if self.numeric_parameter_binding_of(caller_file, caller, position) == Some(binding) {
+                return Some(position);
+            }
+        }
+
+        None
     }
 
     fn relation_of(
@@ -629,7 +685,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Some("Math.floor") | Some("Math.trunc")
                 );
 
-                if !truncating || call.arguments.len() != 1 {
+                if !truncating
+                    || call.arguments.len() != 1
+                    || self.intrinsic_replaced_of(file, &call.callee)
+                {
                     return None;
                 }
 
@@ -692,26 +751,22 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 let (relation, binding) = self.relation_of(file, left, depth)?;
 
-                Some((truncated_relation_of(relation), binding))
+                matches!(relation, ArgumentRelation::Division { .. })
+                    .then_some((truncated_relation_of(relation), binding))
             }
             _ => None,
         }
     }
 
-    fn lower_bound_of(&mut self, file: FileId, node: NodeId, measure: Binding) -> Option<f64> {
-        let ancestors: Vec<NodeId> = self
-            .project
-            .file(file)
-            .semantic
-            .nodes()
-            .ancestor_ids(node)
-            .collect();
+    fn numeric_guards_of(&mut self, file: FileId, node: NodeId, measure: Binding) -> NumericGuards {
+        let project = self.project;
+        let ancestors = project.file(file).semantic.nodes().ancestor_ids(node);
         let mut inner = self.kind_of_node(file, node).span();
-        let mut bound: Option<f64> = None;
+        let mut bound = NumericGuards::default();
 
         for ancestor in ancestors {
             if !self.charge_work(Event::RecurrenceStep, 1) {
-                return None;
+                return NumericGuards::default();
             }
 
             let kind = self.kind_of_node(file, ancestor);
@@ -719,35 +774,57 @@ impl<'p, 'a> Analysis<'p, 'a> {
             match kind {
                 AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => break,
                 AstKind::IfStatement(statement) => {
-                    let taken = encloses(statement.consequent.span(), inner);
-                    let found = self.condition_bound_of(file, &statement.test, measure, taken, 0);
+                    let taken = if encloses(statement.consequent.span(), inner) {
+                        Some(true)
+                    } else if statement
+                        .alternate
+                        .as_ref()
+                        .is_some_and(|alternate| encloses(alternate.span(), inner))
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    };
 
-                    bound = stronger_bound_of(bound, found);
+                    if let Some(taken) = taken {
+                        let found =
+                            self.condition_guards_of(file, &statement.test, measure, taken, 0);
+                        bound = bound.intersect(found);
+                    }
                 }
                 AstKind::ConditionalExpression(expression) => {
-                    let taken = encloses(expression.consequent.span(), inner);
-                    let found = self.condition_bound_of(file, &expression.test, measure, taken, 0);
+                    let taken = if encloses(expression.consequent.span(), inner) {
+                        Some(true)
+                    } else if encloses(expression.alternate.span(), inner) {
+                        Some(false)
+                    } else {
+                        None
+                    };
 
-                    bound = stronger_bound_of(bound, found);
+                    if let Some(taken) = taken {
+                        let found =
+                            self.condition_guards_of(file, &expression.test, measure, taken, 0);
+                        bound = bound.intersect(found);
+                    }
                 }
                 AstKind::LogicalExpression(expression) => {
                     if encloses(expression.right.span(), inner) {
                         let taken = expression.operator == LogicalOperator::And;
                         let found =
-                            self.condition_bound_of(file, &expression.left, measure, taken, 0);
+                            self.condition_guards_of(file, &expression.left, measure, taken, 0);
 
-                        bound = stronger_bound_of(bound, found);
+                        bound = bound.intersect(found);
                     }
                 }
                 AstKind::BlockStatement(block) => {
-                    let found = self.preceding_bound_of(file, &block.body, inner, measure);
+                    let found = self.preceding_guards_of(file, &block.body, inner, measure);
 
-                    bound = stronger_bound_of(bound, found);
+                    bound = bound.intersect(found);
                 }
                 AstKind::FunctionBody(body) => {
-                    let found = self.preceding_bound_of(file, &body.statements, inner, measure);
+                    let found = self.preceding_guards_of(file, &body.statements, inner, measure);
 
-                    bound = stronger_bound_of(bound, found);
+                    bound = bound.intersect(found);
                 }
                 _ => {}
             }
@@ -758,18 +835,46 @@ impl<'p, 'a> Analysis<'p, 'a> {
         bound
     }
 
-    fn preceding_bound_of(
+    fn exits_unconditionally(&mut self, statement: &Statement<'_>, depth: usize) -> bool {
+        if depth >= MAXIMUM_RECURRENCE_DEPTH || !self.charge_work(Event::RecurrenceStep, 1) {
+            return false;
+        }
+
+        match statement {
+            Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
+            Statement::BlockStatement(block) => {
+                for inner in &block.body {
+                    if !self.charge_work(Event::RecurrenceStep, 1)
+                        || matches!(
+                            inner,
+                            Statement::BreakStatement(_) | Statement::ContinueStatement(_)
+                        )
+                    {
+                        return false;
+                    }
+                }
+
+                block
+                    .body
+                    .last()
+                    .is_some_and(|inner| self.exits_unconditionally(inner, depth + 1))
+            }
+            _ => false,
+        }
+    }
+
+    fn preceding_guards_of(
         &mut self,
         file: FileId,
         statements: &'a [Statement<'a>],
         inner: Span,
         measure: Binding,
-    ) -> Option<f64> {
-        let mut bound = None;
+    ) -> NumericGuards {
+        let mut bound = NumericGuards::default();
 
         for statement in statements {
             if !self.charge_work(Event::RecurrenceStep, 1) {
-                return None;
+                return NumericGuards::default();
             }
 
             if statement.span().start >= inner.start {
@@ -780,28 +885,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             };
 
-            if guard.alternate.is_some() || !exits_unconditionally(&guard.consequent, 0) {
+            if guard.alternate.is_some() || !self.exits_unconditionally(&guard.consequent, 0) {
                 continue;
             }
 
-            let found = self.condition_bound_of(file, &guard.test, measure, false, 0);
+            let found = self.condition_guards_of(file, &guard.test, measure, false, 0);
 
-            bound = stronger_bound_of(bound, found);
+            bound = bound.intersect(found);
         }
 
         bound
     }
 
-    fn condition_bound_of(
+    fn condition_guards_of(
         &mut self,
         file: FileId,
         test: &'a Expression<'a>,
         measure: Binding,
         taken: bool,
         depth: usize,
-    ) -> Option<f64> {
+    ) -> NumericGuards {
         if depth >= MAXIMUM_RECURRENCE_DEPTH || !self.charge_work(Event::RecurrenceStep, 1) {
-            return None;
+            return NumericGuards::default();
         }
 
         match unwrap(test) {
@@ -812,40 +917,76 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         false => LogicalOperator::Or,
                     } =>
             {
-                let left = self.condition_bound_of(file, &logical.left, measure, taken, depth + 1);
+                let left = self.condition_guards_of(file, &logical.left, measure, taken, depth + 1);
                 let right =
-                    self.condition_bound_of(file, &logical.right, measure, taken, depth + 1);
+                    self.condition_guards_of(file, &logical.right, measure, taken, depth + 1);
 
-                stronger_bound_of(left, right)
+                left.intersect(right)
             }
             Expression::BinaryExpression(binary) => {
-                self.comparison_bound_of(file, binary, measure, taken)
+                self.comparison_guards_of(file, binary, measure, taken)
             }
-            _ => None,
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                self.condition_guards_of(file, &unary.argument, measure, !taken, depth + 1)
+            }
+            Expression::CallExpression(call)
+                if taken
+                    && self.member_path_of(file, &call.callee).as_deref()
+                        == Some("Number.isFinite")
+                    && !self.intrinsic_replaced_of(file, &call.callee)
+                    && call.arguments.len() == 1
+                    && call.arguments[0]
+                        .as_expression()
+                        .is_some_and(|value| self.measure_reference_of(file, value, measure)) =>
+            {
+                NumericGuards {
+                    finite: true,
+                    ..NumericGuards::default()
+                }
+            }
+            _ => NumericGuards::default(),
         }
     }
 
-    fn comparison_bound_of(
+    fn comparison_guards_of(
         &mut self,
         file: FileId,
         binary: &'a oxc_ast::ast::BinaryExpression<'a>,
         measure: Binding,
         taken: bool,
-    ) -> Option<f64> {
+    ) -> NumericGuards {
         let left = self.measure_reference_of(file, &binary.left, measure);
         let right = self.measure_reference_of(file, &binary.right, measure);
-        let (mirrored, endpoint) = match (left, right) {
-            (true, false) => (false, self.numeric_value_of(file, &binary.right)?),
-            (false, true) => (true, self.numeric_value_of(file, &binary.left)?),
-            _ => return None,
+        let pair = match (left, right) {
+            (true, false) => self
+                .numeric_value_of(file, &binary.right)
+                .map(|value| (false, value)),
+            (false, true) => self
+                .numeric_value_of(file, &binary.left)
+                .map(|value| (true, value)),
+            _ => None,
         };
-        let operator = comparison_operator_of(binary.operator, mirrored, !taken)?;
+        let Some((mirrored, endpoint)) = pair else {
+            return NumericGuards::default();
+        };
+        let Some(operator) = comparison_operator_of(binary.operator, mirrored, !taken) else {
+            return NumericGuards::default();
+        };
+        let mut guards = NumericGuards {
+            ordered: taken,
+            ..NumericGuards::default()
+        };
 
         match operator {
-            BinaryOperator::GreaterThan => Some(endpoint),
-            BinaryOperator::GreaterEqualThan => Some(endpoint - 1.0),
-            _ => None,
+            BinaryOperator::GreaterThan => guards.lower = Some(endpoint),
+            BinaryOperator::GreaterEqualThan => guards.lower = Some(endpoint - 1.0),
+            BinaryOperator::LessThan | BinaryOperator::LessEqualThan => {
+                guards.upper = Some(endpoint)
+            }
+            _ => {}
         }
+
+        guards
     }
 
     fn measure_reference_of(
@@ -955,28 +1096,6 @@ fn comparison_operator_of(
         (false, true) => BinaryOperator::LessThan,
         (false, false) => BinaryOperator::LessEqualThan,
     })
-}
-
-fn exits_unconditionally(statement: &Statement<'_>, depth: usize) -> bool {
-    if depth >= MAXIMUM_RECURRENCE_DEPTH {
-        return false;
-    }
-
-    match statement {
-        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
-        Statement::BlockStatement(block) => {
-            block.body.iter().all(|inner| {
-                !matches!(
-                    inner,
-                    Statement::BreakStatement(_) | Statement::ContinueStatement(_)
-                )
-            }) && block
-                .body
-                .last()
-                .is_some_and(|inner| exits_unconditionally(inner, depth + 1))
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

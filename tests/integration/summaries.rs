@@ -426,7 +426,7 @@ fn labels_of(
 #[test]
 fn self_recursion_charges_its_body_at_every_guarded_level() {
     run_with_source(
-        "export function walk(n: number): number {\n\treturn n > 0 ? walk(n - 1) : 0;\n}",
+        "export function walk(n: number): number {\n\treturn n > 0 && n <= 1000000000 ? walk(n - 1) : 0;\n}",
         |analysis, file| {
             let walk = function_of_name(analysis.project, file, "walk");
             let part = analysis
@@ -445,7 +445,7 @@ fn self_recursion_charges_its_body_at_every_guarded_level() {
 #[test]
 fn separate_cycle_roots_keep_their_own_summary_context() {
     run_with_source(
-        "export function ping(n: number): number {\n\treturn n > 0 ? pong(n - 1) : 0;\n}\nexport function pong(n: number): number {\n\treturn n > 0 ? ping(n - 1) : 0;\n}",
+        "export function ping(n: number): number {\n\treturn n > 0 && n <= 1000000000 ? pong(n - 1) : 0;\n}\nexport function pong(n: number): number {\n\treturn n > 0 && n <= 1000000000 ? ping(n - 1) : 0;\n}",
         |analysis, file| {
             let ping = function_of_name(analysis.project, file, "ping");
             let pong = function_of_name(analysis.project, file, "pong");
@@ -663,7 +663,7 @@ fn a_cold_callback_parameter_call_yields_inside_its_caller() {
     );
 }
 
-const GUARDED_CYCLE: &str = "export function ping(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
+const GUARDED_CYCLE: &str = "export function ping(xs: number[], n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
 const SKIPPING_CYCLE: &str = "export function ping(xs: number[], n: number): number {\n\tif (n === 0) return 0;\n\tconst s = xs.length;\n\treturn s + pong(xs, n - 1);\n}\n/** @perf cold */\nfunction pong(xs: number[], n: number): number {\n\treturn ping(xs, n);\n}\n";
 
 fn assert_solved_depth(analysis: &mut Analysis<'_, '_>, file: olint::project::FileId, name: &str) {
@@ -688,7 +688,7 @@ fn assert_solved_depth(analysis: &mut Analysis<'_, '_>, file: olint::project::Fi
 
 #[test]
 fn a_cold_recursive_function_keeps_its_solved_depth() {
-    let source = "/** @perf cold */\nexport function walk(xs: number[], n: number): number {\n\tif (n <= 0) return 0;\n\tconst s = xs.length;\n\treturn s + walk(xs, n - 1);\n}\n";
+    let source = "/** @perf cold */\nexport function walk(xs: number[], n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tconst s = xs.length;\n\treturn s + walk(xs, n - 1);\n}\n";
 
     run_with_source(source, |analysis, file| {
         assert_solved_depth(analysis, file, "walk");
@@ -1518,7 +1518,7 @@ fn latent_arguments_with_equal_effects_but_different_work_keep_distinct_keys() {
 
 #[test]
 fn a_recursive_generator_keeps_its_solved_lazy_work_while_its_count_stays_unresolved() {
-    let source = "export function* walk(n: number, xs: number[]): Generator<number> { if (n <= 0) return; for (const x of xs) yield x; yield* walk(n - 1, xs); }\nexport function drain(n: number, xs: number[]): number { let t = 0; for (const v of walk(n, xs)) t += v; return t; }";
+    let source = "export function* walk(n: number, xs: number[]): Generator<number> { if (!(n > 0 && n <= 1000000000)) return; for (const x of xs) yield x; yield* walk(n - 1, xs); }\nexport function drain(n: number, xs: number[]): number { let t = 0; for (const v of walk(n, xs)) t += v; return t; }";
 
     run_with_source(source, |analysis, file| {
         let drain = function_of_name(analysis.project, file, "drain");

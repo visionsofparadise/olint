@@ -170,7 +170,7 @@ fn unrelated_named_assumptions_do_not_change_recursive_preference() {
             "",
             "/** @perf O(xs.length^2) */ function unrelated(xs:string) {}",
         ] {
-            let source = format!("/** @perf {mark} */ export function walk(n:number):number {{ return n > 0 ? walk(n-1) : 0; }}\n{unrelated}");
+            let source = format!("/** @perf {mark} */ export function walk(n:number):number {{ return n > 0 && n <= 1000000000 ? walk(n-1) : 0; }}\n{unrelated}");
 
             run_with_source(&source, |analysis, file| {
                 let walk = function_of_name(analysis.project, file, "walk");

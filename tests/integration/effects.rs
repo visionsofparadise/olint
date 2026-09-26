@@ -576,8 +576,8 @@ fn pending_caller_chains_reuse_scheduling_classification() {
 fn scheduling_cycles_keep_late_producers_and_ignore_pure_backedges() {
     for scheduler in ["", "p.then(()=>{values.delete(0);values.add(0);});"] {
         for reverse in [false, true] {
-            let a = format!("function a(n:number){{if(n>0)b(n-1);{scheduler}}}");
-            let b = "function b(n:number){if(n>0)a(n-1);}";
+            let a = format!("function a(n:number){{if(n>0&&n<=1000000000)b(n-1);{scheduler}}}");
+            let b = "function b(n:number){if(n>0&&n<=1000000000)a(n-1);}";
             let functions = if reverse {
                 format!("{b}{a}")
             } else {

@@ -85,7 +85,7 @@ fn assert_recurrence_unresolved(source: &str, name: &str) {
     });
 }
 
-const SCAN_PER_DEPTH: &str = "export function f(n: number, values: number[]): number {\n\tif (n <= 0) return 0;\n\tlet total = 0;\n\tfor (const x of values) total += x;\n\treturn total + f(n - 1, values);\n}\n";
+const SCAN_PER_DEPTH: &str = "export function f(n: number, values: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tlet total = 0;\n\tfor (const x of values) total += x;\n\treturn total + f(n - 1, values);\n}\n";
 
 #[test]
 fn c7_scan_per_depth_charges_the_scan_at_every_level() {
@@ -104,7 +104,7 @@ fn c7_scan_per_depth_charges_the_scan_at_every_level() {
 
 #[test]
 fn a_mutual_cycle_agrees_with_its_direct_equivalent() {
-    let source = "export function f(n: number, values: number[]): number {\n\tif (n <= 0) return 0;\n\tlet total = 0;\n\tfor (const x of values) total += x;\n\treturn total + g(n - 1, values);\n}\nexport function g(n: number, values: number[]): number {\n\treturn f(n, values);\n}\n";
+    let source = "export function f(n: number, values: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tlet total = 0;\n\tfor (const x of values) total += x;\n\treturn total + g(n - 1, values);\n}\nexport function g(n: number, values: number[]): number {\n\treturn f(n, values);\n}\n";
 
     assert_above(source, "f", "O(N)", "O(N^2)");
     assert_above(source, "g", "O(N)", "O(N^2)");
@@ -136,7 +136,7 @@ fn a_mutual_cycle_agrees_with_its_direct_equivalent() {
 
 #[test]
 fn binary_decrement_reports_exponential_growth() {
-    let source = "export function f(n: number): number {\n\tif (n <= 0) return 1;\n\treturn f(n - 1) + f(n - 1) + 1;\n}\n";
+    let source = "export function f(n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 1;\n\treturn f(n - 1) + f(n - 1) + 1;\n}\n";
 
     assert_exceeds_quartic(source, "f", "O((2)^(n))");
 
@@ -148,7 +148,7 @@ fn binary_decrement_reports_exponential_growth() {
 #[test]
 fn a_halved_argument_is_logarithmic_under_its_numeric_guard() {
     let shifted = "export function f(n: number): number {\n\tif (n <= 1) return 0;\n\treturn 1 + f(n >> 1);\n}\n";
-    let floored = "export function f(n: number): number {\n\tif (n <= 1) return 0;\n\treturn 1 + f(Math.floor(n / 2));\n}\n";
+    let floored = "export function f(n: number): number {\n\tif (!(n > 1 && n <= 1000000000)) return 0;\n\treturn 1 + f(Math.floor(n / 2));\n}\n";
 
     for source in [shifted, floored] {
         run_with_source(source, |analysis, file| {
@@ -163,7 +163,7 @@ fn a_halved_argument_is_logarithmic_under_its_numeric_guard() {
 
 #[test]
 fn an_exact_halving_without_a_positive_floor_stays_unresolved() {
-    let guarded = "export function f(n: number): number {\n\tif (n <= 1) return 0;\n\treturn 1 + f(n / 2);\n}\n";
+    let guarded = "export function f(n: number): number {\n\tif (!(n > 1 && n <= 1000000000)) return 0;\n\treturn 1 + f(n / 2);\n}\n";
     let unguarded = "export function f(n: number): number {\n\tif (n <= 0) return 0;\n\treturn 1 + f(n / 2);\n}\n";
 
     assert_class(guarded, "f", "O(log N)", true);
@@ -173,7 +173,7 @@ fn an_exact_halving_without_a_positive_floor_stays_unresolved() {
 #[test]
 fn an_equality_base_case_cannot_prove_a_decrement_terminates() {
     let skipping = "export function f(n: number): number {\n\tif (n === 0) return 0;\n\treturn 1 + f(n - 2);\n}\n";
-    let ordered = "export function f(n: number): number {\n\tif (n <= 0) return 0;\n\treturn 1 + f(n - 2);\n}\n";
+    let ordered = "export function f(n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\treturn 1 + f(n - 2);\n}\n";
 
     assert_recurrence_unresolved(skipping, "f");
     assert_class(ordered, "f", "O(N)", true);
@@ -181,14 +181,14 @@ fn an_equality_base_case_cannot_prove_a_decrement_terminates() {
 
 #[test]
 fn a_measure_sized_multiplicity_keeps_its_factorial_expression() {
-    let source = "export function f(n: number): number {\n\tif (n <= 0) return 1;\n\tlet total = 0;\n\tfor (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += f(n - 1);\n\treturn total;\n}\n";
+    let source = "export function f(n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 1;\n\tlet total = 0;\n\tfor (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += f(n - 1);\n\treturn total;\n}\n";
 
     assert_exceeds_quartic(source, "f", "O((n * (n)!))");
 }
 
 #[test]
 fn mixed_inputs_keep_every_independent_dimension() {
-    let source = "export function f(n: number, values: number[], ys: number[]): number {\n\tif (n <= 0) return 0;\n\tlet total = 0;\n\tfor (const y of ys) total += y;\n\tfor (const x of values) total += x;\n\treturn total + f(n - 1, values, ys);\n}\n";
+    let source = "export function f(n: number, values: number[], ys: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tlet total = 0;\n\tfor (const y of ys) total += y;\n\tfor (const x of values) total += x;\n\treturn total + f(n - 1, values, ys);\n}\n";
 
     run_with_source(source, |analysis, file| {
         let part = summary_of(analysis, file, "f");
@@ -218,7 +218,7 @@ fn a_recursive_call_under_an_unresolved_bound_stays_unresolved() {
 
 #[test]
 fn a_pass_through_callback_keeps_the_solved_depth() {
-    let source = "export function f(n: number, xs: number[], callback: () => void): void {\n\tif (n <= 0) {\n\t\tcallback();\n\t\treturn;\n\t}\n\tfor (const x of xs) callback();\n\tf(n - 1, xs, callback);\n}\nexport function run(xs: number[], n: number): void {\n\tlet total = 0;\n\tf(n, xs, () => {\n\t\ttotal += 1;\n\t});\n}\n";
+    let source = "export function f(n: number, xs: number[], callback: () => void): void {\n\tif (!(n > 0 && n <= 1000000000)) {\n\t\tcallback();\n\t\treturn;\n\t}\n\tfor (const x of xs) callback();\n\tf(n - 1, xs, callback);\n}\nexport function run(xs: number[], n: number): void {\n\tlet total = 0;\n\tf(n, xs, () => {\n\t\ttotal += 1;\n\t});\n}\n";
 
     assert_above(source, "run", "O(N)", "O(N^2)");
 }
@@ -256,7 +256,7 @@ fn a_growing_recursive_callback_stays_incomplete() {
 
 #[test]
 fn a_directive_cost_still_overrides_a_solvable_recurrence() {
-    let source = "/** @perf O(1) */\nexport function f(n: number): number {\n\tif (n <= 0) return 0;\n\treturn 1 + f(n - 1);\n}\n";
+    let source = "/** @perf O(1) */\nexport function f(n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\treturn 1 + f(n - 1);\n}\n";
 
     assert_class(source, "f", "O(1)", true);
 }
@@ -382,61 +382,61 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
         (
             "an array passed through",
             "f",
-            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
+            "export function f(n: number, xs: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
             "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "two arrays swapped between parameters",
             "f",
-            "export function f(n: number, xs: number[], ys: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ys, xs); }",
+            "export function f(n: number, xs: number[], ys: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ys, xs); }",
             "O((n * max(1, xs, ys)))",
         ),
         (
             "a constant number",
             "f",
-            "export function f(n: number, xs: number[], k: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; for (let i = 0; i < k && k >= 0 && k <= 1000000000; i++) t += i; return t + f(n - 1, xs, 3); }",
+            "export function f(n: number, xs: number[], k: number): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += x; for (let i = 0; i < k && k >= 0 && k <= 1000000000; i++) t += i; return t + f(n - 1, xs, 3); }",
             "O(max(xs, k, (n * max(1, xs))))",
         ),
         (
             "a constant string",
             "f",
-            "export function f(n: number, s: string): number { if (n <= 0) return 0; let t = 0; for (const c of s) t += c.length; return t + f(n - 1, \"ab\"); }",
+            "export function f(n: number, s: string): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const c of s) t += c.length; return t + f(n - 1, \"ab\"); }",
             "O(max(n, s))",
         ),
         (
             "an omitted optional argument",
             "f",
-            "export function f(n: number, xs: number[], k?: number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
+            "export function f(n: number, xs: number[], k?: number): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, xs); }",
             "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "a constant alias of a parameter",
             "f",
-            "export function f(n: number, xs: number[]): number { if (n <= 0) return 0; const same = xs; let t = 0; for (const x of same) t += x; return t + f(n - 1, same); }",
+            "export function f(n: number, xs: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; const same = xs; let t = 0; for (const x of same) t += x; return t + f(n - 1, same); }",
             "O(max(n, xs, (n * max(1, n, xs))))",
         ),
         (
             "a rest parameter spread through",
             "f",
-            "export function f(n: number, ...xs: number[]): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ...xs); }",
+            "export function f(n: number, ...xs: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ...xs); }",
             "O(max(n, (n * max(1, n))))",
         ),
         (
             "a module function passed as its callback",
             "run",
-            "function inc(x: number): number { return x + 1; }\nfunction f(n: number, xs: number[], g: (x: number) => number): number { if (n <= 0) return 0; let t = 0; for (const x of xs) t += g(x); return t + f(n - 1, xs, inc); }\nexport function run(n: number, xs: number[]): number { return f(n, xs, inc); }",
+            "function inc(x: number): number { return x + 1; }\nfunction f(n: number, xs: number[], g: (x: number) => number): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += g(x); return t + f(n - 1, xs, inc); }\nexport function run(n: number, xs: number[]): number { return f(n, xs, inc); }",
             "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "a second number decremented under its guard",
             "f",
-            "export function f(n: number, m: number): number { if (n <= 0) return 0; if (m <= 0) return 0; let t = 0; for (let i = 0; i < m && m >= 0 && m <= 1000000000; i++) t += i; return t + f(n - 1, m - 1); }",
+            "export function f(n: number, m: number): number { if (!(n > 0 && n <= 1000000000)) return 0; if (!(m > 0 && m <= 1000000000)) return 0; let t = 0; for (let i = 0; i < m && m >= 0 && m <= 1000000000; i++) t += i; return t + f(n - 1, m - 1); }",
             "O(max(m, (n * max(1, m))))",
         ),
         (
             "a second number halved",
             "f",
-            "export function f(n: number, m: number): number { if (n <= 0) return 0; let t = 0; for (let i = 0; i < m && m >= 0 && m <= 1000000000; i++) t += i; return t + f(n - 1, m >> 1); }",
+            "export function f(n: number, m: number): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (let i = 0; i < m && m >= 0 && m <= 1000000000; i++) t += i; return t + f(n - 1, m >> 1); }",
             "O(max(m, (n * max(1, m))))",
         ),
     ];
@@ -456,9 +456,9 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
     assert_eq!(found, expected);
 }
 
-const CYCLE_WITH_HIDDEN_WORK: &str = "export function cycleStart(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\tlet t = 0;\n\tfor (const x of xs) for (const y of xs) t += x + y;\n\treturn t + new CycleHolder().step(n - 1, xs);\n}\nexport class CycleHolder {\n\tstep(n: number, xs: number[]): number {\n\t\tif (n <= 0) return 0;\n\t\treturn cycleContinue(n - 1, xs) + xs.length;\n\t}\n}\nexport function cycleContinue(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\treturn cycleStart(n - 1, xs);\n}\n";
+const CYCLE_WITH_HIDDEN_WORK: &str = "export function cycleStart(n: number, xs: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tlet t = 0;\n\tfor (const x of xs) for (const y of xs) t += x + y;\n\treturn t + new CycleHolder().step(n - 1, xs);\n}\nexport class CycleHolder {\n\tstep(n: number, xs: number[]): number {\n\t\tif (!(n > 0 && n <= 1000000000)) return 0;\n\t\treturn cycleContinue(n - 1, xs) + xs.length;\n\t}\n}\nexport function cycleContinue(n: number, xs: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\treturn cycleStart(n - 1, xs);\n}\n";
 
-const CLEAN_CYCLE: &str = "export function cycleStart(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\tlet t = 0;\n\tfor (const x of xs) for (const y of xs) t += x + y;\n\treturn t + step(n - 1, xs);\n}\nexport function step(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\treturn cycleContinue(n - 1, xs) + xs.length;\n}\nexport function cycleContinue(n: number, xs: number[]): number {\n\tif (n <= 0) return 0;\n\treturn cycleStart(n - 1, xs);\n}\n";
+const CLEAN_CYCLE: &str = "export function cycleStart(n: number, xs: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\tlet t = 0;\n\tfor (const x of xs) for (const y of xs) t += x + y;\n\treturn t + step(n - 1, xs);\n}\nexport function step(n: number, xs: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\treturn cycleContinue(n - 1, xs) + xs.length;\n}\nexport function cycleContinue(n: number, xs: number[]): number {\n\tif (!(n > 0 && n <= 1000000000)) return 0;\n\treturn cycleStart(n - 1, xs);\n}\n";
 
 fn member_of<'a>(
     project: &olint::project::Project<'a>,
@@ -552,4 +552,80 @@ fn every_member_of_a_clean_solved_component_stays_complete() {
 
     assert_eq!(found.len(), 18);
     assert_eq!(found, expected);
+}
+
+#[test]
+fn numeric_recurrences_require_finite_representable_progress() {
+    for (guard, next) in [
+        ("if(n<=0)return 0;", "n-1"),
+        ("if(n<=1)return 0;", "n/2"),
+        ("if(!(n>0&&n<=18014398509481984))return 0;", "n-1"),
+        ("if(n<=0||n>1000000000)return 0;", "n-1"),
+        ("if(!Number.isFinite(n)||n<=0)return 0;", "n-1"),
+        ("if(!(n>0&&n<=1000000000))return 0;n=Infinity;", "n-1"),
+        ("if(!(n>0&&n<=1000000000))return 0;", "(n-4294967296)|0"),
+    ] {
+        let source = format!("function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c}} export function selected(n:number,xs:number[]):number{{{guard}cube(xs);return selected({next},xs)}}");
+
+        assert_unresolved_cubic_recurrence(&source);
+    }
+}
+
+#[test]
+fn safe_numeric_guards_preserve_recursive_reductions() {
+    for (guard, next, expected) in [
+        ("if(!(n>0&&n<=1000000000))return 0;", "n-1", "O(N)"),
+        ("if(!(n>1&&n<=1000000000))return 0;", "n/2", "O(log N)"),
+        ("if(n<=1)return 0;", "n>>1", "O(log N)"),
+        ("if(n<=1)return 0;", "(n/2)|0", "O(log N)"),
+    ] {
+        let source = format!(
+            "export function selected(n:number):number{{{guard}return 1+selected({next})}}"
+        );
+
+        assert_class(&source, "selected", expected, true);
+    }
+
+    let source = "export function selected(n:number):number{if(!Number.isFinite(n)||n<=1)return 0;return 1+selected(n/2)}";
+
+    run_with_source(source, |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+
+        assert!(!unknown_reasons(analysis, part.unknowns).contains(&UnknownReason::Recurrence));
+        assert_eq!(text_of(analysis, &part.cost), "O(log(n))");
+    });
+}
+
+#[test]
+fn recursive_rounding_requires_unchanged_intrinsic_identity() {
+    for replacement in ["Math.floor=()=>2;", "function unused(){Math.floor=()=>2;}"] {
+        let source = format!("{replacement} export function selected(n:number):number{{if(!(n>1&&n<=1000000000))return 0;return 1+selected(Math.floor(n/2))}}");
+
+        assert_recurrence_unresolved(&source, "selected");
+    }
+}
+
+#[test]
+fn recurrence_tests_cannot_borrow_their_own_later_guards() {
+    for body in [
+        "if(selected(n-1,xs)||!(n>0&&n<=1000000000))return 0;return 1;",
+        "return (selected(n-1,xs)||!(n>0&&n<=1000000000))?0:1;",
+    ] {
+        let source = format!("function cube(xs:number[]){{for(const a of xs)for(const b of xs)for(const c of xs)void c}} export function selected(n:number,xs:number[]):number{{cube(xs);{body}}}");
+
+        assert_unresolved_cubic_recurrence(&source);
+    }
+}
+
+fn assert_unresolved_cubic_recurrence(source: &str) {
+    assert_recurrence_unresolved(source, "selected");
+    run_with_source(source, |analysis, file| {
+        let part = summary_of(analysis, file, "selected");
+
+        assert_eq!(
+            support::projected_class_of(&part.cost),
+            Cost::parse("O(N^3)").unwrap(),
+            "{source}"
+        );
+    });
 }

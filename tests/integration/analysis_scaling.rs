@@ -2329,7 +2329,7 @@ fn conjunct_guard_source(depth: usize) -> String {
         .join("");
 
     format!(
-        "export function selected(n: number, xs: number[], flag: boolean): number {{ let total = 0; for (const x of xs) total += x; if (n > 0{conjuncts}) return total + selected(n - 1, xs, flag); return total; }}"
+        "export function selected(n: number, xs: number[], flag: boolean): number {{ let total = 0; for (const x of xs) total += x; if (!(n <= 1000000000)) return total; if (n > 0{conjuncts}) return total + selected(n - 1, xs, flag); return total; }}"
     )
 }
 
@@ -2360,7 +2360,7 @@ fn a_guard_within_the_recurrence_depth_cap_solves_its_recursion() {
     for depth in [4_u64, 8, 16, 31] {
         assert_eq!(
             conjunct_guard_steps_of(depth as usize, true),
-            4 * depth + 50,
+            4 * depth + 60,
             "{depth}"
         );
     }
@@ -2371,7 +2371,7 @@ fn a_guard_past_the_recurrence_depth_cap_degrades_to_a_recurrence_result() {
     for depth in [32_u64, 34, 40, 46] {
         assert_eq!(
             conjunct_guard_steps_of(depth as usize, false),
-            97,
+            104,
             "{depth}"
         );
     }
@@ -2487,5 +2487,53 @@ fn serialization_exhaustion_retains_independent_known_work() {
             Cost::parse("O(N^3)").unwrap()
         );
         assert_terminal(analysis.scheduler_stats());
+    });
+}
+
+#[test]
+fn wide_recurrence_exit_guards_obey_work_admission() {
+    for width in [512, 1024] {
+        let statements = ";".repeat(width);
+        let source = format!("/** @perf O(N^3) */ function known(xs:number[]){{}} export function selected(n:number,xs:number[]):number{{known(xs);if(!(n>0&&n<=1000000000)){{{statements}return 0}}return selected(n-1,xs)}}");
+
+        assert_recurrence_work_limit(&source);
+    }
+}
+
+#[test]
+fn wide_recurrence_parameter_search_obeys_work_admission() {
+    for width in [512, 1024] {
+        let parameters = (0..width)
+            .map(|index| format!("p{index}:number=0"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!("/** @perf O(N^3) */ function known(){{}} export function selected({parameters},n:number=0):number{{known();if(!(n>0&&n<=1000000000))return 0;return selected(n-1)}}");
+
+        assert_recurrence_work_limit(&source);
+    }
+}
+
+fn assert_recurrence_work_limit(source: &str) {
+    run_with_source(source, |analysis, file| {
+        limit_work(analysis, Event::RecurrenceStep, 256);
+
+        let known = summary_of(analysis, file, "known");
+
+        assert_eq!(
+            support::projected_class_of(&known.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+
+        let part = summary_of(analysis, file, "selected");
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(!part.is_complete());
+        assert!(reasons(analysis, part.unknowns).contains(&UnknownReason::ResourceExhaustion));
+        assert_eq!(
+            support::projected_class_of(&part.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+        assert_eq!(stats.work.consumed(Event::RecurrenceStep), 256);
     });
 }
