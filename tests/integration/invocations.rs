@@ -206,7 +206,7 @@ fn declared_primitive_types_skip_coercion_while_values_keep_getters() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {heavy} const o: {{ n: number }} = {{ n: heavy as any }}; return o.n * 2; }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {heavy} return (heavy as any) + 1; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nconst probe = {{ valueOf() {{ return 1; }} }};\nexport function selected(o: any) {{ return o + 1; }}")), "O(1)", true),
-        (index_of(format!("{QUADRATIC}\nfunction lengthOf(a: number[]) {{ return a.length; }}\nexport function selected(xs: number[]) {{ class Long {{ get length() {{ return quadratic(xs); }} }} return lengthOf(new Long() as any); }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\nfunction lengthOf(a: number[]) {{ return a.length; }}\nexport function selected(xs: number[]) {{ class Long {{ get length() {{ return quadratic(xs); }} }} return lengthOf(new Long() as any); }}")), "O(N^2)", false),
     ];
 
     assert_projected_selected(&cases);

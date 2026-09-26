@@ -377,3 +377,16 @@ fn declared_types_keep_the_runtime_initializer_targets() {
         ])
     );
 }
+
+#[test]
+fn open_parameter_sources_keep_declared_runtime_alternatives() {
+    let source = "class Base { work() {} } class Derived extends Base { work() {} } function local(x: Base) { x.work(); } export function surfaced(y: Base) { y.work(); local(new Base()); }";
+
+    assert_eq!(
+        dispatch_of(source, &["x.work", "y.work"]),
+        expected_of(&[
+            (&["Base.work"], true),
+            (&["Base.work", "Derived.work"], true),
+        ])
+    );
+}

@@ -3155,7 +3155,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         continue;
                     }
 
-                    kind
+                    match kind {
+                        WriteKind::Assigned => WriteKind::Prototype,
+                        _ => kind,
+                    }
                 }
                 _ => kind,
             };
@@ -4628,7 +4631,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     self.collect_receiver(source, value, visited, receiver);
                 }
 
-                return;
+                if !receiver.constrained {
+                    return;
+                }
             }
 
             receiver.constrained = true;

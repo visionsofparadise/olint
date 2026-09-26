@@ -780,6 +780,7 @@ fn global_object_aliases_and_assigned_prototypes_replace_constructors() {
         (index_of(format!("{slow}\nfunction patch(g: any) {{ g.Set = function () {{ return Array.prototype; }}; }}\npatch(globalThis);\n{selected}")), "O(N^3)", true),
         (index_of(format!("{slow}\nconst G: any = globalThis;\nReflect.set(G, 'Set', function () {{ return Array.prototype; }});\n{selected}")), "O(N^3)", true),
         (index_of(format!("{slow}\nexport function selected(xs: number[]) {{ const s: any = new Set<number>(); Object.assign(s, {{ ['__proto__']: Array.prototype }}); s.__proto__.includes = () => slow(xs); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
+        (index_of(format!("{slow}\nexport function selected(xs: number[]) {{ const s: any = new Set<number>(); const key = '__proto__'; Object.assign(s, {{ [key]: Array.prototype }}); s.__proto__.includes = () => slow(xs); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
         (index_of(format!("{slow}\nconst G: any = {{}};\nG.Set = function () {{ return Array.prototype; }};\n{selected}")), "O(1)", false),
     ];
 
