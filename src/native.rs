@@ -2240,12 +2240,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let indexed =
             self.implicit_call_reading_of((file, value.span()), &indexes, "concat index", &[value]);
         let size = self.collection_size_of(file, value);
-        let indexed = indexed.map_parts(|part| {
-            part.scaled(
-                size.length_resolved.then_some(size.length.clone()),
-                &mut self.unknowns,
-            )
-        });
+        let indexed = self.property_visits_of(
+            file,
+            value,
+            indexed,
+            size.length_resolved.then_some(size.length.clone()),
+        );
         reading = reading.merge(indexed, &mut self.unknowns, &mut self.traces);
         let (inherited, unresolved) = self.indexed_property_keys_of();
         keys_open |= unresolved;

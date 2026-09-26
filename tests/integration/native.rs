@@ -2012,3 +2012,91 @@ fn serialization_repeated_array_writes_multiply_child_work() {
         "{reasons:?}"
     );
 }
+
+#[test]
+fn concat_generic_index_reads_multiply_known_getter_work() {
+    for operand in ["ys", "xs"] {
+        let body = format!("(xs:number[],ys:number[]){{const a=xs.slice();const n=xs.length;for(let i=0;i<n&&n>=0&&n<=1000000000;i++){{Object.defineProperty(a,+i,{{get(){{cube({operand});return 0}}}})}}return a.concat([])}}");
+
+        assert_native_property_work(&[(&body, "O(N^4)")]);
+        support::run_with_source(
+            &format!("{HELPERS} export function selected{body}"),
+            |analysis, file| {
+                let function = support::function_of_name(analysis.project, file, "selected");
+                let part = support::summary_of(analysis, file, "selected");
+                let xs = analysis
+                    .bind_function_cost(file, function, &Cost::parse("O(xs)").unwrap())
+                    .unwrap();
+                let ys = analysis
+                    .bind_function_cost(file, function, &Cost::parse("O(ys)").unwrap())
+                    .unwrap();
+                let named = part.cost.text_with(&|id| {
+                    let dimension = Cost::dimension(id, olint::cost::Domain::Size);
+
+                    if dimension == xs {
+                        "xs".to_string()
+                    } else {
+                        assert_eq!(dimension, ys);
+
+                        "ys".to_string()
+                    }
+                });
+
+                let other = if operand == "ys" { "xs" } else { "ys" };
+
+                assert_eq!(named,format!("O(max({other}, ({operand} * max(xs, ys) * {operand}^2), ({operand} * {operand}^2)))"));
+            },
+        );
+    }
+}
+
+#[test]
+fn concat_generic_index_repetition_preserves_scheduled_work() {
+    let source = format!(
+        "{HELPERS} export function selected(xs:number[],ys:number[]){{const a=xs.slice();const n=xs.length;for(let i=0;i<n&&n>=0&&n<=1000000000;i++){{Object.defineProperty(a,+i,{{get(){{Promise.resolve().then(()=>cube(ys));return 0}}}})}}return a.concat([])}}"
+    );
+
+    assert_phase_costs(&source, "O(N)", "O(N^4)");
+}
+
+#[test]
+fn concat_fixed_index_work_stays_once() {
+    assert_native_property_work(&[(
+        "(xs:number[],ys:number[]){const a=xs.slice();Object.defineProperty(a,'0',{get(){cube(ys);return 0}});return a.concat([])}",
+        "O(N^3)",
+    )]);
+}
+
+#[test]
+fn concat_size_exhaustion_retains_independent_known_work() {
+    let source = "/** @perf O(N^3) */ function known(){} export function selected(xs:number[],key:number){known();const a=xs.slice();Object.defineProperty(a,+key,{get(){known();return 0}});return a.concat([])}";
+    let limits = olint::summaries::SchedulerLimits {
+        work: olint::analysis::work::Limits::uniform(100_000)
+            .with(olint::analysis::work::Event::SizeStep, 0),
+        ..olint::summaries::SchedulerLimits::default()
+    };
+
+    support::run_with_source(source, |analysis, file| {
+        analysis.set_scheduler_limits(limits).unwrap();
+
+        let known = support::summary_of(analysis, file, "known");
+
+        assert_eq!(
+            support::projected_class_of(&known.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+
+        let result = support::summary_of(analysis, file, "selected");
+        let reasons = support::unknown_reasons(analysis, result.unknowns);
+
+        assert_eq!(
+            support::projected_class_of(&result.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+        assert!(
+            reasons.contains(&UnknownReason::ResourceExhaustion),
+            "{reasons:?}"
+        );
+        support::assert_scheduler_terminal(analysis.scheduler_stats());
+    });
+}
