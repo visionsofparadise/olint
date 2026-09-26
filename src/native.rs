@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 
 use oxc_ast::ast::{
-    Argument, CallExpression, Expression, MemberExpression, NewExpression, ObjectPropertyKind,
-    RegExpFlags,
+    Argument, CallExpression, Expression, MemberExpression, NewExpression, RegExpFlags,
 };
 use oxc_ast::AstKind;
 use oxc_span::{GetSpan, Span};
@@ -147,7 +146,6 @@ const SPLIT_KEYS: &[&str] = &["@@split"];
 const MATCH_KEYS: &[&str] = &["@@match"];
 const MATCH_ALL_KEYS: &[&str] = &["@@match", "@@matchAll"];
 const SEARCH_KEYS: &[&str] = &["@@search"];
-const TO_JSON_KEYS: &[&str] = &["toJSON"];
 
 const fn pattern_of(keys: &'static [&'static str], matching: Matching, compiles: bool) -> Role {
     Role::Pattern(Pattern {
@@ -946,6 +944,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 _ => count,
             };
 
+            let part = if model.identity == Identity::Namespace("JSON")
+                && site.name == "stringify"
+                && index == 1
+                && role.invokes()
+            {
+                let returned = self.serialized_replacer_reading_of(site);
+
+                part.merge(returned, &mut self.unknowns, &mut self.traces)
+            } else {
+                part
+            };
+
             match count {
                 Count::Once => beside = beside.merge(part, &mut self.unknowns, &mut self.traces),
                 _ => inner = inner.merge(part, &mut self.unknowns, &mut self.traces),
@@ -1417,7 +1427,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 (reading, Count::Once)
             }
             Role::Inspected => (self.inspected_part_of(file, expression), Count::Once),
-            Role::Serialized => (self.serialized_part_of(file, expression), Count::Once),
+            Role::Serialized => (self.serialized_part_of(site, expression), Count::Once),
             Role::Written | Role::Grown | Role::Shrunk => {
                 (self.written_part_of(file, expression), Count::Once)
             }
@@ -2383,76 +2393,712 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.implicit_call_reading_of((file, target.span()), &targets, "setter", &[target])
     }
 
-    fn serialized_part_of(&mut self, file: FileId, value: &'a Expression<'a>) -> Reading {
-        let inspected = self.inspected_part_of(file, value);
-        let keys: Vec<MemberKey> = TO_JSON_KEYS
-            .iter()
-            .map(|name| protocol_key_of(name))
-            .collect();
-
-        if self.is_primitive_operand(file, value) || !self.may_implement_any(&keys) {
-            return inspected;
-        }
-
-        let targets = self.protocol_targets_of(file, value, &keys);
-        let root =
-            self.implicit_call_reading_of((file, value.span()), &targets, "toJSON", &[value]);
-        let nested = match !targets.open && self.serializes_primitives(file, value, &targets) {
-            true => Reading::empty(),
-            false => self.unknown_visits_part_of(file, value),
+    fn is_serialized_value_return(
+        &mut self,
+        target: crate::declarations::FunctionId,
+        returned: &'a Expression<'a>,
+    ) -> bool {
+        let Some(reference) = identifier_of(unwrap(returned)) else {
+            return false;
+        };
+        let Some(
+            declaration @ Declaration::Parameter {
+                file,
+                function,
+                parameter: crate::declarations::ParameterNode::Formal(parameter),
+            },
+        ) = self
+            .declarations
+            .of_reference(self.project, target.file, reference)
+        else {
+            return false;
         };
 
-        inspected
-            .merge(root, &mut self.unknowns, &mut self.traces)
-            .merge(nested, &mut self.unknowns, &mut self.traces)
+        if file != target.file || function.node_id() != target.node {
+            return false;
+        }
+
+        let Some(parameters) = crate::declarations::parameters_of(function) else {
+            return false;
+        };
+
+        parameters
+            .items
+            .get(1)
+            .is_some_and(|value| value.node_id() == parameter.node_id())
+            && self
+                .parameter_binding_of(declaration)
+                .is_some_and(|binding| self.is_parameter_unwritten(binding))
     }
 
-    fn serializes_primitives(
+    fn serialized_replacer_reading_of(&mut self, site: &NativeSite<'a>) -> Reading {
+        let Some(replacer) = site.expression_at(1) else {
+            return Reading::empty();
+        };
+
+        if self.is_non_callable_argument(site.file, replacer) {
+            return Reading::empty();
+        }
+
+        let targets = self
+            .resolved_expression_callee_of(site.file, replacer, replacer.node_id())
+            .targets;
+        let mut reading = Reading::empty();
+        let mut open = targets.open;
+
+        for target in targets.known {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            for returned in self.returned_expressions_of(target) {
+                if !self.charge_targets(1) {
+                    open = true;
+
+                    break;
+                }
+
+                if self.is_serialized_value_return(target, returned) {
+                    continue;
+                }
+
+                let nested = self.serialized_value_reading_of(
+                    target.file,
+                    returned,
+                    &mut Vec::new(),
+                    true,
+                    None,
+                );
+                reading = reading.merge(nested, &mut self.unknowns, &mut self.traces);
+                open |= !self.is_primitive_operand(target.file, returned);
+            }
+        }
+
+        if open {
+            let unknown = self.unknown_visits_part_of(site.file, replacer);
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn serialized_part_of(&mut self, site: &NativeSite<'a>, value: &'a Expression<'a>) -> Reading {
+        let file = site.file;
+        let mut keys = Vec::new();
+        let mut filtered = false;
+        let mut open = false;
+
+        if let Some(replacer) = site.expression_at(1) {
+            let (source, replacer) = self
+                .constant_source_of(file, replacer)
+                .unwrap_or((file, replacer));
+
+            if let Expression::ArrayExpression(array) = unwrap(replacer) {
+                filtered = true;
+
+                if self.charge_targets(array.elements.len() as u64) {
+                    let mut seen = std::collections::HashSet::new();
+
+                    for element in &array.elements {
+                        let key = match element.as_expression().map(unwrap) {
+                            Some(Expression::StringLiteral(value)) => Some(value.value.to_string()),
+                            Some(Expression::NumericLiteral(value)) => {
+                                Some(value.value.to_string())
+                            }
+                            _ => {
+                                open = true;
+
+                                None
+                            }
+                        };
+
+                        if let Some(key) = key {
+                            if seen.insert(key.clone()) {
+                                keys.push(MemberKey::Name(key));
+                            }
+                        }
+                    }
+                } else {
+                    open = true;
+                }
+
+                let _ = source;
+            }
+        }
+
+        let mut reading = self.serialized_value_reading_of(
+            file,
+            value,
+            &mut Vec::new(),
+            false,
+            (filtered && !open).then_some(keys.as_slice()),
+        );
+
+        if open {
+            let unknown = self.unknown_visits_part_of(file, value);
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn serialized_result_of(
         &mut self,
         file: FileId,
         value: &'a Expression<'a>,
-        targets: &TargetSet,
-    ) -> bool {
-        if !targets.known.is_empty() {
-            return targets
-                .known
-                .iter()
-                .all(|target| self.returns_only_primitives(*target));
+        reading: Reading,
+        open: bool,
+    ) -> Reading {
+        if !open {
+            return reading;
         }
 
-        let values: Vec<&'a Expression<'a>> = match unwrap(value) {
-            Expression::ObjectExpression(object) => {
-                let mut values = Vec::new();
+        let unknown = self.unknown_visits_part_of(file, value);
 
-                for property in &object.properties {
-                    let ObjectPropertyKind::ObjectProperty(property) = property else {
-                        return false;
-                    };
+        reading.merge(unknown, &mut self.unknowns, &mut self.traces)
+    }
 
-                    values.push(&property.value);
-                }
+    fn resolve_serialization_methods(
+        &mut self,
+        targets: &mut TargetSet,
+        methods: Vec<(FileId, &'a Expression<'a>)>,
+    ) -> (bool, bool) {
+        let mut may_skip = false;
 
-                values
+        for (source, method) in methods {
+            if !self.charge_targets(1) {
+                return (true, may_skip);
             }
-            Expression::ArrayExpression(array) => {
-                let mut values = Vec::new();
 
-                for element in &array.elements {
-                    let Some(element) = element.as_expression() else {
-                        return false;
-                    };
+            if self.is_non_callable_argument(source, method) {
+                may_skip = true;
 
-                    values.push(element);
-                }
-
-                values
+                continue;
             }
-            _ => return self.has_primitive_elements(file, value),
+
+            let resolved = self
+                .resolved_expression_callee_of(source, method, method.node_id())
+                .targets;
+
+            if !self.merge_iterator_targets(targets, resolved) {
+                return (true, may_skip);
+            }
+        }
+
+        (false, may_skip)
+    }
+
+    fn serialized_bigint_reading_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        active: &mut Vec<(FileId, oxc_semantic::NodeId)>,
+        property_list: Option<&[MemberKey]>,
+    ) -> Reading {
+        if !self.may_implement_any(&[protocol_key_of("toJSON")]) {
+            return Reading::empty();
+        }
+
+        let (mut targets, getters) = self.intrinsic_member_targets_of(Kind::Other, "toJSON");
+        let mut reading = self.implicit_call_reading_of(
+            (file, value.span()),
+            &getters,
+            "BigInt toJSON getter",
+            &[value],
+        );
+        let mut methods = Vec::new();
+        let mut open = !self.append_getter_returns(&getters, &mut methods);
+
+        let (unresolved, _) = self.resolve_serialization_methods(&mut targets, methods);
+        open |= unresolved;
+
+        let called = self.implicit_call_reading_of(
+            (file, value.span()),
+            &targets,
+            "BigInt toJSON",
+            &[value],
+        );
+        reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+        let mut returns = Vec::new();
+        open |= !self.append_getter_returns(&targets, &mut returns);
+
+        for (source, returned) in returns {
+            if !self.charge_targets(1) {
+                break;
+            }
+
+            let child =
+                self.serialized_value_reading_of(source, returned, active, true, property_list);
+            reading = reading.merge(child, &mut self.unknowns, &mut self.traces);
+        }
+
+        if open || self.work_exhausted() {
+            let unknown = self.unknown_visits_part_of(file, value);
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn serialized_value_reading_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        active: &mut Vec<(FileId, oxc_semantic::NodeId)>,
+        transformed: bool,
+        property_list: Option<&[MemberKey]>,
+    ) -> Reading {
+        if self.is_primitive_operand(file, value) {
+            return if transformed || self.excludes_bigint(file, value, false) {
+                Reading::empty()
+            } else {
+                self.serialized_bigint_reading_of(file, value, active, property_list)
+            };
+        }
+
+        if active.len() >= 32
+            || !self.charge_targets(active.len() as u64 + 1)
+            || active.contains(&(file, value.node_id()))
+        {
+            return self.unknown_visits_part_of(file, value);
+        }
+
+        active.push((file, value.node_id()));
+
+        let reading =
+            self.serialized_children_reading_of((file, value), active, transformed, property_list);
+
+        active.pop();
+
+        reading
+    }
+
+    fn property_visits_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        reading: Reading,
+        count: Option<Cost>,
+    ) -> Reading {
+        if reading.completions.is_empty() {
+            return reading;
+        }
+
+        let site = self.project.site_of(file, value.span());
+        let origin = self.source_span(file, value.span());
+        let count = self
+            .charge_targets(reading.completions.len() as u64)
+            .then_some(count)
+            .flatten();
+        let Some(count) = count else {
+            for (_, _, part) in &reading.completions {
+                self.note_unresolved_multiplicity(part);
+            }
+
+            let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
+
+            return reading
+                .map_parts(|part| part.scaled(None, &mut self.unknowns))
+                .retaining(Some(unknown), &mut self.unknowns);
         };
 
-        values
-            .into_iter()
-            .all(|value| self.is_primitive_operand(file, value))
+        reading.map_parts(|part| {
+            crate::cost::nest(
+                "property visits".to_string(),
+                site,
+                origin,
+                count.clone(),
+                part,
+                &mut self.unknowns,
+                &mut self.traces,
+            )
+        })
+    }
+
+    fn serialized_array_reading_of(
+        &mut self,
+        (file, value): (FileId, &'a Expression<'a>),
+        (source, array): (FileId, &'a Expression<'a>),
+        active: &mut Vec<(FileId, oxc_semantic::NodeId)>,
+        property_list: Option<&[MemberKey]>,
+    ) -> Reading {
+        let (children, mut open) = self.iterable_elements_of(source, array, 0);
+        let mut reading = Reading::empty();
+
+        for (child_file, child) in children {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let nested =
+                self.serialized_value_reading_of(child_file, child, active, false, property_list);
+            reading = reading.merge(nested, &mut self.unknowns, &mut self.traces);
+        }
+
+        let (mut keys, unresolved) = self.indexed_property_keys_of();
+        let (own, own_open) = self.own_property_keys_of(file, value, 0);
+        let literal = matches!(unwrap(array), Expression::ArrayExpression(_));
+        open |= unresolved || (own_open && !literal);
+
+        if self.charge_targets((keys.len() + own.len()) as u64) {
+            let mut seen: HashSet<_> = keys.iter().cloned().collect();
+
+            for key in own.into_iter().chain([MemberKey::Index]) {
+                if (matches!(&key, MemberKey::Name(name) if name.parse::<u64>().is_ok())
+                    || key == MemberKey::Index)
+                    && seen.insert(key.clone())
+                {
+                    keys.push(key);
+                }
+            }
+        } else {
+            open = true;
+        }
+
+        let size = self.collection_size_of(file, value);
+
+        let (writes, writes_open) = self.unknown_written_values_of(file, value);
+        open |= writes_open;
+        let mut written = Reading::empty();
+
+        for (source, expression) in writes {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let child =
+                self.serialized_value_reading_of(source, expression, active, false, property_list);
+            written = written.merge(child, &mut self.unknowns, &mut self.traces);
+        }
+
+        let written = self.property_visits_of(
+            file,
+            value,
+            written,
+            size.length_resolved.then_some(size.length.clone()),
+        );
+        reading = reading.merge(written, &mut self.unknowns, &mut self.traces);
+
+        if self.has_primitive_elements(file, value) && !self.excludes_bigint(file, value, true) {
+            let bigint = self.serialized_bigint_reading_of(file, value, active, property_list);
+            let bigint = self.property_visits_of(
+                file,
+                value,
+                bigint,
+                size.length_resolved.then_some(size.length.clone()),
+            );
+            reading = reading.merge(bigint, &mut self.unknowns, &mut self.traces);
+        }
+
+        for key in keys {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let repeated = key == MemberKey::Index;
+            let getters = self.property_accessors_of((file, value), key.clone(), false);
+            let mut indexed = self.implicit_call_reading_of(
+                (file, value.span()),
+                &getters,
+                "JSON index getter",
+                &[value],
+            );
+            let (mut children, unresolved) = self.property_values_of((file, value), &key);
+            open |= unresolved && (!literal || !children.is_empty());
+            open |= getters.open || !self.append_getter_returns(&getters, &mut children);
+
+            for (child_file, child) in children {
+                if !self.charge_targets(1) {
+                    open = true;
+
+                    break;
+                }
+
+                let nested = self.serialized_value_reading_of(
+                    child_file,
+                    child,
+                    active,
+                    false,
+                    property_list,
+                );
+                indexed = indexed.merge(nested, &mut self.unknowns, &mut self.traces);
+            }
+
+            if repeated {
+                indexed = self.property_visits_of(
+                    file,
+                    value,
+                    indexed,
+                    size.length_resolved.then_some(size.length.clone()),
+                );
+            }
+
+            reading = reading.merge(indexed, &mut self.unknowns, &mut self.traces);
+        }
+
+        self.serialized_result_of(file, value, reading, open)
+    }
+
+    fn serialized_children_reading_of(
+        &mut self,
+        (file, value): (FileId, &'a Expression<'a>),
+        active: &mut Vec<(FileId, oxc_semantic::NodeId)>,
+        transformed: bool,
+        property_list: Option<&[MemberKey]>,
+    ) -> Reading {
+        let mut reading = Reading::empty();
+        let mut children = Vec::new();
+        let mut open = false;
+
+        if !transformed {
+            let key = protocol_key_of("toJSON");
+            let getters = self.property_accessors_of((file, value), key.clone(), false);
+            reading = self.implicit_call_reading_of(
+                (file, value.span()),
+                &getters,
+                "toJSON getter",
+                &[value],
+            );
+            let mut targets = self.protocol_targets_of(file, value, std::slice::from_ref(&key));
+
+            if !self.charge_targets((targets.known.len() + getters.known.len()) as u64) {
+                let unknown = self.unknown_visits_part_of(file, value);
+
+                return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+            }
+
+            let excluded: HashSet<_> = getters.known.iter().copied().collect();
+
+            targets.known.retain(|target| !excluded.contains(target));
+
+            let (mut methods, unresolved) = self.property_values_of((file, value), &key);
+            open |= unresolved
+                && (!methods.is_empty()
+                    || !targets.known.is_empty()
+                    || targets.open
+                    || getters.open);
+            open |= !self.append_getter_returns(&getters, &mut methods);
+            let (unresolved, may_skip) = self.resolve_serialization_methods(&mut targets, methods);
+            open |= unresolved;
+
+            let called =
+                self.implicit_call_reading_of((file, value.span()), &targets, "toJSON", &[value]);
+            reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+            open |= targets.open || getters.open;
+
+            if !targets.known.is_empty() {
+                for target in targets.known {
+                    if !self.charge_targets(1) {
+                        open = true;
+
+                        break;
+                    }
+
+                    for returned in self.returned_expressions_of(target) {
+                        if !self.charge_targets(1) {
+                            open = true;
+
+                            break;
+                        }
+
+                        let returned = self.serialized_value_reading_of(
+                            target.file,
+                            returned,
+                            active,
+                            true,
+                            property_list,
+                        );
+                        reading = reading.merge(returned, &mut self.unknowns, &mut self.traces);
+                    }
+                }
+
+                if !open && !may_skip {
+                    return reading;
+                }
+            }
+        }
+
+        if self.has_primitive_elements(file, value)
+            && (self.excludes_bigint(file, value, true)
+                || !self.may_implement_any(&[protocol_key_of("toJSON")]))
+        {
+            let getters = self.indexed_accessors_on(file, value);
+
+            if getters.known.is_empty() && !getters.open {
+                return reading;
+            }
+        }
+
+        let array_source = self
+            .constant_source_of(file, value)
+            .unwrap_or((file, value));
+
+        if matches!(unwrap(array_source.1), Expression::ArrayExpression(_)) {
+            let nested = self.serialized_array_reading_of(
+                (file, value),
+                array_source,
+                active,
+                property_list,
+            );
+
+            return reading.merge(nested, &mut self.unknowns, &mut self.traces);
+        }
+
+        let native_array = self.iteration_kind_of(file, value, 0) == Kind::Array;
+
+        if native_array {
+            let nested = self.serialized_array_reading_of(
+                (file, value),
+                (file, value),
+                active,
+                property_list,
+            );
+            reading = reading.merge(nested, &mut self.unknowns, &mut self.traces);
+        }
+
+        if let Some((source, initializer)) = self.constant_source_of(file, value) {
+            let nested = self.serialized_value_reading_of(
+                source,
+                initializer,
+                active,
+                transformed,
+                property_list,
+            );
+
+            return reading.merge(nested, &mut self.unknowns, &mut self.traces);
+        }
+
+        if let Expression::CallExpression(call) = unwrap(value) {
+            let member = self.callee_member_of(file, call);
+
+            if !self.is_call_exhausted(file, call.node_id())
+                && !self.intrinsic_replaced_of(file, &call.callee)
+                && matches!(
+                    self.native_of(file, call, member, false),
+                    Native::Receiver(Kind::Array)
+                )
+            {
+                let site = self.call_site_of(file, call, member);
+
+                if site.name == "map" {
+                    if let Some(callback) = site.expression_at(0) {
+                        let targets = self
+                            .resolved_expression_callee_of(file, callback, callback.node_id())
+                            .targets;
+                        let size = self
+                            .produced_size_of(file, value)
+                            .unwrap_or_else(|| self.collection_size_of(file, value));
+                        let mut elements = Reading::empty();
+                        let mut returns = Vec::new();
+                        open |= !self.append_getter_returns(&targets, &mut returns);
+
+                        for (source, returned) in returns {
+                            if !self.charge_targets(1) {
+                                open = true;
+
+                                break;
+                            }
+
+                            let child = self.serialized_value_reading_of(
+                                source,
+                                returned,
+                                active,
+                                false,
+                                property_list,
+                            );
+                            elements = elements.merge(child, &mut self.unknowns, &mut self.traces);
+                        }
+
+                        let elements = self.property_visits_of(
+                            file,
+                            value,
+                            elements,
+                            size.length_resolved.then_some(size.length.clone()),
+                        );
+                        reading = reading.merge(elements, &mut self.unknowns, &mut self.traces);
+                        open |= targets.open || !size.length_resolved;
+
+                        if open {
+                            let unknown = self.unknown_visits_part_of(file, value);
+                            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+                        }
+
+                        return reading;
+                    }
+                }
+            }
+        }
+
+        if native_array {
+            return reading;
+        }
+
+        if let Expression::ArrayExpression(array) = unwrap(value) {
+            if self.charge_targets(array.elements.len() as u64) {
+                for element in &array.elements {
+                    match element.as_expression() {
+                        Some(value) => children.push((file, value)),
+                        None => open = true,
+                    }
+                }
+            } else {
+                open = true;
+            }
+        } else {
+            let (keys, unresolved) = match property_list {
+                Some(keys) if self.charge_targets(keys.len() as u64) => (keys.to_vec(), false),
+                Some(_) => (Vec::new(), true),
+                None => self.own_property_keys_of(file, value, 0),
+            };
+            open |= unresolved;
+
+            for key in keys {
+                if !matches!(key, MemberKey::Name(_) | MemberKey::Index) {
+                    continue;
+                }
+
+                let accessors = self.property_accessors_of((file, value), key.clone(), false);
+                let called = self.implicit_call_reading_of(
+                    (file, value.span()),
+                    &accessors,
+                    "JSON getter",
+                    &[value],
+                );
+                reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
+                let (values, unresolved) = self.property_values_of((file, value), &key);
+
+                if self.charge_targets(values.len() as u64) {
+                    children.extend(values);
+                } else {
+                    open = true;
+                }
+
+                open |= unresolved || accessors.open;
+                open |= !self.append_getter_returns(&accessors, &mut children);
+            }
+        }
+
+        for (source, child) in children {
+            if !self.charge_targets(1) {
+                open = true;
+
+                break;
+            }
+
+            let nested =
+                self.serialized_value_reading_of(source, child, active, false, property_list);
+            reading = reading.merge(nested, &mut self.unknowns, &mut self.traces);
+        }
+
+        self.serialized_result_of(file, value, reading, open)
     }
 
     fn grouping_key_part_of(

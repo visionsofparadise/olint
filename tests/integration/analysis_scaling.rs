@@ -2431,3 +2431,61 @@ fn cached_iterator_getter_targets_obey_traversal_limits() {
         });
     }
 }
+
+fn serialization_dispatch_count(count: usize) -> u64 {
+    let fields = (0..count)
+        .map(|index| format!("get p{index}(){{return 1}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!("export function root(){{return JSON.stringify({{{fields}}})}}");
+    let mut consumed = 0;
+
+    run_with_source(&source, |analysis, file| {
+        let result = summary_of(analysis, file, "root");
+        let stats = analysis.scheduler_stats();
+
+        assert!(
+            !stats.work.exhausted(Event::DispatchStep),
+            "{count}: {stats:?}"
+        );
+        assert!(!reasons(analysis, result.unknowns).contains(&UnknownReason::ResourceExhaustion));
+
+        consumed = stats.work.consumed(Event::DispatchStep);
+    });
+
+    consumed
+}
+
+#[test]
+fn serialization_property_discovery_scales_with_enumerated_keys() {
+    let counts = [16, 32, 64].map(serialization_dispatch_count);
+
+    for pair in counts.windows(2) {
+        assert!(pair[1] <= 3 * pair[0], "{counts:?}");
+    }
+}
+
+#[test]
+fn serialization_exhaustion_retains_independent_known_work() {
+    let source = "/** @perf O(N^3) */ function known(){} export function root(){known();return JSON.stringify({x:{get y(){return 1}}})}";
+
+    run_with_source(source, |analysis, file| {
+        limit_work(analysis, Event::DispatchStep, 0);
+
+        let known = summary_of(analysis, file, "known");
+
+        assert_eq!(
+            support::projected_class_of(&known.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+
+        let result = summary_of(analysis, file, "root");
+
+        assert!(reasons(analysis, result.unknowns).contains(&UnknownReason::ResourceExhaustion));
+        assert_eq!(
+            support::projected_class_of(&result.cost),
+            Cost::parse("O(N^3)").unwrap()
+        );
+        assert_terminal(analysis.scheduler_stats());
+    });
+}

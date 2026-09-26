@@ -243,7 +243,7 @@ fn to_json_runs_on_the_serialized_value() {
             "",
             "(xs: number[]) { return JSON.stringify({ toJSON() { return { value: quadratic(xs) }; } }); }",
             "O(N^2)",
-            false,
+            true,
         ),
         (
             "class Box { toJSON() { return 1; } }",
@@ -1819,4 +1819,196 @@ fn assert_native_property_work(cases: &[(&str, &str)]) {
             "{body}: {reasons:?}"
         );
     }
+}
+
+#[test]
+fn native_json_retains_known_property_work() {
+    assert_native_property_work(&[
+        (
+            r#"(xs: number[]) {return JSON.stringify({x:{get y(){cube(xs);return 1}}});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify({x:{toJSON(){cube(xs);return 1}}});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {const child={get y(){cube(xs);return 1}};return JSON.stringify({a:child,b:child});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify([{get y(){cube(xs);return 1}},{get y(){cube(xs);return 1}}]);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify(xs.map(()=>({get y(){cube(xs);return 1}})));}"#,
+            "O(N^4)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify({x:1,get y(){cube(xs);return 1}},["x"]);}"#,
+            "O(N)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify({x:0},(key,value)=>key==="x"?{get y(){cube(xs);return 1}}:value);}"#,
+            "O(N^4)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify({toJSON(){return {get y(){cube(xs);return 1}}}});}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify({toJSON(){return {toJSON(){cube(xs);return 1},y:1}}});}"#,
+            "O(N)",
+        ),
+        (
+            r#"(xs: number[]) {const item:any={get y(){cube(xs);return 1}};item.self=item;return JSON.stringify(item);}"#,
+            "O(N^3)",
+        ),
+        (
+            r#"(xs: number[]) {return JSON.stringify({x:{y:1}});}"#,
+            "O(N)",
+        ),
+    ]);
+}
+
+#[test]
+fn cyclic_serialization_keeps_known_work_and_uncertainty() {
+    let (cost, complete, reasons) = selected_of("", "(xs:number[]){const value:any={get first(){cube(xs);return 1}};value.self=value;return JSON.stringify(value)}");
+
+    assert_eq!(
+        support::projected_class_of(&cost),
+        Cost::parse("O(N^3)").unwrap()
+    );
+    assert!(!complete);
+    assert!(
+        reasons.contains(&UnknownReason::Target)
+            || reasons.contains(&UnknownReason::ResourceExhaustion),
+        "{reasons:?}"
+    );
+}
+
+#[test]
+fn serialization_keeps_numeric_accessors_and_noncallable_to_json() {
+    assert_native_property_work(&[
+        ("(xs:number[]){const a=[0];Object.defineProperty(a,'0',{get(){cube(xs);return 0}});return JSON.stringify({a})}", "O(N^3)"),
+        ("(xs:number[]){const a=[0];const b=a;Object.defineProperty(b,'0',{get(){cube(xs);return 0}});return JSON.stringify({a:b})}", "O(N^3)"),
+        ("(xs:number[]){function indexedCube(xs:number[]){const n=xs.length;for(let i=0;i<n&&n>=0&&n<=1000000000;i++)for(let j=0;j<n&&n>=0&&n<=1000000000;j++)for(let k=0;k<n&&n>=0&&n<=1000000000;k++)void k;}const a=[,];Object.setPrototypeOf(a,{get 0(){indexedCube(xs);return 0}});return JSON.stringify({a})}", "O(N^3)"),
+        ("(xs:number[]){return JSON.stringify({get toJSON(){return 1},child:{get value(){cube(xs);return 0}}})}", "O(N^3)"),
+        ("(xs:number[]){return JSON.stringify({get toJSON(){return ()=>{quadratic(xs);return 1}},child:{get value(){cube(xs);return 0}}})}", "O(N^2)"),
+    ]);
+}
+
+#[test]
+fn serialization_prototype_mutation_retains_iteration_uncertainty() {
+    let source = format!("{HELPERS} export function selected(xs:number[]){{const a=[,];Object.setPrototypeOf(a,{{get 0(){{cube(xs);return 0}}}});return JSON.stringify({{a}})}}");
+    let (_, complete, reasons) = legacy_result_of(&source, "selected");
+
+    assert!(!complete);
+    assert!(reasons.contains(&UnknownReason::Bound), "{reasons:?}");
+}
+
+#[test]
+fn serialization_transformed_unknown_children_keep_known_work() {
+    let source = format!("{HELPERS} export function selected(xs:number[],other:unknown){{return JSON.stringify({{toJSON(){{return {{get value(){{quadratic(xs);return other}}}}}}}})}}");
+    let (cost, complete, reasons) = legacy_result_of(&source, "selected");
+
+    assert_eq!(
+        support::projected_class_of(&cost),
+        Cost::parse("O(N^2)").unwrap(),
+        "{reasons:?}"
+    );
+    assert!(!complete);
+}
+
+#[test]
+fn serialization_nested_schedulers_preserve_pending_owner_effects() {
+    for (written, affected) in [("values", true), ("other", false)] {
+        for property in ["get value()", "toJSON()"] {
+            let source = format!("{HELPERS} export async function selected(xs:number[]){{const values=new Set([0]);const other=new Set([0]);const item={{child:{{{property}{{Promise.resolve().then(()=>{{{written}.delete(0);{written}.add(0)}});return 0}}}}}};JSON.stringify(item);for(const value of values){{await 0;cube(xs)}}}}");
+            let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+            assert_eq!(
+                reasons.contains(&UnknownReason::Bound),
+                affected,
+                "{property} {written}: {reasons:?}"
+            );
+            assert_eq!(
+                support::projected_class_of(&cost),
+                Cost::parse("O(N^3)").unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn serialization_property_lists_preserve_declared_array_indices() {
+    for receiver in ["xs", "xs.slice()"] {
+        let source = format!("{HELPERS} export function selected(xs:number[],ys:number[]){{const a={receiver};Object.defineProperty(a,'0',{{get(){{cube(ys);return 0}}}});return JSON.stringify(a,['x'])}}");
+        let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse("O(N^3)").unwrap(),
+            "{receiver}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn serialization_bigint_hooks_survive_primitive_shortcuts() {
+    for (value, expected) in [
+        ("1n", "O(N^3)"),
+        ("{value:1n}", "O(N^3)"),
+        ("[1n]", "O(N^3)"),
+        ("values", "O(N^4)"),
+        ("1", "O(N)"),
+        ("[1]", "O(N)"),
+    ] {
+        let source = format!("{HELPERS} export function selected(xs:number[],values:bigint[]){{BigInt.prototype.toJSON=function(){{cube(xs);return 0}};return JSON.stringify({value})}}");
+        let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse(expected).unwrap(),
+            "{value}: {reasons:?}"
+        );
+    }
+}
+
+#[test]
+fn serialization_reads_replaced_array_element_shapes() {
+    assert_native_property_work(&[("(xs:number[]){const a:any[]=[0];a[0]={get value(){cube(xs);return 0}};return JSON.stringify({a})}", "O(N^3)")]);
+}
+
+#[test]
+fn serialization_bigint_accessor_returns_callable_hooks() {
+    assert_native_property_work(&[("(xs:number[]){Object.defineProperty(BigInt.prototype,'toJSON',{get(){return ()=>{cube(xs);return 0}}});return JSON.stringify(1n)}", "O(N^3)")]);
+}
+
+#[test]
+fn serialization_unknown_array_writes_retain_child_work() {
+    for annotation in ["number", "string"] {
+        let source = format!("{HELPERS} export function selected(xs:number[],key:{annotation}){{const a:any[]=[0];a[key]={{get value(){{cube(xs);return 0}}}};return JSON.stringify({{a}})}}");
+        let (cost, complete, reasons) = legacy_result_of(&source, "selected");
+
+        assert_eq!(
+            support::projected_class_of(&cost),
+            Cost::parse("O(N^4)").unwrap(),
+            "{annotation}: {reasons:?}"
+        );
+        assert!(!complete);
+        assert!(reasons.contains(&UnknownReason::Target));
+    }
+}
+
+#[test]
+fn serialization_repeated_array_writes_multiply_child_work() {
+    let source = format!("{HELPERS} export function selected(xs:number[],ys:number[]){{const a:any[]=xs.slice();const n=xs.length;for(let i=0;i<n&&n>=0&&n<=1000000000;i++){{a[i]={{get value(){{cube(ys);return 0}}}}}}return JSON.stringify(a)}}");
+    let (cost, _, reasons) = legacy_result_of(&source, "selected");
+
+    assert_eq!(
+        support::projected_class_of(&cost),
+        Cost::parse("O(N^4)").unwrap(),
+        "{reasons:?}"
+    );
 }

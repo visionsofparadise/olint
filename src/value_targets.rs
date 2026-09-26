@@ -132,6 +132,7 @@ enum Owner {
 #[derive(Default)]
 struct Buckets {
     enumerated: HashMap<ValueId, Vec<Option<MemberKey>>>,
+    unknown_values: HashMap<ValueId, Vec<usize>>,
     values: HashMap<(Option<MemberKey>, ValueId), Vec<usize>>,
     classes: HashMap<(Site, Option<MemberKey>), Vec<usize>>,
     objects: HashMap<(Site, Option<MemberKey>), Vec<usize>>,
@@ -1304,6 +1305,43 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let open = self.work_exhausted();
 
         (keys, open)
+    }
+
+    pub(crate) fn unknown_written_values_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> (Vec<(FileId, &'a Expression<'a>)>, bool) {
+        let receiver = self.implicit_receiver_of(file, expression);
+        let mut values = Vec::new();
+        let mut open = false;
+
+        for value in receiver.values {
+            let count = self
+                .values
+                .targets
+                .buckets
+                .unknown_values
+                .get(&value)
+                .map_or(0, Vec::len);
+
+            if !self.charge_targets(count as u64 + 1) {
+                return (values, true);
+            }
+
+            for position in 0..count {
+                let index = self.values.targets.buckets.unknown_values[&value][position];
+                let site = self.values.targets.writes[index].site;
+
+                if let Some((_, Some(expression))) = self.write_parts_of(site) {
+                    values.push((site.0, expression));
+                }
+
+                open = true;
+            }
+        }
+
+        (values, open)
     }
 
     pub(crate) fn own_property_keys_of(
@@ -3256,6 +3294,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             if write.key.is_none() && !callable {
+                if let Owner::Value { value, .. } = &owner {
+                    buckets
+                        .unknown_values
+                        .entry(*value)
+                        .or_default()
+                        .push(index);
+                }
+
                 owners.push((owner, false));
 
                 continue;

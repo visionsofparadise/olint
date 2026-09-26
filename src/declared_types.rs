@@ -904,6 +904,86 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    pub(crate) fn excludes_bigint(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        elements: bool,
+    ) -> bool {
+        if elements {
+            return self
+                .element_type_of(file, expression, 0)
+                .is_some_and(|(source, ty)| self.type_excludes_bigint(source, ty, 0));
+        }
+
+        let expression = unwrap(expression);
+
+        if matches!(
+            expression,
+            Expression::NumericLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::BooleanLiteral(_)
+                | Expression::NullLiteral(_)
+                | Expression::TemplateLiteral(_)
+        ) {
+            return true;
+        }
+
+        let Expression::Identifier(reference) = expression else {
+            return false;
+        };
+        let Some(declaration) = self
+            .declarations
+            .of_reference(self.project, file, reference)
+        else {
+            return false;
+        };
+        let Some((source, Some(ty), _)) = binding_parts_of(&declaration) else {
+            return false;
+        };
+
+        self.type_excludes_bigint(source, ty, 0)
+    }
+
+    fn type_excludes_bigint(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
+        if depth > MAXIMUM_DEPTH || !self.charge_work(crate::analysis::work::Event::DispatchStep, 1)
+        {
+            return false;
+        }
+
+        match ty {
+            TSType::TSStringKeyword(_)
+            | TSType::TSNumberKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+            | TSType::TSNullKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSVoidKeyword(_)
+            | TSType::TSNeverKeyword(_)
+            | TSType::TSTemplateLiteralType(_) => true,
+            TSType::TSParenthesizedType(inner) => {
+                self.type_excludes_bigint(file, &inner.type_annotation, depth + 1)
+            }
+            TSType::TSUnionType(union) => union
+                .types
+                .iter()
+                .all(|part| self.type_excludes_bigint(file, part, depth + 1)),
+            TSType::TSTypeReference(reference) if reference.type_arguments.is_none() => {
+                match self.declaration_of_type_name(file, &reference.type_name) {
+                    Some(Declaration::TypeAlias {
+                        file: source,
+                        declaration,
+                    }) if declaration.type_parameters.is_none() => {
+                        self.type_excludes_bigint(source, &declaration.type_annotation, depth + 1)
+                    }
+                    Some(Declaration::Enum { .. }) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn is_declared_primitive_at(
         &mut self,
         file: FileId,
