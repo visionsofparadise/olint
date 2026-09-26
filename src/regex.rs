@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::Analysis;
 use crate::bounds::short;
 use crate::cost::{Cost, CostError, Part};
+use crate::declarations::FunctionNode;
 use crate::declared_types::Kind;
 use crate::native::{native_model_of, Identity, Matching, Pattern, Role};
 use crate::project::FileId;
@@ -683,8 +684,45 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         ask: impl FnOnce(&[RegexRequest]) -> Result<Vec<RegexAnswer>, RegexError>,
     ) -> Result<Option<String>, RegexError> {
-        let requests = self.regex_requests_of();
+        self.gather_regex_requests(self.regex_requests_of(), ask)
+    }
 
+    pub fn gather_selected_regex_answers(
+        &mut self,
+        functions: &[(FileId, FunctionNode<'a>)],
+        mut ask: impl FnMut(&[RegexRequest]) -> Result<Vec<RegexAnswer>, RegexError>,
+    ) -> Result<Option<String>, RegexError> {
+        let mut unavailable = None;
+
+        loop {
+            self.reset_between_passes();
+            self.needed_regex.clear();
+            self.summarize_reportable(functions);
+
+            let requests: Vec<_> = self
+                .needed_regex
+                .iter()
+                .filter(|request| !self.regex_answers.contains_key(*request))
+                .cloned()
+                .collect();
+
+            if requests.is_empty() {
+                self.reset_between_passes();
+
+                return Ok(unavailable);
+            }
+
+            if let Some(reason) = self.gather_regex_requests(requests, &mut ask)? {
+                unavailable = Some(reason);
+            }
+        }
+    }
+
+    fn gather_regex_requests(
+        &mut self,
+        requests: Vec<RegexRequest>,
+        ask: impl FnOnce(&[RegexRequest]) -> Result<Vec<RegexAnswer>, RegexError>,
+    ) -> Result<Option<String>, RegexError> {
         if requests.is_empty() {
             return Ok(None);
         }
@@ -779,6 +817,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if subject.is_one() {
             return Part::none();
         }
+
+        self.needed_regex.insert(request.clone());
 
         let answer = self.regex_answer_of(&request);
         let repeats = request.repeats(pattern.matching);

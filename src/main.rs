@@ -6,11 +6,12 @@ use clap::error::ErrorKind;
 use clap::Parser;
 use olint::analysis::{Analysis, Options, TypeMode};
 use olint::config::{
-    read_config, validate_entries, ConfigError, UnknownPolicy, CONFIG_FIELDS, ENTRYPOINT_FORMS,
-    LIMIT_FORMS,
+    read_config, validate_entries, Config, ConfigError, UnknownPolicy, CONFIG_FIELDS,
+    ENTRYPOINT_FORMS, LIMIT_FORMS,
 };
 use olint::cost::CostComparison;
-use olint::project::{Project, ProjectError};
+use olint::declarations::FunctionNode;
+use olint::project::{FileId, Project, ProjectError};
 use olint::public::{public_functions, public_roots};
 use olint::regex::{companion_of, RegexError, RegexLimits};
 use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
@@ -128,6 +129,39 @@ fn print_lines(lines: &[String]) {
     let _ = stdout.flush();
 }
 
+impl From<TscError> for Failure {
+    fn from(error: TscError) -> Self {
+        Self::Tsc(error)
+    }
+}
+
+fn roots_of<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    config: &Config,
+    report: bool,
+) -> Result<Vec<(FileId, FunctionNode<'a>)>, Failure> {
+    if !report {
+        return public_roots(analysis, config).map_err(Failure::Config);
+    }
+
+    let mut functions = analysis.reportable();
+
+    if config.explicit_entrypoints {
+        let mut selected: std::collections::HashSet<_> = functions
+            .iter()
+            .map(|(file, function)| (*file, function.node_id()))
+            .collect();
+
+        for function in public_roots(analysis, config).map_err(Failure::Config)? {
+            if selected.insert((function.0, function.1.node_id())) {
+                functions.push(function);
+            }
+        }
+    }
+
+    Ok(functions)
+}
+
 fn run(cli: Cli) -> Result<i32, Failure> {
     run_with_ask(cli, ask)
 }
@@ -156,57 +190,67 @@ fn run_with_ask(
         types: cli.types,
     };
     let mut analysis = Analysis::new(&project, options);
-    let mut functions = analysis.reportable();
-
-    if config.explicit_entrypoints {
-        let mut selected: std::collections::HashSet<_> = functions
-            .iter()
-            .map(|(file, function)| (*file, function.node_id()))
-            .collect();
-
-        for function in public_roots(&mut analysis, &config).map_err(Failure::Config)? {
-            if selected.insert((function.0, function.1.node_id())) {
-                functions.push(function);
-            }
-        }
-    }
-
-    if analysis.options.types != TypeMode::Syntactic {
-        let gathered = analysis.gather_answers(&functions, |queries| {
-            compiler(&project.root, &project.tsconfig_path, queries)
-        });
-
-        match gathered {
-            Ok(rounds) => eprintln!(
-                "tsc: {} sites asked in {} rounds, {}",
-                rounds.sites, rounds.rounds, analysis.tsc_info
-            ),
-            Err(error @ (TscError::NodeUnavailable(_) | TscError::TypescriptUnavailable(_)))
-                if analysis.options.types == TypeMode::Auto =>
-            {
-                eprintln!(
-                    "olint: types from declarations only ({})",
-                    reason_of(&error)
-                );
-
-                analysis.fall_back_to_declarations();
-            }
-            Err(error) => return Err(Failure::Tsc(error)),
-        }
-    }
-
+    let mut assisted = analysis.options.types != TypeMode::Syntactic;
+    let mut rounds = 0;
+    let mut sites = 0;
     let helper = std::env::current_exe().map(|executable| companion_of(&executable));
-    let unavailable = analysis
-        .gather_regex_answers(|requests| match &helper {
-            Ok(helper) => olint::regex::ask(helper, requests, &RegexLimits::default()),
-            Err(error) => Err(RegexError::Unavailable(format!(
-                "the olint executable path is unknown ({error})"
-            ))),
-        })
-        .map_err(Failure::Regex)?;
 
-    if let Some(reason) = unavailable {
-        eprintln!("olint: regex classification unavailable ({reason})");
+    let functions = loop {
+        let functions = if assisted {
+            let gathered = analysis.gather_discovered_answers(
+                |analysis| roots_of(analysis, &config, cli.report),
+                |queries| compiler(&project.root, &project.tsconfig_path, queries),
+            );
+
+            match gathered {
+                Ok((gathered, functions)) => {
+                    rounds += gathered.rounds;
+                    sites += gathered.sites;
+
+                    functions
+                }
+                Err(Failure::Tsc(
+                    error @ (TscError::NodeUnavailable(_) | TscError::TypescriptUnavailable(_)),
+                )) if analysis.options.types == TypeMode::Auto => {
+                    eprintln!(
+                        "olint: types from declarations only ({})",
+                        reason_of(&error)
+                    );
+                    analysis.fall_back_to_declarations();
+
+                    assisted = false;
+
+                    roots_of(&mut analysis, &config, cli.report)?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            roots_of(&mut analysis, &config, cli.report)?
+        };
+        let classified = analysis.regex_answers.len();
+        let unavailable = analysis
+            .gather_selected_regex_answers(&functions, |requests| match &helper {
+                Ok(helper) => olint::regex::ask(helper, requests, &RegexLimits::default()),
+                Err(error) => Err(RegexError::Unavailable(format!(
+                    "the olint executable path is unknown ({error})"
+                ))),
+            })
+            .map_err(Failure::Regex)?;
+
+        if let Some(reason) = unavailable {
+            eprintln!("olint: regex classification unavailable ({reason})");
+        }
+
+        if analysis.regex_answers.len() == classified {
+            break functions;
+        }
+    };
+
+    if assisted {
+        eprintln!(
+            "tsc: {sites} sites asked in {rounds} rounds, {}",
+            analysis.tsc_info
+        );
     }
 
     let public = public_functions(&mut analysis, &config).map_err(Failure::Config)?;

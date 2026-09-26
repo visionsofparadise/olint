@@ -4794,37 +4794,59 @@ impl<'p, 'a> Analysis<'p, 'a> {
     pub fn gather_answers(
         &mut self,
         functions: &[(FileId, FunctionNode<'a>)],
-        mut ask: impl FnMut(&[Query]) -> Result<TscReply, TscError>,
+        ask: impl FnMut(&[Query]) -> Result<TscReply, TscError>,
     ) -> Result<TscRounds, TscError> {
+        self.gather_answers_with(|_| Ok(functions.to_vec()), ask, true)
+            .map(|(rounds, _)| rounds)
+    }
+
+    pub fn gather_discovered_answers<E: From<TscError>>(
+        &mut self,
+        discover: impl FnMut(&mut Self) -> Result<Vec<(FileId, FunctionNode<'a>)>, E>,
+        ask: impl FnMut(&[Query]) -> Result<TscReply, TscError>,
+    ) -> Result<(TscRounds, Vec<(FileId, FunctionNode<'a>)>), E> {
+        let availability = self.tsc_info.is_empty();
+
+        self.gather_answers_with(discover, ask, availability)
+    }
+
+    fn gather_answers_with<E: From<TscError>>(
+        &mut self,
+        mut discover: impl FnMut(&mut Self) -> Result<Vec<(FileId, FunctionNode<'a>)>, E>,
+        mut ask: impl FnMut(&[Query]) -> Result<TscReply, TscError>,
+        availability: bool,
+    ) -> Result<(TscRounds, Vec<(FileId, FunctionNode<'a>)>), E> {
         let mut rounds = TscRounds::default();
 
         self.set_pass(TscPass::Recording);
 
-        loop {
-            self.summarize_reportable(functions);
+        let functions = loop {
+            let functions = discover(self)?;
+
+            self.summarize_reportable(&functions);
 
             let queries = self.needed_queries();
             let asked_nothing = queries.is_empty();
 
-            if !asked_nothing || rounds.rounds == 0 {
-                let reply = ask(&queries)?;
+            if !asked_nothing || (availability && rounds.rounds == 0) {
+                let reply = ask(&queries).map_err(E::from)?;
 
                 rounds.sites += queries.len();
                 rounds.rounds += 1;
 
-                self.take_answers(reply)?;
+                self.take_answers(reply).map_err(E::from)?;
             }
 
             self.reset_between_passes();
 
             if asked_nothing {
-                break;
+                break functions;
             }
-        }
+        };
 
         self.set_pass(TscPass::Answering);
 
-        Ok(rounds)
+        Ok((rounds, functions))
     }
 }
 

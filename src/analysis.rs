@@ -109,6 +109,7 @@ pub struct Analysis<'p, 'a> {
     pub(crate) unclassified_writes: HashMap<(Binding, Option<NodeId>), bool>,
     pub(crate) prototype_members: crate::values::PrototypeMembers<'a>,
     pub regex_answers: HashMap<crate::regex::RegexRequest, crate::regex::RegexAnswer>,
+    pub(crate) needed_regex: IndexSet<crate::regex::RegexRequest>,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -165,6 +166,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             unclassified_writes: HashMap::new(),
             prototype_members: HashMap::new(),
             regex_answers: HashMap::new(),
+            needed_regex: IndexSet::new(),
         }
     }
 }

@@ -2710,3 +2710,461 @@ fn assert_cubic_summary(analysis: &mut Analysis<'_, '_>, file: FileId, name: &st
         Cost::parse("O(N^3)").unwrap()
     );
 }
+#[test]
+fn unrelated_functions_do_not_add_selected_summary_tasks_or_queries() {
+    let mut observations = Vec::new();
+
+    for count in [0, 32, 128] {
+        let mut source = "function dependency(value:any){return value.work()} export function selected(value:any){return dependency(value)}".to_string();
+
+        for index in 0..count {
+            source.push_str(&format!(
+                "function unrelated{index}(value:any){{return value.other{index}()}}"
+            ));
+        }
+
+        run_with_source(&source, |analysis, file| {
+            let selected = function_of_name(analysis.project, file, "selected");
+            let mut sites = 0;
+
+            analysis
+                .gather_answers(&[(file, selected)], |queries| {
+                    sites += queries.len();
+
+                    Ok(olint::tsc::TscReply {
+                        typescript: "static test".into(),
+                        from: "test".into(),
+                        answers: vec![None; queries.len()],
+                    })
+                })
+                .unwrap();
+            analysis.summarize(file, selected);
+
+            let stats = analysis.scheduler_stats();
+
+            assert!(sites > 0);
+            observations.push((
+                sites,
+                stats.tasks,
+                stats.work.consumed(Event::DependencyPair),
+            ));
+        });
+    }
+
+    assert!(
+        observations.windows(2).all(|pair| pair[0] == pair[1]),
+        "{observations:?}"
+    );
+}
+
+#[test]
+fn selected_and_full_scope_preserve_selected_costs_and_unknowns() {
+    let source = "function work(xs:number[]){for(const x of xs)for(const y of xs)void y} function unrelated(value:any){return value.unrelated()} export function selected(xs:number[], value:any){work(xs);return value.selected()}";
+
+    for assisted in [false, true] {
+        let mut results = Vec::new();
+
+        for full in [false, true] {
+            run_with_source(source, |analysis, file| {
+                let selected = function_of_name(analysis.project, file, "selected");
+                let functions = if full {
+                    analysis.reportable()
+                } else {
+                    vec![(file, selected)]
+                };
+
+                if assisted {
+                    analysis
+                        .gather_answers(&functions, |queries| {
+                            Ok(olint::tsc::TscReply {
+                                typescript: "static test".into(),
+                                from: "test".into(),
+                                answers: vec![None; queries.len()],
+                            })
+                        })
+                        .unwrap();
+                } else {
+                    analysis.summarize_reportable(&functions);
+                }
+
+                let part = summary_of(analysis, file, "selected");
+
+                results.push((
+                    part.cost.text_with(&|id| analysis.values.label(id)),
+                    part.is_complete(),
+                    reasons(analysis, part.unknowns),
+                ));
+            });
+        }
+
+        assert_eq!(results[0], results[1], "assisted={assisted}");
+    }
+}
+
+fn query_sites(source: &str, queries: &[olint::tsc::Query]) -> Vec<String> {
+    queries
+        .iter()
+        .map(|query| {
+            let (olint::tsc::Query::Type { pos, end, .. }
+            | olint::tsc::Query::Callee { pos, end, .. }) = query;
+
+            source[*pos as usize..*end as usize].to_owned()
+        })
+        .collect()
+}
+
+fn compiler_target_of(
+    project: &olint::project::Project<'_>,
+    file: FileId,
+    name: &str,
+) -> olint::tsc::CalleeTarget {
+    let olint::declarations::FunctionNode::Function(function) =
+        function_of_name(project, file, name)
+    else {
+        panic!("ordinary function");
+    };
+
+    olint::tsc::CalleeTarget {
+        file: project.file(file).path.to_string_lossy().replace('\\', "/"),
+        start: function.span.start,
+        end: function.span.end,
+    }
+}
+
+fn callee_answers(
+    queries: &[olint::tsc::Query],
+    sites: &[String],
+    expected: &str,
+    target: &olint::tsc::CalleeTarget,
+    open: bool,
+) -> Vec<Option<olint::tsc::TscAnswer>> {
+    queries
+        .iter()
+        .zip(sites)
+        .map(|(query, site)| {
+            (matches!(query, olint::tsc::Query::Callee { .. }) && site == expected).then(|| {
+                olint::tsc::TscAnswer::Callee(olint::tsc::CalleeAnswer {
+                    targets: vec![target.clone()],
+                    open,
+                })
+            })
+        })
+        .collect()
+}
+
+fn run_selected_source(
+    source: &str,
+    body: impl FnOnce(&mut Analysis<'_, '_>, FileId, &olint::config::Config),
+) {
+    support::run_in_project(
+        &[
+            ("tsconfig.json", "{}"),
+            ("index.ts", source),
+            ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+        ],
+        |project, root| {
+            let config = olint::config::read_config(project, None).unwrap();
+            let file = support::file_of(project, root, "index.ts");
+            let mut analysis = Analysis::new(project, support::SYNTACTIC);
+
+            body(&mut analysis, file, &config);
+        },
+    );
+}
+
+#[test]
+fn selected_recording_discovers_compiler_enabled_dependency_queries() {
+    use olint::tsc::TscReply;
+
+    let source = "function dependency(value:any){return value.later()} function make():any{return 1} function unused(value:any){return value.unrelated()} export function selected(value:any){return make().run(value)}";
+
+    run_with_source(source, |analysis, file| {
+        let selected = function_of_name(analysis.project, file, "selected");
+        let target = compiler_target_of(analysis.project, file, "dependency");
+        let mut batches = Vec::new();
+
+        analysis
+            .gather_answers(&[(file, selected)], |queries| {
+                let sites = query_sites(source, queries);
+                let answers = callee_answers(queries, &sites, "make().run", &target, true);
+
+                batches.push(sites);
+
+                Ok(TscReply {
+                    typescript: "static test".into(),
+                    from: "test".into(),
+                    answers,
+                })
+            })
+            .unwrap();
+
+        let first = batches
+            .iter()
+            .position(|sites| sites.iter().any(|site| site == "make().run"))
+            .unwrap();
+        let later = batches
+            .iter()
+            .position(|sites| sites.iter().any(|site| site.contains("later")))
+            .unwrap();
+
+        assert!(later > first, "{batches:?}");
+        assert!(
+            !batches
+                .iter()
+                .flatten()
+                .any(|site| site.contains("unrelated")),
+            "{batches:?}"
+        );
+    });
+}
+
+#[test]
+fn selected_summaries_preserve_writes_in_unselected_source() {
+    for patched in [false, true] {
+        let patch = if patched {
+            "declare const replacement: any; function uncalled(){(Array.prototype as any).includes = replacement;}"
+        } else {
+            "function uncalled(){return 1;}"
+        };
+
+        support::run_in_project(
+            &[
+                ("tsconfig.json", "{}"),
+                ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
+                (
+                    "index.ts",
+                    "export function selected(){return [1,2,3].includes(1)}",
+                ),
+                ("unselected.ts", patch),
+            ],
+            |project, _| {
+                let config = olint::config::read_config(project, None).unwrap();
+                let mut analysis = Analysis::new(project, support::SYNTACTIC);
+                let selected = olint::public::public_roots(&mut analysis, &config).unwrap();
+
+                assert_eq!(selected.len(), 1);
+
+                let (file, function) = selected[0];
+                let reading = analysis.summarize(file, function);
+                let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+
+                assert_eq!(part.is_complete(), !patched, "{part:?}");
+                assert_eq!(part.cost, Cost::ONE);
+            },
+        );
+    }
+}
+
+#[test]
+fn public_discovery_records_compiler_installed_roots_before_regex_gathering() {
+    use olint::regex::{RegexAnswer, QUALIFIED_MODEL};
+
+    use olint::tsc::{TscError, TscReply};
+
+    let source = "function install(this:any){this.run=function run(value:any,text:string){value.onlyNewRoot();return /^a+$/.test(text);};} export function API(this:any){(this as any).install();} function unrelated(value:any){value.unrelated();}";
+    let mut compared = Vec::new();
+
+    for full in [false, true] {
+        run_selected_source(source, |analysis, file, config| {
+            let run = function_of_name(analysis.project, file, "run");
+            let initial = olint::public::public_roots(analysis, config).unwrap();
+
+            assert!(!initial
+                .iter()
+                .any(|(owner, function)| *owner == file && function.node_id() == run.node_id()));
+
+            let target = compiler_target_of(analysis.project, file, "install");
+            let mut batches = Vec::new();
+            let (_, functions) = analysis
+                .gather_discovered_answers(
+                    |analysis| {
+                        let mut selected = olint::public::public_roots(analysis, config)
+                            .map_err(|error| TscError::Malformed(format!("{error:?}")))?;
+
+                        if full {
+                            for function in analysis.reportable() {
+                                if !selected.iter().any(|held| {
+                                    held.0 == function.0 && held.1.node_id() == function.1.node_id()
+                                }) {
+                                    selected.push(function);
+                                }
+                            }
+                        }
+
+                        Ok::<_, TscError>(selected)
+                    },
+                    |queries| {
+                        let sites = query_sites(source, queries);
+                        let answers = callee_answers(
+                            queries,
+                            &sites,
+                            "(this as any).install",
+                            &target,
+                            false,
+                        );
+
+                        batches.push(sites);
+
+                        Ok(TscReply {
+                            typescript: "static test".into(),
+                            from: "test".into(),
+                            answers,
+                        })
+                    },
+                )
+                .unwrap();
+
+            assert!(
+                functions
+                    .iter()
+                    .any(|(owner, function)| *owner == file && function.node_id() == run.node_id()),
+                "full={full}, batches={batches:?}"
+            );
+            assert_eq!(
+                batches
+                    .iter()
+                    .flatten()
+                    .any(|site| site == "value.unrelated"),
+                full,
+                "{batches:?}"
+            );
+
+            if !full {
+                let installer = batches
+                    .iter()
+                    .position(|sites| sites.iter().any(|site| site == "(this as any).install"))
+                    .unwrap();
+                let installed = batches
+                    .iter()
+                    .position(|sites| sites.iter().any(|site| site == "value.onlyNewRoot"))
+                    .unwrap();
+
+                assert!(installed > installer, "{batches:?}");
+            }
+
+            let public = olint::public::public_roots(analysis, config).unwrap();
+            let mut patterns = Vec::new();
+
+            analysis
+                .gather_selected_regex_answers(&functions, |requests| {
+                    patterns.extend(requests.iter().map(|request| request.source.clone()));
+
+                    Ok(vec![
+                        RegexAnswer::Bound {
+                            cost: Cost::N,
+                            model: QUALIFIED_MODEL.into()
+                        };
+                        requests.len()
+                    ])
+                })
+                .unwrap();
+            assert_eq!(patterns, vec!["^a+$"]);
+
+            let part = summary_of(analysis, file, "run");
+
+            compared.push((
+                public
+                    .iter()
+                    .map(|(owner, function)| (*owner, function.node_id()))
+                    .collect::<std::collections::HashSet<_>>(),
+                support::projected_class_of(&part.cost),
+                support::unknown_reasons(analysis, part.unknowns),
+            ));
+        });
+    }
+
+    assert_eq!(compared[0], compared[1]);
+}
+
+#[test]
+fn surface_only_compiler_queries_are_recorded_with_no_callable_roots() {
+    use olint::tsc::{CalleeAnswer, Query, TscAnswer, TscError, TscReply};
+
+    let source = "declare const hooks:any;function inspect(value:any){void value;}function unrelated(value:any){value.onlyBody();}export const api={};hooks.inspect(api);";
+
+    run_selected_source(source, |analysis, file, config| {
+        let target = compiler_target_of(analysis.project, file, "inspect");
+        let mut asked = Vec::new();
+        let (_, functions) = analysis
+            .gather_discovered_answers(
+                |analysis| {
+                    olint::public::public_roots(analysis, config)
+                        .map_err(|error| TscError::Malformed(format!("{error:?}")))
+                },
+                |queries| {
+                    let mut answers = Vec::new();
+
+                    for query in queries {
+                        let (pos, end) = match query {
+                            Query::Type { pos, end, .. } | Query::Callee { pos, end, .. } => {
+                                (*pos, *end)
+                            }
+                        };
+                        let site = &source[pos as usize..end as usize];
+
+                        asked.push(site.to_owned());
+                        answers.push(
+                            (matches!(query, Query::Callee { .. }) && site == "hooks.inspect")
+                                .then(|| {
+                                    TscAnswer::Callee(CalleeAnswer {
+                                        targets: vec![target.clone()],
+                                        open: false,
+                                    })
+                                }),
+                        );
+                    }
+
+                    Ok(TscReply {
+                        typescript: "static test".into(),
+                        from: "test".into(),
+                        answers,
+                    })
+                },
+            )
+            .unwrap();
+
+        assert!(functions.is_empty());
+        assert!(
+            asked.iter().any(|site| site == "hooks.inspect"),
+            "{asked:?}"
+        );
+        assert!(
+            !asked.iter().any(|site| site == "value.onlyBody"),
+            "{asked:?}"
+        );
+    });
+}
+
+#[test]
+fn repeated_discovery_checks_availability_once_and_keeps_the_frozen_wrapper() {
+    use olint::tsc::{TscError, TscReply};
+
+    run_with_source("export const value=1;", |analysis, _| {
+        let mut calls = 0;
+        let mut availability = |queries: &[olint::tsc::Query]| {
+            calls += 1;
+
+            assert!(queries.is_empty());
+
+            Ok(TscReply {
+                typescript: "static test".into(),
+                from: "test".into(),
+                answers: Vec::new(),
+            })
+        };
+
+        for first in [true, false] {
+            let (rounds, roots) = analysis
+                .gather_discovered_answers(|_| Ok::<_, TscError>(Vec::new()), &mut availability)
+                .unwrap();
+
+            assert!(roots.is_empty());
+            assert_eq!(rounds.rounds, if first { 1 } else { 0 });
+            assert_eq!(rounds.sites, 0);
+        }
+
+        analysis.gather_answers(&[], &mut availability).unwrap();
+
+        assert_eq!(calls, 2);
+    });
+}

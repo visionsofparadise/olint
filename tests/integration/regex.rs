@@ -1025,3 +1025,90 @@ fn the_packaged_helper_resolves_its_own_dependency_from_another_cwd() {
     assert_eq!(lines[1]["complexity"]["degree"], 2);
     assert!(!project.path().join("executed.txt").exists());
 }
+
+#[test]
+fn selected_regex_requests_follow_calls_and_recompute_answers() {
+    let source = "function dependency(value: string){return /^a+$/.test(value)} function unreachable(value:string){return /^b+$/.test(value)} export function selected(value:string){return dependency(value)}";
+
+    support::run_with_source(source, |analysis, file| {
+        let selected = support::function_of_name(analysis.project, file, "selected");
+        let mut batches = Vec::new();
+
+        analysis
+            .gather_selected_regex_answers(&[(file, selected)], |requests| {
+                batches.push(requests.to_vec());
+
+                Ok(vec![
+                    RegexAnswer::Bound {
+                        cost: Cost::N,
+                        model: QUALIFIED_MODEL.into()
+                    };
+                    requests.len()
+                ])
+            })
+            .unwrap();
+
+        assert_eq!(batches, vec![requests_of(&[("^a+$", "")])]);
+
+        let part = support::summary_of(analysis, file, "selected");
+
+        assert!(part.is_complete(), "{part:?}");
+        assert_eq!(
+            support::legacy_class_of(analysis, file, selected, &part.cost),
+            Cost::N
+        );
+
+        let functions = analysis.reportable();
+        let mut reported = Vec::new();
+
+        analysis
+            .gather_selected_regex_answers(&functions, |requests| {
+                reported.extend_from_slice(requests);
+
+                Ok(vec![
+                    RegexAnswer::Bound {
+                        cost: Cost::N,
+                        model: QUALIFIED_MODEL.into()
+                    };
+                    requests.len()
+                ])
+            })
+            .unwrap();
+        assert_eq!(reported, requests_of(&[("^b+$", "")]));
+    });
+}
+
+#[test]
+fn empty_selected_regex_scope_does_not_invoke_the_helper() {
+    support::run_with_source(
+        "export function unused(value:string){return /^a+$/.test(value)}",
+        |analysis, _| {
+            analysis
+                .gather_selected_regex_answers(&[], |_| panic!("empty regex scope reached helper"))
+                .unwrap();
+            assert_eq!(analysis.scheduler_stats().tasks, 0);
+        },
+    );
+}
+
+#[test]
+fn selected_regex_gathering_keeps_ignored_dependency_calls() {
+    support::run_in_project(&[
+        ("tsconfig.json", "{}"),
+        ("olint.config.json", r#"{"entrypoints":["index.ts"],"ignore":["helper.ts"]}"#),
+        ("index.ts", "import {match} from './helper'; export function selected(value:string){return match(value)}"),
+        ("helper.ts", "export function match(value:string){return /^a+$/.test(value)} export function unused(value:string){return /^b+$/.test(value)}"),
+    ], |project, _| {
+        let config = olint::config::read_config(project, None).unwrap();
+        let mut analysis = olint::analysis::Analysis::new(project, support::SYNTACTIC);
+        let functions = olint::public::public_roots(&mut analysis, &config).unwrap();
+        let mut asked = Vec::new();
+
+        analysis.gather_selected_regex_answers(&functions, |requests| {
+            asked.extend_from_slice(requests);
+
+            Ok(requests.iter().map(|_| RegexAnswer::Unknown {reason: "test unknown".into()}).collect())
+        }).unwrap();
+        assert_eq!(asked, requests_of(&[("^a+$", "")]));
+    });
+}

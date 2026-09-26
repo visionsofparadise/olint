@@ -115,6 +115,11 @@ fn valid_selection_can_reach_the_compiler_callback() {
     )
     .unwrap();
     std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+    std::fs::write(
+        root.join("olint.config.json"),
+        r#"{"entrypoints":["index.ts"]}"#,
+    )
+    .unwrap();
 
     let cli = Cli {
         min: 0,
@@ -134,4 +139,114 @@ fn valid_selection_can_reach_the_compiler_callback() {
 
     assert!(matches!(result, Err(Failure::Tsc(TscError::Malformed(_)))));
     assert_eq!(calls, 1);
+}
+
+#[test]
+fn lint_queries_follow_selected_roots_and_their_ignored_dependencies() {
+    for report in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        for (path, text) in [
+            ("tsconfig.json", "{}"),
+            ("index.ts", "import {dependency} from './ignored'; export function selected(value:any){return dependency(value)} function unreachable(value:any){return value.unreachable()}"),
+            ("ignored.ts", "export function dependency(value:any){return value.reachable()} export function ignored(value:any){return value.ignored()}"),
+            ("olint.config.json", r#"{"entrypoints":["index.ts"],"ignore":["ignored.ts"]}"#),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+
+        let mut asked = Vec::new();
+        let result = run_with_ask(
+            Cli {
+                min: 0,
+                report,
+                types: TypeMode::Tsc,
+                config: None,
+                tsconfig: root.join("tsconfig.json"),
+            },
+            |_, _, queries| {
+                for query in queries {
+                    let (file, pos, end) = match query {
+                        Query::Type { file, pos, end } | Query::Callee { file, pos, end } => {
+                            (file, pos, end)
+                        }
+                    };
+                    let text = std::fs::read_to_string(file).unwrap();
+
+                    asked.push(text[*pos as usize..*end as usize].to_string());
+                }
+
+                Ok(TscReply {
+                    typescript: "static test".into(),
+                    from: "test".into(),
+                    answers: vec![None; queries.len()],
+                })
+            },
+        );
+
+        assert!(matches!(result, Ok(0)), "{asked:?}");
+        assert!(
+            asked.iter().any(|site| site == "value.reachable"),
+            "{asked:?}"
+        );
+        assert_eq!(
+            asked.iter().any(|site| site == "value.unreachable"),
+            report,
+            "{asked:?}"
+        );
+        assert_eq!(
+            asked.iter().any(|site| site == "value.ignored"),
+            report,
+            "{asked:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_selected_batches_preserve_explicit_type_availability() {
+    for types in [TypeMode::Tsc, TypeMode::Auto, TypeMode::Syntactic] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        std::fs::write(
+            root.join("index.ts"),
+            "export function selected(){return 1}",
+        )
+        .unwrap();
+        std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("olint.config.json"),
+            r#"{"entrypoints":["index.ts"]}"#,
+        )
+        .unwrap();
+
+        let mut calls = 0;
+        let result = run_with_ask(
+            Cli {
+                min: 0,
+                report: false,
+                types,
+                config: None,
+                tsconfig: root.join("tsconfig.json"),
+            },
+            |_, _, queries| {
+                calls += 1;
+
+                assert!(queries.is_empty());
+
+                Err(TscError::TypescriptUnavailable("test availability".into()))
+            },
+        );
+
+        assert_eq!(calls, usize::from(types != TypeMode::Syntactic));
+
+        match types {
+            TypeMode::Tsc => assert!(matches!(
+                result,
+                Err(Failure::Tsc(TscError::TypescriptUnavailable(_)))
+            )),
+            _ => assert!(matches!(result, Ok(0))),
+        }
+    }
 }
