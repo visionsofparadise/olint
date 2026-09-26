@@ -927,6 +927,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.scheduler = Scheduler::new(limits, self.scheduler.generation);
 
+        self.counter_writes.clear();
+
         Ok(())
     }
 
@@ -4761,6 +4763,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.scheduler.body_sizes = body_sizes;
 
         self.bound_seen.clear();
+        self.counter_writes.clear();
         self.pending_scoped.clear();
         self.pending_effects.clear();
         self.scheduling.clear();

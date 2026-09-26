@@ -30,6 +30,8 @@ const MAXIMUM_VALUE_DEPTH: usize = 4;
 
 const LARGEST_CONTRACTION_RATIO: f64 = 0.5;
 
+pub(crate) type CounterWriteSites = Vec<(u32, u32, NodeId)>;
+
 fn quantity_maximum(left: Cost, right: Cost) -> Option<Cost> {
     if left.is_one() && left.compare(&right) == CostComparison::Within {
         return Some(right);
@@ -497,21 +499,84 @@ impl<'p, 'a> Analysis<'p, 'a> {
         })
     }
 
-    fn write_sites_of(&self, file: FileId, counter: Binding, node: NodeId) -> Option<Vec<NodeId>> {
+    fn write_sites_of(
+        &mut self,
+        file: FileId,
+        counter: Binding,
+        node: NodeId,
+    ) -> Option<Vec<NodeId>> {
         let symbol = local_symbol_of(file, counter)?;
-        let project = self.project;
-        let semantic = &project.file(file).semantic;
-        let nodes = semantic.nodes();
+
+        if !self.charge_work(Event::BudgetPrepassNode, 1) {
+            return None;
+        }
+
+        if !self.counter_writes.contains_key(&counter) {
+            let writes = self.counter_write_index_of(file, symbol);
+
+            self.counter_writes.insert(counter, writes);
+        }
+
+        let count = self.counter_writes.get(&counter)?.as_ref()?.len() as u64;
+        let search = 2 * (64 - count.saturating_add(1).leading_zeros() as u64);
+
+        if !self.charge_work(Event::BudgetPrepassNode, search) {
+            return None;
+        }
+
+        let scope = self.kind_of_node(file, node).span();
+        let writes = self.counter_writes.get(&counter)?.as_ref()?;
+        let start = writes.partition_point(|write| write.0 < scope.start);
+        let end = writes.partition_point(|write| write.0 <= scope.end);
+
+        if !self.charge_work(Event::BudgetPrepassNode, 2 * (end - start) as u64) {
+            return None;
+        }
+
+        let writes = self.counter_writes.get(&counter)?.as_ref()?;
 
         Some(
-            semantic
-                .scoping()
-                .get_resolved_references(symbol)
-                .filter(|reference| reference.is_write())
-                .map(|reference| reference.node_id())
-                .filter(|site| is_within(nodes, *site, node))
+            writes[start..end]
+                .iter()
+                .filter(|write| write.1 <= scope.end)
+                .map(|write| write.2)
                 .collect(),
         )
+    }
+
+    fn counter_write_index_of(
+        &mut self,
+        file: FileId,
+        symbol: SymbolId,
+    ) -> Option<CounterWriteSites> {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let mut writes = Vec::new();
+        let references = semantic.scoping().get_resolved_reference_ids(symbol).len() as u64;
+
+        if !self.charge_work(Event::BudgetPrepassNode, references.saturating_mul(3)) {
+            return None;
+        }
+
+        for reference in semantic.scoping().get_resolved_references(symbol) {
+            if reference.is_write() {
+                let node = reference.node_id();
+                let span = semantic.nodes().kind(node).span();
+
+                writes.push((span.start, span.end, node));
+            }
+        }
+
+        let count = writes.len() as u64;
+        let sorting = count.saturating_mul(64 - count.leading_zeros() as u64);
+
+        if !self.charge_work(Event::BudgetPrepassNode, sorting) {
+            return None;
+        }
+
+        writes.sort_unstable_by_key(|write| (write.0, write.1, write.2.index()));
+
+        Some(writes)
     }
 
     fn write_of(
@@ -1545,11 +1610,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
-        let settled = semantic
-            .scoping()
-            .get_resolved_references(symbol)
-            .filter(|reference| reference.is_write())
-            .all(|reference| is_within(nodes, reference.node_id(), repetition.node));
+        let local = self.write_sites_of(file, counter, repetition.node)?;
+        let total = self.counter_writes.get(&counter)?.as_ref()?.len();
+        let settled = local.len() == total;
 
         if !settled {
             return None;

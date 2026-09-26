@@ -2316,7 +2316,7 @@ fn repeating_path_scans_resolve_once_per_loop() {
     for loops in [16_u64, 32, 48] {
         assert_eq!(
             repeating_body_scans_of(loops as usize),
-            142 * loops + 97,
+            169 * loops + 97,
             "{loops}"
         );
     }
@@ -2535,5 +2535,139 @@ fn assert_recurrence_work_limit(source: &str) {
             Cost::parse("O(N^3)").unwrap()
         );
         assert_eq!(stats.work.consumed(Event::RecurrenceStep), 256);
+    });
+}
+
+fn counter_write_counts(count: usize, shared: bool, prefix: bool) -> u64 {
+    let mut source = "export function root(){".to_string();
+
+    if shared {
+        source.push_str("let i=0;");
+    }
+
+    if prefix {
+        for index in 0..count {
+            if shared {
+                source.push_str("void i;");
+            } else {
+                source.push_str(&format!("let i{index}=0;void i{index};"));
+            }
+        }
+    }
+
+    for index in 0..count {
+        let name = if shared {
+            "i".to_string()
+        } else {
+            format!("i{index}")
+        };
+        let declaration = if shared { "" } else { "let " };
+
+        if !prefix {
+            source.push_str(&format!("{declaration}{name}=0;"));
+        }
+
+        source.push_str(&format!("while({name}<8){{{name}++;}}"));
+    }
+
+    source.push('}');
+
+    let mut consumed = 0;
+
+    run_with_source(&source, |analysis, file| {
+        let part = summary_of(analysis, file, "root");
+        let stats = analysis.scheduler_stats();
+
+        assert!(
+            !stats.work.exhausted(Event::BudgetPrepassNode),
+            "{count}/{shared}: {stats:?}"
+        );
+        assert!(!reasons(analysis, part.unknowns).contains(&UnknownReason::ResourceExhaustion));
+
+        consumed = stats.work.consumed(Event::BudgetPrepassNode);
+
+        assert_terminal(stats);
+    });
+
+    consumed
+}
+
+#[test]
+fn reused_counter_discovery_keeps_near_linear_charged_work() {
+    for prefix in [false, true] {
+        for shared in [false, true] {
+            let counts = [16, 32, 64].map(|count| counter_write_counts(count, shared, prefix));
+
+            for pair in counts.windows(2) {
+                assert!(pair[1] <= 3 * pair[0], "{shared}/{prefix}: {counts:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn counter_write_exhaustion_preserves_known_sibling_work() {
+    let source = format!("/** @perf O(N^3) */ function known(){{}} let i=0;function unused(){{{}}} export function root(){{known();while(i<8){{i++}}}}", "void i;".repeat(128));
+
+    run_with_source(&source, |analysis, file| {
+        limit_work(analysis, Event::BudgetPrepassNode, 256);
+
+        let expected = Cost::parse("O(N^3)").unwrap();
+
+        for name in ["known", "root"] {
+            let result = summary_of(analysis, file, name);
+
+            assert_eq!(
+                support::projected_class_of(&result.cost),
+                expected,
+                "{name}"
+            );
+
+            if name == "root" {
+                assert!(
+                    reasons(analysis, result.unknowns).contains(&UnknownReason::ResourceExhaustion)
+                );
+            }
+        }
+
+        assert!(analysis
+            .scheduler_stats()
+            .work
+            .exhausted(Event::BudgetPrepassNode));
+        assert_terminal(analysis.scheduler_stats());
+    });
+}
+
+#[test]
+fn rejected_counter_index_is_rebuilt_after_unused_limits_change() {
+    let source = format!(
+        "export function root(){{let i=0;while(i<8){{i++}}{}}}",
+        "void i;".repeat(128)
+    );
+
+    run_with_source(&source, |analysis, file| {
+        let loop_kind = analysis
+            .project
+            .file(file)
+            .semantic
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.kind(), oxc_ast::AstKind::WhileStatement(_)))
+            .unwrap()
+            .kind();
+
+        limit_work(analysis, Event::BudgetPrepassNode, 16);
+        assert!(analysis.bound_of(file, loop_kind).is_unresolved());
+        assert!(analysis
+            .scheduler_stats()
+            .work
+            .exhausted(Event::BudgetPrepassNode));
+        analysis
+            .set_scheduler_limits(SchedulerLimits::default())
+            .unwrap();
+        assert_eq!(
+            analysis.bound_of(file, loop_kind).factor(),
+            Some(&Cost::ONE)
+        );
     });
 }

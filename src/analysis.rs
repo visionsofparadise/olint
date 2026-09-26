@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::{IndexMap, IndexSet};
 use oxc_semantic::NodeId;
 
+use crate::bounds::CounterWriteSites;
 use crate::budgets::BudgetContext;
 use crate::cost::{Part, Reading};
 use crate::declarations::{Binding, Declarations, FunctionId};
@@ -95,6 +96,7 @@ pub struct Analysis<'p, 'a> {
     pub(crate) scheduling: HashMap<SummaryKey, bool>,
     pub(crate) bound_seen: HashSet<(FileId, NodeId)>,
     pub(crate) active_bounds: HashSet<(FileId, NodeId)>,
+    pub(crate) counter_writes: HashMap<Binding, Option<CounterWriteSites>>,
     pub(crate) repeating_bodies: HashMap<(FileId, NodeId), bool>,
     pub(crate) children: HashMap<FileId, Vec<Vec<NodeId>>>,
     pub(crate) finalizer_replacements: FinalizerReplacements,
@@ -151,6 +153,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             scheduling: HashMap::new(),
             bound_seen: HashSet::new(),
             active_bounds: HashSet::new(),
+            counter_writes: HashMap::new(),
             repeating_bodies: HashMap::new(),
             children: HashMap::new(),
             finalizer_replacements: FinalizerReplacements::new(),
