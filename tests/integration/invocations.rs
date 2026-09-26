@@ -255,7 +255,7 @@ fn destructuring_patterns_read_getters_and_iterate_sources() {
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {it} const {{ p: [a] }} = {{ p: it }}; return a; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {it} let t = 0; for (const [a] of [it, it]) t += a; return t; }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {getter} let t = 0; for (const {{ value }} of [box, box]) t += value; return t; }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {it} try {{ throw it; }} catch ([a]) {{ return a; }} }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ {it} try {{ throw it; }} catch ([a]) {{ return a; }} }}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const {{ a, b }} = {{ a: 1, b: xs }}; return a + b.length; }}")), "O(1)", false),
     ];
 
@@ -850,5 +850,36 @@ fn assert_iteration_bounds(cases: &[support::SelectedCase<'_>], expected: &[(usi
                 "{types:?} {index}: {reasons:?}"
             );
         }
+    }
+}
+
+#[test]
+fn catch_bindings_retain_explicit_thrown_sources() {
+    let cases = [
+        (index_of(format!("{QUADRATIC} export function selected(xs:number[]){{const [value]={{*[Symbol.iterator](){{quadratic(xs);yield 0;}}}};return value;}}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC} export function selected(xs:number[]){{try{{throw {{*[Symbol.iterator](){{quadratic(xs);yield 0;}}}}}}catch([value]){{return value;}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{const {{value}} = {{get value(){{return quadratic(xs)}}}}; return value}}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{throw {{get value(){{return quadratic(xs)}}}}}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{throw {{[Symbol.iterator](){{quadratic(xs);return [0][Symbol.iterator]()}}}}}} catch([value]) {{return value}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{try {{throw 0}} finally {{throw {{get value(){{return quadratic(xs)}}}}}}}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{try {{throw {{get value(){{return quadratic(xs)}}}}}} finally {{void 0}}}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{try {{throw 0}} catch {{throw {{get value(){{return quadratic(xs)}}}}}}}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{if(xs.length) throw {{get value(){{return quadratic(xs)}}}}; throw external()}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{for(const x of xs){{try {{throw {{get value(){{return quadratic(xs)}}}}}} catch({{value}}) {{void value}}}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{function later(){{throw {{get value(){{return quadratic(xs)}}}}}} throw {{value:0}}}} catch({{value}}) {{return value}}}}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{throw {{}}}} catch({{value=quadratic(xs)}}) {{return value}}}}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC} export function selected(xs:number[]){{for(const x of xs){{const {{value}}={{get value(){{return quadratic(xs)}}}};void value}}}}")), "O(N^3)", false),
+        (index_of(format!("{QUADRATIC} export function selected(xs:number[],n:number){{for(let i=0;i<n&&n>=0&&n<=1000000;i++){{try{{throw {{get value(){{return quadratic(xs)}}}}}}catch({{value}}){{void value}}}}}}")), "O(N^3)", true),
+    ];
+
+    assert_projected_selected(&cases);
+
+    for types in [TypeMode::Syntactic, TypeMode::Tsc] {
+        let (_, reasons) = support::selected_case_of(&cases[9].0, types);
+
+        assert!(
+            reasons.contains(&UnknownReason::Bound),
+            "{types:?}: {reasons:?}"
+        );
     }
 }

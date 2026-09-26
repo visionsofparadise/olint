@@ -2671,3 +2671,42 @@ fn rejected_counter_index_is_rebuilt_after_unused_limits_change() {
         );
     });
 }
+
+#[test]
+fn catch_source_budget_retains_ready_summary() {
+    let source = format!("/** @perf O(N^3) */ function known(){{}} export function root(){{known();try{{{}throw {{get value(){{return 1}}}}}}catch({{value}}){{return value}}}}", ";".repeat(512));
+
+    for (limit, exhausted) in [(128, true), (100_000, false)] {
+        run_with_source(&source, |analysis, file| {
+            limit_work(analysis, Event::TraversalEdge, limit);
+
+            assert_cubic_summary(analysis, file, "known");
+
+            let result = summary_of(analysis, file, "root");
+
+            assert_eq!(
+                reasons(analysis, result.unknowns).contains(&UnknownReason::ResourceExhaustion),
+                exhausted
+            );
+
+            if !exhausted {
+                assert_eq!(
+                    support::projected_class_of(&result.cost),
+                    Cost::parse("O(N^3)").unwrap()
+                );
+            }
+
+            assert_cubic_summary(analysis, file, "known");
+            assert_terminal(analysis.scheduler_stats());
+        });
+    }
+}
+
+fn assert_cubic_summary(analysis: &mut Analysis<'_, '_>, file: FileId, name: &str) {
+    let part = summary_of(analysis, file, name);
+
+    assert_eq!(
+        support::projected_class_of(&part.cost),
+        Cost::parse("O(N^3)").unwrap()
+    );
+}

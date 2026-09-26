@@ -12,6 +12,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 use oxc_syntax::scope::ScopeId;
 
+use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::constants::constant_initializer_of;
 use crate::cost::{Cost, ExecutionPhase, Part, Preference, Reading};
@@ -19,7 +20,7 @@ use crate::declarations::{Declaration, FunctionId, FunctionNode, TargetSet};
 use crate::declared_types::{is_primitive_result, Kind};
 use crate::project::{has_key_after_spread, FileId, JsxRuntime, Project};
 use crate::receivers::Placement;
-use crate::syntax::{member_expression_of, unwrap};
+use crate::syntax::{member_expression_of, unwrap, Root};
 use crate::unknowns::UnknownReason;
 use crate::values::{
     outermost_of, protocol_key_of, ArgumentFacts, Definedness, Iteration, MemberKey, ValueFacts,
@@ -1246,7 +1247,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             AstKind::FormalParameter(parameter) => {
                 Some(self.pattern_parameter_sources_of(file, parameter))
             }
-            AstKind::CatchParameter(_) => Some(open),
+            AstKind::CatchParameter(_) => Some(self.catch_sources_of(file, parent)),
             AstKind::AssignmentExpression(assignment) if assignment.left.span() == span => {
                 Some(Sources {
                     values: vec![(file, &assignment.right)],
@@ -1259,6 +1260,42 @@ impl<'p, 'a> Analysis<'p, 'a> {
             AstKind::ForInStatement(statement) if statement.left.span() == span => Some(open),
             _ => None,
         }
+    }
+
+    fn catch_sources_of(&mut self, file: FileId, parameter: NodeId) -> Sources<'a> {
+        let mut sources = Sources {
+            values: Vec::new(),
+            open: true,
+        };
+        let project = self.project;
+        let nodes = project.file(file).semantic.nodes();
+        let clause = nodes.parent_id(parameter);
+        let AstKind::TryStatement(statement) = nodes.parent_kind(clause) else {
+            return sources;
+        };
+
+        if statement
+            .handler
+            .as_ref()
+            .is_none_or(|handler| handler.node_id() != clause)
+        {
+            return sources;
+        }
+
+        for statement in &statement.block.body {
+            if !self.charge_work(Event::TraversalEdge, 1) {
+                break;
+            }
+
+            for kind in self.counted_subtree(file, Root::Statement(statement), Event::TraversalEdge)
+            {
+                if let AstKind::ThrowStatement(thrown) = kind {
+                    sources.values.push((file, &thrown.argument));
+                }
+            }
+        }
+
+        sources
     }
 
     fn pattern_parameter_sources_of(
