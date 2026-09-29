@@ -44,6 +44,13 @@ const MARKER_PACKAGE: &str = r#"require("node:fs").writeFileSync(require("node:p
 exports.checkSync = () => { throw new Error("analysed project recheck"); };
 "#;
 
+const CLOCKED_PACKAGE: &str = r#"let now = 0;
+const step = () => (now += 3600000);
+Date.now = step;
+performance.now = step;
+module.exports = require(RECHECK);
+"#;
+
 fn selected_of(body: &str) -> LegacyResult {
     classified_result_of(&format!("export function selected{body}"), "selected")
 }
@@ -76,6 +83,7 @@ fn copy_directory(from: &Path, to: &Path) {
 enum Dependency<'d> {
     Pinned,
     Missing,
+    Clocked,
     Fake {
         version: &'d str,
         behaviour: &'d str,
@@ -107,6 +115,25 @@ fn package_of(helper: Option<&str>, dependency: Dependency<'_>) -> TempDir {
             }
         }
         Dependency::Missing => {}
+        Dependency::Clocked => {
+            let package = modules.join("recheck");
+            let installed = Path::new(env!("CARGO_MANIFEST_DIR")).join("node_modules/recheck");
+
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("package.json"),
+                r#"{"name":"recheck","version":"4.5.0","main":"index.js"}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                package.join("index.js"),
+                CLOCKED_PACKAGE.replace(
+                    "RECHECK",
+                    &serde_json::to_string(&installed.to_string_lossy()).unwrap(),
+                ),
+            )
+            .unwrap();
+        }
         Dependency::Fake { version, behaviour } => {
             let package = modules.join("recheck");
 
@@ -468,7 +495,7 @@ fn unrequested_classifications_stay_unknown() {
 #[test]
 fn analysis_exhaustion_yields_unknown() {
     let limits = RegexLimits {
-        timeout: Duration::ZERO,
+        source_bytes: 4,
         ..RegexLimits::default()
     };
     let answers = ask(
@@ -588,7 +615,7 @@ fn helpers_request_only_automaton_analysis_without_recall() {
     assert_eq!(calls.len(), 1, "{lint:?}");
     assert_eq!(
         calls[0]["parameters"],
-        serde_json::json!({"checker":"automaton","recallTimeout":-1,"timeout":10000,"maxRecallStringSize":128})
+        serde_json::json!({"checker":"automaton","timeout":null,"recallTimeout":-1,"maxRecallStringSize":128})
     );
     assert_eq!(
         (
@@ -650,6 +677,8 @@ fn malformed_replies_are_tool_errors() {
         "return { ...answer(source, flags, { type: \"linear\", isFuzz: false }), status: \"maybe\" };",
         "return { ...answer(source, flags, { type: \"linear\", isFuzz: false }), error: { kind: \"timeout\" } };",
         "return { source, flags, status: \"unknown\", checker: \"automaton\", error: { kind: \"surprise\" } };",
+        "return { source, flags, status: \"unknown\", checker: \"automaton\", error: { kind: \"timeout\" } };",
+        "return { source, flags, status: \"unknown\", checker: \"automaton\", error: { kind: \"cancel\" } };",
         "return { source, flags, status: \"unknown\", error: { kind: \"x\".repeat(100000) } };",
         "return answer(source, flags, { type: \"cubic\", isFuzz: false });",
         "return answer(source, flags, { type: \"linear\", degree: 1, isFuzz: false });",
@@ -739,10 +768,24 @@ fn the_deadline_terminates_a_stuck_helper() {
         &limits,
     );
 
-    assert_eq!(
-        kinds_of(&answers.unwrap()),
-        ["bound", "exhausted", "exhausted"]
-    );
+    assert_eq!(answers, Err(RegexError::Deadline(Duration::from_secs(3))));
+}
+
+#[test]
+fn answers_are_identical_under_a_stubbed_clock() {
+    let requests = requests_of(&[
+        ("^a*a*$", ""),
+        ("^(a+)+$", ""),
+        ("\\s+", "g"),
+        ("^(?=a)a+$", ""),
+    ]);
+    let limits = RegexLimits::default();
+    let answers = ask(&repository_helper_of(), &requests, &limits).unwrap();
+    let clocked = package_of(Some(&helper_script_of()), Dependency::Clocked);
+    let stubbed = ask(&packaged_helper_of(&clocked), &requests, &limits).unwrap();
+
+    assert_eq!(kinds_of(&answers), ["bound", "unknown", "bound", "unknown"]);
+    assert_eq!(stubbed, answers);
 }
 
 #[test]
@@ -1009,7 +1052,7 @@ fn the_packaged_helper_resolves_its_own_dependency_from_another_cwd() {
         .stdin
         .take()
         .unwrap()
-        .write_all(br#"{"version":1,"timeout":10000,"requests":[{"source":"^a*a*$","flags":""}]}"#)
+        .write_all(br#"{"version":2,"requests":[{"source":"^a*a*$","flags":""}]}"#)
         .unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -1020,7 +1063,7 @@ fn the_packaged_helper_resolves_its_own_dependency_from_another_cwd() {
         .collect();
 
     assert_eq!(output.status.code(), Some(0), "{stdout}");
-    assert_eq!(lines[0], serde_json::json!({"version":1,"recheck":"4.5.0"}));
+    assert_eq!(lines[0], serde_json::json!({"version":2,"recheck":"4.5.0"}));
     assert_eq!(lines[1]["complexity"]["type"], "polynomial");
     assert_eq!(lines[1]["complexity"]["degree"], 2);
     assert!(!project.path().join("executed.txt").exists());

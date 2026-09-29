@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import workerThreads from "node:worker_threads";
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const RECHECK_VERSION = "4.5.0";
 const MALFORMED_REQUEST = 2;
 const PACKAGE_UNAVAILABLE = 3;
@@ -18,9 +18,6 @@ const fail = (status, message) => {
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
 if (input.version !== PROTOCOL_VERSION) {
 	fail(MALFORMED_REQUEST, `protocol version ${JSON.stringify(input.version)} where ${PROTOCOL_VERSION} is supported`);
-}
-if (!Number.isInteger(input.timeout) || input.timeout < 0) {
-	fail(MALFORMED_REQUEST, `timeout ${JSON.stringify(input.timeout)} is not a non-negative integer`);
 }
 if (
 	!Array.isArray(input.requests) ||
@@ -70,7 +67,7 @@ if (manifest.version !== RECHECK_VERSION) {
 }
 const { checkSync } = createRequire(manifestPath)("./");
 
-const parameters = { checker: "automaton", recallTimeout: -1, timeout: input.timeout, maxRecallStringSize: 128 };
+const parameters = { checker: "automaton", timeout: null, recallTimeout: -1, maxRecallStringSize: 128 };
 const reply = (value) => fs.writeSync(1, JSON.stringify(value) + "\n");
 
 reply({ version: PROTOCOL_VERSION, recheck: manifest.version });

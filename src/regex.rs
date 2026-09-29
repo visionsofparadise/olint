@@ -20,7 +20,7 @@ use crate::project::FileId;
 use crate::syntax::unwrap;
 use crate::unknowns::UnknownReason;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const RECHECK_VERSION: &str = "4.5.0";
 pub const QUALIFIED_MODEL: &str = "recheck 4.5.0 automaton ordered backtracking";
 pub const HELPER_NAME: &str = "regex_sidecar.mjs";
@@ -51,11 +51,11 @@ pub enum RegexAnswer {
 pub enum RegexError {
     Unavailable(String),
     Malformed(String),
+    Deadline(Duration),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegexLimits {
-    pub timeout: Duration,
     pub deadline: Duration,
     pub source_bytes: usize,
     pub requests: usize,
@@ -66,7 +66,6 @@ pub struct RegexLimits {
 impl Default for RegexLimits {
     fn default() -> Self {
         RegexLimits {
-            timeout: Duration::from_secs(10),
             deadline: Duration::from_secs(120),
             source_bytes: 4096,
             requests: 1024,
@@ -178,7 +177,6 @@ fn degree_cost_of(degree: u64) -> Result<Cost, CostError> {
 #[derive(Serialize)]
 struct WireRequest<'r> {
     version: u32,
-    timeout: u64,
     requests: Vec<WireEntry<'r>>,
 }
 
@@ -223,8 +221,6 @@ enum Class {
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Failure {
-    Timeout,
-    Cancel,
     Unsupported,
     Invalid,
 }
@@ -329,7 +325,6 @@ fn exchange(
 
     let wire = serde_json::to_vec(&WireRequest {
         version: PROTOCOL_VERSION,
-        timeout: u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
         requests: sent
             .iter()
             .map(|index| WireEntry {
@@ -474,13 +469,7 @@ fn exchange(
     };
 
     match outcome? {
-        Stop::Deadline => exhausted(
-            format!(
-                "regex analysis exceeded its {} second deadline",
-                limits.deadline.as_secs_f64()
-            ),
-            replies,
-        ),
+        Stop::Deadline => Err(RegexError::Deadline(limits.deadline)),
         Stop::Closed => match status {
             Some(0) if replies.len() == sent.len() => Ok(replies),
             Some(0) => Err(RegexError::Malformed(format!(
@@ -564,11 +553,6 @@ fn answer_of(text: &str, request: &RegexRequest) -> Result<RegexAnswer, RegexErr
     }
 
     match (reply.status, reply.complexity, reply.error) {
-        (Status::Unknown, None, Some(Failure::Timeout | Failure::Cancel)) => {
-            Ok(RegexAnswer::Exhausted {
-                reason: "recheck exhausted its analysis budget".to_string(),
-            })
-        }
         (Status::Unknown, None, Some(Failure::Unsupported)) => Ok(RegexAnswer::Unknown {
             reason: "recheck does not support this pattern".to_string(),
         }),

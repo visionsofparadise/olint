@@ -104,6 +104,10 @@ impl fmt::Display for Failure {
             Failure::Regex(RegexError::Unavailable(message)) => {
                 format!("regex classification unavailable: {message}")
             }
+            Failure::Regex(RegexError::Deadline(deadline)) => format!(
+                "regex helper exceeded its {} second deadline",
+                deadline.as_secs_f64()
+            ),
             Failure::Usage(message) => message.clone(),
         };
 
