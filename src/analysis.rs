@@ -87,7 +87,7 @@ pub struct Analysis<'p, 'a> {
     pub(crate) latent_readings: HashMap<crate::summaries::SummaryId, Reading>,
     pub(crate) suspensions: HashMap<(FileId, NodeId), bool>,
     pub(crate) latent_returns: HashMap<(FunctionId, u64), crate::summaries::LatentSources>,
-    pub(crate) pending_scoped: HashMap<(FileId, NodeId, crate::cost::ExecutionPhase), Part>,
+    pub(crate) pending_scoped: IndexMap<(FileId, NodeId, crate::cost::ExecutionPhase), Part>,
     pub(crate) pending_effects:
         HashMap<SummaryKey, Option<Vec<(crate::unknowns::SourceSpan, Effects)>>>,
     pub(crate) interference: Effects,
@@ -150,7 +150,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             latent_readings: HashMap::new(),
             suspensions: HashMap::new(),
             latent_returns: HashMap::new(),
-            pending_scoped: HashMap::new(),
+            pending_scoped: IndexMap::new(),
             pending_effects: HashMap::new(),
             interference: Effects::default(),
             pending_enabled: None,

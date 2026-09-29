@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use indexmap::IndexSet;
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, FormalParameter, MethodDefinitionKind,
     PropertyKind,
@@ -43,6 +44,16 @@ const MAXIMUM_RECURRENCE_ROUNDS: usize = 4;
 mod tests;
 
 pub type Substitutions = HashMap<Binding, ArgumentFacts>;
+
+fn ordered_substitutions(substitutions: &Substitutions) -> Vec<(&Binding, &ArgumentFacts)> {
+    let mut entries: Vec<_> = substitutions.iter().collect();
+
+    entries.sort_by_key(|(binding, _)| match binding {
+        Binding::Symbol { file, symbol } => (file.0, symbol.index()),
+    });
+
+    entries
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SummaryId(pub u32);
@@ -224,12 +235,12 @@ struct SummaryTask {
     root_id: usize,
     inputs: Substitutions,
     state: TaskState,
-    dependencies: HashSet<TaskId>,
+    dependencies: IndexSet<TaskId>,
     pending_children: usize,
     recurrence_members: Arc<HashSet<FunctionId>>,
     stable_loops: HashMap<(FileId, NodeId), (Reading, Effects)>,
     invocations: HashMap<(crate::unknowns::SourceSpan, FunctionId), (Vec<TaskId>, bool)>,
-    waiters: HashSet<TaskId>,
+    waiters: IndexSet<TaskId>,
     credit: Option<FallbackCredit>,
     fallback: bool,
     passes: u64,
@@ -472,7 +483,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut available = std::collections::HashSet::new();
         let referenced = cost.names();
         let mut roots = Vec::new();
-        let mut inputs: Vec<_> = inputs.iter().collect();
+        let mut inputs = ordered_substitutions(inputs);
 
         inputs.sort_by_key(|(binding, _)| {
             let depth = match self.declarations.of_binding(self.project, **binding) {
@@ -656,8 +667,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Err(crate::unknowns::SemanticError::Resource);
         }
 
-        let mut facts: Vec<_> = substitutions
-            .iter()
+        let facts = ordered_substitutions(substitutions)
+            .into_iter()
             .map(|(binding, facts)| {
                 let mut value = facts.value.clone();
 
@@ -771,10 +782,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             })
             .collect::<Result<Vec<_>, crate::unknowns::SemanticError>>()?;
 
-        facts.sort_by_key(|facts| match facts.binding {
-            Binding::Symbol { file, symbol } => (file.0, symbol.index()),
-        });
-
         Ok(SummaryKey {
             interference: Effects::default(),
             storage_arguments: self.storage_arguments.clone(),
@@ -862,9 +869,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let is_root = self.root_sizes.is_none();
 
         if is_root {
-            let mut roots: Vec<_> = substitutions
-                .values()
-                .filter_map(|facts| facts.value.size.clone())
+            let mut roots: Vec<_> = ordered_substitutions(&substitutions)
+                .into_iter()
+                .filter_map(|(_, facts)| facts.value.size.clone())
                 .collect();
 
             roots.sort_by_key(Cost::structural_key);
@@ -887,19 +894,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub fn summary_records_for(&self, function: FunctionId) -> Vec<&SummaryRecord> {
-        self.summaries
+        let mut ids: Vec<_> = self
+            .summaries
             .iter()
             .filter(|(key, _)| key.function == function)
-            .map(|(_, id)| &self.summaries_arena[id.0 as usize])
+            .map(|(_, id)| id.0)
+            .collect();
+
+        ids.sort_unstable();
+
+        ids.into_iter()
+            .map(|id| &self.summaries_arena[id as usize])
             .collect()
     }
     pub fn member_local_records_for(&self, function: FunctionId) -> Vec<&SummaryRecord> {
-        self.scheduler
+        let mut records: Vec<_> = self
+            .scheduler
             .local_records
             .iter()
             .filter(|(id, _)| self.scheduler.tasks[id.0].key.function == function)
-            .map(|(_, record)| record)
-            .collect()
+            .collect();
+
+        records.sort_unstable_by_key(|(id, _)| id.0);
+
+        records.into_iter().map(|(_, record)| record).collect()
     }
     pub fn scheduler_stats(&self) -> SchedulerStats {
         SchedulerStats {
@@ -1148,12 +1166,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             root_id,
             inputs,
             state: TaskState::Queued,
-            dependencies: HashSet::new(),
+            dependencies: IndexSet::new(),
             pending_children: 0,
             recurrence_members: Arc::default(),
             stable_loops: HashMap::new(),
             invocations: HashMap::new(),
-            waiters: HashSet::new(),
+            waiters: IndexSet::new(),
             credit: Some(credit),
             fallback: false,
             passes: 0,

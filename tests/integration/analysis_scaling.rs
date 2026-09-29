@@ -3168,3 +3168,74 @@ fn repeated_discovery_checks_availability_once_and_keeps_the_frozen_wrapper() {
         assert_eq!(calls, 2);
     });
 }
+
+const SCHEDULING_CHILD: &str = "OLINT_SCHEDULING_CHILD";
+
+fn scheduling_outcomes() -> Vec<String> {
+    let loops = "for(const x of xs){for(const y of xs){x+y}}".repeat(6);
+    let source = format!("function r(xs:number[],n:number):number{{if(n>0){{s(xs,n-1);t(xs,n-1)}}return 1}} function s(xs:number[],n:number):number{{if(n>0){{r(xs,n-1);t(xs,n-1)}}{loops}return 1}} function t(xs:number[],n:number):number{{if(n>0){{r(xs,n-1);s(xs,n-1)}}return 1}} export function root(xs:number[]){{r(xs,3);s(xs,3);t(xs,3)}}");
+    let mut outcomes = Vec::new();
+
+    for (event, limit) in [
+        (Event::TaskKey, 100_000),
+        (Event::TaskKey, 6),
+        (Event::BodyPass, 5),
+    ] {
+        for _ in 0..4 {
+            run_with_source(&source, |analysis, file| {
+                limit_work(analysis, event, limit);
+
+                let part = summary_of(analysis, file, "root");
+
+                outcomes.push(format!(
+                    "{event:?} {limit}: {:?} {} {:?} {:?}",
+                    part.cost,
+                    part.is_complete(),
+                    reasons(analysis, part.unknowns),
+                    analysis.scheduler_stats()
+                ));
+            });
+        }
+    }
+
+    outcomes
+}
+
+#[test]
+fn scheduling_is_identical_across_processes() {
+    if std::env::var_os(SCHEDULING_CHILD).is_some() {
+        for outcome in scheduling_outcomes() {
+            println!("outcome {outcome}");
+        }
+
+        return;
+    }
+
+    let mut outcomes = BTreeSet::new();
+
+    for _ in 0..4 {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "analysis_scaling::scheduling_is_identical_across_processes",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SCHEDULING_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+
+        assert!(output.status.success(), "{stdout}");
+        assert_eq!(stdout.matches("outcome ").count(), 12, "{stdout}");
+
+        outcomes.extend(
+            stdout
+                .lines()
+                .filter_map(|line| line.split_once("outcome "))
+                .map(|(_, outcome)| outcome.to_string()),
+        );
+    }
+
+    assert_eq!(outcomes.len(), 3, "{outcomes:#?}");
+}

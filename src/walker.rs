@@ -432,11 +432,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let inner = std::mem::replace(&mut self.pending_scoped, outer);
 
         for (scope, part) in inner {
-            let pending = self.pending_scoped.remove(&scope).unwrap_or_default().max(
-                part.preferred(preference),
-                &mut self.unknowns,
-                &mut self.traces,
-            );
+            let pending = self
+                .pending_scoped
+                .shift_remove(&scope)
+                .unwrap_or_default()
+                .max(
+                    part.preferred(preference),
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
 
             self.pending_scoped.insert(scope, pending);
         }
@@ -1521,7 +1525,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         for phase in phases {
-            if let Some(hoisted) = self.pending_scoped.remove(&(file, node, phase)) {
+            if let Some(hoisted) = self.pending_scoped.shift_remove(&(file, node, phase)) {
                 body.join(
                     phase,
                     Completion::Normal,
@@ -1683,7 +1687,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if let (true, Some(scope)) = (cancels, scope) {
                 let pending = self
                     .pending_scoped
-                    .remove(&(file, scope, phase))
+                    .shift_remove(&(file, scope, phase))
                     .unwrap_or_default()
                     .max(looped, &mut self.unknowns, &mut self.traces);
 
