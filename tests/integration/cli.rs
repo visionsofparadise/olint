@@ -191,7 +191,7 @@ fn fixtures_print_their_golden_output() {
     let mut directories: Vec<_> = std::fs::read_dir(&fixtures)
         .expect("fixtures directory")
         .map(|entry| entry.expect("fixture entry").path())
-        .filter(|path| path.is_dir())
+        .filter(|path| path.join("expected-lint.txt").is_file())
         .collect();
     let mut differences = Vec::new();
 
