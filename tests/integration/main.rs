@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod constants;
 mod costs;
+mod dead_ends;
 mod declarations;
 mod declared_types;
 mod directives;
