@@ -2,3 +2,4 @@ package-lock.json
 Cargo.lock
 tests/fixtures/
 corpus/ledger.json
+proofs/lake-manifest.json

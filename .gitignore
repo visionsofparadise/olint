@@ -12,3 +12,4 @@ target/
 gen/
 corpus/.cache/
 corpus/target/
+proofs/.lake/

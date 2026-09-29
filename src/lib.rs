@@ -10,6 +10,7 @@ pub mod directives;
 pub mod effects;
 pub mod flow;
 pub mod invocations;
+pub mod lean_syntax;
 pub mod native;
 pub mod paths;
 pub mod project;

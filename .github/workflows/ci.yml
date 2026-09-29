@@ -41,3 +41,15 @@ jobs:
          - run: cargo check --locked --all-targets
            env:
               RUSTUP_TOOLCHAIN: 1.96.0
+
+   proofs:
+      runs-on: ubuntu-latest
+      steps:
+         - uses: actions/checkout@v7.0.1
+         - name: Install elan
+           run: |
+              curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+              echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+         - name: Fetch the Mathlib cache
+           run: cd proofs && lake exe cache get
+         - run: npm run proofs
