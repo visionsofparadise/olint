@@ -20,6 +20,7 @@ mod public;
 mod receivers;
 mod recurrences;
 mod regex;
+mod snapshot;
 mod summaries;
 mod summary_fallback;
 mod summary_recording;

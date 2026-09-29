@@ -130,7 +130,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.warn_conflict(&tags, site);
 
-        preference_of(&tags)
+        let preference = preference_of(&tags);
+
+        if preference.is_some() {
+            self.assertions += 1;
+        }
+
+        preference
     }
 
     pub fn function_tags(&mut self, file: FileId, function: FunctionNode<'a>) -> Vec<PerfTag> {

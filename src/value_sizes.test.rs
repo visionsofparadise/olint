@@ -65,6 +65,7 @@ fn value_facts_receive_only_constant_cardinality() {
         crate::analysis::Options {
             minimum_exponent: 2,
             types: crate::analysis::TypeMode::Syntactic,
+            record_nodes: false,
         },
     );
     let inputs = analysis.function_inputs(file, function, Default::default());

@@ -273,6 +273,28 @@ impl Unknowns {
         Ok(SemanticKeyId(completed.expect("root evaluation completed")))
     }
 
+    pub fn origins(&self, root: Option<UnknownId>) -> Vec<&Unknown> {
+        let mut pending: Vec<_> = root.into_iter().collect();
+        let mut visited = HashSet::new();
+        let mut found = Vec::new();
+
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+
+            match self.node(id) {
+                UnknownNode::Origin(unknown) => found.push(unknown),
+                UnknownNode::Call { child, .. } | UnknownNode::Scale { child, .. } => {
+                    pending.push(*child)
+                }
+                UnknownNode::Join { children } => pending.extend(children),
+            }
+        }
+
+        found
+    }
+
     pub fn lines(&self, project: &Project<'_>, root: UnknownId) -> Vec<String> {
         self.lines_with(project, root, &|id, out| write!(out, "size_{id}"))
     }

@@ -305,6 +305,7 @@ fn results_of(source: &str, types: TypeMode, names: &[&str]) -> Vec<(Cost, bool)
             Options {
                 minimum_exponent: 2,
                 types,
+                record_nodes: false,
             },
         );
 

@@ -233,6 +233,7 @@ struct SummaryTask {
     credit: Option<FallbackCredit>,
     fallback: bool,
     passes: u64,
+    asserted: bool,
     produced: Option<Produced>,
     deferred_reading: Option<Reading>,
     deferred_storage: Option<crate::effects::Storage>,
@@ -296,6 +297,7 @@ pub(crate) struct Scheduler {
     work: WorkBudget,
     tasks: Vec<SummaryTask>,
     keys: HashMap<SummaryKey, TaskId>,
+    recorded: HashSet<SummaryKey>,
     root_ids: HashMap<Vec<Cost>, usize>,
     closed_ready: HashMap<(FunctionId, bool, usize), TaskId>,
     queue: VecDeque<TaskId>,
@@ -342,6 +344,7 @@ impl Scheduler {
             work: WorkBudget::new(limits.work),
             tasks: Vec::new(),
             keys: HashMap::new(),
+            recorded: HashSet::new(),
             root_ids: HashMap::new(),
             closed_ready: HashMap::new(),
             queue: VecDeque::new(),
@@ -854,6 +857,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         substitutions: Substitutions,
         raw: bool,
     ) -> Reading {
+        let recorded = substitutions.is_empty() && self.scheduler.active.is_none();
         let substitutions = self.function_inputs(file, function, substitutions);
         let is_root = self.root_sizes.is_none();
 
@@ -873,7 +877,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.root_sizes = Some(roots);
         }
 
-        let reading = self.summarize_in(file, function, substitutions, raw);
+        let reading = self.summarize_in(file, function, substitutions, raw, recorded && is_root);
 
         if is_root {
             self.root_sizes = None;
@@ -934,6 +938,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     pub(crate) fn charge_work(&mut self, event: Event, amount: u64) -> bool {
         self.charge_work_set(Charges::one(event, amount))
+    }
+
+    fn note_summary_assertions(&mut self, id: SummaryId) {
+        if self.asserted_summaries.contains(&id) {
+            self.assertions += 1;
+        }
     }
 
     pub(crate) fn fallback_active(&self) -> bool {
@@ -1147,6 +1157,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             credit: Some(credit),
             fallback: false,
             passes: 0,
+            asserted: false,
             produced: None,
             deferred_reading: None,
             deferred_storage: None,
@@ -1162,7 +1173,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn request_reading(&mut self, key: SummaryKey, inputs: Substitutions) -> (Reading, bool) {
         if self.scheduler.active.is_none() {
-            if let Some(id) = self.summaries.get(&key) {
+            if let Some(id) = self.summaries.get(&key).copied() {
+                self.note_summary_assertions(id);
+
                 return (self.summaries_arena[id.0 as usize].reading.clone(), false);
             }
         }
@@ -1226,6 +1239,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if let TaskState::Ready(record) = self.scheduler.tasks[id.0].state {
+            self.note_summary_assertions(record);
+
             let reading = self.summaries_arena[record.0 as usize].reading.clone();
             let recurrence = Arc::clone(&self.scheduler.tasks[id.0].recurrence_members);
             let cyclic = self.scheduler.active.is_some_and(|parent| {
@@ -1264,10 +1279,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.drive_summaries();
 
         match self.scheduler.tasks[id.0].state {
-            TaskState::Ready(record) => (
-                self.summaries_arena[record.0 as usize].reading.clone(),
-                false,
-            ),
+            TaskState::Ready(record) => {
+                self.note_summary_assertions(record);
+
+                (
+                    self.summaries_arena[record.0 as usize].reading.clone(),
+                    false,
+                )
+            }
             _ => unreachable!("summary driver drains admitted roots"),
         }
     }
@@ -1278,6 +1297,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         function: FunctionNode<'a>,
         substitutions: Substitutions,
         raw: bool,
+        recorded: bool,
     ) -> Reading {
         let substitutions = self.function_inputs(file, function, substitutions);
         let Ok(mut key) = self.key_of(file, function, &substitutions) else {
@@ -1290,6 +1310,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             );
         };
         key.raw = raw;
+
+        if recorded && self.options.record_nodes {
+            self.scheduler.recorded.insert(key.clone());
+        }
 
         self.request_reading(key, substitutions).0
     }
@@ -1315,6 +1339,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let storage = self.scheduler.tasks[id.0].deferred_storage.take();
         let record = self.store_summary(key, reading, effects, produced, deferred, storage);
         self.scheduler.tasks[id.0].state = TaskState::Ready(record);
+
+        if self.options.record_nodes && self.scheduler.tasks[id.0].asserted {
+            self.asserted_summaries.insert(record);
+        }
 
         let task = &self.scheduler.tasks[id.0];
 
@@ -1393,6 +1421,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let saved_bounds = std::mem::take(&mut self.bound_seen);
         let saved_warnings = std::mem::take(&mut self.warnings);
         let saved_errors = std::mem::take(&mut self.errors);
+        let recording = (self.options.record_nodes
+            && self.scheduler.recorded.contains(&key)
+            && key.raw == cost_tag_of(&self.function_tags(key.function.file, function)).is_some())
+        .then_some(key.function);
+        let saved_recording = std::mem::replace(&mut self.recording, recording);
+        let assertions = self.assertions;
         self.scheduler.active = Some(id);
 
         self.scheduler.missing.clear();
@@ -1451,6 +1485,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.interference = saved_interference;
         self.storage_arguments = saved_storage;
         self.collecting_pending = saved_collecting;
+        self.recording = saved_recording;
+        self.scheduler.tasks[id.0].asserted |= self.assertions != assertions;
         let pending = std::mem::take(&mut self.scheduler.missing);
         let exhausted = self.scheduler.exhausted;
         let warnings = std::mem::replace(&mut self.warnings, saved_warnings);
@@ -2379,6 +2415,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if tags.contains(&PerfTag::Ignore) {
                 self.stats.count("@perf ignore: function");
 
+                self.assertions += 1;
+
                 self.current_effects = Effects::unknown();
 
                 return Reading::empty();
@@ -2386,6 +2424,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if let Some((cost, text)) = cost_tag_of(&tags) {
                 self.stats.count("@perf O(...): function");
+
+                self.assertions += 1;
 
                 let (cost, unresolved) =
                     match cost.bind_known(&mut |cost| self.bind_cost_in(cost, substitutions)) {
@@ -4454,6 +4494,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .get(&record)
                 .cloned()
                 .filter(|_| consume);
+
+            self.note_summary_assertions(record);
+
             let record = self.summaries_arena[record.0 as usize].clone();
 
             self.current_effects.join(&record.effects);
@@ -4764,6 +4807,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.bound_seen.clear();
         self.counter_writes.clear();
+        self.node_records.clear();
         self.pending_scoped.clear();
         self.pending_effects.clear();
         self.scheduling.clear();
@@ -5434,6 +5478,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn record_latent_of(&mut self, id: SummaryId, generator: bool) -> Latent {
+        self.note_summary_assertions(id);
+
         let record = &self.summaries_arena[id.0 as usize];
         let reading = record.reading.clone();
         let yields = match (record.result.latent.is_some(), generator) {

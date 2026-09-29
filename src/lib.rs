@@ -18,6 +18,7 @@ pub mod receivers;
 pub mod recurrences;
 pub mod regex;
 pub mod report;
+pub mod snapshot;
 pub mod summaries;
 pub mod syntax;
 pub mod tables;

@@ -11,6 +11,7 @@ use support::{file_of, first_node_of, run_in_project};
 const OPTIONS: Options = Options {
     minimum_exponent: 2,
     types: TypeMode::Syntactic,
+    record_nodes: false,
 };
 
 fn arrow_of<'a>(initializer: Option<&'a Expression<'a>>) -> Option<FunctionNode<'a>> {

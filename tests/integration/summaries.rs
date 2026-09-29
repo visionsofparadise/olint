@@ -156,6 +156,7 @@ fn an_erased_this_parameter_consumes_no_callback_argument_with_compiler_types() 
                 Options {
                     minimum_exponent: 2,
                     types: TypeMode::Tsc,
+                    record_nodes: false,
                 },
             );
             let functions = analysis.reportable();

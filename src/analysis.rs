@@ -29,6 +29,7 @@ pub enum TypeMode {
 pub struct Options {
     pub minimum_exponent: u32,
     pub types: TypeMode,
+    pub record_nodes: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -110,6 +111,10 @@ pub struct Analysis<'p, 'a> {
     pub(crate) prototype_members: crate::values::PrototypeMembers<'a>,
     pub regex_answers: HashMap<crate::regex::RegexRequest, crate::regex::RegexAnswer>,
     pub(crate) needed_regex: IndexSet<crate::regex::RegexRequest>,
+    pub(crate) recording: Option<FunctionId>,
+    pub(crate) assertions: u64,
+    pub(crate) asserted_summaries: HashSet<SummaryId>,
+    pub(crate) node_records: HashMap<crate::snapshot::RecordKey, crate::snapshot::NodeRecord>,
 }
 
 impl<'p, 'a> Analysis<'p, 'a> {
@@ -167,6 +172,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             prototype_members: HashMap::new(),
             regex_answers: HashMap::new(),
             needed_regex: IndexSet::new(),
+            recording: None,
+            assertions: 0,
+            asserted_summaries: HashSet::new(),
+            node_records: HashMap::new(),
         }
     }
 }

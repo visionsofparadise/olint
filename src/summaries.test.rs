@@ -34,6 +34,7 @@ fn retained_lazy_callbacks_cannot_alias_a_new_generation() {
         Options {
             minimum_exponent: 2,
             types: crate::analysis::TypeMode::Syntactic,
+            record_nodes: false,
         },
     );
     let old = analysis.argument_facts_of(file, &call.arguments[0]);
@@ -107,6 +108,7 @@ fn resource_fallback_keeps_observed_scheduled_and_joined_latent_work() {
         Options {
             minimum_exponent: 2,
             types: crate::analysis::TypeMode::Syntactic,
+            record_nodes: false,
         },
     );
 

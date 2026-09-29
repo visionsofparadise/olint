@@ -188,6 +188,7 @@ fn run_with_ask(
     let options = Options {
         minimum_exponent: cli.min,
         types: cli.types,
+        record_nodes: false,
     };
     let mut analysis = Analysis::new(&project, options);
     let mut assisted = analysis.options.types != TypeMode::Syntactic;

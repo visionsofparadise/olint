@@ -269,6 +269,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     fn inner_bound_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Bound {
         if self.perf_tags(file, loop_kind).contains(&PerfTag::Bounded) {
+            self.assertions += 1;
+
             return constant_bound_of("@perf bounded");
         }
 

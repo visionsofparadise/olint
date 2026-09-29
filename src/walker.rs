@@ -347,6 +347,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn cost_of_node(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
+        let Some(function) = self.recording.filter(|_| !is_deferred_kind(&kind)) else {
+            return self.unrecorded_cost_of_node(file, kind);
+        };
+        let assertions = self.assertions;
+        let reading = self.unrecorded_cost_of_node(file, kind);
+        let asserted = self.assertions != assertions;
+
+        self.record_node(file, kind, function, &reading, asserted);
+
+        reading
+    }
+
+    fn unrecorded_cost_of_node(&mut self, file: FileId, kind: AstKind<'a>) -> Reading {
         if !self.charge_work(Event::WalkerNode, 1) {
             return Reading::of_part(self.deferred_unknown(
                 file,
@@ -389,6 +402,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             self.stats.count("@perf ignore: statement");
 
+            self.assertions += 1;
+
             return Reading::empty();
         }
 
@@ -409,6 +424,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         } else {
             "@perf cold: statement"
         });
+
+        self.assertions += 1;
 
         let outer = std::mem::take(&mut self.pending_scoped);
         let reading = self.reading_of_node(file, kind, &tags);
@@ -435,6 +452,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             self.stats.count("@perf bounded: statement");
 
+            self.assertions += 1;
+
             return Reading::empty();
         }
 
@@ -446,6 +465,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             } else {
                 "@perf O(...): statement"
             });
+
+            self.assertions += 1;
 
             let site = self.site_of_node(file, kind.node_id());
 

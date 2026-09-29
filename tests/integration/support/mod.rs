@@ -54,6 +54,7 @@ pub fn file_of(project: &Project<'_>, root: &Path, relative: &str) -> FileId {
 pub const SYNTACTIC: Options = Options {
     minimum_exponent: 2,
     types: TypeMode::Syntactic,
+    record_nodes: false,
 };
 
 pub fn assert_scheduler_terminal(stats: olint::summaries::SchedulerStats) {
@@ -74,29 +75,12 @@ pub fn unknown_reasons(
     analysis: &Analysis<'_, '_>,
     root: Option<olint::unknowns::UnknownId>,
 ) -> std::collections::BTreeSet<olint::unknowns::UnknownReason> {
-    use olint::unknowns::UnknownNode;
-
-    let mut pending: Vec<_> = root.into_iter().collect();
-    let mut visited = std::collections::HashSet::new();
-    let mut found = std::collections::BTreeSet::new();
-
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
-            continue;
-        }
-
-        match analysis.unknowns.node(id) {
-            UnknownNode::Origin(unknown) => {
-                found.insert(unknown.reason);
-            }
-            UnknownNode::Call { child, .. } | UnknownNode::Scale { child, .. } => {
-                pending.push(*child)
-            }
-            UnknownNode::Join { children } => pending.extend(children),
-        }
-    }
-
-    found
+    analysis
+        .unknowns
+        .origins(root)
+        .into_iter()
+        .map(|unknown| unknown.reason)
+        .collect()
 }
 
 pub fn probes_of<'a>(project: &Project<'a>, file: FileId) -> Vec<&'a Expression<'a>> {
@@ -388,6 +372,7 @@ pub fn project_result_in(
         olint::analysis::Options {
             minimum_exponent: 2,
             types,
+            record_nodes: false,
         },
     );
 
