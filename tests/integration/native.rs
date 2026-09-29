@@ -205,12 +205,6 @@ fn json_callbacks_run_for_every_visited_value() {
         ),
         (
             "",
-            "(s: string, xs: number[]) { return JSON.parse(s, (_, value) => { quadratic(xs); return value; }); }",
-            "O(N^3)",
-            true,
-        ),
-        (
-            "",
             r#"(xs: number[]) { return JSON.stringify(xs, ["a"]); }"#,
             "O(N)",
             true,
@@ -313,7 +307,7 @@ fn unknown_callbacks_keep_known_work_and_stay_partial() {
         ),
         (
             "(s: string, reviver: (key: string, value: unknown) => unknown) { return JSON.parse(s, reviver); }",
-            "O(N)",
+            "O(1)",
         ),
         (
             "(xs: number[], key: (x: number) => string) { return Map.groupBy(xs, key); }",
@@ -331,25 +325,132 @@ fn unknown_callbacks_keep_known_work_and_stay_partial() {
 
         if body.contains("Map.groupBy") { assert!(reasons.contains(&UnknownReason::Bound), "{reasons:?}"); }
 
+        if body.contains("JSON.parse") {
+            assert!(
+                reasons.contains(&UnknownReason::ImplementationDefined),
+                "{reasons:?}"
+            );
+        }
+
         assert!(reasons.contains(&UnknownReason::Target), "{body}: {reasons:?}");
     }
 }
 
 #[test]
-fn array_from_and_sort_comparator_controls_remain() {
-    assert_selected(&[
+fn array_from_callbacks_run_per_element() {
+    assert_selected(&[(
+        "",
+        "(xs: number[]) { return Array.from(xs, () => quadratic(xs)); }",
+        "O(N^3)",
+        true,
+    )]);
+}
+
+fn assert_partial_with(cases: &[(&str, &str, &str)], reason: UnknownReason) {
+    for (declarations, body, expected) in cases {
+        let (cost, complete, reasons) = selected_of(declarations, body);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert!(!complete, "{body}: {reasons:?}");
+        assert!(reasons.contains(&reason), "{body}: {reasons:?}");
+    }
+}
+
+fn assert_implementation_defined(cases: &[(&str, &str, &str)]) {
+    assert_partial_with(cases, UnknownReason::ImplementationDefined);
+}
+
+#[test]
+fn sorts_call_their_comparator_an_implementation_defined_number_of_times() {
+    assert_implementation_defined(&[
+        ("", "(xs: number[]) { return xs.sort(); }", "O(1)"),
+        ("", "(xs: number[]) { return xs.toSorted(); }", "O(1)"),
+        ("", "(xs: Uint8Array) { return xs.sort(); }", "O(1)"),
+        ("", "(xs: Float64Array) { return xs.toSorted(); }", "O(1)"),
+        ("", "() { return [3, 1, 2].sort(); }", "O(1)"),
         (
             "",
-            "(xs: number[]) { return Array.from(xs, () => quadratic(xs)); }",
-            "O(N^3)",
-            true,
+            "(xs: number[]) { return xs.sort((a, b) => a - b); }",
+            "O(1)",
         ),
         (
             "",
             "(xs: number[]) { return xs.sort(() => scan(xs)); }",
-            "O(N^2 log N)",
-            true,
+            "O(N)",
         ),
+        (
+            "",
+            "(xs: number[]) { return xs.toSorted(() => scan(xs)); }",
+            "O(N)",
+        ),
+    ]);
+}
+
+#[test]
+fn locale_and_unicode_string_methods_are_unknown_contributions() {
+    assert_implementation_defined(&[
+        (
+            "",
+            "(s: string, t: string) { return s.localeCompare(t); }",
+            "O(1)",
+        ),
+        ("", "(s: string) { return s.toLocaleLowerCase(); }", "O(1)"),
+        ("", "(s: string) { return s.toLocaleUpperCase(); }", "O(1)"),
+        ("", r#"(s: string) { return s.normalize("NFD"); }"#, "O(1)"),
+        ("", "(s: string) { return s.toLowerCase(); }", "O(1)"),
+        ("", "(s: string) { return s.toUpperCase(); }", "O(1)"),
+        ("", "(s: string) { return s.trim(); }", "O(1)"),
+        ("", "(s: string) { return s.trimStart(); }", "O(1)"),
+        ("", "(s: string) { return s.trimEnd(); }", "O(1)"),
+        ("", r#"() { return "Ab".toLowerCase(); }"#, "O(1)"),
+        (
+            "",
+            "(xs: number[], s: string) { for (const x of xs) s.trim(); }",
+            "O(N)",
+        ),
+    ]);
+}
+
+#[test]
+fn json_parse_is_an_unknown_contribution_and_its_reviver_count_is_unknown() {
+    assert_implementation_defined(&[
+        ("", "(s: string) { return JSON.parse(s); }", "O(1)"),
+        (
+            "",
+            "(s: string, xs: number[]) { return JSON.parse(s, (_, value) => { quadratic(xs); return value; }); }",
+            "O(N^2)",
+        ),
+    ]);
+}
+
+#[test]
+fn host_buffer_and_structured_clone_are_unknown_contributions() {
+    let buffer = "declare const Buffer: { from(value: unknown): unknown; concat(list: unknown[], total?: number): unknown; alloc(size: number): unknown; allocUnsafe(size: number): unknown; compare(a: unknown, b: unknown): number };";
+
+    assert_implementation_defined(&[
+        (buffer, "(s: string) { return Buffer.from(s); }", "O(1)"),
+        (
+            buffer,
+            "(a: Uint8Array, b: Uint8Array) { return Buffer.concat([a, b]); }",
+            "O(1)",
+        ),
+        (
+            buffer,
+            "(parts: Uint8Array[]) { return Buffer.concat(parts); }",
+            "O(1)",
+        ),
+        (buffer, "(n: number) { return Buffer.alloc(n); }", "O(1)"),
+        (
+            buffer,
+            "(n: number) { return Buffer.allocUnsafe(n); }",
+            "O(1)",
+        ),
+        (
+            buffer,
+            "(a: Uint8Array, b: Uint8Array) { return Buffer.compare(a, b); }",
+            "O(1)",
+        ),
+        ("", "(xs: number[]) { return structuredClone(xs); }", "O(1)"),
     ]);
 }
 
@@ -386,12 +487,18 @@ fn namespace_models_require_intrinsic_identity() {
         "{reasons:?}"
     );
 
-    assert_selected(&[(
+    let (cost, complete, reasons) = selected_of(
         "declare const Buffer: { concat(list: unknown[]): unknown };",
         "(parts: unknown[]) { return Buffer.concat(parts); }",
-        "O(N^2)",
-        true,
-    )]);
+    );
+
+    assert_eq!(cost, Cost::ONE);
+    assert!(!complete);
+    assert!(
+        reasons.contains(&UnknownReason::ImplementationDefined)
+            && !reasons.contains(&UnknownReason::Target),
+        "{reasons:?}"
+    );
 }
 
 #[test]
@@ -666,38 +773,6 @@ fn independent_inner_sizes_stay_explicit() {
 }
 
 #[test]
-fn buffer_concatenation_charges_every_part() {
-    let buffer = "declare const Buffer: { concat(list: unknown[], total?: number): unknown };";
-
-    assert_selected(&[
-        (
-            buffer,
-            "(a: Uint8Array, b: Uint8Array) { return Buffer.concat([a, b]); }",
-            "O(N)",
-            true,
-        ),
-        (
-            buffer,
-            "(parts: Uint8Array[]) { return Buffer.concat(parts); }",
-            "O(N^2)",
-            true,
-        ),
-        (
-            buffer,
-            "(a: Uint8Array, total: number) { return Buffer.concat([a], total); }",
-            "O(N)",
-            true,
-        ),
-        (
-            buffer,
-            "() { return Buffer.concat([new Uint8Array(2), new Uint8Array(3)]); }",
-            "O(1)",
-            true,
-        ),
-    ]);
-}
-
-#[test]
 fn repeated_strings_keep_materialization_unknown() {
     for body in [
         r#"(count: number) { return "x".repeat(count); }"#,
@@ -734,16 +809,7 @@ fn repeated_strings_keep_materialization_unknown() {
 }
 
 fn assert_unknown_visits(cases: &[(&str, &str, &str)]) {
-    for (declarations, body, expected) in cases {
-        let (cost, complete, reasons) = selected_of(declarations, body);
-
-        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
-        assert!(!complete, "{body}: {reasons:?}");
-        assert!(
-            reasons.contains(&UnknownReason::Bound),
-            "{body}: {reasons:?}"
-        );
-    }
+    assert_partial_with(cases, UnknownReason::Bound);
 }
 
 #[test]

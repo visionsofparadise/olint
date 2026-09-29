@@ -15,7 +15,7 @@ use crate::declared_types::Kind;
 use crate::invocations::{coercion_keys, iteration_keys};
 use crate::project::FileId;
 use crate::syntax::{body_root_of, identifier_of, member_expression_of, unwrap};
-use crate::tables::{STRING_LINEAR, TYPED_ARRAYS};
+use crate::tables::{STRING_IMPLEMENTATION_DEFINED, STRING_LINEAR, TYPED_ARRAYS};
 use crate::unknowns::UnknownReason;
 use crate::values::{protocol_key_of, ArgumentFacts, MemberKey, Size};
 
@@ -48,6 +48,9 @@ pub enum Operand {
 pub enum Work {
     Constant,
     Linear(Operand),
+    /// ECMAScript leaves the work implementation-defined, or no ECMA-262 steps define it, so the
+    /// call is an unknown contribution and its callbacks run an unknown number of times (spec §2.4).
+    ImplementationDefined,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,10 +290,12 @@ pub static MODELS: &[NativeModel] = &[
         &[Role::Iterated, Role::Callback(Count::PerElement)],
         Role::Read,
     ),
+    // ECMA-262 §25.5.1: the parse step validates against ECMA-404 and evaluates through ParseText,
+    // which define a grammar rather than algorithm steps.
     model_of(
         Identity::Namespace("JSON"),
         &["parse"],
-        Work::Linear(Operand::First),
+        Work::ImplementationDefined,
         &[Role::Coerced, Role::Callback(Count::PerElement)],
         Role::Read,
     ),
@@ -305,10 +310,11 @@ pub static MODELS: &[NativeModel] = &[
         ],
         Role::Read,
     ),
+    // Buffer (Node.js) and structuredClone (HTML) are host APIs with no ECMA-262 steps.
     model_of(
         Identity::Namespace("Buffer"),
         &["from"],
-        Work::Linear(Operand::First),
+        Work::ImplementationDefined,
         &[Role::Opaque],
         Role::Coerced,
     ),
@@ -316,7 +322,7 @@ pub static MODELS: &[NativeModel] = &[
         model_of(
             Identity::Namespace("Buffer"),
             &["concat"],
-            Work::Linear(Operand::Elements),
+            Work::ImplementationDefined,
             &[Role::Read],
             Role::Coerced,
         ),
@@ -325,21 +331,21 @@ pub static MODELS: &[NativeModel] = &[
     model_of(
         Identity::Namespace("Buffer"),
         &["alloc", "allocUnsafe"],
-        Work::Linear(Operand::First),
+        Work::ImplementationDefined,
         &[],
         Role::Coerced,
     ),
     model_of(
         Identity::Namespace("Buffer"),
         &["compare"],
-        Work::Linear(Operand::First),
+        Work::ImplementationDefined,
         &[],
         Role::Read,
     ),
     model_of(
         Identity::Function,
         &["structuredClone"],
-        Work::Linear(Operand::Graph),
+        Work::ImplementationDefined,
         &[Role::Inspected],
         Role::Opaque,
     ),
@@ -469,6 +475,13 @@ pub static MODELS: &[NativeModel] = &[
         Identity::Receiver(Kind::String),
         STRING_LINEAR,
         Work::Linear(Operand::Receiver),
+        &[],
+        Role::Coerced,
+    ),
+    model_of(
+        Identity::Receiver(Kind::String),
+        STRING_IMPLEMENTATION_DEFINED,
+        Work::ImplementationDefined,
         &[],
         Role::Coerced,
     ),
@@ -1058,6 +1071,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             beside = beside.merge(hidden, &mut self.unknowns, &mut self.traces);
         }
 
+        if model.work == Work::ImplementationDefined {
+            inner = self.implementation_defined_reading_of(file, site.span, inner);
+        }
+
         if unresolved {
             let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
             let scaled = self.unknowns.scale(Some(unknown), None);
@@ -1144,6 +1161,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         reading.merge(part, &mut self.unknowns, &mut self.traces)
+    }
+
+    /// Spec §2.4: the call's own work is an unknown contribution, and the callback work in `inner`
+    /// runs an unknown number of times.
+    pub(crate) fn implementation_defined_reading_of(
+        &mut self,
+        file: FileId,
+        span: Span,
+        inner: Reading,
+    ) -> Reading {
+        let origin = self.source_span(file, span);
+        let unknown = self
+            .unknowns
+            .origin(origin, UnknownReason::ImplementationDefined);
+
+        for (_, _, part) in &inner.completions {
+            self.note_unresolved_multiplicity(part);
+        }
+
+        inner
+            .map_parts(|part| part.scaled(None, &mut self.unknowns))
+            .retaining(Some(unknown), &mut self.unknowns)
     }
 
     fn resumed_part_of(&mut self, site: &NativeSite<'a>) -> Reading {
@@ -1358,6 +1397,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn native_charge_of(&mut self, site: &NativeSite<'a>, model: &NativeModel) -> Size {
+        if model.work == Work::ImplementationDefined {
+            return Size::constant();
+        }
+
         if let Some(size) = self.iterated_size_of(site, model, 0) {
             return size;
         }
@@ -1414,7 +1457,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let first = site.arguments.first();
 
         match work {
-            Work::Constant | Work::Linear(Operand::Arity) => true,
+            Work::Constant | Work::Linear(Operand::Arity) | Work::ImplementationDefined => true,
             Work::Linear(
                 Operand::Graph
                 | Operand::Each

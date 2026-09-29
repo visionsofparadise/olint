@@ -1,14 +1,13 @@
 public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
+O(1) [partial]     38
 O(1)               33
-O(1) [partial]     31
 O(xs)              18
 O(xs) [partial]     8
 O(max(1, rows^2))    8
 O(max(1, rows^2)) [partial]    7
 O(n) [partial]      6
-O((xs * log(xs)))    5
 O(N)                5
 O(o)                4
 O(N) [partial]      4
@@ -16,7 +15,7 @@ O(matrix) [partial]    3
 O(max(1, (xs * xs^2)))    3
 O(max(1, xs^2))     3
 O(n)                3
-O((xs * log(xs))) [partial]    2
+O((xs * log(xs)))    2
 O(prefix)           2
 O(max(1, (matrix * max(o, matrix))))    2
 O(t)                1
@@ -31,35 +30,15 @@ O(rows^2)           1
 O(max(xs, needle))    1
 O(max(1, (strings * max(strings, needle))))    1
 O(max(re, needles)) [partial]    1
-O(text)             1
-O(parts^2)          1
 O(items^2) [partial]    1
 O(max(1, (rows * rows^2)))    1
 O(max(1, (matrix * matrix^2)))    1
-
-O((xs * log(xs))) breakInsideLoop  src/branches.ts:126 [partial]
-    does [break branch: runs once per loop]               src/branches.ts:129
-    does row.sort() [n log n]                             src/branches.ts:130  x N log N
-
-O((xs * log(xs))) returnInsideLoop  src/branches.ts:116 [partial]
-    does [return branch: runs once per call]              src/branches.ts:118
-    does row.sort() [n log n]                             src/branches.ts:119  x N log N
 
 O((xs * log(xs))) nlognExpressionStatementTagged  src/branches.ts:103
     reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))
 
 O((xs * log(xs))) nlognStatementTagged  src/branches.ts:89
     reads as @perf O(N log N)                                 src/branches.ts:92  = O((xs * log(xs)))
-
-O((xs * log(xs))) usesPathAlias  src/modules/paths.ts:3
-    calls sharedFn()                                       src/modules/paths.ts:4  = O((xs * log(xs)))
-    does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
-
-O((xs * log(xs))) sharedFn  src/lib/shared.ts:1
-    does xs.sort() [n log n]                              src/lib/shared.ts:2  x N log N
-
-O((xs * log(xs))) sortMethodCall  src/methods.ts:5
-    does xs.sort() [n log n]                              src/methods.ts:6  x N log N
 
 O(rows^2)      readsGetter  src/classes.ts:49
     calls WithGetter.total() [getter]                      src/classes.ts:50  = O(rows^2)
@@ -72,10 +51,7 @@ O(N^2)         WithGetter.total  src/classes.ts:43
 
 O(items^2)     structuredCloneCall  src/methods.ts:51 [partial]
     does items.map()                                      src/methods.ts:52  x N
-        does structuredClone()                            src/methods.ts:52  x N
-
-O(parts^2)     bufferConcatCall  src/methods.ts:47
-    does Buffer.concat(parts)                             src/methods.ts:48  x (parts * N)
+        does iterator visits                              src/methods.ts:52  x N
 
 O(max(base, xs)) functionReturningFunction  src/calls.ts:35 [partial]
     does xs.map()                                         src/calls.ts:37  x N
@@ -371,9 +347,6 @@ O(prefix)      surrogateCutLabel  src/methods.ts:94
 O(n)           setCallback  src/methods.ts:80 [partial]
     does list.map()                                       src/methods.ts:83  x N
 
-O(text)        jsonParseCall  src/methods.ts:41
-    does JSON.parse(text)                                 src/methods.ts:42  x N
-
 O(n)           arrayFromCallback  src/methods.ts:37
     does Array.from({ length: n })                        src/methods.ts:38  x n
 
@@ -417,6 +390,10 @@ O(1)           singleIterationLoop  src/bounds.ts:71
 O(1)           forAwaitLoop  src/bounds.ts:89 [partial]
 
 O(1)           unaryHalving  src/bounds.ts:95 [partial]
+
+O(1)           returnInsideLoop  src/branches.ts:116 [partial]
+
+O(1)           breakInsideLoop  src/branches.ts:126 [partial]
 
 O(1)           coldBlockAllCold  src/branches.ts:146 [partial]
 
@@ -494,11 +471,17 @@ O(1)           asConstArray  src/constants.ts:45
 
 O(1)           stringLiteralConstant  src/constants.ts:49
 
+O(1)           sortMethodCall  src/methods.ts:5 [partial]
+
 O(1)           setLinearCall  src/methods.ts:9 [partial]
 
 O(1)           mapLinearCall  src/methods.ts:13 [partial]
 
 O(1)           regexpConstCall  src/methods.ts:23 [partial]
+
+O(1)           jsonParseCall  src/methods.ts:41 [partial]
+
+O(1)           bufferConcatCall  src/methods.ts:47 [partial]
 
 O(1)           unknownReceiverCall  src/methods.ts:55 [partial]
 
@@ -535,4 +518,8 @@ O(1)           destructuredParam  src/types.ts:55
 O(1)           callsMethodShapedProperty  src/types.ts:62 [partial]
 
 O(1)           usesNamedThing  src/types.ts:66
+
+O(1)           sharedFn  src/lib/shared.ts:1 [partial]
+
+O(1)           usesPathAlias  src/modules/paths.ts:3 [partial]
 

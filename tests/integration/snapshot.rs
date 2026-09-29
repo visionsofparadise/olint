@@ -91,6 +91,21 @@ fn model_rows_ignore_the_unknown_policy_and_minimum() {
 }
 
 #[test]
+fn model_rows_name_implementation_defined_unknowns() {
+    let rows = model_rows_with(RECORDING, None);
+    let sort = rows
+        .iter()
+        .flat_map(|row| &row.unknowns)
+        .find(|(key, reason)| {
+            key.path == "src/methods.ts"
+                && key.kind == "CallExpression"
+                && reason == "implementation-defined work"
+        });
+
+    assert!(sort.is_some());
+}
+
+#[test]
 fn model_function_rows_match_their_report_rows() {
     let root = model_root();
     let allocator = Allocator::default();

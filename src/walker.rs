@@ -30,8 +30,8 @@ use crate::syntax::{
     member_expression_of, unwrap, Root,
 };
 use crate::tables::{
-    ARRAY_LINEAR, ARRAY_N_LOG_N, CALLBACK_METHODS, LINEAR_CONSTRUCTORS, MAP_LINEAR, REGEXP_LINEAR,
-    SET_LINEAR,
+    ARRAY_IMPLEMENTATION_DEFINED, ARRAY_LINEAR, CALLBACK_METHODS, LINEAR_CONSTRUCTORS, MAP_LINEAR,
+    REGEXP_LINEAR, SET_LINEAR,
 };
 use crate::types::ResolvedCallee;
 use crate::unknowns::{SourceSpan, UnknownId, UnknownReason};
@@ -2726,60 +2726,39 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.stats.count("share: array method");
         }
 
-        if array_like && (is_listed(ARRAY_N_LOG_N, &method) || is_listed(ARRAY_LINEAR, &method)) {
+        if array_like && is_listed(ARRAY_IMPLEMENTATION_DEFINED, &method) {
+            let callback = self.callback_part_of(file, first);
+            let part = self.implementation_defined_reading_of(file, call.span, callback);
+
+            return reading.merge(part, &mut self.unknowns, &mut self.traces);
+        }
+
+        if array_like && is_listed(ARRAY_LINEAR, &method) {
             self.stats.count(&format!(
                 "array method: {}",
                 if bounded { "bounded" } else { "N" }
             ));
-        }
 
-        let sorting = match array_like {
-            true if is_listed(ARRAY_N_LOG_N, &method) => Some(true),
-            true if is_listed(ARRAY_LINEAR, &method) => Some(false),
-            _ => None,
-        };
-
-        if let Some(sorting) = sorting {
             let produced = match bounded {
                 true => None,
                 false => self.produced_size_of(file, receiver),
             };
-            let mut unresolved = match produced.as_ref().is_some_and(|size| !size.length_resolved) {
+            let unresolved = match produced.as_ref().is_some_and(|size| !size.length_resolved) {
                 true => self.unknown_part(file, call.span, UnknownReason::SizeRelation),
                 false => Part::none(),
             };
-            let length = produced.filter(|size| size.exceeds).map(|size| size.length);
-            let factor = match (sorting, length) {
-                (false, length) => length.unwrap_or(Cost::N),
-                (true, None) => Cost::N_LOG_N,
-                (true, Some(length)) => match Cost::logarithm(length.clone())
-                    .and_then(|logarithm| length.multiply(&logarithm))
-                {
-                    Ok(factor) => factor,
-                    Err(_) => {
-                        let exhausted =
-                            self.unknown_part(file, call.span, UnknownReason::ResourceExhaustion);
-
-                        unresolved =
-                            unresolved.max(exhausted, &mut self.unknowns, &mut self.traces);
-
-                        length
-                    }
-                },
-            };
-            let callback = match sorting || is_listed(CALLBACK_METHODS, &method) {
+            let factor = produced
+                .filter(|size| size.exceeds)
+                .map_or(Cost::N, |size| size.length);
+            let callback = match is_listed(CALLBACK_METHODS, &method) {
                 true => self.callback_part_of(file, first),
                 false => Reading::empty(),
-            };
-            let suffix = match sorting {
-                true => " [n log n]",
-                false => "",
             };
             let part = if bounded {
                 callback
             } else {
                 self.nest_reading(
-                    label(suffix),
+                    label(""),
                     site,
                     self.source_span(file, call.span),
                     factor,
@@ -2860,7 +2839,7 @@ fn is_modelled(native: Native, method: &str) -> bool {
     match native {
         Native::Modelled(_) => true,
         Native::Receiver(Kind::Array) => {
-            is_listed(ARRAY_N_LOG_N, method) || is_listed(ARRAY_LINEAR, method)
+            is_listed(ARRAY_IMPLEMENTATION_DEFINED, method) || is_listed(ARRAY_LINEAR, method)
         }
         Native::Receiver(Kind::Set) => is_listed(SET_LINEAR, method),
         Native::Receiver(Kind::Map) => is_listed(MAP_LINEAR, method),

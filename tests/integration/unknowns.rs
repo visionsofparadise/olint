@@ -328,6 +328,33 @@ fn known_native_cost_does_not_prove_empty_effects() {
     }
 }
 
+#[test]
+fn implementation_defined_built_ins_name_their_reason_and_unknown_callback_counts() {
+    run_with_source(
+        "declare function g(): number;
+export function f(xs: number[]) { return xs.sort(() => g()); }",
+        |analysis, file| {
+            let part = summary_of(analysis, file, "f");
+            let lines = unknown_lines(analysis, part);
+
+            assert!(
+                lines.iter().any(
+                    |line| line.contains("unknown implementation-defined work at ")
+                        && line.contains("; multiplicity O(1)")
+                ),
+                "{lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("unknown call target at ")
+                        && line.contains("; multiplicity unknown")),
+                "{lines:?}"
+            );
+        },
+    );
+}
+
 fn unknown_lines(
     analysis: &olint::analysis::Analysis<'_, '_>,
     part: olint::cost::Part,

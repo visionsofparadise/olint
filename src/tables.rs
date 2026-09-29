@@ -32,7 +32,10 @@ pub static ARRAY_LINEAR: &[&str] = &[
     "set",
 ];
 
-pub static ARRAY_N_LOG_N: &[&str] = &["sort", "toSorted"];
+// ECMA-262 §23.1.3.30, §23.1.3.34, §23.2.3.29, §23.2.3.33: sort and toSorted reach
+// SortIndexedProperties (§23.1.3.30.1), which calls SortCompare in an implementation-defined
+// sequence, so each is an unknown contribution (spec §2.4).
+pub static ARRAY_IMPLEMENTATION_DEFINED: &[&str] = &["sort", "toSorted"];
 
 pub static CALLBACK_METHODS: &[&str] = &[
     "forEach",
@@ -47,8 +50,6 @@ pub static CALLBACK_METHODS: &[&str] = &[
     "findLast",
     "findLastIndex",
     "flatMap",
-    "sort",
-    "toSorted",
 ];
 
 pub static SET_LINEAR: &[&str] = &[
@@ -80,19 +81,25 @@ pub static STRING_LINEAR: &[&str] = &[
     "repeat",
     "padStart",
     "padEnd",
-    "trim",
-    "trimStart",
-    "trimEnd",
-    "toLowerCase",
-    "toUpperCase",
-    "toLocaleLowerCase",
-    "toLocaleUpperCase",
-    "normalize",
-    "localeCompare",
     "startsWith",
     "endsWith",
     "concat",
     "codePointAt",
+];
+
+// ECMA-262 §22.1.3.12, §22.1.3.15, §22.1.3.26-28, §22.1.3.30, §22.1.3.32-34: these delegate
+// their work to host locale data or to Unicode algorithms rather than ECMAScript steps, so each
+// is an unknown contribution (spec §2.4).
+pub static STRING_IMPLEMENTATION_DEFINED: &[&str] = &[
+    "localeCompare",
+    "normalize",
+    "toLocaleLowerCase",
+    "toLocaleUpperCase",
+    "toLowerCase",
+    "toUpperCase",
+    "trim",
+    "trimStart",
+    "trimEnd",
 ];
 
 pub static REGEXP_LINEAR: &[&str] = &["test", "exec"];
@@ -209,10 +216,11 @@ pub static REFLECTIVE_WRITES: &[&str] = &[
 pub fn method_matters(method: &str) -> bool {
     [
         ARRAY_LINEAR,
-        ARRAY_N_LOG_N,
+        ARRAY_IMPLEMENTATION_DEFINED,
         SET_LINEAR,
         MAP_LINEAR,
         STRING_LINEAR,
+        STRING_IMPLEMENTATION_DEFINED,
         REGEXP_LINEAR,
     ]
     .iter()

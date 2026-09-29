@@ -218,11 +218,13 @@ fn binding_rests_copy_their_source_and_fixed_sources_stay_constant() {
 }
 
 #[test]
-fn sorting_a_declared_array_reads_n_log_n() {
+fn sorting_a_declared_array_is_an_unknown_contribution() {
     let (reading, labels) = reading_of("export function f(xs: number[]) {\n\txs.sort();\n}", "f");
+    let total = reading.total();
 
-    assert_eq!(reading.total().cost, Cost::N_LOG_N);
-    assert_eq!(labels, vec!["xs.sort() [n log n]"]);
+    assert_eq!(total.cost, Cost::ONE);
+    assert!(!total.is_complete());
+    assert!(labels.is_empty(), "{labels:?}");
 }
 
 #[test]
@@ -644,7 +646,7 @@ fn replacements_follow_prototype_provenance_globals_and_proven_numeric_keys() {
         (index_of("export function selected(xs: number[]) { const ys: any = []; ys.__proto__.includes = function () { return true; }; const zs = [1, 2, 3]; zs.includes(0); for (const x of xs) void x; }".to_string()), "O(N)", true),
         (index_of(format!("function slowKeys(xs: number[]) {{ {CUBIC} return []; }}\n(globalThis as any).Object = {{ keys: (o: any) => slowKeys(o) }};\nexport function selected(xs: number[]) {{ return Object.keys(xs); }}")), "O(N^3)", true),
         (index_of("function install(name: string, value: unknown) { (globalThis as any)[name] = value; }\ninstall('Object', { keys: () => [] });\nexport function selected(xs: number[]) { return Object.keys(xs); }".to_string()), "O(N)", true),
-        (index_of("function install(name: string, value: unknown) { (globalThis as any)[name] = value; }\ninstall('structuredClone', () => 0);\nexport function selected(xs: number[]) { return structuredClone(xs); }".to_string()), "O(N)", true),
+        (index_of("function install(name: string, value: unknown) { (globalThis as any)[name] = value; }\ninstall('structuredClone', () => 0);\nexport function selected(xs: number[]) { return structuredClone(xs); }".to_string()), "O(1)", true),
         (index_of("function place(ys: unknown[], at: number, v: unknown) { ys[at] = v; }\nplace([], 0, () => 0);\nexport function selected(xs: number[], ys: unknown[]) { for (let i = 0; i < 3; i++) (xs as any)[i] = ys[i]; let j = 0; j = j + 1; (xs as any)[j * 2] = ys[0]; return xs.includes(0); }".to_string()), "O(N)", false),
     ];
 

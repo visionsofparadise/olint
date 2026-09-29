@@ -13,7 +13,9 @@ use crate::analysis::Analysis;
 use crate::declarations::{parameters_of, Binding, Declaration, FunctionNode, ParameterNode};
 use crate::project::FileId;
 use crate::syntax::{call_of, is_const_type, is_identifier_pattern, member_expression_of, unwrap};
-use crate::tables::{KIND_OF_NAME, STRING_LINEAR, STRING_TO_ARRAY, TYPED_ARRAYS};
+use crate::tables::{
+    KIND_OF_NAME, STRING_IMPLEMENTATION_DEFINED, STRING_LINEAR, STRING_TO_ARRAY, TYPED_ARRAYS,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1674,7 +1676,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             if received.kind == Kind::String
-                && STRING_LINEAR.contains(&method)
+                && (STRING_LINEAR.contains(&method)
+                    || STRING_IMPLEMENTATION_DEFINED.contains(&method))
                 && !NON_STRING_RESULTS.contains(&method)
             {
                 return declared_type_of(Kind::String);
