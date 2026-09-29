@@ -38,3 +38,6 @@ tempfile = "=3.27.0"
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+
+[profile.dev]
+debug = false
