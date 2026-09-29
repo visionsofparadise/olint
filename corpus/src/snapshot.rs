@@ -19,11 +19,13 @@ use olint::project::Project;
 use olint::public::public_functions;
 use olint::regex::{RegexError, RegexLimits};
 use olint::snapshot::{snapshot_rows, SCHEMA};
+use olint::summaries::SchedulerLimits;
 use olint::tsc::{ask_counted, TscError};
 use oxc_allocator::Allocator;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::alloc;
 use crate::members::{members, Member};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,9 +84,16 @@ pub struct MemberCounts {
     /// Consumed work per scheduler `Event`, in `EVENTS` order.
     pub events: Map<String, Value>,
     pub exhausted: Vec<String>,
+    /// Events whose consumed work reached olint's default scheduler limit, which caps them whether or not the
+    /// scheduler flagged the event exhausted.
+    #[serde(default)]
+    pub at_limit: Vec<String>,
     pub tasks: usize,
     pub maximum_body_passes: u64,
-    /// Peak live bytes, which action 1.4's counting allocator fills.
+    /// |G|: the syntax nodes of every file the project loaded, counted as `oxc_semantic` AST nodes, the node universe
+    /// `NodeKey` spans and kinds are drawn from.
+    pub nodes: Option<u64>,
+    /// Peak live bytes the counting allocator saw from project load through `snapshot_rows`.
     pub peak_bytes: Option<u64>,
     pub tsc: Option<TscTotals>,
     pub warnings: Vec<String>,
@@ -116,17 +125,17 @@ pub struct MemberArgs {
     pub unknown: Option<String>,
 }
 
-struct Source {
-    tree: PathBuf,
-    key: String,
+pub struct Source {
+    pub tree: PathBuf,
+    pub key: String,
     locked: bool,
 }
 
-fn head_corpus() -> PathBuf {
+pub fn head_corpus() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn absolute(path: &Path) -> Result<PathBuf, String> {
+pub fn absolute(path: &Path) -> Result<PathBuf, String> {
     std::path::absolute(path).map_err(|error| format!("cannot resolve {}: {error}", path.display()))
 }
 
@@ -148,7 +157,7 @@ fn status_of(command: &mut Command, label: &str) -> Result<(), String> {
     }
 }
 
-fn materialize(src: &str, repo: &Path, cache: &Path) -> Result<Source, String> {
+pub fn materialize(src: &str, repo: &Path, cache: &Path) -> Result<Source, String> {
     let directory = Path::new(src);
 
     if directory.is_dir() {
@@ -265,7 +274,7 @@ fn copy_directory(from: &Path, to: &Path, skipped: &[&str]) -> Result<(), String
 
 /// Builds `olint-corpus` inside the tree against the shared target directory, then copies the binary out so a later
 /// build for another tree cannot replace it mid-run.
-fn build(source: &Source, cache: &Path) -> Result<PathBuf, String> {
+pub fn build(source: &Source, cache: &Path) -> Result<PathBuf, String> {
     let target = cache.join("target");
     let mut command = Command::new("cargo");
 
@@ -403,7 +412,7 @@ fn failed(error: String) -> MemberCounts {
     }
 }
 
-fn run_member(
+pub fn run_member(
     binary: &Path,
     tree: &Path,
     out: &Path,
@@ -520,9 +529,16 @@ pub fn snapshot_member(args: MemberArgs) -> Result<(), String> {
 }
 
 fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
+    alloc::reset_peak();
+
     let allocator = Allocator::default();
     let project = Project::load(&allocator, &args.root.join("tsconfig.json"))
         .map_err(|error| format!("project does not load: {error:?}"))?;
+    let nodes = project
+        .files
+        .iter()
+        .map(|file| file.semantic.nodes().len() as u64)
+        .sum();
     let options = Options {
         minimum_exponent: 2,
         types: args.pass.mode(),
@@ -536,6 +552,7 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
 
         config.unknown = unknown_policy_of(Some(&Value::from(policy.as_str())))
             .map_err(|error| format!("unknown policy {policy}: {error:?}"))?;
+
         public_functions(&mut analysis, &config)
             .map_err(|error| format!("public functions do not resolve: {error:?}"))?;
     }
@@ -606,6 +623,7 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
     }
 
     let rows = snapshot_rows(&mut analysis);
+    let peak_bytes = alloc::peak();
 
     write_rows(&args.rows, &rows)?;
 
@@ -625,6 +643,13 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         .map(|event| format!("{event:?}"))
         .collect();
 
+    let limits = SchedulerLimits::default().work;
+    let at_limit = EVENTS
+        .iter()
+        .filter(|event| stats.work.consumed(**event) >= limits.limit(**event))
+        .map(|event| format!("{event:?}"))
+        .collect();
+
     warnings.extend(analysis.warnings.iter().cloned());
 
     Ok(MemberCounts {
@@ -639,9 +664,11 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         rows: rows.len(),
         events,
         exhausted,
+        at_limit,
         tasks: stats.tasks,
         maximum_body_passes: stats.maximum_body_passes,
-        peak_bytes: None,
+        nodes: Some(nodes),
+        peak_bytes: Some(peak_bytes),
         tsc,
         warnings,
     })

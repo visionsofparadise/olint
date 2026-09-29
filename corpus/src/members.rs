@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::families;
+
 pub const FIXTURES: [&str; 2] = ["model", "tags"];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,7 +28,7 @@ pub fn members(tree: &Path, cache: &Path) -> Result<Vec<Member>, String> {
     let mut found = packages(cache)?;
 
     found.extend(fixtures(tree)?);
-    found.extend(families(tree));
+    found.extend(family_members(cache)?);
     found.extend(ceilings(tree));
     found.sort();
 
@@ -87,9 +89,19 @@ fn fixtures(tree: &Path) -> Result<Vec<Member>, String> {
     Ok(found)
 }
 
-/// The scaling families of `corpus/families/`, which action 1.4 adds.
-fn families(_tree: &Path) -> Vec<Member> {
-    Vec::new()
+/// The scaling families of `corpus/families/`, each generated into the cache at n = 2^`MEMBER_K`.
+fn family_members(cache: &Path) -> Result<Vec<Member>, String> {
+    let size = families::size_of(families::MEMBER_K);
+
+    families::FAMILIES
+        .iter()
+        .map(|family| {
+            Ok(Member {
+                id: families::member_id(family.name),
+                root: families::ensure(cache, family, size)?,
+            })
+        })
+        .collect()
 }
 
 /// The instance families of `proofs/Olint/Ceilings/`, which action 7.3 adds.
@@ -117,6 +129,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("fixtures/{name} is a member"));
 
             assert!(member.root.join("tsconfig.json").is_file());
+        }
+
+        for family in &families::FAMILIES {
+            let member = found
+                .iter()
+                .find(|member| member.id == families::member_id(family.name))
+                .unwrap_or_else(|| panic!("family {} is a member", family.name));
+
+            assert!(member.root.join("src/index.ts").is_file());
         }
 
         assert!(found.windows(2).all(|pair| pair[0] < pair[1]));

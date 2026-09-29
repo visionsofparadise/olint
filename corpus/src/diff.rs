@@ -26,6 +26,7 @@ use olint::cost::{Cost, CostComparison, Domain};
 use olint::snapshot::{NodeKey, NodeRow, NodeState, SCHEMA};
 use serde::Deserialize;
 
+use crate::scale::{raised_orders, read_scale};
 use crate::snapshot::{Pass, PASSES};
 
 /// Unmatched lowerings printed before the rest are summarized as a count.
@@ -627,26 +628,38 @@ pub fn compare(base: &Path, head: &Path, trailers: &[Trailer]) -> Result<Report,
         }
 
         totals.added = new.keys().filter(|key| !old.contains_key(*key)).count();
+
         report.members.insert((pass, member), totals);
     }
 
     Ok(report)
 }
 
-/// §5.3 hook: a raised growth order on a scaling family fails. Action 1.4 writes `corpus/.cache/scale/<sha>.json`
-/// and fills this comparison; until then the check passes when either side has no scaling data.
-fn scaling_problems(cache: &Path, base: &str, head: &str) -> Vec<String> {
+/// §5.3: a raised growth order on a scaling family fails. The comparison runs when both `corpus/.cache/scale/<sha>.json`
+/// files exist, and passes with a note otherwise.
+fn scaling_problems(
+    cache: &Path,
+    base: &str,
+    head: &str,
+) -> Result<(Vec<String>, Option<String>), String> {
     let base = cache.join("scale").join(format!("{base}.json"));
     let head = cache.join("scale").join(format!("{head}.json"));
 
-    match base.is_file() && head.is_file() {
-        false => Vec::new(),
-        true => vec![format!(
-            "scaling data exists at {} and {}, but the growth-order comparison (action 1.4) is not implemented",
-            base.display(),
-            head.display()
-        )],
+    if !(base.is_file() && head.is_file()) {
+        return Ok((
+            Vec::new(),
+            Some(format!(
+                "no scaling comparison: run `scale` for both sides ({} and {})",
+                base.display(),
+                head.display()
+            )),
+        ));
     }
+
+    Ok((
+        raised_orders(&read_scale(&base)?, &read_scale(&head)?),
+        None,
+    ))
 }
 
 /// §5.2 hook: a Known bound below a ceiling of its node fails. Action 7.3 adds `proofs/Olint/Ceilings/` and fills
@@ -736,9 +749,10 @@ pub fn diff(base: &str, head: &str) -> Result<(), String> {
         &trailers,
     )?;
 
-    report
-        .problems
-        .extend(scaling_problems(&cache, &base, &head));
+    let (scaling, note) = scaling_problems(&cache, &base, &head)?;
+
+    report.problems.extend(scaling);
+    report.notes.extend(note);
     report.problems.extend(ceiling_problems(repo, &head)?);
 
     for pass in PASSES {

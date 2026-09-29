@@ -5,12 +5,21 @@
 //!     [--unknown <policy>]
 //! olint-corpus diff <base-sha> <head-sha>
 //! olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]
+//! olint-corpus scale --src <sha|tree> [--family <name>] [--min-k <k>] [--max-k <k>] [--out <file>] [--jobs <n>]
+//!     [--timeout <seconds>]
 //! ```
 
+mod alloc;
 mod diff;
+#[path = "../families/mod.rs"]
+mod families;
 mod members;
+mod scale;
 mod selftest;
 mod snapshot;
+
+#[global_allocator]
+static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -23,7 +32,8 @@ use snapshot::{MemberArgs, Pass, SnapshotArgs};
 const USAGE: &str = "usage:
   olint-corpus snapshot --src <sha|tree> [--out <dir>] [--jobs <n>] [--timeout <seconds>] [--member <prefix>]... [--unknown <policy>]
   olint-corpus diff <base-sha> <head-sha>
-  olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]";
+  olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]
+  olint-corpus scale --src <sha|tree> [--family <name>] [--min-k <k>] [--max-k <k>] [--out <file>] [--jobs <n>] [--timeout <seconds>]";
 
 struct Flags(Vec<(String, String)>);
 
@@ -137,6 +147,19 @@ fn run(arguments: &[String]) -> Result<(), String> {
                 jobs: flags.number("jobs", default_jobs())? as usize,
                 timeout: Duration::from_secs(flags.number("timeout", 900)?),
                 work: flags.optional("work").map(PathBuf::from),
+            })
+        }
+        "scale" => {
+            flags.check(&["src", "family", "min-k", "max-k", "out", "jobs", "timeout"])?;
+
+            scale::scale(scale::ScaleArgs {
+                src: flags.required("src")?,
+                family: flags.optional("family"),
+                min_k: flags.number("min-k", u64::from(families::MIN_K))? as u32,
+                max_k: flags.number("max-k", u64::from(families::MAX_K))? as u32,
+                out: flags.optional("out").map(PathBuf::from),
+                jobs: flags.number("jobs", default_jobs())? as usize,
+                timeout: Duration::from_secs(flags.number("timeout", 900)?),
             })
         }
         "snapshot-member" => {

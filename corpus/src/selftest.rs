@@ -688,6 +688,7 @@ pub fn selftest(args: SelftestArgs) -> Result<(), String> {
             ),
             Err(message) => {
                 failed += 1;
+
                 println!(
                     "check {check} FAILED in {:.1}s: {message}",
                     elapsed.as_secs_f64()
