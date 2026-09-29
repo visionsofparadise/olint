@@ -35,6 +35,8 @@ fn kind_label_of(kind: Kind) -> &'static str {
         Kind::Array => "array",
         Kind::Set => "set",
         Kind::Map => "map",
+        Kind::WeakSet => "weakset",
+        Kind::WeakMap => "weakmap",
         Kind::String => "string",
         Kind::RegExp => "regexp",
         Kind::Other => "other",

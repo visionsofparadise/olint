@@ -21,6 +21,8 @@ pub enum Kind {
     Array,
     Set,
     Map,
+    WeakSet,
+    WeakMap,
     String,
     RegExp,
     Other,
@@ -32,7 +34,7 @@ impl Kind {
     pub fn rank(self) -> u8 {
         match self {
             Kind::Array => 6,
-            Kind::Set | Kind::Map => 5,
+            Kind::Set | Kind::Map | Kind::WeakSet | Kind::WeakMap => 5,
             Kind::Unknown => 4,
             Kind::String => 3,
             Kind::RegExp => 2,
@@ -373,7 +375,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let name = type_name_text_of(&reference.type_name);
 
         if let Some(kind) = named_kind_of(name) {
-            return declared_type_of(kind);
+            if !is_weak_kind(kind) || self.is_global_type_name(file, &reference.type_name) {
+                return declared_type_of(kind);
+            }
         }
 
         if let Some(argument) = first_type_argument_of(reference) {
@@ -1551,7 +1555,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Expression::NewExpression(new) => {
                 if let Expression::Identifier(callee) = &new.callee {
                     if let Some(kind) = named_kind_of(callee.name.as_str()) {
-                        return declared_type_of(kind);
+                        if !is_weak_kind(kind) || self.is_intrinsic_reference(file, callee) {
+                            return declared_type_of(kind);
+                        }
                     }
 
                     return declared_type_of(Kind::Other);
@@ -1783,6 +1789,10 @@ fn typing_of_member(member: Option<Member<'_>>) -> Option<Typing<'_>> {
         }
         _ => None,
     }
+}
+
+fn is_weak_kind(kind: Kind) -> bool {
+    matches!(kind, Kind::WeakSet | Kind::WeakMap)
 }
 
 fn named_kind_of(name: &str) -> Option<Kind> {

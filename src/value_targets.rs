@@ -430,6 +430,8 @@ fn builtin_kind_of(name: &str) -> BuiltinKind {
         "Array" => Some(Kind::Array),
         "Set" => Some(Kind::Set),
         "Map" => Some(Kind::Map),
+        "WeakSet" => Some(Kind::WeakSet),
+        "WeakMap" => Some(Kind::WeakMap),
         "String" => Some(Kind::String),
         "RegExp" => Some(Kind::RegExp),
         "Object" => None,
@@ -6237,6 +6239,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         "Array" => Kind::Array,
                         "Set" => Kind::Set,
                         "Map" => Kind::Map,
+                        "WeakSet" => Kind::WeakSet,
+                        "WeakMap" => Kind::WeakMap,
                         "RegExp" => Kind::RegExp,
                         _ => Kind::Unknown,
                     }

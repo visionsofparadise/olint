@@ -182,6 +182,24 @@ const fn writing(model: NativeModel, receiver: Role) -> NativeModel {
     NativeModel { receiver, ..model }
 }
 
+const fn keyed(
+    kind: Kind,
+    names: &'static [&'static str],
+    arguments: &'static [Role],
+    receiver: Role,
+) -> NativeModel {
+    writing(
+        model_of(
+            Identity::Receiver(kind),
+            names,
+            Work::Linear(Operand::Receiver),
+            arguments,
+            Role::Read,
+        ),
+        receiver,
+    )
+}
+
 pub static MODELS: &[NativeModel] = &[
     producing(
         model_of(
@@ -454,45 +472,71 @@ pub static MODELS: &[NativeModel] = &[
         &[],
         Role::Coerced,
     ),
+    // ECMA-262 §24.2.4.1, §24.4.3.1: add scans [[SetData]] before appending.
+    keyed(Kind::Set, &["add"], &[Role::Stored], Role::Grown),
+    keyed(Kind::WeakSet, &["add"], &[Role::Stored], Role::Grown),
+    // ECMA-262 §24.1.3.9, §24.3.3.5: set scans [[MapData]] before appending.
+    keyed(
+        Kind::Map,
+        &["set"],
+        &[Role::Stored, Role::Stored],
+        Role::Grown,
+    ),
+    keyed(
+        Kind::WeakMap,
+        &["set"],
+        &[Role::Stored, Role::Stored],
+        Role::Grown,
+    ),
+    // ECMA-262 §24.2.4.2, §24.2.4.4, §24.4.3.3: delete scans [[SetData]] and clear visits every entry.
+    keyed(Kind::Set, &["delete", "clear"], &[Role::Read], Role::Shrunk),
+    keyed(Kind::WeakSet, &["delete"], &[Role::Read], Role::Shrunk),
+    // ECMA-262 §24.1.3.1, §24.1.3.3, §24.3.3.2: delete scans [[MapData]] and clear visits every entry.
+    keyed(Kind::Map, &["delete", "clear"], &[Role::Read], Role::Shrunk),
+    keyed(Kind::WeakMap, &["delete"], &[Role::Read], Role::Shrunk),
+    // ECMA-262 §24.2.4.8, §24.4.3.4: has scans [[SetData]].
+    keyed(Kind::Set, &["has"], &[Role::Read], Role::Read),
+    keyed(Kind::WeakSet, &["has"], &[Role::Read], Role::Read),
+    // ECMA-262 §24.1.3.6, §24.1.3.7, §24.3.3.3, §24.3.3.4: get and has scan [[MapData]].
+    keyed(Kind::Map, &["get", "has"], &[Role::Read], Role::Read),
+    keyed(Kind::WeakMap, &["get", "has"], &[Role::Read], Role::Read),
+    // ECMA-262 §23.1.3.23: push sets one index per argument.
     writing(
         model_of(
-            Identity::Receiver(Kind::Set),
-            &["add"],
-            Work::Constant,
-            &[Role::Stored],
-            Role::Read,
+            Identity::Receiver(Kind::Array),
+            &["push"],
+            Work::Linear(Operand::Arity),
+            &[],
+            Role::Stored,
         ),
         Role::Grown,
     ),
+    // ECMA-262 §23.1.3.22: pop reads and deletes the last index.
     writing(
         model_of(
-            Identity::Receiver(Kind::Map),
-            &["set"],
+            Identity::Receiver(Kind::Array),
+            &["pop"],
             Work::Constant,
-            &[Role::Stored, Role::Stored],
-            Role::Read,
-        ),
-        Role::Grown,
-    ),
-    writing(
-        model_of(
-            Identity::Receiver(Kind::Set),
-            &["delete", "clear"],
-            Work::Constant,
-            &[Role::Read],
+            &[],
             Role::Read,
         ),
         Role::Shrunk,
     ),
-    writing(
-        model_of(
-            Identity::Receiver(Kind::Map),
-            &["delete", "clear"],
-            Work::Constant,
-            &[Role::Read],
-            Role::Read,
-        ),
-        Role::Shrunk,
+    // ECMA-262 §23.1.3.1: at reads one index.
+    model_of(
+        Identity::Receiver(Kind::Array),
+        &["at"],
+        Work::Constant,
+        &[Role::Coerced],
+        Role::Read,
+    ),
+    // ECMA-262 §22.1.3.1, §22.1.3.2, §22.1.3.3: at, charAt and charCodeAt read one code unit.
+    model_of(
+        Identity::Receiver(Kind::String),
+        &["at", "charAt", "charCodeAt"],
+        Work::Constant,
+        &[Role::Coerced],
+        Role::Read,
     ),
     model_of(
         Identity::Receiver(Kind::Set),
@@ -622,6 +666,14 @@ impl<'a> NativeSite<'a> {
 
     pub(crate) fn iterates(&self, model: &NativeModel, index: usize) -> bool {
         self.role_of(model, index) == Role::Iterated
+    }
+}
+
+fn scans_entries_per_element(site: &NativeSite<'_>, model: &NativeModel) -> bool {
+    match model.identity {
+        Identity::Constructor => matches!(site.name.as_str(), "Set" | "Map"),
+        Identity::Namespace("Object" | "Map") => site.name == "groupBy",
+        _ => false,
     }
 }
 
@@ -920,6 +972,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         inner = inner.merge(conversions, &mut self.unknowns, &mut self.traces);
 
+        if scans_entries_per_element(site, model) && !bounded {
+            let scanned = Part::unmarked(charge.length.clone(), None);
+
+            inner = inner.merge(scanned, &mut self.unknowns, &mut self.traces);
+        }
+
         if model.identity == Identity::Receiver(Kind::Array) && site.name == "concat" {
             let copied = self.concat_reading_of(site);
             beside = beside.merge(copied, &mut self.unknowns, &mut self.traces);
@@ -1124,7 +1182,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             Identity::Function => Some(format!("{}()", site.name)),
             Identity::Constructor => Some(format!("new {}()", site.name)),
-            Identity::Receiver(Kind::Array | Kind::Set | Kind::Map) => {
+            Identity::Receiver(
+                Kind::Array | Kind::Set | Kind::Map | Kind::WeakSet | Kind::WeakMap,
+            ) => {
                 let receiver = site
                     .receiver
                     .map(|receiver| short(self.text_of(file, receiver.span())))

@@ -140,10 +140,10 @@ pub static KIND_OF_NAME: &[(&str, Kind)] = &[
     ("ReadonlyArray", Kind::Array),
     ("Set", Kind::Set),
     ("ReadonlySet", Kind::Set),
-    ("WeakSet", Kind::Set),
+    ("WeakSet", Kind::WeakSet),
     ("Map", Kind::Map),
     ("ReadonlyMap", Kind::Map),
-    ("WeakMap", Kind::Map),
+    ("WeakMap", Kind::WeakMap),
     ("String", Kind::String),
     ("RegExp", Kind::RegExp),
 ];

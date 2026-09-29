@@ -3,9 +3,9 @@ public coverage [partial]
 
 O(1)               33
 O(1) [partial]     31
-O(xs)              17
-O(xs) [partial]     9
-O(max(1, rows^2))    9
+O(xs)              18
+O(xs) [partial]     8
+O(max(1, rows^2))    8
 O(max(1, rows^2)) [partial]    7
 O(n) [partial]      6
 O((xs * log(xs)))    5
@@ -34,6 +34,7 @@ O(max(re, needles)) [partial]    1
 O(text)             1
 O(parts^2)          1
 O(items^2) [partial]    1
+O(max(1, (rows * rows^2)))    1
 O(max(1, (matrix * matrix^2)))    1
 
 O((xs * log(xs))) breakInsideLoop  src/branches.ts:126 [partial]
@@ -119,6 +120,10 @@ O(max(1, (matrix * max(o, matrix)))) unionOfClosed  src/types.ts:18
     in loop for-of                                           src/types.ts:20  x matrix
         in loop for-of                                       src/types.ts:20  x N
 
+O(max(1, (rows * rows^2))) newSetNonConst  src/methods.ts:59
+    in loop for-of                                           src/methods.ts:61  x rows
+        calls Set()                                        src/methods.ts:61  = O(N)
+
 O(max(1, (strings * max(strings, needle)))) stringLinearCall  src/methods.ts:17
     in loop for-of                                           src/methods.ts:19  x strings
         does s.indexOf() [string]                         src/methods.ts:19  x N
@@ -181,10 +186,6 @@ O(max(1, rows^2)) reexportDefault  src/modules/reexports.ts:3
 O(max(1, xs^2)) a  src/modules/star.ts:1
     in loop for-of                                           src/modules/star.ts:3  x xs
         in loop for-of                                       src/modules/star.ts:3  x N
-
-O(max(1, rows^2)) newSetNonConst  src/methods.ts:59
-    in loop for-of                                           src/methods.ts:61  x rows
-        calls Set()                                        src/methods.ts:61  = O(N)
 
 O(max(1, matrix^2)) labeledLoop  src/bounds.ts:78
     in loop for-of                                           src/bounds.ts:80  x matrix
@@ -404,7 +405,7 @@ O(xs)          pushesToReadonlyItems  src/classes.ts:81 [partial]
     calls WithReadonlyItems.addAll()                       src/classes.ts:83  = O(xs)
     does spread ...xs                                     src/classes.ts:78  x N
 
-O(xs)          WithReadonlyItems.addAll  src/classes.ts:77 [partial]
+O(xs)          WithReadonlyItems.addAll  src/classes.ts:77
     does spread ...xs                                     src/classes.ts:78  x N
 
 O(1)           constantBoundLoop  src/bounds.ts:6

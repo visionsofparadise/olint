@@ -92,13 +92,16 @@ fn escaped_values_invalidate_facts_that_unknown_calls_can_reach() {
 fn unknown_calls_leave_unrelated_isolated_locals_intact() {
     for body in [
         "for (let i = 0; i < n && n >= 0 && n <= 1000000; i++) { opaque(xs); total++; }",
-        "for (let i = 0; i < n && n >= 0 && n <= 1000000; i++) { xs.push(i); total++; }",
         "const box = { v: 1 }; let i = 0; for (let j = 0; j < n && n >= 0 && n <= 1000000; j++) { opaque(box); while (i >= 0 && i < n && n >= 0 && n <= 1000000) { i++; total++; } }",
     ] {
         let source = format!("export function f(n: number, xs: number[]) {{ let total = 0; {body} return total; }}");
 
         assert_eq!(result_of(&source, "f"), (cost("O(N)"), false), "{body}");
     }
+
+    let pushed = "export function f(n: number, xs: number[]) { let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000; i++) { xs.push(i); total++; } return total; }";
+
+    assert_eq!(result_of(pushed, "f"), (cost("O(N)"), true));
 
     let unrelated = "export function f(n: number) { let i = 0, other = 0, total = 0; const bump = () => { other++; }; for (let j = 0; j < n && n >= 0 && n <= 1000000; j++) { bump(); while (i >= 0 && i < n && n >= 0 && n <= 1000000) { i++; total++; } } return total + other; }";
 
@@ -473,8 +476,8 @@ fn implicit_native_and_consumed_generator_work_can_schedule_writers() {
     for (producer, unresolved) in [
         ("Array.from({[Symbol.iterator](){p.then(()=>{values.delete(0);values.add(0);});return [0][Symbol.iterator]();}});",true),
         ("Object.values({get value(){p.then(()=>{values.delete(0);values.add(0);});return 0;}});",true),
-        ("function* start(){p.then(()=>{values.delete(0);values.add(0);});yield 0;}for(const ignored of start()){}",true),
-        ("function* start(){p.then(()=>{values.delete(0);values.add(0);});yield 0;}start();",false),
+        ("function* start(){p.then(()=>{values.add(0);});yield 0;}for(const ignored of start()){}",true),
+        ("function* start(){p.then(()=>{values.add(0);});yield 0;}start();",false),
     ] {
         for (written, shared) in [("values", true), ("other", false)] {
         let producer=producer.replace("values.", &format!("{written}."));

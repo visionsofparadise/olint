@@ -78,6 +78,7 @@ const COERCED_MEMBERS: [&str; 5] = [
 const ITERATED_MEMBERS: [&str; 5] = ["values", "next", "return", "@@iterator", "@@asyncIterator"];
 const AWAITED_MEMBERS: [&str; 1] = ["then"];
 const GROWING_METHODS: [&str; 2] = ["push", "unshift"];
+const DELETING_METHODS: [&str; 2] = ["delete", "clear"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cardinality {
@@ -780,6 +781,50 @@ impl<'p, 'a> Analysis<'p, 'a> {
             true => GrowthSummary::Unstable,
             false => GrowthSummary::Sites { calls, open },
         }
+    }
+
+    pub(crate) fn has_deleted_entries(
+        &mut self,
+        file: FileId,
+        reference: &'a oxc_ast::ast::IdentifierReference<'a>,
+    ) -> bool {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let Some(symbol) = reference
+            .reference_id
+            .get()
+            .and_then(|id| semantic.scoping().get_reference(id).symbol_id())
+        else {
+            return false;
+        };
+        let references = value_references_of(semantic.scoping(), symbol);
+
+        if !self.charge_work(Event::SizeStep, references.len() as u64) {
+            return true;
+        }
+
+        let nodes = semantic.nodes();
+
+        references.into_iter().any(|(node, _)| {
+            let current = outermost_of(nodes, node);
+            let member = nodes.parent_id(current);
+            let AstKind::StaticMemberExpression(access) = nodes.kind(member) else {
+                return false;
+            };
+
+            if access.object.span() != nodes.kind(current).span()
+                || !DELETING_METHODS.contains(&access.property.name.as_str())
+            {
+                return false;
+            }
+
+            let callee = outermost_of(nodes, member);
+
+            matches!(
+                nodes.parent_kind(callee),
+                AstKind::CallExpression(call) if call.callee.span() == nodes.kind(callee).span()
+            )
+        })
     }
 
     fn growing_call_of(&mut self, file: FileId, node: NodeId) -> Option<&'a CallExpression<'a>> {

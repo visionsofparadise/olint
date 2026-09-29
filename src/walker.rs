@@ -2575,8 +2575,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             if self.intrinsic_replaced_of(file, callee) {
                 let native = self.native_of(file, call, member, true);
+                let method = member
+                    .map(|member| self.method_name_of(file, member))
+                    .unwrap_or_default();
 
-                if is_modelled(native) {
+                if is_modelled(native, &method) {
                     let intrinsic =
                         self.intrinsic_reading_of(file, call, member, native, Reading::empty());
 
@@ -2853,14 +2856,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 }
 
-fn is_modelled(native: Native) -> bool {
+fn is_modelled(native: Native, method: &str) -> bool {
     match native {
         Native::Modelled(_) => true,
-        Native::Receiver(kind) => matches!(
-            kind,
-            Kind::Array | Kind::Set | Kind::Map | Kind::String | Kind::RegExp
-        ),
-        Native::Unmodelled => false,
+        Native::Receiver(Kind::Array) => {
+            is_listed(ARRAY_N_LOG_N, method) || is_listed(ARRAY_LINEAR, method)
+        }
+        Native::Receiver(Kind::Set) => is_listed(SET_LINEAR, method),
+        Native::Receiver(Kind::Map) => is_listed(MAP_LINEAR, method),
+        Native::Receiver(Kind::RegExp) => is_listed(REGEXP_LINEAR, method),
+        Native::Receiver(_) | Native::Unmodelled => false,
     }
 }
 

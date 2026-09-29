@@ -176,19 +176,19 @@ fn grouping_keys_coerce_callback_results() {
         (
             key,
             "(xs: number[]) { return Object.groupBy(xs, (x: number) => x); }",
-            "O(N)",
+            "O(N^2)",
             true,
         ),
         (
             key,
             "(xs: number[]) { return Object.groupBy(xs, () => new Key() as any); }",
-            "O(N)",
+            "O(N^2)",
             false,
         ),
         (
             key,
             "(xs: number[]) { return Map.groupBy(xs, () => new Key()); }",
-            "O(N)",
+            "O(N^2)",
             true,
         ),
     ]);
@@ -752,7 +752,7 @@ fn live_collection_callbacks_run_once_per_budgeted_visit() {
         (
             "",
             "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length * xs.length) values.add(values.size); }); return values; }",
-            "O(N^2)",
+            "O(N^3)",
             true,
         ),
         (
@@ -764,19 +764,19 @@ fn live_collection_callbacks_run_once_per_budgeted_visit() {
         (
             "",
             "(xs: number[]) { const values = new Set([0]); const alias = values; values.forEach(() => { if (alias.size < xs.length * xs.length) alias.add(alias.size); }); return values; }",
-            "O(N^2)",
+            "O(N^3)",
             true,
         ),
         (
             "",
             "(n: number) { const table = new Map<number, number>(); table.set(0, 0); table.forEach((value, key) => { if (n >= table.size) table.set(key + 1, value); }); return table; }",
-            "O(N)",
+            "O(N^2)",
             true,
         ),
         (
             "",
             "(s: Set<number>) { let total = 0; s.forEach((value) => { if (s.size < 10) s.add(value + 1); total += value; }); return total; }",
-            "O(N)",
+            "O(max(1, N * max(1, N)))",
             true,
         ),
     ]);
@@ -784,7 +784,7 @@ fn live_collection_callbacks_run_once_per_budgeted_visit() {
     assert_eq!(
         bound_result_of(
             "(xs: number[]) { const values = new Set([0]); values.forEach(() => { if (values.size < xs.length * xs.length) values.add(values.size); }); return values; }",
-            "O(max(1, xs^2))"
+            "O(max(1, xs^3))"
         ),
         (true, true)
     );
@@ -912,25 +912,153 @@ fn stable_live_collections_stay_size_bounded() {
             "O(N^2)",
             true,
         ),
+    ]);
+}
+
+#[test]
+fn keyed_collection_methods_scan_their_entries() {
+    assert_selected(&[
         (
             "",
-            "(s: Set<number>, xs: number[]) { s.forEach(() => { s.clear(); scan(xs); }); }",
+            "(xs: number[]) { const table = new Map<number, number>(); xs.forEach((x) => { table.set(x, x); }); return table; }",
             "O(N^2)",
             true,
         ),
         (
             "",
-            "(s: Set<number>, t: Set<number>, xs: number[]) { s.forEach((value) => { t.delete(value); scan(xs); }); }",
+            "(n: number) { const values = new Set<number>(); for (let i = 0; i < n && n >= 0 && n <= 1000000; i++) values.add(i); return values; }",
             "O(N^2)",
             true,
         ),
         (
             "",
-            "(target: Set<number>, table: Map<number, number>) { target.add(1); table.set(1, 2); target.delete(1); table.clear(); }",
-            "O(1)",
+            "(table: Map<string, number>) { return table.get(\"key\"); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(table: Map<string, number>) { return table.has(\"key\"); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(values: Set<string>) { return values.has(\"key\"); }",
+            "O(N)",
             true,
         ),
     ]);
+}
+
+#[test]
+fn weak_collections_scan_their_entries() {
+    assert_selected(&[
+        (
+            "",
+            "(table: WeakMap<object, number>, key: object) { table.set(key, 1); table.delete(key); return table.get(key) ?? table.has(key); }",
+            "O(N)",
+            false,
+        ),
+        (
+            "",
+            "(table: WeakMap<object, number>, key: object) { table.set(key, 1); return table.get(key) ?? table.has(key); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(values: WeakSet<object>, key: object) { values.add(key); return values.has(key); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(xs: object[]) { const values = new WeakSet<object>(); xs.forEach((x) => { values.add(x); }); return values; }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "class WeakMap<K, V> { get(key: K): V | undefined { return undefined; } }",
+            "(table: WeakMap<object, number>, key: object) { return table.get(key); }",
+            "O(1)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn constant_natives_do_constant_work() {
+    assert_selected(&[
+        (
+            "",
+            "(xs: number[]) { xs.push(1); return xs.length; }",
+            "O(1)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { xs.push(1, 2, 3); return xs.length; }",
+            "O(1)",
+            true,
+        ),
+        ("", "(xs: number[]) { return xs.pop(); }", "O(1)", true),
+        ("", "(xs: number[]) { return xs.at(-1); }", "O(1)", true),
+        ("", "(s: string) { return s.at(-1); }", "O(1)", true),
+        ("", "(s: string) { return s.charAt(0); }", "O(1)", true),
+        ("", "(s: string) { return s.charCodeAt(0); }", "O(1)", true),
+        (
+            "",
+            "(xs: number[]) { for (const x of xs) xs.at(x); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(s: string, xs: number[]) { for (const x of xs) s.charCodeAt(x); }",
+            "O(N)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn deleted_entries_leave_later_scans_and_iterations_unknown() {
+    for (body, expected) in [
+        (
+            "(s: Set<number>, xs: number[]) { s.forEach(() => { s.clear(); scan(xs); }); }",
+            "O(N^2)",
+        ),
+        (
+            "(s: Set<number>, t: Set<number>, xs: number[]) { s.forEach((value) => { t.delete(value); scan(xs); }); }",
+            "O(N^2)",
+        ),
+        (
+            "(target: Set<number>, table: Map<number, number>) { target.add(1); table.set(1, 2); target.delete(1); table.clear(); }",
+            "O(N)",
+        ),
+        (
+            "(s: Set<number>, t: Set<number>) { let total = 0; for (const value of s) { t.delete(value); total += value; } return total; }",
+            "O(N^2)",
+        ),
+        (
+            "(xs: number[]) { const values = new Set(xs); values.delete(0); let total = 0; for (const value of values) total += value; return total; }",
+            "O(N^2)",
+        ),
+        (
+            "(m: Map<number, number>, xs: number[]) { m.clear(); m.forEach(() => scan(xs)); }",
+            "O(N^2)",
+        ),
+    ] {
+        let (cost, complete, reasons) = selected_of("", body);
+
+        assert_eq!(cost, Cost::parse(expected).unwrap(), "{body}: {reasons:?}");
+        assert!(!complete, "{body}: {reasons:?}");
+        assert!(
+            reasons.contains(&UnknownReason::SizeRelation),
+            "{body}: {reasons:?}"
+        );
+    }
 }
 
 #[test]
@@ -942,11 +1070,7 @@ fn array_for_each_keeps_its_snapshot_length() {
         let (cost, complete, reasons) = selected_of("", body);
 
         assert_eq!(cost, Cost::parse("O(N^2)").unwrap(), "{body}: {reasons:?}");
-        assert!(!complete, "{body}: {reasons:?}");
-        assert!(
-            !reasons.contains(&UnknownReason::Bound),
-            "{body}: {reasons:?}"
-        );
+        assert!(complete, "{body}: {reasons:?}");
     }
 }
 
@@ -1406,13 +1530,13 @@ fn collection_constructor_modes_preserve_native_controls() {
     assert_selected(&[
         ("", "() { return new Set(); }", "O(1)", true),
         ("", "() { return new Map(null); }", "O(1)", true),
-        ("", "(xs: number[]) { return new Set(xs); }", "O(N)", true),
+        ("", "(xs: number[]) { return new Set(xs); }", "O(N^2)", true),
         ("", "(xs: number[]) { return new Uint8Array(xs); }", "O(N)", true),
         ("", "() { return new Uint8Array(); }", "O(1)", true),
         ("", "() { return new Uint8Array(4); }", "O(1)", true),
         ("", "() { return new Uint8Array('4'); }", "O(1)", true),
         ("", "() { return new Uint8Array({ length: 2, 0: 1, 1: 2 }); }", "O(1)", true),
-        ("", "(xs: number[]) { const values = new Set(xs); return new Uint8Array(values); }", "O(N)", true),
+        ("", "(xs: number[]) { const values = new Set(xs); return new Uint8Array(values); }", "O(N^2)", true),
         ("", "(xs: number[]) { Set.prototype.add = function(value) { cube(xs); }; return new Set(xs); }", "O(N^4)", false),
         ("", "(xs: number[]) { Object.defineProperty(Set.prototype, 'add', { get() { cube(xs); return function(value) {}; } }); return new Set(xs); }", "O(N^3)", false),
     ]);

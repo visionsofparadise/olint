@@ -80,7 +80,11 @@ const TYPED_ARRAYS = new Set([
 	"BigInt64Array",
 	"BigUint64Array",
 ]);
-const rank = { array: 6, set: 5, map: 5, unknown: 4, string: 3, regexp: 2, other: 1 };
+const rank = { array: 6, set: 5, map: 5, weakset: 5, weakmap: 5, unknown: 4, string: 3, regexp: 2, other: 1 };
+const isLibrarySymbol = (symbol) =>
+	(symbol?.getDeclarations() ?? []).some((declaration) =>
+		/(^|\/)lib\.[^/]*\.d\.ts$/.test(declaration.getSourceFile().fileName),
+	);
 const kindOfType = (checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return "unknown";
 	if (t.isUnion())
@@ -89,8 +93,10 @@ const kindOfType = (checker, t) => {
 	if (checker.isArrayType?.(t) || checker.isTupleType?.(t)) return "array";
 	const name = t.getSymbol()?.getName() ?? "";
 	if (name === "Array" || name === "ReadonlyArray" || TYPED_ARRAYS.has(name)) return "array";
-	if (name === "Set" || name === "ReadonlySet" || name === "WeakSet") return "set";
-	if (name === "Map" || name === "ReadonlyMap" || name === "WeakMap") return "map";
+	if (name === "Set" || name === "ReadonlySet") return "set";
+	if (name === "Map" || name === "ReadonlyMap") return "map";
+	if (name === "WeakSet") return isLibrarySymbol(t.getSymbol()) ? "weakset" : "other";
+	if (name === "WeakMap") return isLibrarySymbol(t.getSymbol()) ? "weakmap" : "other";
 	if (name === "String") return "string";
 	if (name === "RegExp") return "regexp";
 	if (t.isTypeParameter()) {

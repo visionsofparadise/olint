@@ -1070,6 +1070,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.output_size_of(&site, model, depth)
             }
             Expression::CallExpression(call) => self.call_size_of(file, call, depth),
+            Expression::Identifier(reference) if self.has_deleted_entries(file, reference) => {
+                Some(Size::unresolved())
+            }
             Expression::Identifier(reference) => self.holder_size_of(file, reference, depth),
             _ => None,
         }

@@ -226,13 +226,13 @@ fn sorting_a_declared_array_reads_n_log_n() {
 }
 
 #[test]
-fn a_set_of_a_parameter_is_linear() {
+fn a_set_of_a_parameter_scans_its_entries_per_element() {
     let (reading, labels) = reading_of(
         "export function f(xs: number[]) {\n\treturn new Set(xs);\n}",
         "f",
     );
 
-    assert_eq!(reading.total().cost, Cost::N);
+    assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap());
     assert_eq!(labels, vec!["new Set()"]);
 }
 
@@ -704,7 +704,7 @@ fn declared_builtin_kinds_need_construction_or_call_evidence() {
         (index_of(format!("{slow}\nfunction set(target: Set<number>, key: string, value: unknown) {{ (target as any)[key] = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, 'includes', () => slow(xs)); return xs.includes(0); }}")), "O(N)", true),
         (index_of(format!("{slow}\nfunction set(target: Set<number>, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(xs as any, () => slow(xs)); return xs.includes(0); }}")), "O(N^3)", true),
         (index_of("function set(target: string, value: unknown) { (target as any).includes = value; }\nset(Array.prototype as any, () => true);\nexport function selected(xs: number[]) { const zs = [1, 2]; return zs.includes(0) && xs.includes(0); }".to_string()), "O(N)", true),
-        (index_of(format!("{slow}\nfunction set(target: Set<number>, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(new Set(xs), () => slow(xs)); return xs.includes(0); }}")), "O(N)", false),
+        (index_of(format!("{slow}\nfunction set(target: Set<number>, value: unknown) {{ (target as any).includes = value; }}\nexport function selected(xs: number[]) {{ set(new Set(xs), () => slow(xs)); return xs.includes(0); }}")), "O(N^2)", false),
     ];
 
     assert_dispatched(&cases);
