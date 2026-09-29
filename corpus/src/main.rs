@@ -2,18 +2,28 @@
 //!
 //! ```text
 //! olint-corpus snapshot --src <sha|tree> [--out <dir>] [--jobs <n>] [--timeout <seconds>] [--member <prefix>]...
+//!     [--unknown <policy>]
+//! olint-corpus diff <base-sha> <head-sha>
+//! olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]
 //! ```
 
+mod diff;
 mod members;
+mod selftest;
 mod snapshot;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use selftest::{SelftestArgs, CHECKS};
 use snapshot::{MemberArgs, Pass, SnapshotArgs};
 
-const USAGE: &str = "usage: olint-corpus snapshot --src <sha|tree> [--out <dir>] [--jobs <n>] [--timeout <seconds>] [--member <prefix>]...";
+const USAGE: &str = "usage:
+  olint-corpus snapshot --src <sha|tree> [--out <dir>] [--jobs <n>] [--timeout <seconds>] [--member <prefix>]... [--unknown <policy>]
+  olint-corpus diff <base-sha> <head-sha>
+  olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]";
 
 struct Flags(Vec<(String, String)>);
 
@@ -77,15 +87,37 @@ fn default_jobs() -> u64 {
     std::thread::available_parallelism().map_or(1, |count| (count.get() as u64 / 2).clamp(1, 8))
 }
 
+fn checks_of(text: Option<String>) -> Result<BTreeSet<u8>, String> {
+    let Some(text) = text else {
+        return Ok(CHECKS.into_iter().collect());
+    };
+
+    text.split(',')
+        .map(|check| match check.trim().parse::<u8>() {
+            Ok(number) if CHECKS.contains(&number) => Ok(number),
+            _ => Err(format!("--check takes numbers from 1 to 5, got {check}")),
+        })
+        .collect()
+}
+
 fn run(arguments: &[String]) -> Result<(), String> {
     let Some((command, rest)) = arguments.split_first() else {
         return Err(USAGE.to_string());
     };
+
+    if command == "diff" {
+        let [base, head] = rest else {
+            return Err(USAGE.to_string());
+        };
+
+        return diff::diff(base, head);
+    }
+
     let flags = Flags::parse(rest)?;
 
     match command.as_str() {
         "snapshot" => {
-            flags.check(&["src", "out", "jobs", "timeout", "member"])?;
+            flags.check(&["src", "out", "jobs", "timeout", "member", "unknown"])?;
 
             snapshot::snapshot(SnapshotArgs {
                 src: flags.required("src")?,
@@ -93,10 +125,22 @@ fn run(arguments: &[String]) -> Result<(), String> {
                 jobs: flags.number("jobs", default_jobs())? as usize,
                 timeout: Duration::from_secs(flags.number("timeout", 900)?),
                 only: flags.all("member"),
+                unknown: flags.optional("unknown"),
+            })
+        }
+        "selftest" => {
+            flags.check(&["member", "check", "jobs", "timeout", "work"])?;
+
+            selftest::selftest(SelftestArgs {
+                only: flags.all("member"),
+                checks: checks_of(flags.optional("check"))?,
+                jobs: flags.number("jobs", default_jobs())? as usize,
+                timeout: Duration::from_secs(flags.number("timeout", 900)?),
+                work: flags.optional("work").map(PathBuf::from),
             })
         }
         "snapshot-member" => {
-            flags.check(&["root", "pass", "rows", "counts", "tree"])?;
+            flags.check(&["root", "pass", "rows", "counts", "tree", "unknown"])?;
 
             let pass = flags.required("pass")?;
 
@@ -106,6 +150,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
                 rows: PathBuf::from(flags.required("rows")?),
                 counts: PathBuf::from(flags.required("counts")?),
                 tree: PathBuf::from(flags.required("tree")?),
+                unknown: flags.optional("unknown"),
             })
         }
         _ => Err(USAGE.to_string()),

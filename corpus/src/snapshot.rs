@@ -14,7 +14,9 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use olint::analysis::work::EVENTS;
 use olint::analysis::{Analysis, Options, TypeMode};
+use olint::config::{read_config, unknown_policy_of};
 use olint::project::Project;
+use olint::public::public_functions;
 use olint::regex::{RegexError, RegexLimits};
 use olint::snapshot::{snapshot_rows, SCHEMA};
 use olint::tsc::{ask_counted, TscError};
@@ -52,7 +54,7 @@ impl Pass {
     }
 
     /// The pass's directory inside a snapshot: syntactic rows at the root, tsc rows under `tsc/`.
-    fn directory(self, out: &Path) -> PathBuf {
+    pub fn directory(self, out: &Path) -> PathBuf {
         match self {
             Pass::Syntactic => out.to_path_buf(),
             Pass::Tsc => out.join("tsc"),
@@ -101,6 +103,8 @@ pub struct SnapshotArgs {
     pub jobs: usize,
     pub timeout: Duration,
     pub only: Vec<String>,
+    /// Applies the member's `olint.config.json` with this unknown policy before snapshotting, for selftest check 5.
+    pub unknown: Option<String>,
 }
 
 pub struct MemberArgs {
@@ -109,6 +113,7 @@ pub struct MemberArgs {
     pub rows: PathBuf,
     pub counts: PathBuf,
     pub tree: PathBuf,
+    pub unknown: Option<String>,
 }
 
 struct Source {
@@ -330,7 +335,15 @@ pub fn snapshot(args: SnapshotArgs) -> Result<(), String> {
                     break;
                 };
                 let begun = Instant::now();
-                let counts = run_member(&binary, &source.tree, &out, *pass, member, args.timeout);
+                let counts = run_member(
+                    &binary,
+                    &source.tree,
+                    &out,
+                    *pass,
+                    member,
+                    args.timeout,
+                    args.unknown.as_deref(),
+                );
 
                 eprintln!(
                     "[{}/{}] {} {}: {} rows{} in {:.1}s",
@@ -397,6 +410,7 @@ fn run_member(
     pass: Pass,
     member: &Member,
     timeout: Duration,
+    unknown: Option<&str>,
 ) -> MemberCounts {
     let rows = pass.directory(out).join(format!("{}.jsonl.gz", member.id));
     let log = out
@@ -420,8 +434,15 @@ fn run_member(
         Ok(file) => file,
         Err(error) => return failed(format!("cannot create {}: {error}", log.display())),
     };
-    let spawned = Command::new(binary)
-        .arg("snapshot-member")
+    let mut command = Command::new(binary);
+
+    command.arg("snapshot-member");
+
+    if let Some(unknown) = unknown {
+        command.args(["--unknown", unknown]);
+    }
+
+    let spawned = command
         .arg("--root")
         .arg(&member.root)
         .args(["--pass", pass.name()])
@@ -508,6 +529,17 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         record_nodes: true,
     };
     let mut analysis = Analysis::new(&project, options);
+
+    if let Some(policy) = &args.unknown {
+        let mut config = read_config(&project, None)
+            .map_err(|error| format!("config does not read: {error:?}"))?;
+
+        config.unknown = unknown_policy_of(Some(&Value::from(policy.as_str())))
+            .map_err(|error| format!("unknown policy {policy}: {error:?}"))?;
+        public_functions(&mut analysis, &config)
+            .map_err(|error| format!("public functions do not resolve: {error:?}"))?;
+    }
+
     let helper = args.tree.join("src/regex_sidecar.mjs");
     let pinned = match args.pass {
         Pass::Tsc => Some(pinned_typescript(&args.tree)?),
