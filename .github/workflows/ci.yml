@@ -30,6 +30,7 @@ jobs:
          - run: npm run check
          - run: npm run unit
          - run: npm run integration
+         - run: cargo test --locked --manifest-path corpus/Cargo.toml
          - run: npm run build
 
    msrv:

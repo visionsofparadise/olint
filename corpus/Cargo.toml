@@ -1,0 +1,22 @@
+[package]
+name = "olint-corpus"
+version = "0.1.0"
+authors = ["Matt Cavender"]
+description = "Evaluation corpus harness for olint"
+license = "MIT"
+publish = false
+edition = "2021"
+rust-version = "1.96"
+
+# An empty workspace table makes this package its own workspace root, so it never joins a workspace above it.
+[workspace]
+
+[lints.rust]
+nonstandard_style = "deny"
+
+[dependencies]
+olint = { path = ".." }
+oxc_allocator = "=0.149.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+flate2 = "=1.1.10"

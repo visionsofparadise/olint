@@ -10,3 +10,5 @@ coverage/
 .stylelintcache
 target/
 gen/
+corpus/.cache/
+corpus/target/
