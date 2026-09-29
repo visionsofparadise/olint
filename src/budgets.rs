@@ -92,6 +92,7 @@ pub struct BudgetContext {
 pub struct Spend {
     pub text: String,
     pub share: Option<Binding>,
+    pub step: Option<NodeId>,
     pub scope: Option<NodeId>,
     pub magnitude: StepMagnitude,
     pub potential: Potential,
@@ -920,6 +921,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Some(Spend {
                 text: budget.text.clone(),
                 share: None,
+                step: None,
                 scope: budget.scope,
                 magnitude: match proven {
                     true => StepMagnitude::Constant,
@@ -961,6 +963,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Some(Spend {
             text,
             share: identifier_binding,
+            step: Some(unwrap(e).node_id()),
             scope,
             magnitude: StepMagnitude::Stable,
             potential,

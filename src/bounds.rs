@@ -1917,6 +1917,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
             && self.is_counter_reference(file, interval.0, unwrap(&width.right))
     }
 
+    pub(crate) fn share_quantity_of(
+        &mut self,
+        file: FileId,
+        loop_kind: AstKind<'a>,
+        step: NodeId,
+    ) -> Option<Cost> {
+        let AstKind::AssignmentExpression(assignment) = self.kind_of_node(file, step) else {
+            return None;
+        };
+        let body = loop_body_of(loop_kind)?;
+        let node = loop_kind.node_id();
+        let (update, initial) = match loop_kind {
+            AstKind::ForStatement(statement) => (
+                statement.update.as_ref().map(unwrap),
+                self.loop_variable_of(file, statement),
+            ),
+            _ => (None, None),
+        };
+        let repetition = Repetition {
+            node,
+            body,
+            update,
+            initial,
+            returns_to_head: self.returns_to_head(file, node, body),
+            geometric_proof: "halving",
+        };
+
+        self.bounded_quantity_of(file, &assignment.right, &repetition, 0)
+            .map(|(cost, _)| cost)
+    }
+
     fn share_bound_of(
         &mut self,
         file: FileId,

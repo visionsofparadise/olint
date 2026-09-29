@@ -987,7 +987,28 @@ fn midpoint_proofs_require_a_finite_nonwrapping_interval() {
 fn guarded_independent_endpoints_remain_distinct() {
     let source = "export function f(n:number,m:number){if(n>=0&&n<=1000000000&&m>=0&&m<=1000000000){let i=0;for(let j=0;j<n;j++){while(i<m)i++;}}}";
 
-    assert_named_cost(source, "O(m)", true);
+    assert_named_cost(source, "O(n + m)", true);
+}
+
+#[test]
+fn a_cancelled_loop_completes_normally_under_the_loops_that_enclose_it() {
+    let source = "export function f(n: number, xs: number[], ys: number[]): number { if (n >= 0 && n <= 1000000000) { let i = 0, total = 0; for (const x of xs) { for (const y of ys) { while (i < n && i >= 0) { i++; total += y; } } } return total; } return 0; }";
+
+    assert_named_cost(source, "O(n + xs * ys)", true);
+}
+
+#[test]
+fn a_cancelled_loop_evaluates_its_test_on_every_visit() {
+    let source = "function sum(xs: readonly number[]): number { let s = 0; for (const x of xs) s += x; return s; } export function f(n: number, m: number, xs: number[]): number { if (n >= 0 && n <= 1000000000 && m >= 0 && m <= 1000000000) { let i = 0, c = 0; for (let j = 0; j < n; j++) { while (sum(xs) > j && i < m && i >= 0) { i++; c++; } } return c; } return 0; }";
+
+    assert_named_cost(source, "O(n * xs + m * xs)", true);
+}
+
+#[test]
+fn a_share_charges_the_final_step_past_the_budget() {
+    let source = "export function f(n: number, m: number): number { if (n >= 0 && n <= 1000000000 && m >= 1 && m <= 1000000000) { let i = 0, steps = 0, t = 0; while (i < n && i >= 0 && steps < n && steps >= 0) { const k = m; for (let j = 0; j < k; j++) t++; i += k; steps++; } return t; } return 0; }";
+
+    assert_named_cost(source, "O(n + m)", true);
 }
 
 #[test]

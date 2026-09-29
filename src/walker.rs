@@ -1442,14 +1442,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let visits = budget
             .as_ref()
             .and_then(|budget| self.visits_since(file, budget.scope));
+        let proven = bound.factor().is_some()
+            && !invalidation.bound
+            && budget
+                .as_ref()
+                .is_some_and(|budget| self.visits_resolved_since(file, budget.scope));
         let granted = match (&budget, &visits) {
-            (Some(budget), Some(visits)) => budget.share.filter(|_| {
+            (Some(budget), Some(visits)) if proven => budget.share.filter(|_| {
                 visits
                     .multiply(&factor)
                     .is_ok_and(|charge| charge_covers(&charge, &budget.potential.cost()))
             }),
             _ => None,
         };
+        let overshoot = granted.and_then(|_| {
+            let step = budget.as_ref()?.step?;
+            let share = self.share_quantity_of(file, kind, step)?;
+
+            Cost::sum(vec![factor.clone(), share]).ok()
+        });
+        let granted = granted.filter(|_| overshoot.is_some());
 
         if let Some(share) = granted {
             self.share_bindings.push(share);
@@ -1464,6 +1476,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let suspends = self.is_async_context(file, body.node_id(), false)
             && self.suspends(file, body.node_id());
+        let header = visit.clone();
         let body_raw =
             self.cost_of_statement(file, body)
                 .merge(visit, &mut self.unknowns, &mut self.traces);
@@ -1640,7 +1653,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             }
 
-            let looped = self.nest_part(label.clone(), site, origin, factor.clone(), body_main);
+            let charged = overshoot.clone().unwrap_or_else(|| factor.clone());
+            let looped = self.nest_part(label.clone(), site, origin, charged, body_main);
             let looped = match escaped {
                 true => looped,
                 false => looped.executed(),
@@ -1653,6 +1667,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 &mut self.unknowns,
                 &mut self.traces,
             );
+
+            if cancels && (scope.is_some() || self.inside_loop(file, node)) {
+                let visited = header.part_of(phase, Completion::Normal).executed();
+
+                result.join(
+                    phase,
+                    Completion::Normal,
+                    visited,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
+            }
 
             if let (true, Some(scope)) = (cancels, scope) {
                 let pending = self
@@ -1679,6 +1705,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         result
+    }
+
+    fn visits_resolved_since(&self, file: FileId, scope: Option<NodeId>) -> bool {
+        let start = match scope {
+            Some(scope) => self
+                .enclosing_factors
+                .iter()
+                .position(|(held, node, _, _)| *held == file && *node == scope)
+                .map(|position| position + 1),
+            None => Some(0),
+        };
+
+        start.is_some_and(|start| {
+            self.enclosing_factors[start..]
+                .iter()
+                .all(|(_, _, _, resolved)| *resolved)
+        })
     }
 
     fn visits_since(&self, file: FileId, scope: Option<NodeId>) -> Option<Cost> {

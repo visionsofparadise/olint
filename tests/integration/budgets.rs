@@ -596,7 +596,7 @@ fn a_budget_cancels_only_where_its_charge_covers_the_potential_across_every_visi
         (
             "a while under two enclosing loops",
             "for (let j = 0; j < n; j++) { for (const y of xs) { while (i < n) { i++; total += y; } } }",
-            "O(N)",
+            "O(N^2)",
             true,
         ),
         (
