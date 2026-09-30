@@ -1513,16 +1513,6 @@ fn assert_linear_size_steps(source: fn(usize) -> String, name: &str) {
     );
 }
 
-fn forwarding_chain_source(count: usize) -> String {
-    (0..count)
-        .map(|index| match index + 1 == count {
-            true => format!("export function f{index}(xs: number[]): number {{ let total = 0; for (const x of xs) {{ total += x; }} return total; }}"),
-            false => format!("export function f{index}(xs: number[]): number {{ return f{}(xs) + {index}; }}", index + 1),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn supplied_holder_source(count: usize) -> String {
     let mut lines = vec![
         "function g(a: number[]): number { let total = 0; for (const x of a) { total += x; } return total; }".to_string(),
@@ -1540,8 +1530,51 @@ fn supplied_holder_source(count: usize) -> String {
 
 #[test]
 fn supplied_sizes_charge_each_binding_scan_once() {
-    assert_linear_size_steps(forwarding_chain_source, "f0");
     assert_linear_size_steps(supplied_holder_source, "f");
+}
+
+fn forwarding_tree_source(count: usize) -> String {
+    (0..count)
+        .map(|index| match index {
+            0 => "export function f0(xs: number[]): number { let total = 0; for (const x of xs) { total += x; } return total; }".to_string(),
+            _ => format!("export function f{index}(xs: number[]): number {{ return f{}(xs) + {index}; }}", (index - 1) / 2),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn snapshot_size_steps_of(count: usize) -> (u64, u64) {
+    let mut found = None;
+
+    run_with_source(&forwarding_tree_source(count), |analysis, _| {
+        olint::snapshot::snapshot_rows(analysis);
+
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+
+        found = Some((
+            stats.work.consumed(Event::SizeStep),
+            stats.work.consumed(Event::BodyPass),
+        ));
+    });
+
+    found.expect("size steps")
+}
+
+#[test]
+fn forwarded_parameters_are_sized_once_per_site_across_specializations() {
+    let [base, single, double] = [32, 64, 96].map(snapshot_size_steps_of);
+
+    assert!(
+        double.1 - base.1 > 2 * (single.1 - base.1),
+        "{base:?} {single:?} {double:?}"
+    );
+    assert_eq!(
+        double.0 - base.0,
+        2 * (single.0 - base.0),
+        "{base:?} {single:?} {double:?}"
+    );
 }
 
 #[test]

@@ -3076,21 +3076,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        if let Some(expression) = expression.filter(|expression| {
-            !matches!(
-                expression,
-                Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
-            )
-        }) {
-            if value.size.is_none() {
-                value.size = self.size_of_value(file, expression);
-            }
-
-            if value.size.is_none() && !self.is_primitive_operand(file, expression) {
-                value.size = self.supplied_size_of(file, expression);
-            }
-        }
-
         let mut callback_open = false;
         let declaration = expression.and_then(|expression| match expression {
             Expression::Identifier(reference) => {
@@ -3114,6 +3099,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }),
         });
 
+        // An unwritten parameter passes on the facts it received, size included, so it is answered
+        // before the argument is sized: sizing it would repeat on every body pass of every
+        // specialization and be discarded.
         if let Some(binding) =
             declaration.and_then(|declaration| self.parameter_binding_of(declaration))
         {
@@ -3124,6 +3112,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .filter(|_| self.is_parameter_unwritten(binding))
             {
                 return facts;
+            }
+        }
+
+        if let Some(expression) = expression.filter(|expression| {
+            !matches!(
+                expression,
+                Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+            )
+        }) {
+            if value.size.is_none() {
+                value.size = self.size_of_value(file, expression);
+            }
+
+            if value.size.is_none() && !self.is_primitive_operand(file, expression) {
+                value.size = self.supplied_size_of(file, expression);
             }
         }
 
