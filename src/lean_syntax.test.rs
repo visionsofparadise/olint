@@ -504,6 +504,7 @@ fn a_scope_function_shadowing_a_global_is_refused() {
             .build(program)
             .semantic
     };
+
     fn function<'s, 'a>(semantic: &'s Semantic<'a>) -> FunctionRef<'s, 'a> {
         FunctionRef {
             semantic,
