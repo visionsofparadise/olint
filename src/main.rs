@@ -260,7 +260,13 @@ fn run_with_ask(
     let public = public.functions;
     let mut selected_comparisons = Vec::new();
     let code = if cli.report {
-        let rows = report_rows_of(&mut analysis, &functions);
+        let mut rows = report_rows_of(&mut analysis, &functions);
+
+        for (row, (file, function)) in rows.iter_mut().zip(&functions) {
+            row.entry = public
+                .iter()
+                .any(|entry| entry.file == *file && entry.function.node_id() == function.node_id());
+        }
 
         selected_unknowns.extend(rows.iter().filter_map(|row| row.unknowns));
 

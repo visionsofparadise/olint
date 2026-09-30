@@ -92,10 +92,8 @@
         "stdout": {
           "all": {
             "contains": [
-              "O(xs^2)        tagged [asserted]  index.ts:3"
-            ],
-            "absent": [
-              "statement [asserted]"
+              "O(xs^2)        tagged [asserted]  index.ts:3",
+              "O(xs)          statement [asserted]  index.ts:5"
             ]
           }
         }

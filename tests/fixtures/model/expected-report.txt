@@ -28,3 +28,506 @@ O((xs * log(xs))) nlognFunctionTagged [asserted]  src/branches.ts:97
 O((xs * log(xs))) nlognStatementTagged [asserted]  src/branches.ts:89
     reads as @perf O(N log N)                                 src/branches.ts:92  = O((xs * log(xs)))
 
+O(rows)        callsHashPrivateMethod  src/classes.ts:37 [partial]
+    unknown origin: call target at src/classes.ts:38 [927..964]; multiplicity O(1)
+    unknown origin: call target at src/classes.ts:34 [826..845]; multiplicity O(1) via src/classes.ts:38 [927..964]
+    unknown origin: input size relation at src/classes.ts:30 [736..766]; multiplicity unknown via src/classes.ts:38 [927..964] -> src/classes.ts:34 [826..845]
+    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows)
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows)
+    in loop for-of                                           src/classes.ts:30  x rows
+
+O(rows)        WithHashPrivateMethod.run  src/classes.ts:33 [partial]
+    unknown origin: call target at src/classes.ts:34 [826..845]; multiplicity O(1)
+    unknown origin: input size relation at src/classes.ts:30 [736..766]; multiplicity unknown via src/classes.ts:34 [826..845]
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows)
+    in loop for-of                                           src/classes.ts:30  x rows
+
+O(rows)        callsPrivateMethod  src/classes.ts:23 [partial]
+    unknown origin: call target at src/classes.ts:24 [582..615]; multiplicity O(1)
+    unknown origin: call target at src/classes.ts:20 [486..504]; multiplicity O(1) via src/classes.ts:24 [582..615]
+    unknown origin: input size relation at src/classes.ts:16 [396..426]; multiplicity unknown via src/classes.ts:24 [582..615] -> src/classes.ts:20 [486..504]
+    calls WithPrivateMethod.run()                          src/classes.ts:24  = O(rows)
+    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows)
+    in loop for-of                                           src/classes.ts:16  x rows
+
+O(rows)        WithPrivateMethod.run  src/classes.ts:19 [partial]
+    unknown origin: call target at src/classes.ts:20 [486..504]; multiplicity O(1)
+    unknown origin: input size relation at src/classes.ts:16 [396..426]; multiplicity unknown via src/classes.ts:20 [486..504]
+    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows)
+    in loop for-of                                           src/classes.ts:16  x rows
+
+O(rows)        instantiateCostedCtor  src/classes.ts:9 [partial]
+    unknown origin: input size relation at src/classes.ts:5 [116..146]; multiplicity unknown via src/classes.ts:10 [246..266]
+    calls CostedCtor()                                     src/classes.ts:10  = O(rows)
+    in loop for-of                                           src/classes.ts:5  x rows
+
+O(rows)        CostedCtor.constructor  src/classes.ts:3 [partial]
+    unknown origin: input size relation at src/classes.ts:5 [116..146]; multiplicity unknown
+    in loop for-of                                           src/classes.ts:5  x rows
+
+O(o)           forInRecord  src/bounds.ts:65
+    in loop for-in                                           src/bounds.ts:67  x o
+
+O(xs)          parenthesizedRest  src/calls.ts:74
+    does spread ...(rest)                                 src/calls.ts:77  x xs
+
+O(obj)         destructureObjectRest  src/calls.ts:59 [partial]
+    unknown origin: call target at src/calls.ts:61 [1439..1446]; multiplicity O(obj)
+    does spread ...rest                                   src/calls.ts:61  x obj
+
+O(xs)          destructureRest  src/calls.ts:52
+    does spread ...rest                                   src/calls.ts:55  x xs
+
+O(xs)          functionReturningFunction  src/calls.ts:35 [partial]
+    unknown origin: call target at src/calls.ts:37 [903..908]; multiplicity O(xs)
+    does xs.map()                                         src/calls.ts:37  x xs
+
+O(o)           forInClosed  src/bounds.ts:59
+    in loop for-in                                           src/bounds.ts:61  x o
+
+O(xs)          inlineCallbackCall  src/calls.ts:27
+    does xs.map()                                         src/calls.ts:28  x xs
+
+O(t)           forOfTuple  src/bounds.ts:53
+    in loop for-of                                           src/bounds.ts:55  x t
+
+O(xs)          swapPattern  src/budgets.ts:97 [partial]
+    unknown origin: iteration bound at src/budgets.ts:101 [1858..1885]; multiplicity unknown
+    in loop for-of                                           src/budgets.ts:100  x xs
+
+O(xs)          compoundBound  src/budgets.ts:74 [partial]
+    unknown origin: iteration bound at src/budgets.ts:78 [1499..1530]; multiplicity unknown
+    in loop for-of                                           src/budgets.ts:77  x xs
+
+O(xs)          shorthandDestructure  src/budgets.ts:47 [partial]
+    unknown origin: iteration bound at src/budgets.ts:51 [1068..1110]; multiplicity unknown
+    unknown origin: call target at src/budgets.ts:56 [1124..1130]; multiplicity O(1) via src/budgets.ts:56 [1124..1130]
+    in loop for-of                                           src/budgets.ts:50  x xs
+
+O(matrix)      whileHalvingMidpoint  src/bounds.ts:38 [partial]
+    unknown origin: iteration bound at src/bounds.ts:43 [912..1022]; multiplicity unknown
+    in loop for-of                                           src/bounds.ts:40  x matrix
+
+O(xs)          hotLocalFunctionDeclaration  src/branches.ts:207 [partial]
+    unknown origin: input size relation at src/branches.ts:211 [5062..5092]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:211  x xs
+
+O(xs)          callsColdFunctionBesideLinear [asserted]  src/branches.ts:190 [partial]
+    unknown origin: input size relation at src/branches.ts:55 [1264..1319]; multiplicity unknown via src/branches.ts:191 [4555..4577]
+    unknown origin: input size relation at src/branches.ts:55 [1285..1319]; multiplicity unknown via src/branches.ts:191 [4555..4577]
+    in loop for-of                                           src/branches.ts:192  x xs
+
+O(matrix)      whileHalvingShift  src/bounds.ts:26 [partial]
+    unknown origin: iteration bound at src/bounds.ts:30 [678..725]; multiplicity unknown
+    in loop for-of                                           src/bounds.ts:28  x matrix
+
+O(xs)          coldElseBranch [asserted]  src/branches.ts:153 [partial]
+    unknown origin: input size relation at src/branches.ts:159 [3869..3924]; multiplicity unknown
+    unknown origin: input size relation at src/branches.ts:159 [3890..3924]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:156  x xs
+
+O(xs)          switchDiscriminantCost  src/branches.ts:137
+    does xs.indexOf()                                     src/branches.ts:138  x xs
+
+O(xs)          maxTaggedPublicFn  src/branches.ts:110 [partial]
+    unknown origin: input size relation at src/branches.ts:112 [2848..2903]; multiplicity unknown
+    unknown origin: input size relation at src/branches.ts:112 [2869..2903]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:112  x xs
+
+O(matrix)      geometricStepLoop  src/bounds.ts:18 [partial]
+    unknown origin: iteration bound at src/bounds.ts:21 [473..527]; multiplicity unknown
+    in loop for-of                                           src/bounds.ts:20  x matrix
+
+O(xs)          boundedNonLoopStatement [asserted]  src/branches.ts:81 [partial]
+    unknown origin: input size relation at src/branches.ts:85 [2135..2165]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:85  x xs
+
+O(xs)          boundedLoopStatement [asserted]  src/branches.ts:74
+    in loop for-of                                           src/branches.ts:77  x xs
+
+O(xs)          ignoredStatementFn [asserted]  src/branches.ts:59
+    in loop for-of                                           src/branches.ts:63  x xs
+
+O(xs)          coldFunctionTagged  src/branches.ts:53 [partial]
+    unknown origin: input size relation at src/branches.ts:55 [1264..1319]; multiplicity unknown
+    unknown origin: input size relation at src/branches.ts:55 [1285..1319]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:55  x xs
+
+O(xs)          coldStatementFn [asserted]  src/branches.ts:44 [partial]
+    unknown origin: input size relation at src/branches.ts:47 [1034..1089]; multiplicity unknown
+    unknown origin: input size relation at src/branches.ts:47 [1055..1089]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:48  x xs
+
+O(xs)          hotBlockStatement [asserted]  src/branches.ts:36 [partial]
+    unknown origin: input size relation at src/branches.ts:38 [821..851]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:40  x xs
+
+O(xs)          hotTryBranch [asserted]  src/branches.ts:25 [partial]
+    unknown origin: input size relation at src/branches.ts:31 [674..704]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:29  x xs
+
+O(rows)        reexportDefault  src/modules/reexports.ts:3 [partial]
+    unknown origin: input size relation at src/modules/reexports.ts:5 [141..175]; multiplicity unknown
+    in loop for-of                                           src/modules/reexports.ts:5  x rows
+
+O(matrix)      tripleNestedOverLimit  src/types.ts:70 [partial]
+    unknown origin: input size relation at src/types.ts:72 [1716..1771]; multiplicity unknown
+    unknown origin: input size relation at src/types.ts:72 [1737..1771]; multiplicity unknown
+    in loop for-of                                           src/types.ts:72  x matrix
+
+O(xs)          hotCaseBranch [asserted]  src/branches.ts:12 [partial]
+    unknown origin: input size relation at src/branches.ts:20 [455..485]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:17  x xs
+
+O(matrix)      typeAliasChain  src/types.ts:45 [partial]
+    unknown origin: input size relation at src/types.ts:47 [1107..1149]; multiplicity unknown
+    in loop for-of                                           src/types.ts:47  x matrix
+
+O(matrix)      unionOfClosed  src/types.ts:18 [partial]
+    unknown origin: input size relation at src/types.ts:20 [437..486]; multiplicity unknown
+    in loop for-of                                           src/types.ts:20  x matrix
+
+O(o)           forInIndexSig  src/types.ts:6
+    in loop for-in                                           src/types.ts:8  x o
+
+O(xs)          a  src/modules/star.ts:1 [partial]
+    unknown origin: input size relation at src/modules/star.ts:3 [81..111]; multiplicity unknown
+    in loop for-of                                           src/modules/star.ts:3  x xs
+
+O(xs)          hotIfBranch [asserted]  src/branches.ts:1 [partial]
+    unknown origin: input size relation at src/branches.ts:7 [188..218]; multiplicity unknown
+    in loop for-of                                           src/branches.ts:5  x xs
+
+O(n)           directRecursion  src/recursion.ts:4
+    calls factorialLike()                                  src/recursion.ts:5  = O(n)
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+
+O(prefix)      nextLineLabel  src/methods.ts:98
+    does (prefix + "ab").split() [string]                src/methods.ts:99  x prefix
+
+O(prefix)      surrogateCutLabel  src/methods.ts:94
+    does (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa�....split() [string] src/methods.ts:95  x prefix
+
+O(rows)        spreadRestKeys  src/methods.ts:90 [partial]
+    unknown origin: input size relation at src/methods.ts:91 [2218..2238]; multiplicity O(1)
+    unknown origin: input size relation at src/methods.ts:91 [2218..2238]; multiplicity unknown
+    does spread ...rows                                   src/methods.ts:90  x rows
+
+O(rows)        spreadRestTupleSet  src/methods.ts:86 [partial]
+    unknown origin: input size relation at src/methods.ts:87 [2119..2135]; multiplicity O(1)
+    does spread ...rows                                   src/methods.ts:86  x rows
+
+O(rows)        newSetNonConst  src/methods.ts:59 [partial]
+    unknown origin: input size relation at src/methods.ts:61 [1635..1637]; multiplicity O(rows)
+    unknown origin: input size relation at src/methods.ts:61 [1627..1638]; multiplicity O(rows)
+    unknown origin: input size relation at src/methods.ts:61 [1627..1638]; multiplicity unknown
+    unknown origin: input size relation at src/methods.ts:61 [1627..1643]; multiplicity O(rows)
+    in loop for-of                                           src/methods.ts:61  x rows
+
+O(items)       structuredCloneCall  src/methods.ts:51 [partial]
+    unknown origin: input size relation at src/methods.ts:52 [1403..1404]; multiplicity O(items)
+    unknown origin: call target at src/methods.ts:52 [1403..1404]; multiplicity unknown
+    unknown origin: implementation-defined work at src/methods.ts:52 [1387..1405]; multiplicity O(items)
+    does items.map()                                      src/methods.ts:52  x items
+
+O(n)           arrayFromCallback  src/methods.ts:37
+    does Array.from({ length: n })                        src/methods.ts:38  x n
+
+O(o)           objectKeysCall  src/methods.ts:33
+    does Object.keys(o)                                   src/methods.ts:34  x o
+
+O(strings)     stringLinearCall  src/methods.ts:17 [partial]
+    unknown origin: input size relation at src/methods.ts:19 [543..560]; multiplicity O(strings)
+    unknown origin: input size relation at src/methods.ts:19 [543..560]; multiplicity unknown
+    in loop for-of                                           src/methods.ts:19  x strings
+
+O(xs)          arrayLinearCall  src/methods.ts:1
+    does xs.includes()                                    src/methods.ts:2  x xs
+
+O(xs)          AccessorHolder.helper  src/classes.ts:150
+    in loop for-of                                           src/classes.ts:151  x xs
+
+O(matrix)      labeledLoop  src/bounds.ts:78 [partial]
+    unknown origin: input size relation at src/bounds.ts:81 [1659..1727]; multiplicity unknown
+    in loop for-of                                           src/bounds.ts:80  x matrix
+
+O(xs)          AccessorHolder.sweep  src/classes.ts:141
+    in loop for-of                                           src/classes.ts:142  x xs
+
+O(rows)        usesClassExpression  src/classes.ts:94 [partial]
+    unknown origin: call target at src/classes.ts:95 [2313..2351]; multiplicity O(1)
+    unknown origin: input size relation at src/classes.ts:90 [2190..2220]; multiplicity unknown via src/classes.ts:95 [2313..2351]
+    calls <class>.run()                                    src/classes.ts:95  = O(rows)
+    in loop for-of                                           src/classes.ts:90  x rows
+
+O(rows)        <class>.run  src/classes.ts:88 [partial]
+    unknown origin: input size relation at src/classes.ts:90 [2190..2220]; multiplicity unknown
+    in loop for-of                                           src/classes.ts:90  x rows
+
+O(xs)          pushesToReadonlyItems  src/classes.ts:81 [partial]
+    unknown origin: call target at src/classes.ts:83 [2029..2041]; multiplicity O(1)
+    calls WithReadonlyItems.addAll()                       src/classes.ts:83  = O(xs)
+    does spread ...xs                                     src/classes.ts:78  x xs
+
+O(xs)          WithReadonlyItems.addAll  src/classes.ts:77
+    does spread ...xs                                     src/classes.ts:78  x xs
+
+O(rows)        callsArrowProperty  src/classes.ts:71 [partial]
+    unknown origin: call target at src/classes.ts:72 [1762..1799]; multiplicity O(1)
+    unknown origin: input size relation at src/classes.ts:67 [1640..1670]; multiplicity unknown via src/classes.ts:72 [1762..1799]
+    calls WithArrowProperty.handler()                      src/classes.ts:72  = O(rows)
+    in loop for-of                                           src/classes.ts:67  x rows
+
+O(rows)        WithArrowProperty.handler  src/classes.ts:65 [partial]
+    unknown origin: input size relation at src/classes.ts:67 [1640..1670]; multiplicity unknown
+    in loop for-of                                           src/classes.ts:67  x rows
+
+O(rows)        callsStaticMethod  src/classes.ts:60 [partial]
+    unknown origin: call target at src/classes.ts:61 [1488..1518]; multiplicity O(1)
+    unknown origin: input size relation at src/classes.ts:56 [1368..1398]; multiplicity unknown via src/classes.ts:61 [1488..1518]
+    calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows)
+    in loop for-of                                           src/classes.ts:56  x rows
+
+O(rows)        WithStaticMethod.compute  src/classes.ts:54 [partial]
+    unknown origin: input size relation at src/classes.ts:56 [1368..1398]; multiplicity unknown
+    in loop for-of                                           src/classes.ts:56  x rows
+
+O(1)           constantBoundLoop  src/bounds.ts:6
+
+O(1)           constantOffsetFromStart  src/bounds.ts:12 [partial]
+    unknown origin: iteration bound at src/bounds.ts:14 [289..347]; multiplicity unknown
+    unknown origin: call target at src/bounds.ts:14 [336..341]; multiplicity unknown
+
+O(1)           singleIterationLoop  src/bounds.ts:71
+
+O(1)           forAwaitLoop  src/bounds.ts:89 [partial]
+    unknown origin: call target at src/bounds.ts:91 [1867..1869]; multiplicity O(1)
+    unknown origin: iteration bound at src/bounds.ts:91 [1845..1880]; multiplicity unknown
+    unknown origin: call target at src/bounds.ts:91 [1867..1869]; multiplicity unknown
+    unknown origin: operation model at src/bounds.ts:91 [1845..1880]; multiplicity O(1)
+
+O(1)           unaryHalving  src/bounds.ts:95 [partial]
+    unknown origin: iteration bound at src/bounds.ts:98 [2001..2109]; multiplicity unknown
+
+O(1)           returnInsideLoop  src/branches.ts:116 [partial]
+    unknown origin: iteration bound at src/branches.ts:117 [2980..3104]; multiplicity unknown
+    unknown origin: implementation-defined work at src/branches.ts:119 [3046..3071]; multiplicity unknown
+
+O(1)           breakInsideLoop  src/branches.ts:126 [partial]
+    unknown origin: iteration bound at src/branches.ts:128 [3193..3301]; multiplicity unknown
+    unknown origin: implementation-defined work at src/branches.ts:130 [3251..3276]; multiplicity unknown
+
+O(1)           coldBlockAllCold [asserted]  src/branches.ts:146 [partial]
+    unknown origin: iteration bound at src/branches.ts:148 [3569..3624]; multiplicity unknown
+    unknown origin: input size relation at src/branches.ts:148 [3591..3624]; multiplicity unknown
+    unknown origin: iteration bound at src/branches.ts:148 [3591..3624]; multiplicity unknown
+    unknown origin: operation model at src/branches.ts:148 [3612..3623]; multiplicity unknown
+    unknown origin: iteration bound at src/branches.ts:150 [3641..3673]; multiplicity unknown
+    unknown origin: operation model at src/branches.ts:150 [3663..3672]; multiplicity unknown
+
+O(1)           hotConstantBranch [asserted]  src/branches.ts:164
+
+O(1)           coldOnlyLoopBody [asserted]  src/branches.ts:175 [partial]
+    unknown origin: input size relation at src/branches.ts:179 [4269..4299]; multiplicity unknown
+
+O(1)           callsIgnoredFunction [asserted]  src/branches.ts:184 [partial]
+    unknown origin: iteration bound at src/branches.ts:186 [4397..4455]; multiplicity unknown
+
+O(1)           callsHotFunctionBesideQuadratic [asserted]  src/branches.ts:201 [partial]
+    unknown origin: input size relation at src/branches.ts:203 [4844..4874]; multiplicity unknown
+
+O(1)           drainedBudget  src/budgets.ts:1 [partial]
+    unknown origin: iteration bound at src/budgets.ts:5 [124..168]; multiplicity unknown
+
+O(1)           scopedBudget  src/budgets.ts:13 [partial]
+    unknown origin: iteration bound at src/budgets.ts:15 [277..414]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:18 [355..411]; multiplicity unknown
+
+O(1)           shareOfBudget  src/budgets.ts:26 [partial]
+    unknown origin: iteration bound at src/budgets.ts:29 [538..744]; multiplicity unknown
+    unknown origin: operation model at src/budgets.ts:30 [570..587]; multiplicity unknown
+    unknown origin: input size relation at src/budgets.ts:32 [636..653]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:33 [657..731]; multiplicity unknown
+
+O(1)           ordinaryForLoopCounterExcluded  src/budgets.ts:41 [partial]
+    unknown origin: iteration bound at src/budgets.ts:43 [858..899]; multiplicity unknown
+
+O(1)           namespaceWrite  src/budgets.ts:62 [partial]
+    unknown origin: iteration bound at src/budgets.ts:64 [1277..1366]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:65 [1302..1335]; multiplicity unknown
+
+O(1)           callBound  src/budgets.ts:86 [partial]
+    unknown origin: iteration bound at src/budgets.ts:88 [1661..1731]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:89 [1685..1718]; multiplicity unknown
+    unknown origin: call target at src/budgets.ts:89 [1696..1703]; multiplicity unknown via src/budgets.ts:89 [1696..1703]
+
+O(1)           shorthandDefault  src/budgets.ts:109 [partial]
+    unknown origin: iteration bound at src/budgets.ts:111 [2035..2113]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:112 [2059..2086]; multiplicity unknown
+    unknown origin: call target at src/budgets.ts:115 [2102..2108]; multiplicity unknown via src/budgets.ts:115 [2102..2108]
+
+O(1)           nestedNamespaceWrite  src/budgets.ts:123 [partial]
+    unknown origin: iteration bound at src/budgets.ts:125 [2301..2399]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:126 [2327..2361]; multiplicity unknown
+
+O(1)           mergedBlockWrite  src/budgets.ts:140 [partial]
+    unknown origin: iteration bound at src/budgets.ts:142 [2583..2669]; multiplicity unknown
+    unknown origin: iteration bound at src/budgets.ts:143 [2608..2639]; multiplicity unknown
+
+unknown        callbackSubstituted  src/calls.ts:13
+    unknown origin: iteration bound at src/calls.ts:9 [196..237]; multiplicity unknown via src/calls.ts:14 [319..347]
+    unknown origin: iteration bound at src/calls.ts:3 [60..97]; multiplicity unknown via src/calls.ts:14 [319..347] -> src/calls.ts:9 [231..236]
+
+O(1)           spreadAtCallSite  src/calls.ts:21 [partial]
+    unknown origin: iteration bound at src/calls.ts:23 [520..567]; multiplicity unknown
+    unknown origin: input size relation at src/calls.ts:23 [560..565]; multiplicity unknown
+    unknown origin: input size relation at src/calls.ts:17 [369..376]; multiplicity unknown via src/calls.ts:23 [552..566]
+    unknown origin: input size relation at src/calls.ts:18 [406..437]; multiplicity unknown via src/calls.ts:23 [552..566]
+
+unknown        callThroughCast  src/calls.ts:48
+    unknown origin: iteration bound at src/calls.ts:42 [968..1005]; multiplicity unknown via src/calls.ts:49 [1125..1152]
+
+O(1)           instantiationExpression  src/calls.ts:69
+
+O(1)           WithGetter.constructor  src/classes.ts:42
+
+O(1)           WithGetter.total  src/classes.ts:43 [partial]
+    unknown origin: input size relation at src/classes.ts:45 [1077..1136]; multiplicity unknown
+    unknown origin: input size relation at src/classes.ts:45 [1106..1136]; multiplicity unknown
+
+unknown        readsGetter  src/classes.ts:49
+    unknown origin: input size relation at src/classes.ts:45 [1077..1136]; multiplicity unknown via src/classes.ts:50 [1220..1246]
+    unknown origin: input size relation at src/classes.ts:45 [1106..1136]; multiplicity unknown via src/classes.ts:50 [1220..1246]
+
+O(1)           new WithArrowProperty()  src/classes.ts:64
+
+O(1)           new WithReadonlyItems()  src/classes.ts:75
+
+unknown        useMergedHolder  src/classes.ts:113
+    unknown origin: call target at src/classes.ts:114 [2609..2627]; multiplicity O(1)
+    unknown origin: call target at src/classes.ts:114 [2609..2634]; multiplicity O(1)
+    unknown origin: call target at src/classes.ts:109 [2539..2549]; multiplicity O(1) via src/classes.ts:114 [2609..2634]
+    unknown origin: input size relation at src/classes.ts:106 [2485..2507]; multiplicity unknown via src/classes.ts:114 [2609..2634] -> src/classes.ts:109 [2539..2549]
+
+unknown        ComputedKeys.[ Symbol.iterator ]  src/classes.ts:118
+    unknown origin: operation model at src/classes.ts:119 [2701..2713]; multiplicity O(1)
+
+unknown        useQuotedHolder  src/classes.ts:136
+    unknown origin: call target at src/classes.ts:137 [2938..2956]; multiplicity O(1)
+    unknown origin: call target at src/classes.ts:137 [2938..2963]; multiplicity O(1)
+    unknown origin: call target at src/classes.ts:132 [2868..2878]; multiplicity O(1) via src/classes.ts:137 [2938..2963]
+    unknown origin: input size relation at src/classes.ts:129 [2814..2836]; multiplicity unknown via src/classes.ts:137 [2938..2963] -> src/classes.ts:132 [2868..2878]
+
+O(1)           new AccessorHolder() [asserted]  src/classes.ts:140
+
+O(1)           AccessorHolder.build  src/classes.ts:144 [partial]
+    unknown origin: iteration bound at src/classes.ts:145 [3112..3148]; multiplicity unknown
+    unknown origin: call target at src/classes.ts:145 [3132..3147]; multiplicity unknown
+
+O(1)           AccessorHolder.run  src/classes.ts:157 [partial]
+    unknown origin: iteration bound at src/classes.ts:158 [3399..3434]; multiplicity unknown
+    unknown origin: call target at src/classes.ts:158 [3419..3433]; multiplicity unknown
+
+O(1)           AccessorHolder.walk  src/classes.ts:160 [partial]
+    unknown origin: iteration bound at src/classes.ts:161 [3485..3522]; multiplicity unknown
+    unknown origin: call target at src/classes.ts:161 [3505..3521]; multiplicity unknown
+
+O(1)           arrayLiteralSpread  src/constants.ts:1
+
+O(1)           conditionalConstants  src/constants.ts:6
+
+O(1)           derivedConstantArrays  src/constants.ts:10
+
+O(1)           newArrayConstant  src/constants.ts:20
+
+unknown        readonlyFieldConst  src/constants.ts:31
+    unknown origin: call target at src/constants.ts:32 [658..683]; multiplicity O(1)
+
+O(1)           constEnumKeys  src/constants.ts:41
+
+O(1)           asConstArray  src/constants.ts:45
+
+O(1)           stringLiteralConstant  src/constants.ts:49
+
+unknown        sortMethodCall  src/methods.ts:5
+    unknown origin: implementation-defined work at src/methods.ts:6 [170..194]; multiplicity O(1)
+
+unknown        setLinearCall  src/methods.ts:9
+    unknown origin: iteration bound at src/methods.ts:10 [279..292]; multiplicity unknown
+    unknown origin: call target at src/methods.ts:10 [289..291]; multiplicity unknown
+
+unknown        mapLinearCall  src/methods.ts:13
+    unknown origin: iteration bound at src/methods.ts:14 [396..409]; multiplicity unknown
+    unknown origin: call target at src/methods.ts:14 [406..408]; multiplicity unknown
+
+unknown        regexpConstCall  src/methods.ts:23
+    unknown origin: operation model at src/methods.ts:24 [643..645]; multiplicity O(1)
+
+O(1)           regexpVarCall  src/methods.ts:27 [partial]
+    unknown origin: iteration bound at src/methods.ts:29 [769..828]; multiplicity unknown
+    unknown origin: input size relation at src/methods.ts:29 [803..818]; multiplicity unknown
+    unknown origin: operation model at src/methods.ts:29 [803..805]; multiplicity unknown
+
+unknown        jsonParseCall  src/methods.ts:41
+    unknown origin: implementation-defined work at src/methods.ts:42 [1119..1135]; multiplicity O(1)
+
+unknown        bufferConcatCall  src/methods.ts:47
+    unknown origin: implementation-defined work at src/methods.ts:48 [1271..1291]; multiplicity O(1)
+
+unknown        unknownReceiverCall  src/methods.ts:55
+    unknown origin: operation model at src/methods.ts:56 [1493..1514]; multiplicity O(1)
+
+O(1)           newMapConstant  src/methods.ts:65
+
+O(1)           setCallback  src/methods.ts:80 [partial]
+    unknown origin: input size relation at src/methods.ts:83 [2001..2040]; multiplicity O(1)
+    unknown origin: iteration bound at src/methods.ts:83 [2001..2040]; multiplicity unknown
+    unknown origin: input size relation at src/methods.ts:83 [2017..2039]; multiplicity unknown
+
+O(1)           setCallbackCallsMethod  src/methods.ts:112 [partial]
+    unknown origin: input size relation at src/methods.ts:114 [2690..2732]; multiplicity O(1)
+    unknown origin: iteration bound at src/methods.ts:114 [2690..2732]; multiplicity unknown
+    unknown origin: call target at src/methods.ts:114 [2706..2731]; multiplicity unknown
+
+unknown        mutualRecursionCaller  src/recursion.ts:14
+    unknown origin: recurrence at src/recursion.ts:11 [281..366]; multiplicity O(1) via src/recursion.ts:15 [435..447] -> src/recursion.ts:9 [262..277] -> src/recursion.ts:12 [347..363] -> src/recursion.ts:9 [262..277]
+
+O(1)           threeCycleEntry  src/recursion.ts:32 [partial]
+    unknown origin: iteration bound at src/recursion.ts:34 [977..1029]; multiplicity unknown
+    unknown origin: call target at src/recursion.ts:20 [559..592]; multiplicity unknown via src/recursion.ts:34 [1010..1028]
+    unknown origin: call target at src/recursion.ts:20 [559..592]; multiplicity unknown via src/recursion.ts:34 [1010..1028] -> src/recursion.ts:20 [559..592] -> src/recursion.ts:25 [711..735]
+
+O(1)           callsCycleMemberDirectly  src/recursion.ts:38 [partial]
+    unknown origin: iteration bound at src/recursion.ts:40 [1143..1207]; multiplicity unknown
+    unknown origin: call target at src/recursion.ts:40 [1176..1206]; multiplicity unknown
+    unknown origin: call target at src/recursion.ts:20 [559..592]; multiplicity unknown via src/recursion.ts:40 [1176..1206] -> src/recursion.ts:25 [711..735] -> src/recursion.ts:30 [864..885]
+
+unknown        pkgWrapped  src/modules/external.ts:3
+    unknown origin: call target at src/modules/external.ts:4 [89..98]; multiplicity O(1)
+
+unknown        usesNamespaceImport  src/modules/named.ts:7
+    unknown origin: call target at src/modules/named.ts:8 [150..169]; multiplicity O(1)
+    unknown origin: call target at src/modules/external.ts:4 [89..98]; multiplicity O(1) via src/modules/named.ts:8 [150..169]
+
+O(1)           pickType  src/types.ts:29
+
+O(1)           omitType  src/types.ts:32
+
+O(1)           readonlyType  src/types.ts:35
+
+unknown        keyofType  src/types.ts:39
+    unknown origin: call target at src/types.ts:40 [904..913]; multiplicity O(1)
+
+O(1)           genericWithConstraint  src/types.ts:51
+
+O(1)           destructuredParam  src/types.ts:55
+
+unknown        callsMethodShapedProperty  src/types.ts:62
+    unknown origin: operation model at src/types.ts:63 [1517..1526]; multiplicity O(1)
+
+O(1)           usesNamedThing  src/types.ts:66
+
+unknown        usesPathAlias  src/modules/paths.ts:3
+    unknown origin: implementation-defined work at src/lib/shared.ts:2 [57..81]; multiplicity O(1) via src/modules/paths.ts:4 [103..115]
+

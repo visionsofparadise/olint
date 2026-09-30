@@ -1,6 +1,6 @@
-use super::{lines_of_chain, lines_of_report, lint_header_of, ReportRow};
+use super::{lines_of_chain, lines_of_report, lint_header_of, verdict_of, ReportRow, Verdict};
 use crate::config::{Config, Limit};
-use crate::cost::{Cost, State};
+use crate::cost::{Cost, Part, State};
 use crate::project::{FileId, Site};
 use crate::trace::TraceArena;
 use crate::unknowns::{SourceSpan, UnknownId};
@@ -82,6 +82,7 @@ fn chains_pad_labels_and_nest_inner_calls() {
 
 fn row_of(cost: Cost, name: &str, file: u32, line: u32) -> ReportRow {
     ReportRow {
+        entry: false,
         envelope: Some(
             Cost::N
                 .bind(
@@ -336,4 +337,62 @@ fn rows_render_each_state_with_its_marks_and_origins() {
             "",
         ]
     );
+}
+
+/// §4.3: an Unknown entry has no floor, so its verdict is Inconclusive whatever cost it carries, while a Partial
+/// entry's floor above the limit still Exceeds it.
+#[test]
+fn an_unknown_entry_is_inconclusive() {
+    let linear = Cost::dimension(1, crate::cost::Domain::Size);
+    let unknown = Part {
+        cost: linear.clone(),
+        unknowns: Some(UnknownId(1)),
+        ..Part::none()
+    };
+    let partial = Part::unmarked(linear, None);
+    let partial = Part {
+        unknowns: Some(UnknownId(1)),
+        ..partial
+    };
+
+    assert_eq!(unknown.state(), State::Unknown);
+    assert_eq!(verdict_of(&unknown, &Cost::ONE), Verdict::Inconclusive);
+    assert_eq!(partial.state(), State::Partial);
+    assert_eq!(verdict_of(&partial, &Cost::ONE), Verdict::Exceeds);
+}
+
+/// §4.7: every entry shows its bound, floor or Unknown state with its origins whatever `--min` is, including an
+/// entry whose envelope does not bind; `--min` filters only the other rows.
+#[test]
+fn entries_render_whatever_the_minimum() {
+    let mut partial = row_of(Cost::ONE, "partial_entry", 0, 1);
+    let mut unknown = row_of(Cost::ONE, "unknown_entry", 0, 2);
+    let helper = row_of(Cost::ONE, "helper", 0, 3);
+
+    partial.entry = true;
+    partial.state = State::Partial;
+    partial.unknowns = Some(UnknownId(1));
+    unknown.entry = true;
+    unknown.state = State::Unknown;
+    unknown.unknowns = Some(UnknownId(2));
+    unknown.envelope = None;
+
+    let lines = lines_of_report(
+        &Values::default(),
+        &TraceArena::default(),
+        "tsconfig.json",
+        &[partial, unknown, helper],
+        3,
+        &|site, out| write!(out, "src/a.ts:{}", site.line),
+        &|root| vec![format!("unknown call target at src/a.ts:{}", root.0)],
+    );
+    let text = lines.join("\n");
+
+    assert!(text.contains(
+        "O(1)           partial_entry  src/a.ts:1 [partial]\n    unknown origin: call target at src/a.ts:1"
+    ));
+    assert!(text.contains(
+        "unknown        unknown_entry  src/a.ts:2\n    unknown origin: call target at src/a.ts:2"
+    ));
+    assert!(!text.contains("helper  src/a.ts:3"));
 }

@@ -94,10 +94,12 @@ pub enum Verdict {
     Inconclusive,
 }
 
-/// The verdict of a reading against `limit`. A Known reading's cost is its bound, and any other reading's cost its
-/// floor, the join of its proven contributions. Ceilings (§4.2) join the Exceeds side in action 7.3.
+/// The verdict of a reading against `limit`. A Known reading's cost is its bound, and a Partial reading's cost its
+/// floor, the join of its proven contributions. An Unknown reading has no floor, so it is Inconclusive (§4.3).
+/// Ceilings (§4.2) join the Exceeds side in action 7.3.
 pub fn verdict_of(part: &Part, limit: &Cost) -> Verdict {
     match (part.state(), part.cost.compare(limit)) {
+        (State::Unknown, _) => Verdict::Inconclusive,
         (State::Known, CostComparison::Within) => Verdict::Within,
         (_, CostComparison::Exceeds) => Verdict::Exceeds,
         _ => Verdict::Inconclusive,
@@ -157,6 +159,8 @@ pub fn findings_of<'a>(
 }
 
 pub struct ReportRow {
+    /// The row is an entry, which the report shows whatever `--min` is (§4.7).
+    pub entry: bool,
     pub envelope: Option<Cost>,
     pub unknowns: Option<UnknownId>,
     pub state: State,
@@ -205,6 +209,7 @@ pub fn report_rows_of<'a>(
         let envelope = analysis.bind_function_cost(file, function, &Cost::N).ok();
 
         rows.push(ReportRow {
+            entry: false,
             envelope,
             unknowns: part.unknowns,
             state: part.state(),
@@ -398,7 +403,8 @@ fn lines_of_report(
     let mut flagged: Vec<&ReportRow> = rows
         .iter()
         .filter(|row| {
-            if minimum_exponent == 0 {
+            // §4.7: every entry shows its state and origins; `--min` filters only the other rows.
+            if row.entry || minimum_exponent == 0 {
                 return true;
             }
 

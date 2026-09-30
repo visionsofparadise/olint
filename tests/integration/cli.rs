@@ -240,8 +240,9 @@ fn minimum_filter_preserves_logarithmic_exception_and_unknown_policy() {
     ] {
         for unknown in [false, true] {
             let body = if unknown { "callback();" } else { "" };
+            // `--min` filters the helper's row, while the entry that calls it shows whatever the minimum (§4.7).
             let source = format!(
-                "export function selected(n: number, callback: () => void) {{\n/** @perf O({expression}) */\nvoid 0;\n{body}\n}}"
+                "function inner(n: number, callback: () => void) {{\n/** @perf O({expression}) */\nvoid 0;\n{body}\n}}\nexport function selected(n: number, callback: () => void) {{ inner(n, callback); }}"
             );
             let mut previous = None;
 
@@ -266,16 +267,20 @@ fn minimum_filter_preserves_logarithmic_exception_and_unknown_policy() {
                 assert_eq!(
                     stdout
                         .lines()
-                        .any(|line| line.contains(" selected [asserted]  index.ts:")),
+                        .any(|line| line.contains(" inner [asserted]  index.ts:")),
                     visible,
                     "{expression} {minimum}: {stdout}"
                 );
 
-                if visible {
+                for (name, shown) in [("inner", visible), ("selected", true)] {
+                    if !shown {
+                        continue;
+                    }
+
                     let row = stdout
                         .lines()
-                        .find(|line| line.contains(" selected [asserted]  index.ts:"))
-                        .unwrap();
+                        .find(|line| line.contains(&format!(" {name} [asserted]  index.ts:")))
+                        .unwrap_or_else(|| panic!("{expression} {minimum}: {stdout}"));
 
                     assert_eq!(row.contains("[partial]"), unknown, "{row}");
                 }
