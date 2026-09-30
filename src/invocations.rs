@@ -596,7 +596,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             reading = reading.merge(consumed, &mut self.unknowns, &mut self.traces);
         }
 
-        (!reading.holds_no_work()).then_some(reading)
+        // An unknown visit count leaves no cost (§1 Floor) but its unknowns, which the reading must keep.
+        let unknown = reading
+            .completions
+            .iter()
+            .any(|channel| channel.2.unknowns.is_some());
+
+        (unknown || !reading.holds_no_work()).then_some(reading)
     }
 
     fn protocol_parts_of(
@@ -757,7 +763,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             return next
-                .map_parts(|part| part.scaled(None, &mut self.unknowns))
+                .map_parts(|part| part.unmultiplied(&mut self.unknowns))
                 .retaining(Some(bound), &mut self.unknowns);
         };
 

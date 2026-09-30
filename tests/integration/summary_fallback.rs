@@ -362,7 +362,7 @@ deferred();
 
 #[test]
 fn unavailable_multiplier() {
-    fallback_case(UNAVAILABLE_MULTIPLIER, "O(N^3)", true, true, false, false);
+    fallback_case(UNAVAILABLE_MULTIPLIER, "O(1)", true, true, false, false);
 }
 
 const ASSUMED_STATEMENT_BEFORE: &str = r#"function deferred() {}

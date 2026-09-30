@@ -1,4 +1,4 @@
-use olint::cost::{Cost, Part, Reading};
+use olint::cost::{Cost, Part, Reading, State};
 use olint::unknowns::Unknowns;
 use std::cell::RefCell;
 use std::ops::Deref;
@@ -1531,18 +1531,20 @@ fn loop_tests_and_updates_repeat_at_the_iteration_count() {
 }
 
 #[test]
-fn opaque_loop_endpoints_keep_known_test_work_partial() {
+fn opaque_loop_endpoints_leave_their_repeated_test_out_of_the_floor() {
+    // The test runs once per visit of a loop whose visit count is unknown, so its work is an unknown contribution
+    // and adds nothing to the floor (§1 Floor).
     for (helper, body, expected) in [
         (
             LOOP_QUADRATIC,
             "for (let i = 0; i < quadratic(xs); i++) void i;",
-            "O(N^2)",
+            "O(1)",
         ),
-        (LOOP_SCAN, "let i = 0; while (i < scan(xs)) i++;", "O(N)"),
+        (LOOP_SCAN, "let i = 0; while (i < scan(xs)) i++;", "O(1)"),
         (
             LOOP_SCAN,
             "let i = 0; do { i++; } while (i < scan(xs));",
-            "O(N)",
+            "O(1)",
         ),
     ] {
         let (reading, _) = reading_of(
@@ -1552,6 +1554,39 @@ fn opaque_loop_endpoints_keep_known_test_work_partial() {
 
         assert_eq!(reading.total().cost, Cost::parse(expected).unwrap());
         assert!(!reading.total().is_complete());
+    }
+}
+
+/// S1-6 (G4): the while may run zero times, so its quadratic body is an unknown contribution and adds nothing to the
+/// floor (§1 Floor).
+#[test]
+fn an_unresolved_loop_body_adds_nothing_to_the_floor() {
+    let (reading, _) = reading_of(
+        "export function f(xs: number[]): number { let c = 0; let k = 1; while (k !== xs.length) { for (const a of xs) for (const b of xs) c += a * b; k = (k * 3) % 7; } return c; }",
+        "f",
+    );
+    let total = reading.total();
+
+    assert_eq!(total.cost, Cost::ONE);
+    assert_ne!(total.state(), State::Known);
+}
+
+/// A loop's initializer runs once whatever its visit count, so a proven initializer stays in the floor of a loop
+/// whose bound is unresolved, and the node is Partial (§1 State).
+#[test]
+fn an_unresolved_loop_keeps_its_proven_initializer_in_the_floor() {
+    for body in [
+        "for (let i = scan(xs); i !== 7; i = (i * 3) % 7) { for (const a of xs) for (const b of xs) void (a + b); }",
+        "for (const x of tapped(xs)) { for (const a of xs) void a; }",
+    ] {
+        let (reading, _) = reading_of(
+            &format!("{LOOP_SCAN}function tapped(xs: number[]): Iterable<number> {{ scan(xs); return {{ [Symbol.iterator]() {{ return {{ next() {{ return {{ done: false, value: 1 }}; }} }}; }} }}; }}\nexport function f(xs: number[]) {{ {body} }}"),
+            "f",
+        );
+        let total = reading.total();
+
+        assert_eq!(total.cost, Cost::parse("O(N)").unwrap(), "{body}");
+        assert_eq!(total.state(), State::Partial, "{body}");
     }
 }
 

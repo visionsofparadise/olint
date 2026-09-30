@@ -1,35 +1,32 @@
 public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
-O(1) [partial]     38
+O(1) [partial]     48
 O(1)               33
 O(xs)              18
-O(xs) [partial]     8
 O(max(1, rows^2))    8
 O(max(1, rows^2)) [partial]    7
-O(n) [partial]      6
 O(N)                5
 O(o)                4
+O(xs) [partial]     4
 O(N) [partial]      4
 O(matrix) [partial]    3
 O(max(1, (xs * xs^2)))    3
 O(max(1, xs^2))     3
 O(n)                3
+O(n) [partial]      3
 O((xs * log(xs)))    2
 O(prefix)           2
 O(max(1, (matrix * max(o, matrix))))    2
 O(t)                1
 O(max(1, matrix^2))    1
 O(max(xs, target))    1
-O(max(n, g, xs)) [partial]    1
-O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
 O(obj) [partial]    1
 O(N^2)              1
 O(rows^2)           1
 O(max(xs, needle))    1
 O(max(1, (strings * (max(strings, needle))^(2))))    1
-O(max(re, needles)) [partial]    1
 O(items^2) [partial]    1
 O(max(1, (rows * rows^2)))    1
 O(max(1, (matrix * matrix^2)))    1
@@ -56,14 +53,8 @@ O(items^2)     structuredCloneCall  src/methods.ts:51 [partial]
 O(max(base, xs)) functionReturningFunction  src/calls.ts:35 [partial]
     does xs.map()                                         src/calls.ts:37  x N
 
-O(max(n, g, xs)) shareOfBudget  src/budgets.ts:26 [partial]
-    does xs.slice()                                       src/budgets.ts:31  x N
-
 O(max(xs, target)) switchDiscriminantCost  src/branches.ts:137
     does xs.indexOf()                                     src/branches.ts:138  x N
-
-O(max(re, needles)) regexpVarCall  src/methods.ts:27 [partial]
-    does re.test() [regexp]                               src/methods.ts:29  x N
 
 O(max(xs, needle)) arrayLinearCall  src/methods.ts:1
     does xs.includes()                                    src/methods.ts:2  x N
@@ -190,11 +181,6 @@ O(max(1, rows^2)) callsStaticMethod  src/classes.ts:60 [partial]
     in loop for-of                                           src/classes.ts:56  x rows
         in loop for-of                                       src/classes.ts:56  x N
 
-O(max(1, rows)) spreadAtCallSite  src/calls.ts:21 [partial]
-    does spread ...xs                                     src/calls.ts:23  x N
-        calls sumRest()                                    src/calls.ts:23  = O(rows)
-        does spread ...args                               src/calls.ts:17  x N
-
 O(o)           forInRecord  src/bounds.ts:65
     in loop for-in                                           src/bounds.ts:67  x N
 
@@ -297,16 +283,6 @@ O(xs)          hotCaseBranch  src/branches.ts:12
 O(o)           forInIndexSig  src/types.ts:6
     in loop for-in                                           src/types.ts:8  x N
 
-O(n)           callsCycleMemberDirectly  src/recursion.ts:38 [partial]
-    calls CycleHolder.step()                               src/recursion.ts:40  = O(n)
-    calls cycleContinue()                                  src/recursion.ts:25  = O(n)
-    calls cycleStart()                                     src/recursion.ts:30  = O(n)
-
-O(n)           threeCycleEntry  src/recursion.ts:32 [partial]
-    calls cycleStart()                                     src/recursion.ts:34  = O(n)
-    calls CycleHolder.step()                               src/recursion.ts:20  = O(n)
-    calls cycleContinue()                                  src/recursion.ts:25  = O(n)
-
 O(xs)          hotIfBranch  src/branches.ts:1
     in loop for-of                                           src/branches.ts:5  x xs
 
@@ -331,10 +307,6 @@ O(n)           factorialLike  src/recursion.ts:1
     calls factorialLike()                                  src/recursion.ts:2  = O(n)
     calls factorialLike()                                  src/recursion.ts:2  = O(n)
 
-O(xs)          setCallbackCallsMethod  src/methods.ts:112 [partial]
-    calls RoundEngine.run()                                src/methods.ts:114  = O(xs)
-    does xs.indexOf()                                     src/methods.ts:104  x N
-
 O(xs)          RoundEngine.run  src/methods.ts:103
     does xs.indexOf()                                     src/methods.ts:104  x N
 
@@ -344,32 +316,17 @@ O(prefix)      nextLineLabel  src/methods.ts:98
 O(prefix)      surrogateCutLabel  src/methods.ts:94
     does (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa�....split() [string] src/methods.ts:95  x N
 
-O(n)           setCallback  src/methods.ts:80 [partial]
-    does list.map()                                       src/methods.ts:83  x N
-
 O(n)           arrayFromCallback  src/methods.ts:37
     does Array.from({ length: n })                        src/methods.ts:38  x n
 
 O(o)           objectKeysCall  src/methods.ts:33
     does Object.keys(o)                                   src/methods.ts:34  x N
 
-O(xs)          AccessorHolder.walk  src/classes.ts:160 [partial]
-    calls AccessorHolder.hidden()                          src/classes.ts:161  = O(xs)
-    in loop for-of                                           src/classes.ts:148  x xs
-
-O(xs)          AccessorHolder.run  src/classes.ts:157 [partial]
-    calls AccessorHolder.sweep()                           src/classes.ts:158  = O(xs)
-    in loop for-of                                           src/classes.ts:142  x xs
-
 O(xs)          AccessorHolder.helper  src/classes.ts:150
     in loop for-of                                           src/classes.ts:151  x xs
 
 O(xs)          AccessorHolder.hidden  src/classes.ts:147
     in loop for-of                                           src/classes.ts:148  x xs
-
-O(xs)          AccessorHolder.build  src/classes.ts:144 [partial]
-    calls AccessorHolder.helper()                          src/classes.ts:145  = O(xs)
-    in loop for-of                                           src/classes.ts:151  x xs
 
 O(xs)          AccessorHolder.sweep  src/classes.ts:141
     in loop for-of                                           src/classes.ts:142  x xs
@@ -413,6 +370,8 @@ O(1)           drainedBudget  src/budgets.ts:1 [partial]
 
 O(1)           scopedBudget  src/budgets.ts:13 [partial]
 
+O(1)           shareOfBudget  src/budgets.ts:26 [partial]
+
 O(1)           ordinaryForLoopCounterExcluded  src/budgets.ts:41 [partial]
 
 O(1)           namespaceWrite  src/budgets.ts:62 [partial]
@@ -430,6 +389,8 @@ O(1)           costedCallback  src/calls.ts:1 [partial]
 O(1)           runNTimes  src/calls.ts:7 [partial]
 
 O(1)           callbackSubstituted  src/calls.ts:13 [partial]
+
+O(1)           spreadAtCallSite  src/calls.ts:21 [partial]
 
 O(1)           makeAdder  src/calls.ts:31
 
@@ -450,6 +411,12 @@ O(1)           new WithReadonlyItems()  src/classes.ts:75
 O(1)           ComputedKeys.[ Symbol.iterator ]  src/classes.ts:118 [partial]
 
 O(1)           new AccessorHolder()  src/classes.ts:140
+
+O(1)           AccessorHolder.build  src/classes.ts:144 [partial]
+
+O(1)           AccessorHolder.run  src/classes.ts:157 [partial]
+
+O(1)           AccessorHolder.walk  src/classes.ts:160 [partial]
 
 O(1)           arrayLiteralSpread  src/constants.ts:1
 
@@ -479,6 +446,8 @@ O(1)           mapLinearCall  src/methods.ts:13 [partial]
 
 O(1)           regexpConstCall  src/methods.ts:23 [partial]
 
+O(1)           regexpVarCall  src/methods.ts:27 [partial]
+
 O(1)           jsonParseCall  src/methods.ts:41 [partial]
 
 O(1)           bufferConcatCall  src/methods.ts:47 [partial]
@@ -491,13 +460,21 @@ O(1)           makeCallbackSet  src/methods.ts:72
 
 O(1)           makeDoubled  src/methods.ts:76
 
+O(1)           setCallback  src/methods.ts:80 [partial]
+
 O(1)           makeRoundEngine  src/methods.ts:108
+
+O(1)           setCallbackCallsMethod  src/methods.ts:112 [partial]
 
 O(1)           isEvenRec  src/recursion.ts:8 [partial]
 
 O(1)           isOddRec  src/recursion.ts:11 [partial]
 
 O(1)           mutualRecursionCaller  src/recursion.ts:14 [partial]
+
+O(1)           threeCycleEntry  src/recursion.ts:32 [partial]
+
+O(1)           callsCycleMemberDirectly  src/recursion.ts:38 [partial]
 
 O(1)           pkgWrapped  src/modules/external.ts:3 [partial]
 

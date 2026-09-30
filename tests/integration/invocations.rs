@@ -78,8 +78,8 @@ fn iterator_protocols_charge_acquisition_each_visit_and_applicable_close() {
     let closing = "{ [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; }, return() { quadratic(xs); return { done: true, value: 0 }; } }; } }";
     let cubic = "{ [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; }, return() { for (const x of xs) quadratic(xs); return { done: true, value: 0 }; } }; } }";
     let cases = [
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; for (const value of iterable) {{}} }}")), "O(N^2)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; return [...iterable]; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; for (const value of iterable) {{}} }}")), "O(1)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; return [...iterable]; }}")), "O(N)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Walk {{ [Symbol.iterator]() {{ return this; }} next() {{ quadratic(xs); return {{ done: true, value: 0 }}; }} }} for (const v of new Walk()) {{}} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {{ *[Symbol.iterator]() {{ yield quadratic(xs); }} }}; for (const v of iterable) {{}} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; for (const value of iterable) {{ if (value) break; }} }}")), "O(N^2)", false),
@@ -115,8 +115,8 @@ fn unknown_implementations_keep_proven_multiplicity_and_surrounding_work() {
         (index_of(format!("{QUADRATIC}\nexport function selected(tag: (parts: TemplateStringsArray) => number, xs: number[], n: number) {{ let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += tag`x` + quadratic(xs); return total; }}")), "O(N^3)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(descriptor: PropertyDescriptor, xs: number[], n: number) {{ const o = {{}} as {{ v: number }}; Object.defineProperty(o, 'v', descriptor); let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += o.v + quadratic(xs); return total; }}")), "O(N^3)", true),
         (index_of(format!("{QUADRATIC}\nexport function selected(f: () => number, xs: number[], n: number) {{ const box = {{ valueOf() {{ return 1; }} }}; box.valueOf = f; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += +box + quadratic(xs); return total; }}")), "O(N^3)", true),
-        (index_of(format!("{QUADRATIC}\nexport function selected(step: () => IteratorResult<number>, xs: number[]) {{ const iterator = {{ next(): IteratorResult<number> {{ return {{ done: true, value: 0 }}; }} }}; iterator.next = step; const iterable = {{ [Symbol.iterator]() {{ return iterator; }} }}; let total = 0; for (const v of iterable) total += quadratic(xs); return total; }}")), "O(N^2)", true),
-        (index_of(format!("{QUADRATIC}\nexport class Keys {{ [Symbol.iterator]() {{ return [1].values(); }} }}\nexport function selected(items: Iterable<number>, xs: number[]) {{ let total = 0; for (const v of items) total += quadratic(xs); return total; }}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\nexport function selected(step: () => IteratorResult<number>, xs: number[]) {{ const iterator = {{ next(): IteratorResult<number> {{ return {{ done: true, value: 0 }}; }} }}; iterator.next = step; const iterable = {{ [Symbol.iterator]() {{ return iterator; }} }}; let total = 0; for (const v of iterable) total += quadratic(xs); return total; }}")), "O(1)", true),
+        (index_of(format!("{QUADRATIC}\nexport class Keys {{ [Symbol.iterator]() {{ return [1].values(); }} }}\nexport function selected(items: Iterable<number>, xs: number[]) {{ let total = 0; for (const v of items) total += quadratic(xs); return total; }}")), "O(1)", true),
         (index_of(format!("{QUADRATIC}\nexport class Keys {{ [Symbol.iterator]() {{ return [1].values(); }} }}\nexport function selected(xs: number[]) {{ let total = 0; for (const x of xs) total += quadratic(xs); return total; }}")), "O(N^3)", false),
         (index_of(format!("{QUADRATIC}\nclass Holder {{ get value() {{ return 1; }} }}\nexport function selected(o: {{ value: number }}, xs: number[], n: number) {{ let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += o.value + quadratic(xs); return total + new Holder().value; }}")), "O(N^3)", true),
     ];
@@ -266,7 +266,7 @@ fn destructuring_patterns_read_getters_and_iterate_sources() {
 fn delegated_yields_and_head_targets_run_the_protocol_per_visit() {
     let it = "const it = { [Symbol.iterator]() { let count = 0; return { next() { quadratic(xs); return { done: count++ >= xs.length, value: 1 }; } }; } };";
     let cases = [
-        (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {it} yield* it; }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(N^2)", false),
+        (index_of(format!("{QUADRATIC}\nfunction* walk(xs: number[]) {{ {it} yield* it; }}\nexport function selected(xs: number[]) {{ for (const v of walk(xs)) void v; }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const box = {{ set p(v: number) {{ quadratic(xs); }} }}; for (box.p of xs) {{}} }}")), "O(N^3)", false),
     ];
 
@@ -311,7 +311,7 @@ fn unresolved_iteration_protocols_leave_multiplicity_unproven() {
         "/** @perf O(xs^2) */\nfunction quadratic(xs: number[]): number { return xs.length; }";
     let cases = [
         (format!("{set}\nexport function selected(xs: number[]) {{ let t = 0; for (const a of xs) for (const b of xs) t += a * b; return t; }}"), "O(1)", UnknownReason::Bound),
-        (format!("{set}\n{indexed}\nexport function selected(xs: number[]) {{ let t = 0; for (const a of xs) t += quadratic(xs); return t; }}"), "O(N^2)", UnknownReason::Bound),
+        (format!("{set}\n{indexed}\nexport function selected(xs: number[]) {{ let t = 0; for (const a of xs) t += quadratic(xs); return t; }}"), "O(1)", UnknownReason::Bound),
     ];
 
     assert_reasons(&cases);
@@ -865,7 +865,7 @@ fn catch_bindings_retain_explicit_thrown_sources() {
         (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{try {{throw {{get value(){{return quadratic(xs)}}}}}} finally {{void 0}}}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{try {{throw 0}} catch {{throw {{get value(){{return quadratic(xs)}}}}}}}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
         (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{if(xs.length) throw {{get value(){{return quadratic(xs)}}}}; throw external()}} catch({{value}}) {{return value}}}}")), "O(N^2)", true),
-        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{for(const x of xs){{try {{throw {{get value(){{return quadratic(xs)}}}}}} catch({{value}}) {{void value}}}}}}")), "O(N^2)", true),
+        (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{for(const x of xs){{try {{throw {{get value(){{return quadratic(xs)}}}}}} catch({{value}}) {{void value}}}}}}")), "O(1)", true),
         (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{function later(){{throw {{get value(){{return quadratic(xs)}}}}}} throw {{value:0}}}} catch({{value}}) {{return value}}}}")), "O(1)", true),
         (index_of(format!("{QUADRATIC}\ndeclare function external(): any; export function selected(xs:number[]){{try {{throw {{}}}} catch({{value=quadratic(xs)}}) {{return value}}}}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC} export function selected(xs:number[]){{for(const x of xs){{const {{value}}={{get value(){{return quadratic(xs)}}}};void value}}}}")), "O(N^3)", false),

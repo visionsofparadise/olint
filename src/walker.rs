@@ -1629,7 +1629,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.note_unresolved_multiplicity(&body_main);
 
                 let main = body_main
-                    .scaled(None, &mut self.unknowns)
+                    .unmultiplied(&mut self.unknowns)
                     .retaining(unresolved, &mut self.unknowns)
                     .max(absorbed, &mut self.unknowns, &mut self.traces);
 

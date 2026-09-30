@@ -1,19 +1,20 @@
 public coverage [partial]
 # tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 135 public functions
 
-O(max(1, (xs * xs^2))) > O(N^2)  coldFunctionTagged  src/branches.ts:53  via src/index.ts
+olint proves O(max(1, (xs * xs^2))), above the limit O(N^2)  coldFunctionTagged  src/branches.ts:53  via src/index.ts
     in loop for-of                                           src/branches.ts:55  x xs
         in loop for-of                                       src/branches.ts:55  x N
             in loop for-of                                   src/branches.ts:55  x N
 
-O(max(1, (rows * rows^2))) > O(N^2)  newSetNonConst  src/methods.ts:59  via src/index.ts
+olint proves O(max(1, (rows * rows^2))), above the limit O(N^2)  newSetNonConst  src/methods.ts:59  via src/index.ts
     in loop for-of                                           src/methods.ts:61  x rows
         calls Set()                                        src/methods.ts:61  = O(N)
 
-O(max(1, (matrix * matrix^2))) > O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src/index.ts
+olint proves O(max(1, (matrix * matrix^2))), above the limit O(N^2)  tripleNestedOverLimit  src/types.ts:70  via src/index.ts
     in loop for-of                                           src/types.ts:72  x matrix
         in loop for-of                                       src/types.ts:72  x N
             in loop for-of                                   src/types.ts:72  x N
 
 3 over limit
-62 partial results
+each cost over its limit is what olint proves; an instance's work may fall below it
+61 partial results

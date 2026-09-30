@@ -14,7 +14,9 @@ use olint::declarations::FunctionNode;
 use olint::project::{FileId, Project, ProjectError};
 use olint::public::{public_functions, public_roots};
 use olint::regex::{companion_of, RegexError, RegexLimits};
-use olint::report::{lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding};
+use olint::report::{
+    lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding, Verdict,
+};
 use olint::tsc::{ask, Query, TscError, TscReply};
 use olint::unknowns::{SourceSpan, UnknownReason};
 use oxc_allocator::Allocator;
@@ -289,7 +291,7 @@ fn run_with_ask(
         let mut checked = Vec::with_capacity(public.len());
 
         for public in public {
-            let mut part = analysis
+            let part = analysis
                 .summarize(public.file, public.function)
                 .total(&mut analysis.unknowns, &mut analysis.traces);
 
@@ -310,8 +312,9 @@ fn run_with_ask(
                     },
                     UnknownReason::Comparison,
                 );
-                part.unknowns = analysis.unknowns.join(part.unknowns, Some(unknown));
 
+                // An incomparable limit makes the entry's verdict Inconclusive (§4.3) and leaves its state as it is.
+                selected_unknowns.push(unknown);
                 selected_comparisons.push(format!(
                     "unknown comparison for {} against {} via {} at {}:{}",
                     analysis.name_of(public.file, public.function),
@@ -332,12 +335,11 @@ fn run_with_ask(
 
         let mut over: Vec<&Finding> = checked
             .iter()
-            .filter(|finding| {
-                finding.public.limits.iter().any(|applicable| {
-                    finding.part.cost.compare(&applicable.limit.cost) == CostComparison::Exceeds
-                })
-            })
+            .filter(|finding| finding.verdict() == Some(Verdict::Exceeds))
             .collect();
+        let inconclusive = checked
+            .iter()
+            .any(|finding| finding.verdict() == Some(Verdict::Inconclusive));
 
         over.sort_by(|left, right| {
             order_by_cost_descending(&left.part.cost, &right.part.cost)
@@ -356,9 +358,12 @@ fn run_with_ask(
 
         selected_unknowns.extend(checked.iter().filter_map(|finding| finding.part.unknowns));
 
+        // §4.5 fails on Exceeds and §4.6 on Inconclusive under "error". Every unknown origin still fails under "error"
+        // until action 4.6 narrows it to Inconclusive entries (G41).
         i32::from(
             !over.is_empty()
-                || (config.unknown == UnknownPolicy::Error && !selected_unknowns.is_empty()),
+                || (config.unknown == UnknownPolicy::Error
+                    && (inconclusive || !selected_unknowns.is_empty())),
         )
     };
 

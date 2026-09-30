@@ -815,13 +815,13 @@ fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential(
         (
             "an offset share endpoint under an unresolved budget loop",
             shared_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(step)",
+            "O(1)",
             false,
         ),
         (
             "a counter the enclosing unresolved loop resets",
             reset_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(step * ys)",
+            "O(ys)",
             false,
         ),
     ];
@@ -835,13 +835,13 @@ fn a_subunit_share_consumer_keeps_the_factor_its_enclosing_loop_multiplies() {
         (
             "a quarter step under an unresolved budget loop",
             shared_window_source("for (let k = offset; k < offset + step; k += 1 / 4) total++;"),
-            "O(step)",
+            "O(1)",
             false,
         ),
         (
             "a unit step under an unresolved budget loop",
             shared_window_source("for (let k = offset; k < offset + step; k++) total++;"),
-            "O(step)",
+            "O(1)",
             false,
         ),
         (
@@ -905,7 +905,7 @@ fn unresolved_repetition_retains_proven_local_collection_work() {
 
     assert_eq!(
         (support::projected_class_of(&known), complete),
-        (cost("O(N^2)"), false)
+        (cost("O(1)"), false)
     );
     assert!(bound_is_unknown(source, "f"));
 }

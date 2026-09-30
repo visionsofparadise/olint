@@ -1,17 +1,17 @@
 # tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 10 public functions
 
-O(max(1, (xs * xs^2))) > O(N^2)  Engine.run  src/public.ts:21  via src/index.ts
+olint proves O(max(1, (xs * xs^2))), above the limit O(N^2)  Engine.run  src/public.ts:21  via src/index.ts
     calls cubic()                                          src/public.ts:22  = O(max(1, (xs * xs^2)))
     in loop for-of                                           src/public.ts:3  x xs
         in loop for-of                                       src/public.ts:3  x N
             in loop for-of                                   src/public.ts:3  x N
 
-O(max(1, (xs * xs^2))) > O(N^2)  cubic  src/public.ts:1  via src/index.ts
+olint proves O(max(1, (xs * xs^2))), above the limit O(N^2)  cubic  src/public.ts:1  via src/index.ts
     in loop for-of                                           src/public.ts:3  x xs
         in loop for-of                                       src/public.ts:3  x N
             in loop for-of                                   src/public.ts:3  x N
 
-O(max(1, (xs * xs^2))) > O(N^2)  uses  src/public.ts:34  via src/index.ts
+olint proves O(max(1, (xs * xs^2))), above the limit O(N^2)  uses  src/public.ts:34  via src/index.ts
     calls notExported()                                    src/public.ts:34  = O(max(1, (xs * xs^2)))
     calls cubic()                                          src/public.ts:31  = O(max(1, (xs * xs^2)))
     in loop for-of                                           src/public.ts:3  x xs
@@ -19,4 +19,5 @@ O(max(1, (xs * xs^2))) > O(N^2)  uses  src/public.ts:34  via src/index.ts
             in loop for-of                                   src/public.ts:3  x N
 
 3 over limit
+each cost over its limit is what olint proves; an instance's work may fall below it
 2 partial results

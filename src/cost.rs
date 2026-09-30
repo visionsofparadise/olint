@@ -1676,6 +1676,28 @@ pub enum Preference {
     Hot,
 }
 
+/// Spec §1 State of a node's reading: Known when no contribution is unknown, Unknown when unknown contributions are
+/// its only work, Partial otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Known,
+    Partial,
+    Unknown,
+}
+
+/// The state of a reading whose unknown contributions are `unknowns` and whose preference is Absent when `absent`. A
+/// contribution under an unknown multiplicity adds nothing to the cost (`Part::unmultiplied`), so the cost joins the
+/// proven contributions only: the bound when nothing is unknown, the floor otherwise. A reading that executes no work
+/// of its own stays Absent however many unknowns it carries, so an Absent reading with unknowns has no proven
+/// contribution and is Unknown.
+pub fn state_of(unknowns: Option<UnknownId>, absent: bool) -> State {
+    match (unknowns, absent) {
+        (None, _) => State::Known,
+        (Some(_), true) => State::Unknown,
+        (Some(_), false) => State::Partial,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Part {
     pub origin: Option<SourceSpan>,
@@ -1708,6 +1730,20 @@ impl Part {
         self.retained = unknowns.scale(self.retained, factor);
 
         self
+    }
+
+    /// Spec §1 Contribution and Floor: work under an unknown multiplicity is an unknown contribution, so it adds no
+    /// cost to its node's floor and its unknowns stay, scaled by the unknown factor.
+    pub fn unmultiplied(self, unknowns: &mut Unknowns) -> Self {
+        Part {
+            cost: Cost::ONE,
+            trace: None,
+            ..self.scaled(None, unknowns)
+        }
+    }
+
+    pub fn state(&self) -> State {
+        state_of(self.unknowns, self.is_absent())
     }
 
     pub fn explanation_failed(mut self, origin: SourceSpan, unknowns: &mut Unknowns) -> Self {
@@ -2167,13 +2203,14 @@ pub fn nest(
         selected_unknowns = unknowns.join(selected_unknowns, Some(failure));
     }
 
-    let cost = match factor.multiply(&inner.cost) {
-        Ok(cost) => cost,
+    // A product past the cost representation is an unknown contribution, so it adds nothing to the floor (§1 Floor).
+    let (cost, trace) = match factor.multiply(&inner.cost) {
+        Ok(cost) => (cost, trace.ok()),
         Err(_) => {
             let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
             selected_unknowns = unknowns.join(selected_unknowns, Some(failure));
 
-            inner.cost
+            (Cost::ONE, None)
         }
     };
 
@@ -2185,7 +2222,7 @@ pub fn nest(
         unknowns: selected_unknowns,
         retained,
         cost,
-        trace: trace.ok(),
+        trace,
         preference: inner.preference,
     }
 }

@@ -328,6 +328,73 @@ fn captured(command: &mut Command) -> (Option<i32>, String, String) {
     )
 }
 
+/// Lints `source` as the only entrypoint under `max` and the `unknown` policy.
+fn verdict_lint_of(source: &str, max: &str, policy: &str) -> (Option<i32>, String) {
+    let config = serde_json::json!({ "entrypoints": ["index.ts"], "max": max, "unknown": policy });
+    let directory = support::project_of(&[
+        ("tsconfig.json", "{}"),
+        ("index.ts", source),
+        ("olint.config.json", &config.to_string()),
+    ]);
+    let (code, stdout, _) = captured(
+        Command::new(env!("CARGO_BIN_EXE_olint"))
+            .args(["--types", "syntactic"])
+            .current_dir(directory.path()),
+    );
+
+    (code, stdout)
+}
+
+/// §4.1-§4.6: Within passes every policy; Exceeds fails every policy and states the bound olint proves (§4.4); an
+/// Inconclusive entry, Partial under its limit or Known against an incomparable limit, fails only under "error".
+#[test]
+fn verdicts_decide_the_lint_exit_under_each_policy() {
+    const SCAN: &str =
+        "export function f(xs: number[]) { let c = 0; for (const a of xs) c += a; return c; }";
+
+    const CUBE: &str = "export function f(xs: number[]) { let c = 0; for (const a of xs) for (const b of xs) for (const d of xs) c += a + b + d; return c; }";
+
+    const PARTIAL: &str = "declare function opaque(): void;\nexport function f(xs: number[]) { opaque(); let c = 0; for (const a of xs) c += a; return c; }";
+
+    const INCOMPARABLE: &str = "/** @perf O(n^2) */ export function f(n: number, m: number) {}";
+
+    for (label, source, max, exits, over) in [
+        ("within", SCAN, "O(N^2)", [0, 0, 0], false),
+        ("exceeds a bound", CUBE, "O(N^2)", [1, 1, 1], true),
+        ("inconclusive partial", PARTIAL, "O(N^2)", [0, 0, 1], false),
+        (
+            "inconclusive comparison",
+            INCOMPARABLE,
+            "O(m)",
+            [0, 0, 1],
+            false,
+        ),
+    ] {
+        for (policy, exit) in ["ignore", "warn", "error"].into_iter().zip(exits) {
+            let (code, stdout) = verdict_lint_of(source, max, policy);
+
+            assert_eq!(code, Some(exit), "{label} {policy}: {stdout}");
+            assert_eq!(
+                stdout.contains("1 over limit"),
+                over,
+                "{label} {policy}: {stdout}"
+            );
+        }
+    }
+
+    let (_, stdout) = verdict_lint_of(CUBE, "O(N^2)", "warn");
+
+    assert!(
+        stdout.contains("olint proves O((xs * xs^2)), above the limit O(N^2)  f  index.ts:1"),
+        "{stdout}"
+    );
+
+    // An incomparable limit leaves the entry Known: its verdict is Inconclusive, its state unchanged (§3.5).
+    let (_, stdout) = verdict_lint_of(INCOMPARABLE, "O(m)", "warn");
+
+    assert!(!stdout.contains("partial results"), "{stdout}");
+}
+
 #[test]
 fn an_absent_channel_neither_cancels_a_cold_cost_nor_hides_an_open_target() {
     let helpers = "export function quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nexport function coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nexport class Engine {\n\t// @perf cold\n\trebuild(xs: number[]) {\n\t\treturn quadratic(xs);\n\t}\n}\n";

@@ -6,12 +6,12 @@ use oxc_span::GetSpan;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Analysis;
-use crate::cost::{Cost, Part, Reading};
+use crate::cost::{state_of, Cost, Part, Reading, State};
 use crate::declarations::FunctionId;
+use crate::flow::loop_phases_of;
 use crate::project::FileId;
 use crate::report::report_rows_of;
 use crate::summaries::Substitutions;
-use crate::syntax::is_iteration_kind;
 use crate::unknowns::{SourceSpan, UnknownId};
 use crate::values::{SizeQuantity, RECURRENCE_BASE, RECURRENCE_FLOOR};
 
@@ -32,6 +32,16 @@ pub enum NodeState {
     Known,
     Partial,
     Unknown,
+}
+
+impl From<State> for NodeState {
+    fn from(state: State) -> Self {
+        match state {
+            State::Known => NodeState::Known,
+            State::Partial => NodeState::Partial,
+            State::Unknown => NodeState::Unknown,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -66,17 +76,24 @@ struct Entry {
     absent: bool,
     asserted: bool,
     function: bool,
-    iteration: bool,
+    /// For a loop, the children its visits do not repeat (the initializer and the iterable), whose contributions
+    /// carry multiplicity one; `None` for any other node, whose children all do.
+    once: Option<Vec<NodeId>>,
     children: Vec<usize>,
 }
 
 impl Entry {
     fn state(&self) -> NodeState {
-        match (self.unknowns, self.absent) {
-            (None, _) => NodeState::Known,
-            (Some(_), true) => NodeState::Unknown,
-            (Some(_), false) => NodeState::Partial,
-        }
+        state_of(self.unknowns, self.absent).into()
+    }
+
+    fn contributes(&self, child: &Entry) -> bool {
+        !child.function
+            && child.state() == NodeState::Known
+            && self
+                .once
+                .as_ref()
+                .is_none_or(|once| once.contains(&child.node))
     }
 }
 
@@ -285,7 +302,7 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
             absent,
             asserted,
             function: true,
-            iteration: false,
+            once: None,
             children: Vec::new(),
         });
     }
@@ -305,6 +322,14 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
             continue;
         }
 
+        let once = loop_phases_of(analysis.kind_of_node(origin.file, record.node)).map(|phases| {
+            phases
+                .initialize
+                .into_iter()
+                .chain(phases.iterable)
+                .collect()
+        });
+
         located.insert((origin.file, record.node), entries.len());
         entries.push(Entry {
             key: node_key_of(analysis, origin, kind),
@@ -315,7 +340,7 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
             unknowns: record.part.unknowns,
             asserted: record.asserted,
             function: false,
-            iteration: is_iteration_kind(&analysis.kind_of_node(origin.file, record.node)),
+            once,
             children: Vec::new(),
         });
     }
@@ -345,12 +370,12 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
         .map(|entry| {
             let state = entry.state();
             let text = labels.text(&entry.cost);
-            let mut contributions: Vec<(NodeKey, String)> = match (state, entry.iteration) {
-                (NodeState::Partial, false) => entry
+            let mut contributions: Vec<(NodeKey, String)> = match state {
+                NodeState::Partial => entry
                     .children
                     .iter()
                     .map(|child| &entries[*child])
-                    .filter(|child| !child.function && child.state() == NodeState::Known)
+                    .filter(|child| entry.contributes(child))
                     .map(|child| (child.key.clone(), labels.text(&child.cost)))
                     .collect(),
                 _ => Vec::new(),

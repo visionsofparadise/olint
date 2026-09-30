@@ -3740,7 +3740,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                     (
                         crate::cost::ExecutionPhase::Immediate,
-                        part.retaining(Some(unknown), &mut self.unknowns),
+                        part.unmultiplied(&mut self.unknowns)
+                            .retaining(Some(unknown), &mut self.unknowns),
                     )
                 }
                 (crate::cost::ExecutionPhase::Lazy, Deferral::Consumed) => {
@@ -5648,7 +5649,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let latent = self.targets_latent_of(file, call, targets.clone())?;
-        let part = self.consumed_part_of(file, call.span, &latent);
+        let part = self
+            .consumed_part_of(file, call.span, &latent)
+            .map_parts(|part| part.unmultiplied(&mut self.unknowns));
         let origin = self.source_span(file, call.span);
         let unknown = self.unknowns.origin(origin, UnknownReason::Multiplicity);
 

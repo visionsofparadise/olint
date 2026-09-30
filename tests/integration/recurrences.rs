@@ -180,10 +180,17 @@ fn an_equality_base_case_cannot_prove_a_decrement_terminates() {
 }
 
 #[test]
-fn a_measure_sized_multiplicity_keeps_its_factorial_expression() {
+fn a_measure_sized_multiplicity_under_an_unresolved_loop_adds_nothing_to_the_floor() {
     let source = "export function f(n: number): number {\n\tif (!(n > 0 && n <= 1000000000)) return 1;\n\tlet total = 0;\n\tfor (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += f(n - 1);\n\treturn total;\n}\n";
 
-    assert_exceeds_quartic(source, "f", "O((n * (n)!))");
+    // The component's effects leave the loop's bound unresolved, so the recursive calls it repeats are an unknown
+    // contribution and the node is Unknown (§1 Floor), where the body once gave O((n * (n)!)).
+    run_with_source(source, |analysis, file| {
+        let part = summary_of(analysis, file, "f");
+
+        assert_eq!(text_of(analysis, &part.cost), "O(1)");
+        assert!(unknown_reasons(analysis, part.unknowns).contains(&UnknownReason::Bound));
+    });
 }
 
 #[test]

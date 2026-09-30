@@ -19,7 +19,11 @@ fn summary_of(
 }
 
 fn cli(source: &str, policy: Option<&str>, report: bool) -> std::process::Output {
-    let mut config = serde_json::json!({ "entrypoints": ["index.ts"], "max": "O(N^2)" });
+    cli_under(source, "O(N^2)", policy, report)
+}
+
+fn cli_under(source: &str, max: &str, policy: Option<&str>, report: bool) -> std::process::Output {
+    let mut config = serde_json::json!({ "entrypoints": ["index.ts"], "max": max });
 
     if let Some(policy) = policy {
         config["unknown"] = serde_json::json!(policy);
@@ -98,8 +102,46 @@ fn known_over_limit_fails_every_policy_even_with_unresolved_work() {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        assert!(stdout.contains("[partial] > O(N^2)"));
+        assert!(stdout.contains("olint proves at least O(callback^3), above the limit O(N^2)"));
         assert!(stdout.contains("@perf O(N^3)"));
+    }
+}
+
+/// S1-6 (G4): the while may run zero times, so its quadratic body is no proven contribution. The entry is Unknown,
+/// its verdict against O(N) Inconclusive (§4.3), so lint fails only under "error" (§4.6).
+#[test]
+fn an_unresolved_loop_body_is_no_floor_for_an_exceeds_verdict() {
+    let source = "export function unbounded(xs: number[]): number { let c = 0; let k = 1; while (k !== xs.length) { for (const a of xs) for (const b of xs) c += a * b; k = (k * 3) % 7; } return c; }";
+
+    for (policy, code) in [("ignore", 0), ("warn", 0), ("error", 1)] {
+        let output = cli_under(source, "O(N)", Some(policy), false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(output.status.code(), Some(code), "{policy}: {stdout}");
+        assert!(stdout.contains("0 over limit"), "{policy}: {stdout}");
+        assert!(!stdout.contains("above the limit"), "{policy}: {stdout}");
+    }
+}
+
+/// A proven contribution beside an unresolved loop is a floor, and a floor above the limit Exceeds it under every
+/// policy (§4.2, §4.5), stated as what olint proves (§4.4).
+#[test]
+fn a_floor_above_the_limit_exceeds_it_in_every_policy() {
+    let source = "export function floor(xs: number[]): number { let k = 1; while (k !== xs.length) { k = (k * 3) % 7; } let c = 0; for (const a of xs) for (const b of xs) c += a * b; return c; }";
+
+    for policy in ["ignore", "warn", "error"] {
+        let output = cli_under(source, "O(N)", Some(policy), false);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(output.status.code(), Some(1), "{policy}: {stdout}");
+        assert!(
+            stdout.contains("olint proves at least O(xs^2), above the limit O(N)  floor"),
+            "{policy}: {stdout}"
+        );
+        assert!(
+            stdout.contains("an instance's work may fall below it"),
+            "{policy}: {stdout}"
+        );
     }
 }
 

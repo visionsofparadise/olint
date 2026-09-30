@@ -639,7 +639,7 @@ fn recurrence_contexts_preserve_selection_and_independent_loop_assumptions() {
             true,
             false,
         ),
-        ("for(const item of xs)b();", "O(N^3)", true, true),
+        ("for(const item of xs)b();", "O(1)", true, true),
         (
             "/** @perf bounded */\nfor(const item of xs)b();",
             "O(N^3)",
@@ -740,7 +740,13 @@ fn fallback_preserves_authoritative_and_ready_work_in_both_orders() {
             let function = function_of_name(analysis.project, file, "root");
             let part = summary_of(analysis, file, "root");
 
-            assert_class(analysis, file, function, &part, "O(N^3)", "{body}");
+            // An unbounded loop adds its body to no floor (§1 Floor).
+            let expected = match body.starts_with("for(;;)") {
+                true => "O(1)",
+                false => "O(N^3)",
+            };
+
+            assert_class(analysis, file, function, &part, expected, "{body}");
             assert!(reasons(analysis, part.unknowns).contains(&UnknownReason::ResourceExhaustion));
             assert_eq!(
                 reasons(analysis, part.unknowns).contains(&UnknownReason::Bound),
@@ -2011,7 +2017,7 @@ fn loop_phase_walks_of(loops: usize) -> u64 {
         .collect();
     let source = scanning_loop_source(statements);
 
-    known_work_of(source, Event::WalkerNode, "O(N)", true)
+    known_work_of(source, Event::WalkerNode, "O(1)", true)
 }
 
 fn known_work_of(source: String, event: Event, expected: &str, unknown_bound: bool) -> u64 {
@@ -2308,7 +2314,7 @@ fn repeating_body_scans_of(loops: usize) -> u64 {
         .collect();
     let source = scanning_loop_source(statements);
 
-    known_work_of(source, Event::BudgetPrepassNode, "O(N)", true)
+    known_work_of(source, Event::BudgetPrepassNode, "O(1)", true)
 }
 
 #[test]

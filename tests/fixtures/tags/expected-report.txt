@@ -3,9 +3,8 @@
 O(xs)               9
 O(max(1, (xs * xs^2)))    8
 O(max(1, xs^2))     4
-O(1) [partial]      2
+O(1) [partial]      3
 O(max(1, xs, (xs * max(xs, fast))))    1
-O(xs) [partial]     1
 O(1)                1
 O(max(1, (xs^2 * xs^2)))    1
 

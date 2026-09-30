@@ -1144,7 +1144,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             inner = inner
-                .map_parts(|part| part.scaled(None, &mut self.unknowns))
+                .map_parts(|part| part.unmultiplied(&mut self.unknowns))
                 .retaining(scaled, &mut self.unknowns);
         }
 
@@ -1570,7 +1570,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         inner
-            .map_parts(|part| part.scaled(None, &mut self.unknowns))
+            .map_parts(|part| part.unmultiplied(&mut self.unknowns))
             .retaining(Some(unknown), &mut self.unknowns)
     }
 
@@ -3250,7 +3250,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
 
             return reading
-                .map_parts(|part| part.scaled(None, &mut self.unknowns))
+                .map_parts(|part| part.unmultiplied(&mut self.unknowns))
                 .retaining(Some(unknown), &mut self.unknowns);
         };
 

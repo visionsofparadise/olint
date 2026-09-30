@@ -335,7 +335,10 @@ fn failed_constraints_keep_their_own_entry_provenance() {
     assert_eq!(output.status.code(), Some(1));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let violation = stdout.lines().find(|line| line.contains(" > ")).unwrap();
+    let violation = stdout
+        .lines()
+        .find(|line| line.contains(", above the limit "))
+        .unwrap();
 
     assert!(violation.ends_with("via left.ts"), "{violation}");
     assert!(!violation.contains("right.ts"));
@@ -358,7 +361,8 @@ fn independent_conjunctions_preserve_both_failure_and_unknown_context() {
     ]);
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("[partial] > O(n)"));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("olint proves O(n^2), above the limit O(n)"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("against O(m) via right.ts"));
 }
 
@@ -427,7 +431,8 @@ fn incomparable_duplicates_keep_both_constraints_in_either_order() {
             ]);
 
             assert_eq!(output.status.code(), Some(1));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("[partial] > O(n)"));
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("olint proves O(n^2), above the limit O(n)"));
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr).contains("against O(m)"),
                 policy != "ignore"
@@ -506,7 +511,10 @@ fn unresolved_additive_assumptions_preserve_independent_known_work() {
 
             assert_eq!(output.status.code(), Some(1), "{annotation}: {stdout}");
             assert!(stdout.contains("1 over limit"), "{annotation}: {stdout}");
-            assert!(stdout.contains("[partial]"), "{annotation}: {stdout}");
+            assert!(
+                stdout.contains("olint proves at least "),
+                "{annotation}: {stdout}"
+            );
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr).contains("input size relation"),
                 policy != "ignore"

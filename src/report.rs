@@ -1,6 +1,6 @@
 use crate::analysis::Analysis;
 use crate::config::Config;
-use crate::cost::{Cost, CostComparison, Part};
+use crate::cost::{Cost, CostComparison, Part, State};
 use crate::declarations::FunctionNode;
 use crate::directives::cost_tag_of;
 use crate::paths::relative_path_of;
@@ -83,11 +83,54 @@ fn row_text_of(
     )
 }
 
+/// Spec §4.1-§4.3: an entry's verdict against a limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The entry is Known and olint proves its bound at or below the limit.
+    Within,
+    /// olint proves the entry's bound or floor above the limit.
+    Exceeds,
+    Inconclusive,
+}
+
+/// The verdict of a reading against `limit`. A Known reading's cost is its bound, and any other reading's cost its
+/// floor, the join of its proven contributions. Ceilings (§4.2) join the Exceeds side in action 7.3.
+pub fn verdict_of(part: &Part, limit: &Cost) -> Verdict {
+    match (part.state(), part.cost.compare(limit)) {
+        (State::Known, CostComparison::Within) => Verdict::Within,
+        (_, CostComparison::Exceeds) => Verdict::Exceeds,
+        _ => Verdict::Inconclusive,
+    }
+}
+
 pub struct Finding<'a> {
     pub public: PublicFunction<'a>,
     pub part: Part,
     pub name: String,
     pub site: Site,
+}
+
+impl Finding<'_> {
+    /// The entry's verdict against each of its limits, in the order of `public.limits`.
+    pub fn verdicts(&self) -> impl Iterator<Item = Verdict> + '_ {
+        self.public
+            .limits
+            .iter()
+            .map(|applicable| verdict_of(&self.part, &applicable.limit.cost))
+    }
+
+    /// The entry's verdict: Exceeds when it exceeds any limit, else Inconclusive when any verdict is, else Within;
+    /// `None` for an entry without a limit.
+    pub fn verdict(&self) -> Option<Verdict> {
+        self.verdicts()
+            .fold(None, |held, verdict| match (held, verdict) {
+                (Some(Verdict::Exceeds), _) | (_, Verdict::Exceeds) => Some(Verdict::Exceeds),
+                (Some(Verdict::Inconclusive), _) | (_, Verdict::Inconclusive) => {
+                    Some(Verdict::Inconclusive)
+                }
+                _ => Some(Verdict::Within),
+            })
+    }
 }
 
 pub struct ReportRow {
@@ -198,12 +241,16 @@ pub fn lint_lines(
     ];
 
     for finding in over {
-        for applicable in finding.public.limits.iter().filter(|applicable| {
-            finding.part.cost.compare(&applicable.limit.cost) == CostComparison::Exceeds
-        }) {
+        for (applicable, _) in finding
+            .public
+            .limits
+            .iter()
+            .zip(finding.verdicts())
+            .filter(|(_, verdict)| *verdict == Verdict::Exceeds)
+        {
             lines.push(format!(
-                "{} > {}{}  {}  {}  via {}",
-                partial_text(values, &finding.part.cost, finding.part.unknowns),
+                "{}, above the limit {}{}  {}  {}  via {}",
+                proven_text(values, &finding.part),
                 applicable.limit.text,
                 if finding.public.own_limit {
                     " [@perf max]"
@@ -222,6 +269,13 @@ pub fn lint_lines(
     }
 
     lines.push(format!("{} over limit", over.len()));
+
+    if !over.is_empty() {
+        lines.push(
+            "each cost over its limit is what olint proves; an instance's work may fall below it"
+                .into(),
+        );
+    }
 
     let incomplete = checked
         .iter()
@@ -362,6 +416,16 @@ fn partial_text(values: &Values, cost: &Cost, unknowns: Option<UnknownId>) -> St
         format!("{} [partial]", cost.text_with(&|id| values.label(id)))
     } else {
         cost.text_with(&|id| values.label(id))
+    }
+}
+
+/// §4.4: an Exceeds line states what olint proves, a bound or a floor, which an instance's work may fall below.
+fn proven_text(values: &Values, part: &Part) -> String {
+    let text = part.cost.text_with(&|id| values.label(id));
+
+    match part.state() {
+        State::Known => format!("olint proves {text}"),
+        State::Partial | State::Unknown => format!("olint proves at least {text}"),
     }
 }
 

@@ -1,35 +1,32 @@
 public coverage [partial]
 # tsconfig.json  (164 functions in 15 files)
 
-O(1) [partial]     38
+O(1) [partial]     48
 O(1)               33
 O(xs)              18
-O(xs) [partial]     8
 O(max(1, rows^2))    8
 O(max(1, rows^2)) [partial]    7
-O(n) [partial]      6
 O(N)                5
 O(o)                4
+O(xs) [partial]     4
 O(N) [partial]      4
 O(matrix) [partial]    3
 O(max(1, (xs * xs^2)))    3
 O(max(1, xs^2))     3
 O(n)                3
+O(n) [partial]      3
 O((xs * log(xs)))    2
 O(prefix)           2
 O(max(1, (matrix * max(o, matrix))))    2
 O(t)                1
 O(max(1, matrix^2))    1
 O(max(xs, target))    1
-O(max(n, g, xs)) [partial]    1
-O(max(1, rows)) [partial]    1
 O(max(base, xs)) [partial]    1
 O(obj) [partial]    1
 O(N^2)              1
 O(rows^2)           1
 O(max(xs, needle))    1
 O(max(1, (strings * (max(strings, needle))^(2))))    1
-O(max(re, needles)) [partial]    1
 O(items^2) [partial]    1
 O(max(1, (rows * rows^2)))    1
 O(max(1, (matrix * matrix^2)))    1

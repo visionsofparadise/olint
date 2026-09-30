@@ -287,3 +287,59 @@ fn labels_name_each_dimension_uniquely() {
         assert!(Cost::parse(bound).is_ok(), "{bound} parses back");
     }
 }
+
+/// §1 Floor: an unresolved loop's repeated work is no proven contribution, so it leaves the floors and contributions
+/// of the loop and the function, while a loop's initializer runs once and stays a proven contribution.
+#[test]
+fn unresolved_loops_leave_their_repeated_work_out_of_floors_and_contributions() {
+    const UNBOUNDED: &str = "export function unbounded(xs: number[]): number { let c = 0; let k = 1; while (k !== xs.length) { for (const a of xs) for (const b of xs) c += a * b; k = (k * 3) % 7; } return c; }\n";
+
+    const INITIALIZED: &str = "function scan(xs: number[]) { let total = 0; for (const x of xs) total += x; return total; }\nexport function initialized(xs: number[]) { for (let i = scan(xs); i !== 7; i = (i * 3) % 7) { for (const a of xs) for (const b of xs) void (a + b); } }\n";
+
+    let rows = source_rows(&format!("{UNBOUNDED}{INITIALIZED}"));
+    let row_of = |kind: &str, start: usize| {
+        rows.iter()
+            .find(|row| row.key.kind == kind && row.key.start == start as u32)
+            .unwrap_or_else(|| panic!("{kind} at {start} has a row"))
+    };
+
+    for kind in ["Function", "WhileStatement"] {
+        let start = match kind {
+            "Function" => UNBOUNDED.find("function").unwrap(),
+            _ => UNBOUNDED.find("while").unwrap(),
+        };
+        let row = row_of(kind, start);
+
+        assert_ne!(row.state, NodeState::Known, "{row:?}");
+        assert!(
+            row.floor
+                .iter()
+                .chain(row.contributions.iter().map(|(_, bound)| bound))
+                .all(|cost| Cost::parse(cost) == Ok(Cost::ONE)),
+            "{row:?}"
+        );
+        assert!(!row.unknowns.is_empty(), "{row:?}");
+    }
+
+    let offset = UNBOUNDED.len();
+    let row = row_of(
+        "ForStatement",
+        offset + INITIALIZED.find("for (let i").unwrap(),
+    );
+
+    assert_eq!(row.state, NodeState::Partial, "{row:?}");
+    assert!(
+        row.floor
+            .as_deref()
+            .is_some_and(|floor| floor.contains("xs$")),
+        "{row:?}"
+    );
+    assert_eq!(
+        row.contributions
+            .iter()
+            .map(|(key, _)| key.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["VariableDeclaration"],
+        "{row:?}"
+    );
+}

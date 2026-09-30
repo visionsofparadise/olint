@@ -3,9 +3,8 @@
 O(xs)               9
 O(max(1, (xs * xs^2)))    8
 O(max(1, xs^2))     4
-O(1) [partial]      2
+O(1) [partial]      3
 O(max(1, xs, (xs * max(xs, fast))))    1
-O(xs) [partial]     1
 O(1)                1
 O(max(1, (xs^2 * xs^2)))    1
 
@@ -96,10 +95,6 @@ O(xs)          hotBranch  src/tags.ts:26
 O(xs)          hotSecondStatement  src/tags.ts:141
     in loop for-of                                           src/tags.ts:146  x xs
 
-O(xs)          callsCostFn  src/tags.ts:135 [partial]
-    calls costFn()                                         src/tags.ts:137  = O(xs)
-    reads as @perf O(N)                                       src/tags.ts:129  = O(xs)
-
 O(xs)          coldBranch  src/tags.ts:15
     in loop for-of                                           src/tags.ts:21  x xs
 
@@ -115,6 +110,8 @@ O(xs)          coldStatement  src/tags.ts:7
 O(1)           callsIgnoredAndCold  src/tags.ts:83 [partial]
 
 O(1)           Svc.run  src/tags.ts:97 [partial]
+
+O(1)           callsCostFn  src/tags.ts:135 [partial]
 
 O(1)           hotSingleStatementBranch  src/tags.ts:153
 
