@@ -601,6 +601,41 @@ fn a_readonly_field_folds_only_through_an_exact_receiver() {
     }
 }
 
+/// ECMA-262 §10.2.2: `new` yields an object a constructor returns in place of the instance, and
+/// `super()` binds a base constructor's returned object as `this`, so a class whose constructor or
+/// base constructor returns a value no longer holds its own fields.
+#[test]
+fn a_returning_constructor_leaves_its_instances_inexact() {
+    let returning =
+        "class A { readonly n: number = 1; constructor(k: number) { return { n: k }; } }";
+    let base = "class Base { constructor(k: number) { return { n: k }; } }";
+
+    for (source, expected) in [
+        (
+            format!("{returning} export function f(k: number) {{ const a = new A(k); for (let i = 0; i < a.n; i++) {{}} }}"),
+            "iteration bound",
+        ),
+        (
+            format!("{returning} export function f(k: number) {{ for (let i = 0; i < new A(k).n; i++) {{}} }}"),
+            "iteration bound",
+        ),
+        (
+            format!("{base} class B extends Base {{ readonly n: number = 1; }} export function f(k: number) {{ for (let i = 0; i < new B(k).n; i++) {{}} }}"),
+            "iteration bound",
+        ),
+        (
+            format!("{base} class B extends Base {{ readonly n: number = 1; constructor(k: number) {{ super(k); for (let i = 0; i < this.n; i++) {{}} }} }} export function f(k: number) {{ new B(k); }}"),
+            "iteration bound",
+        ),
+        (
+            "class A { readonly n: number = 1; constructor(k: number) { if (k) return; const g = () => { return k; }; g(); } } export function f(k: number) { for (let i = 0; i < new A(k).n; i++) {} }".to_string(),
+            "constant bound",
+        ),
+    ] {
+        assert_eq!(first_reason_of(&source), expected, "{source}");
+    }
+}
+
 #[test]
 fn a_fresh_local_allocation_cannot_be_reached_through_a_parameter() {
     for (source, unknown) in [

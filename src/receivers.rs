@@ -1,8 +1,11 @@
 use oxc_ast::ast::{
-    Class, ClassElement, Expression, IdentifierReference, MemberExpression, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, TSType,
+    ArrowFunctionExpression, Class, ClassElement, Expression, Function, IdentifierReference,
+    MemberExpression, MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, PropertyKey,
+    ReturnStatement, TSType,
 };
 use oxc_ast::AstKind;
+use oxc_ast_visit::Visit;
+use oxc_syntax::scope::ScopeFlags;
 
 use crate::declarations::{element_name_of, is_module_file, Declaration, Declarations};
 use crate::declared_types::{declarator_of_identifier, formal_parameter_of_identifier};
@@ -12,6 +15,41 @@ use oxc_span::GetSpan;
 
 const MAXIMUM_BASE_CLASSES: usize = 32;
 const MAXIMUM_ALIASES: usize = 8;
+
+/// Whether a function body returns a value, outside the functions nested in it.
+#[derive(Default)]
+struct ValueReturns {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for ValueReturns {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+
+    fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
+        self.found |= statement.argument.is_some();
+    }
+}
+
+/// Whether the constructor `class` declares returns a value: ECMA-262 §10.2.2 [[Construct]]
+/// then yields that value when it is an object, in place of the instance the class built.
+fn constructor_returns_value(class: &Class<'_>) -> bool {
+    class.body.body.iter().any(|element| match element {
+        ClassElement::MethodDefinition(method)
+            if method.kind == MethodDefinitionKind::Constructor =>
+        {
+            let mut returns = ValueReturns::default();
+
+            if let Some(body) = &method.value.body {
+                returns.visit_function_body(body);
+            }
+
+            returns.found
+        }
+        _ => false,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Placement {
@@ -215,11 +253,39 @@ impl<'a> Declarations<'a> {
         };
 
         exact.is_some_and(|(target, class, placement)| {
-            matches!(
-                self.inherited_member_of(project, target, class, &name, placement),
-                Some(Declaration::Member { element: found, .. }) if std::ptr::eq(found, element)
-            )
+            (placement != Placement::Instance || self.constructs_itself(project, target, class))
+                && matches!(
+                    self.inherited_member_of(project, target, class, &name, placement),
+                    Some(Declaration::Member { element: found, .. }) if std::ptr::eq(found, element)
+                )
         })
+    }
+
+    /// Whether constructing `class` yields the instance it builds: neither its constructor nor
+    /// any base constructor returns a value, since `new` yields a returned object in place of the
+    /// instance and `super()` binds it as the derived class's `this`. An unresolved base may
+    /// return anything.
+    fn constructs_itself(&self, project: &Project<'a>, file: FileId, class: &'a Class<'a>) -> bool {
+        let mut current = (file, class);
+
+        for _ in 0..MAXIMUM_BASE_CLASSES {
+            let (file, class) = current;
+
+            if constructor_returns_value(class) {
+                return false;
+            }
+
+            if class.heritage.is_none() {
+                return true;
+            }
+
+            match self.base_class_of(project, file, class) {
+                Some(base) => current = base,
+                None => return false,
+            }
+        }
+
+        false
     }
 
     /// The class a constant binding holds an instance of: `const x = new C()`.
