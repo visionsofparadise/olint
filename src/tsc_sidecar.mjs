@@ -81,22 +81,26 @@ const TYPED_ARRAYS = new Set([
 	"BigUint64Array",
 ]);
 const NULLISH = ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void | ts.TypeFlags.Never;
-const isLibrarySymbol = (symbol) =>
+// A library symbol is declared in one of the program's default library files, whatever their path,
+// so a project file named like `lib.dom.d.ts` declares no built-in.
+const isLibrarySymbol = (program, symbol) =>
 	(symbol?.getDeclarations() ?? []).some((declaration) =>
-		/(^|\/)lib\.[^/]*\.d\.ts$/.test(declaration.getSourceFile().fileName),
+		program.isSourceFileDefaultLibrary(declaration.getSourceFile()),
 	);
 // A union's value has one of its parts' types, so its kind is known only when the non-nullish
 // parts agree; a built-in kind needs the type's symbol to be the library's own.
-const kindOfType = (checker, t) => {
+const kindOfType = (program, checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return "unknown";
 	if (t.isUnion()) {
-		const kinds = new Set(t.types.filter((type) => !(type.flags & NULLISH)).map((type) => kindOfType(checker, type)));
+		const kinds = new Set(
+			t.types.filter((type) => !(type.flags & NULLISH)).map((type) => kindOfType(program, checker, type)),
+		);
 		return kinds.size === 1 ? [...kinds][0] : "unknown";
 	}
 	if (t.flags & ts.TypeFlags.StringLike) return "string";
 	if (checker.isArrayType?.(t) || checker.isTupleType?.(t)) return "array";
 	const symbol = t.getSymbol();
-	const name = isLibrarySymbol(symbol) ? symbol.getName() : "";
+	const name = isLibrarySymbol(program, symbol) ? symbol.getName() : "";
 	if (name === "Array" || name === "ReadonlyArray" || TYPED_ARRAYS.has(name)) return "array";
 	if (name === "Set" || name === "ReadonlySet") return "set";
 	if (name === "Map" || name === "ReadonlyMap") return "map";
@@ -106,20 +110,20 @@ const kindOfType = (checker, t) => {
 	if (name === "RegExp") return "regexp";
 	if (t.isTypeParameter()) {
 		const base = t.getConstraint();
-		return base ? kindOfType(checker, base) : "other";
+		return base ? kindOfType(program, checker, base) : "other";
 	}
 	return "other";
 };
 const isTuple = (checker, t) => !!checker.isTupleType?.(t);
-const isStructuralObject = (checker, t) => {
+const isStructuralObject = (program, checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.NonPrimitive)) return false;
-	if (t.isUnion() || t.isIntersection()) return t.types.every((type) => isStructuralObject(checker, type));
+	if (t.isUnion() || t.isIntersection()) return t.types.every((type) => isStructuralObject(program, checker, type));
 	if (t.isTypeParameter()) {
 		const base = t.getConstraint();
-		return base ? isStructuralObject(checker, base) : false;
+		return base ? isStructuralObject(program, checker, base) : false;
 	}
 	if (!(t.flags & ts.TypeFlags.Object)) return false;
-	if (kindOfType(checker, t) !== "other") return false;
+	if (kindOfType(program, checker, t) !== "other") return false;
 	if (checker.getIndexInfosOfType(t).length > 0) return false;
 	if (t.getSymbol()?.getName() === "Object") return false;
 	return t.getProperties().length > 0;
@@ -303,10 +307,10 @@ const answerOf = (program, q) => {
 	const t = checker.getTypeAtLocation(unwrapNode(n) ?? n);
 	return {
 		query: "type",
-		kind: kindOfType(checker, t),
+		kind: kindOfType(program, checker, t),
 		tuple:
 			isTuple(checker, t) || (t.isUnion() && t.types.length > 0 && t.types.every((type) => isTuple(checker, type))),
-		structural: isStructuralObject(checker, t),
+		structural: isStructuralObject(program, checker, t),
 	};
 };
 const answersOf = (queries) => {

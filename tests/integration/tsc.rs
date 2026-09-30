@@ -281,6 +281,52 @@ fn the_sidecar_answers_types_and_callees_in_utf8_offsets() {
     assert_eq!((*start, *end), (method_start, method_end));
 }
 
+/// G21: only a symbol the program's default library declares is a built-in, so a project file whose name looks
+/// like a library file declares a class of its own, and the global `Set` stays the built-in.
+#[test]
+fn only_default_library_symbols_are_built_in() {
+    let index = "import { Set as Shim } from \"./lib.shim\";\ndeclare const own: Shim<number>;\ndeclare const global: Set<number>;\nexport const values = [own, global];\n";
+    let directory = project_of(&[
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "strict": true, "target": "es2022" }, "include": ["src"] }"#,
+        ),
+        (
+            "src/lib.shim.d.ts",
+            "export declare class Set<T> { size: number; has(value: T): boolean; }\n",
+        ),
+        ("src/index.ts", index),
+    ]);
+    let file = directory
+        .path()
+        .join("src/index.ts")
+        .to_string_lossy()
+        .into_owned();
+    let query_of = |needle: &str| {
+        let start = index.rfind(needle).expect("needle occurs");
+
+        Query::Type {
+            file: file.clone(),
+            pos: start as u32,
+            end: (start + needle.len()) as u32,
+        }
+    };
+    let reply = reply_of(
+        &directory.path().join("tsconfig.json"),
+        &[query_of("own"), query_of("global")],
+    );
+    let kinds: Vec<_> = reply
+        .answers
+        .iter()
+        .map(|answer| match answer {
+            Some(TscAnswer::Type(TypeAnswer { kind, .. })) => *kind,
+            other => panic!("a type answer: {other:?}"),
+        })
+        .collect();
+
+    assert_eq!(kinds, [Kind::Other, Kind::Set]);
+}
+
 fn legacy_classes_of(source: &str, types: TypeMode, names: &[&str]) -> Vec<Cost> {
     results_of(source, types, names)
         .into_iter()
