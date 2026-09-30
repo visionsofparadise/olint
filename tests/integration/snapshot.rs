@@ -1,11 +1,13 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use olint::analysis::{Analysis, Options};
-use olint::config::read_config;
+use olint::config::{read_config, unknown_policy_of};
+use olint::cost::Cost;
 use olint::project::Project;
 use olint::public::public_functions;
-use olint::report::report_rows_of;
-use olint::snapshot::{snapshot_rows, NodeKey, NodeRow, NodeState};
+use olint::report::{lint_lines, report_lines, report_rows_of, Finding};
+use olint::snapshot::{snapshot_rows, Labels, NodeKey, NodeRow, NodeState};
 use oxc_allocator::Allocator;
 use oxc_span::GetSpan;
 
@@ -22,19 +24,18 @@ fn model_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model")
 }
 
-fn model_rows_with(options: Options, config: Option<&Path>) -> Vec<NodeRow> {
-    let root = model_root();
+/// Loads the model fixture and runs `run` on a fresh analysis with `options`.
+fn on_model<T>(options: Options, run: impl FnOnce(&Project<'_>, &mut Analysis<'_, '_>) -> T) -> T {
     let allocator = Allocator::default();
-    let project = Project::load(&allocator, &root.join("tsconfig.json")).expect("fixture loads");
+    let project =
+        Project::load(&allocator, &model_root().join("tsconfig.json")).expect("fixture loads");
     let mut analysis = Analysis::new(&project, options);
 
-    if let Some(config) = config {
-        let config = read_config(&project, Some(config)).expect("config reads");
+    run(&project, &mut analysis)
+}
 
-        public_functions(&mut analysis, &config).expect("public functions resolve");
-    }
-
-    snapshot_rows(&mut analysis)
+fn model_rows() -> Vec<NodeRow> {
+    on_model(RECORDING, |_, analysis| snapshot_rows(analysis))
 }
 
 fn serialized(rows: &[NodeRow]) -> String {
@@ -43,8 +44,8 @@ fn serialized(rows: &[NodeRow]) -> String {
 
 #[test]
 fn model_rows_are_byte_identical_across_runs() {
-    let first = model_rows_with(RECORDING, None);
-    let second = model_rows_with(RECORDING, None);
+    let first = model_rows();
+    let second = model_rows();
 
     assert!(first.windows(2).all(|pair| pair[0].key < pair[1].key));
     assert!(first.iter().any(|row| row.state == NodeState::Partial));
@@ -55,36 +56,86 @@ fn model_rows_are_byte_identical_across_runs() {
     assert_eq!(serialized(&first), serialized(&second));
 }
 
+/// Runs the lint or the report diagnostics under one unknown policy and `--min`, as `olint` does, then snapshots:
+/// the policy reaches rows only through that path, so the rows must equal the plain snapshot's (§3.5).
+fn rows_after_diagnostics(policy: &str, minimum_exponent: u32, report: bool) -> (String, usize) {
+    let options = Options {
+        minimum_exponent,
+        ..RECORDING
+    };
+
+    on_model(options, |project, analysis| {
+        let mut config =
+            read_config(project, Some(&model_root().join("olint.config.json"))).expect("config");
+
+        config.unknown =
+            unknown_policy_of(Some(&serde_json::Value::from(policy))).expect("policy parses");
+
+        let public = public_functions(analysis, &config).expect("public functions resolve");
+        let lines = match report {
+            true => {
+                let functions = analysis.reportable();
+                let rows = report_rows_of(analysis, &functions);
+
+                report_lines(
+                    &analysis.values,
+                    &analysis.traces,
+                    project,
+                    &rows,
+                    minimum_exponent,
+                )
+            }
+            false => {
+                let mut checked = Vec::new();
+
+                for public in public.functions {
+                    let part = analysis
+                        .summarize(public.file, public.function)
+                        .total(&mut analysis.unknowns, &mut analysis.traces);
+
+                    checked.push(Finding {
+                        name: analysis.name_of(public.file, public.function),
+                        site: analysis.function_site_of(public.file, public.function),
+                        public,
+                        part,
+                    });
+                }
+
+                // Every finding renders as over its limit, so the lint path formats each one.
+                let over: Vec<&Finding> = checked.iter().collect();
+
+                lint_lines(
+                    &analysis.values,
+                    &analysis.traces,
+                    project,
+                    &config,
+                    &checked,
+                    &over,
+                )
+            }
+        };
+
+        (serialized(&snapshot_rows(analysis)), lines.len())
+    })
+}
+
 #[test]
-fn model_rows_ignore_the_unknown_policy_and_minimum() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let base: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(model_root().join("olint.config.json")).expect("config"),
-    )
-    .expect("config parses");
-    let mut expected = None;
+fn model_rows_ignore_the_policy_minimum_and_diagnostics_path() {
+    let plain = serialized(&model_rows());
 
     for policy in ["ignore", "warn", "error"] {
-        let mut config = base.clone();
-
-        config["unknown"] = serde_json::Value::from(policy);
-
-        let path = directory.path().join(format!("{policy}.json"));
-
-        std::fs::write(&path, config.to_string()).expect("config writes");
-
         for minimum_exponent in [0, 2, 100] {
-            let rows = serialized(&model_rows_with(
-                Options {
-                    minimum_exponent,
-                    ..RECORDING
-                },
-                Some(&path),
-            ));
+            for report in [false, true] {
+                let (rows, lines) = rows_after_diagnostics(policy, minimum_exponent, report);
 
-            match &expected {
-                Some(expected) => assert_eq!(&rows, expected, "{policy} --min {minimum_exponent}"),
-                None => expected = Some(rows),
+                assert!(
+                    lines > 0,
+                    "{policy} --min {minimum_exponent} report {report}"
+                );
+                assert_eq!(
+                    rows, plain,
+                    "{policy} --min {minimum_exponent} report {report}"
+                );
             }
         }
     }
@@ -92,7 +143,7 @@ fn model_rows_ignore_the_unknown_policy_and_minimum() {
 
 #[test]
 fn model_rows_name_implementation_defined_unknowns() {
-    let rows = model_rows_with(RECORDING, None);
+    let rows = model_rows();
     let sort = rows
         .iter()
         .flat_map(|row| &row.unknowns)
@@ -107,13 +158,14 @@ fn model_rows_name_implementation_defined_unknowns() {
 
 #[test]
 fn model_function_rows_match_their_report_rows() {
-    let root = model_root();
-    let allocator = Allocator::default();
-    let project = Project::load(&allocator, &root.join("tsconfig.json")).expect("fixture loads");
-    let mut analysis = Analysis::new(&project, RECORDING);
-    let rows = snapshot_rows(&mut analysis);
+    on_model(RECORDING, check_function_rows);
+}
+
+fn check_function_rows(project: &Project<'_>, analysis: &mut Analysis<'_, '_>) {
+    let rows = snapshot_rows(analysis);
     let functions = analysis.reportable();
-    let reported = report_rows_of(&mut analysis, &functions);
+    let reported = report_rows_of(analysis, &functions);
+    let labels = Labels::of(analysis);
 
     assert!(rows.len() > functions.len());
 
@@ -133,7 +185,7 @@ fn model_function_rows_match_their_report_rows() {
             .iter()
             .find(|row| row.key == key)
             .unwrap_or_else(|| panic!("{key:?} has a row"));
-        let text = report.cost.text_with(&|id| analysis.values.label(id));
+        let text = labels.text(&report.cost);
 
         assert_eq!(
             row.state != NodeState::Known,
@@ -149,5 +201,89 @@ fn model_function_rows_match_their_report_rows() {
             },
             "{key:?}"
         );
+    }
+}
+
+fn source_rows(source: &str) -> Vec<NodeRow> {
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    std::fs::create_dir_all(directory.path().join("src")).expect("src");
+    std::fs::write(
+        directory.path().join("tsconfig.json"),
+        r#"{ "compilerOptions": { "target": "ES2022", "module": "ESNext", "strict": true, "noEmit": true }, "include": ["src/**/*.ts"] }"#,
+    )
+    .expect("tsconfig");
+    std::fs::write(directory.path().join("src/index.ts"), source).expect("source");
+
+    let allocator = Allocator::default();
+    let project =
+        Project::load(&allocator, &directory.path().join("tsconfig.json")).expect("project loads");
+    let mut analysis = Analysis::new(&project, RECORDING);
+
+    snapshot_rows(&mut analysis)
+}
+
+/// The rows inside the function whose text starts at `start`, with spans made relative to it.
+fn rows_from(rows: &[NodeRow], start: u32, end: u32) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.key.start >= start && row.key.end <= end)
+        .map(|row| {
+            format!(
+                "{} {}-{} {:?} {:?} {:?} {}",
+                row.key.kind,
+                row.key.start - start,
+                row.key.end - start,
+                row.state,
+                row.bound,
+                row.floor,
+                row.contributions.len()
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn node_recording_is_independent_of_declaration_order() {
+    const MAIN: &str = "export function main() {\n\treturn helper();\n}\n";
+
+    const HELPER: &str = "export function helper() {\n\tlet total = 0;\n\tfor (let index = 0; index < 64; index++) {\n\t\ttotal += index;\n\t}\n\treturn total;\n}\n";
+
+    let mut found = Vec::new();
+
+    for (source, offset) in [
+        (format!("{MAIN}{HELPER}"), MAIN.len()),
+        (format!("{HELPER}{MAIN}"), 0),
+    ] {
+        let rows = source_rows(&source);
+        let start = offset as u32;
+
+        found.push(rows_from(&rows, start, start + HELPER.len() as u32));
+    }
+
+    assert!(
+        found[0].len() > 1,
+        "helper records more than its function row: {:?}",
+        found[0]
+    );
+    assert_eq!(found[0], found[1]);
+}
+
+#[test]
+fn labels_name_each_dimension_uniquely() {
+    let rows = source_rows(
+        "export function first(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) total += x;\n\treturn total;\n}\nexport function second(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) total += x;\n\treturn total;\n}\n",
+    );
+    let bounds: BTreeSet<&str> = rows
+        .iter()
+        .filter(|row| row.key.kind == "Function")
+        .filter_map(|row| row.bound.as_deref())
+        .collect();
+
+    // Two parameters named `xs` are two dimensions, so the bounds differ in text and each parses back.
+    assert_eq!(bounds.len(), 2, "{bounds:?}");
+
+    for bound in &bounds {
+        assert!(bound.contains('$'), "{bound}");
+        assert!(Cost::parse(bound).is_ok(), "{bound} parses back");
     }
 }

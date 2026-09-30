@@ -869,19 +869,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let is_root = self.root_sizes.is_none();
 
         if is_root {
-            let mut roots: Vec<_> = ordered_substitutions(&substitutions)
-                .into_iter()
-                .filter_map(|(_, facts)| facts.value.size.clone())
-                .collect();
-
-            roots.sort_by_key(Cost::structural_key);
-            roots.dedup();
-
-            if roots.is_empty() {
-                roots.push(Cost::dimension(u64::MAX, crate::cost::Domain::Size));
-            }
-
-            self.root_sizes = Some(roots);
+            self.root_sizes = Some(root_sizes_of(&substitutions));
         }
 
         let reading = self.summarize_in(file, function, substitutions, raw, recorded && is_root);
@@ -891,6 +879,33 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         reading
+    }
+
+    /// Whether any summary, task or node record survives from earlier summarization in this pass.
+    pub(crate) fn has_summary_state(&self) -> bool {
+        !self.summaries.is_empty()
+            || !self.scheduler.tasks.is_empty()
+            || !self.node_records.is_empty()
+    }
+
+    /// Marks the root summary key of each function for node recording before any of them is summarized, so a
+    /// function whose root key is first evaluated as another root's callee records its nodes in that evaluation,
+    /// and the recorded rows are independent of declaration order.
+    pub(crate) fn register_recorded_roots(&mut self, functions: &[(FileId, FunctionNode<'a>)]) {
+        for (file, function) in functions.iter().copied() {
+            let raw = cost_tag_of(&self.function_tags(file, function)).is_some();
+            let substitutions = self.function_inputs(file, function, Substitutions::new());
+            let saved = self.root_sizes.replace(root_sizes_of(&substitutions));
+            let key = self.key_of(file, function, &substitutions);
+
+            self.root_sizes = saved;
+
+            if let Ok(mut key) = key {
+                key.raw = raw;
+
+                self.scheduler.recorded.insert(key);
+            }
+        }
     }
 
     pub fn summary_records_for(&self, function: FunctionId) -> Vec<&SummaryRecord> {
@@ -6098,6 +6113,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .into_iter()
             .all(|reference| self.is_tracked_consumption(file, reference, depth + 1))
     }
+}
+
+/// The root sizes of a root summary with `substitutions`: each input's size, deduplicated, else the envelope.
+fn root_sizes_of(substitutions: &Substitutions) -> Vec<Cost> {
+    let mut roots: Vec<_> = ordered_substitutions(substitutions)
+        .into_iter()
+        .filter_map(|(_, facts)| facts.value.size.clone())
+        .collect();
+
+    roots.sort_by_key(Cost::structural_key);
+    roots.dedup();
+
+    if roots.is_empty() {
+        roots.push(Cost::dimension(u64::MAX, crate::cost::Domain::Size));
+    }
+
+    roots
 }
 
 fn marker_cost_of(index: usize) -> Cost {

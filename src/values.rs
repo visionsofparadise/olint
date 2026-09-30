@@ -433,6 +433,15 @@ impl Values {
         facts
     }
 
+    /// Every size dimension `quantity` allocated, with the value and quantity it measures.
+    pub(crate) fn quantity_dimensions(
+        &self,
+    ) -> impl Iterator<Item = (u64, ValueId, SizeQuantity)> + '_ {
+        self.quantities
+            .iter()
+            .map(|((value, quantity), id)| (*id, *value, *quantity))
+    }
+
     pub fn origin_of_value(&self, value: ValueId) -> Option<SourceSpan> {
         self.spans.get(&value).copied()
     }

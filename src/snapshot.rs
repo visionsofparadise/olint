@@ -13,8 +13,11 @@ use crate::report::report_rows_of;
 use crate::summaries::Substitutions;
 use crate::syntax::is_iteration_kind;
 use crate::unknowns::{SourceSpan, UnknownId};
+use crate::values::{SizeQuantity, RECURRENCE_BASE, RECURRENCE_FLOOR};
 
-pub const SCHEMA: u32 = 1;
+/// Row schema. Version 2 renders each size dimension with a label unique to it (`Labels`), where version 1 used the
+/// report's labels, which can name different dimensions with the same text.
+pub const SCHEMA: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeKey {
@@ -158,8 +161,96 @@ fn unknown_origins_of(
     found.into_iter().collect()
 }
 
+/// Snapshot cost labels: each size dimension renders as a name unique to it and stable across runs, so identical
+/// text always names the same dimension. A quantity's name is its report label, with characters outside
+/// `[A-Za-z0-9_]` replaced by `_`, then `$`, the quantity (`l` length, `k` keys, `v` value), the measured value's
+/// source span `<start>_<end>` and a hash of its file's project-relative path. The envelope stays `N`, and recurrence
+/// markers render as `recursion$r<index>`. The report keeps its own labels.
+pub struct Labels {
+    names: HashMap<u64, String>,
+}
+
+impl Labels {
+    pub fn of(analysis: &Analysis<'_, '_>) -> Labels {
+        let names = analysis
+            .values
+            .quantity_dimensions()
+            .map(|(id, value, quantity)| {
+                let mut name: String = analysis
+                    .values
+                    .label(id)
+                    .chars()
+                    .map(|character| match character.is_ascii_alphanumeric() {
+                        true => character,
+                        false => '_',
+                    })
+                    .collect();
+
+                if !name.starts_with(|character: char| character.is_ascii_alphabetic()) {
+                    name.insert(0, '_');
+                }
+
+                let quantity = match quantity {
+                    SizeQuantity::Length => 'l',
+                    SizeQuantity::Keys => 'k',
+                    SizeQuantity::Value => 'v',
+                };
+                let origin = match analysis.values.origin_of_value(value) {
+                    Some(origin) => format!(
+                        "{}_{}_{:08x}",
+                        origin.start,
+                        origin.end,
+                        path_hash(&analysis.project.file(origin.file).relative)
+                    ),
+                    None => format!("d{id}"),
+                };
+
+                (id, format!("{name}${quantity}{origin}"))
+            })
+            .collect();
+
+        Labels { names }
+    }
+
+    pub fn name(&self, id: u64) -> String {
+        match id {
+            u64::MAX => "N".to_string(),
+            id if id >= RECURRENCE_FLOOR => format!("recursion$r{}", RECURRENCE_BASE - id),
+            id => self
+                .names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("size$d{id}")),
+        }
+    }
+
+    pub fn text(&self, cost: &Cost) -> String {
+        cost.text_with(&|id| self.name(id))
+    }
+}
+
+/// FNV-1a over the path's bytes: a fixed hash, so labels are identical across runs and platforms.
+fn path_hash(path: &str) -> u32 {
+    path.bytes().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
 pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
     let functions = analysis.reportable();
+
+    // Under `record_nodes`, every reportable function's nodes are recorded once, from the evaluation of its root
+    // summary key: summaries left from earlier summarization are dropped so each root key evaluates in this pass, and
+    // the root keys are registered before any evaluation, so a root first reached as another root's callee records
+    // there.
+    if analysis.options.record_nodes {
+        if analysis.has_summary_state() {
+            analysis.reset_between_passes();
+        }
+
+        analysis.register_recorded_roots(&functions);
+    }
+
     let mut entries = Vec::new();
     let mut located: HashMap<(FileId, NodeId), usize> = HashMap::new();
     let mut reportable = HashSet::with_capacity(functions.len());
@@ -248,23 +339,19 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
     }
 
     let mut kinds = HashMap::new();
+    let labels = Labels::of(analysis);
     let mut rows: Vec<NodeRow> = entries
         .iter()
         .map(|entry| {
             let state = entry.state();
-            let text = entry.cost.text_with(&|id| analysis.values.label(id));
+            let text = labels.text(&entry.cost);
             let mut contributions: Vec<(NodeKey, String)> = match (state, entry.iteration) {
                 (NodeState::Partial, false) => entry
                     .children
                     .iter()
                     .map(|child| &entries[*child])
                     .filter(|child| !child.function && child.state() == NodeState::Known)
-                    .map(|child| {
-                        (
-                            child.key.clone(),
-                            child.cost.text_with(&|id| analysis.values.label(id)),
-                        )
-                    })
+                    .map(|child| (child.key.clone(), labels.text(&child.cost)))
                     .collect(),
                 _ => Vec::new(),
             };
