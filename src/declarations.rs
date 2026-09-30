@@ -273,7 +273,16 @@ pub struct Declarations<'a> {
     resolution_stats: Cell<ResolutionStats>,
     module_records: Vec<&'a ModuleRecord<'a>>,
     evals: RefCell<HashMap<FileId, std::rc::Rc<[NodeId]>>>,
+    dynamic_scopes: RefCell<HashMap<FileId, std::rc::Rc<DynamicScopes>>>,
     project_eval: Cell<Option<bool>>,
+}
+
+/// The regions of one file where a name can resolve outside the static scope chain: the body of
+/// each `with` statement, and the function that owns each sloppy direct eval, `None` for an eval
+/// at the top level, which reaches the whole file.
+struct DynamicScopes {
+    withs: Vec<Span>,
+    evals: Vec<Option<Span>>,
 }
 
 impl<'a> Declarations<'a> {
@@ -303,6 +312,7 @@ impl<'a> Declarations<'a> {
                 .map(|file| file.module_record)
                 .collect(),
             evals: RefCell::new(HashMap::new()),
+            dynamic_scopes: RefCell::new(HashMap::new()),
             project_eval: Cell::new(None),
         }
     }
@@ -1242,41 +1252,64 @@ impl<'a> Declarations<'a> {
         file: FileId,
         reference: &IdentifierReference<'a>,
     ) -> bool {
-        let semantic = &project.file(file).semantic;
-        let nodes = semantic.nodes();
-        let node = reference.node_id();
+        let scopes = self.dynamic_scopes_of(project, file);
         let span = reference.span;
 
-        if nodes.ancestors(node).any(|ancestor| {
-            matches!(ancestor.kind(), AstKind::WithStatement(with) if with.body.span().contains_inclusive(span))
-        }) {
-            return true;
+        scopes
+            .withs
+            .iter()
+            .any(|body| body.contains_inclusive(span))
+            || scopes
+                .evals
+                .iter()
+                .any(|owner| owner.is_none_or(|owner| owner.contains_inclusive(span)))
+    }
+
+    /// The file's `with` bodies and sloppy direct evals, found once per file so a reference's
+    /// query compares spans instead of walking its ancestors. Strict eval code declares its
+    /// variables in its own environment, so only a sloppy eval adds a binding to the enclosing
+    /// function's, which every nested reference sees.
+    fn dynamic_scopes_of(&self, project: &Project<'a>, file: FileId) -> std::rc::Rc<DynamicScopes> {
+        if let Some(scopes) = self.dynamic_scopes.borrow().get(&file) {
+            return scopes.clone();
         }
 
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
         let scoping = semantic.scoping();
+        let withs = nodes
+            .iter()
+            .filter_map(|node| match node.kind() {
+                AstKind::WithStatement(with) => Some(with.body.span()),
+                _ => None,
+            })
+            .collect();
+        let evals = self
+            .direct_evals_of(project, file)
+            .iter()
+            .filter(|eval| {
+                !scoping
+                    .scope_flags(nodes.get_node(**eval).scope_id())
+                    .is_strict_mode()
+            })
+            .map(|eval| {
+                nodes
+                    .ancestors(*eval)
+                    .find_map(|ancestor| match ancestor.kind() {
+                        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => {
+                            Some(ancestor.kind().span())
+                        }
+                        _ => None,
+                    })
+            })
+            .collect();
+        let scopes = std::rc::Rc::new(DynamicScopes { withs, evals });
 
-        // Strict eval code declares its variables in its own environment, so only a sloppy eval
-        // adds a binding to the enclosing function's, which every nested reference sees.
-        self.direct_evals_of(project, file).iter().any(|eval| {
-            if scoping
-                .scope_flags(nodes.get_node(*eval).scope_id())
-                .is_strict_mode()
-            {
-                return false;
-            }
+        self.dynamic_scopes
+            .borrow_mut()
+            .insert(file, scopes.clone());
 
-            let owner = nodes
-                .ancestors(*eval)
-                .find(|ancestor| {
-                    matches!(
-                        ancestor.kind(),
-                        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
-                    )
-                })
-                .map(|ancestor| ancestor.id());
-
-            owner.is_none_or(|owner| nodes.ancestor_ids(node).any(|ancestor| ancestor == owner))
-        })
+        scopes
     }
 
     fn runtime_declarations_of(

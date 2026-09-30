@@ -520,6 +520,30 @@ fn direct_eval_and_with_open_callable_bindings() {
         ),
         (
             "index.js",
+            "const work = function(){return 1}; function run(o){ with (o) {} work(); }",
+            vec![0],
+            false,
+        ),
+        (
+            "index.js",
+            "const work = function(){return 1}; function load(code){ eval(code); } function run(){ work(); }",
+            vec![0],
+            false,
+        ),
+        (
+            "index.js",
+            "const work = function(){return 1}; function run(code){ 'use strict'; eval(code); work(); }",
+            vec![0],
+            false,
+        ),
+        (
+            "index.js",
+            "const work = function(){return 1}; function run(code){ eval(code); { const inner = () => work(); inner(); } }",
+            vec![0],
+            true,
+        ),
+        (
+            "index.js",
             "const work = function(){return 1}; function run(){ work(); }",
             vec![0],
             false,
