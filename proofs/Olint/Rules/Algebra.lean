@@ -13,7 +13,8 @@ constant for all of them: every dimension reads as at least `1`, so the monomial
 `within` holds uniformly, small dimensions included (`monoWithin_le`).
 
 Every lemma holds in every world `W`, whatever its spec-internal step costs `W.ops` and the
-intrinsics it modifies: the family A rules rest on no G52 draft and consult no intrinsic.
+intrinsics it modifies: the family A rules rest on none of the G52 drafts' values, only on the
+shapes `SpecOps` fixes for them, and consult no intrinsic.
 
 **Composition.** `seq-max`, `branch-join` and `channel-total` compose child certificates: a
 child's bound holds at every configuration its entry's run reaches at the child

@@ -20,8 +20,12 @@ definitions (`f.eq_1`, `f.eq_def`, `f.eq_unfold`). It fails, so `lean` exits non
   draft premise `W.ops = SpecOps.draft` before `Bound`.
 
 A theorem whose statement or proof reaches `Olint.Model.SpecOps.draft` rests on the G52 step
-cost drafts, which are not yet signed into §2; the audit lists it as pending Matt's signature
-(§2.1), and a certificate resting on the drafts does not count as accepted until he signs.
+cost drafts, which are not yet signed into §2. So does a theorem that reaches a `SpecOps` field
+whose type fixes a draft's shape: property lookup, List append, number-to-key conversion, object
+creation and function object creation, each a constant, and List membership, a function of the
+List's length alone. A theorem stated for every `SpecOps` still rests on those shapes. The audit
+lists each such theorem as pending Matt's signature (§2.1), naming what it rests on, and a
+certificate resting on a draft does not count as accepted until he signs.
 -/
 
 open Lean System
@@ -34,6 +38,16 @@ def allowed : Array Name := #[``propext, ``Classical.choice, ``Quot.sound]
 /-- The G52 draft step costs, tracked like an axiom so the audit can report what rests on
 them. -/
 def draft : Name := `Olint.Model.SpecOps.draft
+
+/-- The `SpecOps` fields whose types fix the shape of a G52 draft, the constant costs and List
+membership's cost in the List's length alone, tracked like `draft`: a theorem that reads one
+rests on that shape whatever the field's value. -/
+def shapes : Array Name := #[`Olint.Model.SpecOps.propertyLookup, `Olint.Model.SpecOps.listAppend,
+  `Olint.Model.SpecOps.listContains, `Olint.Model.SpecOps.numberToKey,
+  `Olint.Model.SpecOps.objectCreate, `Olint.Model.SpecOps.closureCreate]
+
+/-- Everything tracked as unsigned: the drafts' values and the shapes. -/
+def unsigned : Array Name := #[draft] ++ shapes
 
 /-- The `.lean` files under a directory, recursively; none when it does not exist. -/
 partial def leanFiles (dir : FilePath) : IO (Array FilePath) := do
@@ -51,9 +65,9 @@ def moduleOf (p : FilePath) : Name :=
   (p.withExtension "").components.foldl
     (fun n c => if c == "." || c.isEmpty then n else Name.str n c) .anonymous
 
-/-- The axioms, and the draft, a constant depends on, memoised across constants, following the
-same edges as `#print axioms` (`Lean.collectAxioms`): types, values, and an inductive's
-constructors. -/
+/-- The axioms, and the unsigned drafts, a constant depends on, memoised across constants,
+following the same edges as `#print axioms` (`Lean.collectAxioms`): types, values, and an
+inductive's constructors. -/
 partial def axiomsOf (env : Environment) (c : Name) : StateM (NameMap (Array Name)) (Array Name) := do
   if let some r := (← get).find? c then return r
   modify (·.insert c #[])
@@ -63,7 +77,7 @@ partial def axiomsOf (env : Environment) (c : Name) : StateM (NameMap (Array Nam
       let mut deps := info.type.getUsedConstants
       if let some v := info.value? (allowOpaque := true) then deps := deps ++ v.getUsedConstants
       if let .inductInfo i := info then deps := deps ++ i.ctors.toArray
-      let mut acc : Array Name := if c == draft then #[draft] else #[]
+      let mut acc : Array Name := if unsigned.contains c then #[c] else #[]
       for d in deps do
         for a in ← axiomsOf env d do
           if !acc.contains a then acc := acc.push a
@@ -130,25 +144,27 @@ def audit : IO Unit := do
   let sorted := targets.qsort (fun a b => Name.lt a.1 b.1)
   let mut memo : NameMap (Array Name) := {}
   let mut bad : Array (Name × Array Name) := #[]
-  let mut pending : Array Name := #[]
+  let mut pending : Array (Name × Array Name) := #[]
   let mut shapes : Array Name := #[]
   let mut certificates := 0
   for (n, m) in sorted do
     let (deps, memo') := (axiomsOf env n).run memo
     memo := memo'
-    let axs := (deps.filter (· != draft)).qsort Name.lt
+    let axs := (deps.filter (!unsigned.contains ·)).qsort Name.lt
     IO.println s!"'{n}' depends on axioms: {axs.toList}"
     let extra := axs.filter fun a => !allowed.contains a
     if !extra.isEmpty then bad := bad.push (n, extra)
-    if deps.contains draft then pending := pending.push n
+    let drafts := (deps.filter unsigned.contains).qsort Name.lt
+    if !drafts.isEmpty then pending := pending.push (n, drafts)
     if isCertificate m n then
       certificates := certificates + 1
       if let some (.thmInfo info) := env.find? n then
         if !isCertificateStatement info.type then shapes := shapes.push n
   IO.println s!"audited {sorted.size} theorems in {mods.size} modules"
   IO.println s!"checked the statement of {certificates} certificate theorems"
-  for n in pending do
-    IO.println s!"pending signature (rests on the G52 drafts, SpecOps.draft): '{n}'"
+  for (n, drafts) in pending do
+    IO.println s!"pending signature (rests on the G52 drafts {drafts.toList}): '{n}'"
+  IO.println s!"{pending.size} theorems pending signature"
   let mut errors : Array String := #[]
   if !bypass.isEmpty then
     errors := errors.push s!"kernel-check bypass `debug.{needle}` in {bypass.toList}"

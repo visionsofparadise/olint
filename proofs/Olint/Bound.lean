@@ -51,8 +51,9 @@ facts exclude that:
 A certificate theorem holds in every world `W` satisfying `NoReplacement W xs` for the
 intrinsics `xs` its derivation relies on (§2.2, olint's intrinsic-replacement scan, certified in
 Phase 5). A derivation whose soundness needs the G52 draft step costs states `W.ops =
-SpecOps.draft` as a further premise, and counts as pending Matt's signature until he signs the
-drafts into §2 (§2.1, §6.3); `scripts/axioms.lean` reports it so.
+SpecOps.draft` as a further premise. It, and every derivation that reaches a `SpecOps` field
+whose type fixes a draft's shape (`Olint.Model.SpecOps`), counts as pending Matt's signature
+until he signs the drafts into §2 (§2.1, §6.3); `scripts/axioms.lean` reports it so.
 
 ## Ceilings need a separate reading
 

@@ -35,9 +35,10 @@ parent's syntax, so a child certificate concerns exactly the syntax it bounds.
 analysed program modifies none of the intrinsics `xs` (`NoReplacement W xs`, §2.2). That premise
 is part of every certificate theorem's statement; olint discharges it with its
 intrinsic-replacement scan (family G, `intrinsic-replacement-scan`, certified in Phase 5). The
-theorem quantifies over the world's spec-internal step costs `W.ops` too, so it rests on no G52
-draft; a family whose soundness needs the drafts adds the premise `W.ops = SpecOps.draft`, which
-`scripts/axioms.lean` reports as pending Matt's signature (§2.1, §6.3). A generated certificate
+theorem quantifies over the world's spec-internal step costs `W.ops` too, so it rests on none of
+the G52 drafts' values, though it rests on the shapes `SpecOps` fixes for them; a family whose
+soundness needs the drafts' values adds the premise `W.ops = SpecOps.draft`. `scripts/axioms.lean`
+reports both as pending Matt's signature (§2.1, §6.3). A generated certificate
 theorem passes the derivation explicitly, since `costOf` does not determine it:
 
 ```lean

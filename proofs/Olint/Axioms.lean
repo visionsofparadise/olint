@@ -8,10 +8,14 @@ Each clause of spec §2 is encoded here, and nowhere else:
 * **§2.1** Proven results rest on this file's definitions, the model in `Olint.Model`, and Lean's
   standard axioms (`propext`, `Classical.choice`, `Quot.sound`). The file declares no `axiom`.
   The step costs of spec-internal operations are §2 axiom drafts awaiting Matt's signature
-  (ledger gap G52), so the model takes them as a parameter, `SpecOps`, and the drafts are one
-  instance of it, `SpecOps.draft`. A theorem that holds for every `SpecOps` rests on no draft;
-  a theorem that needs the draft names `SpecOps.draft` in its statement, and
-  `scripts/axioms.lean` reports it as pending signature (§2.1, §6.3).
+  (ledger gap G52), so the model takes them as a parameter, `SpecOps`, and the drafts' values
+  are one instance of it, `SpecOps.draft`. A theorem that holds for every `SpecOps` rests on
+  none of those values, but it still rests on the shapes the fields' types fix, which are
+  drafts too: property lookup, List append, number-to-key conversion, object creation and
+  function object creation each cost a constant, and List membership costs a function of the
+  List's length alone. `scripts/axioms.lean` reports as pending signature every theorem that
+  reaches one of those fields, and every theorem that needs the drafts' values, which names
+  `SpecOps.draft` in its statement (§2.1, §6.3).
 * **§2.2** Built-ins are the fixed definitions `builtinGlobal`, `builtinMethod`, `builtinGetter`
   and `step`. The work semantics consults them only after the program's own bindings, own
   properties and class members, so the certificate's own code shadows them. The rest of the
@@ -46,7 +50,9 @@ their own steps. `SpecOps` is the parameter; `SpecOps.draft` holds the §2 axiom
 pending Matt's signature. -/
 
 /-- The step costs of spec-internal operations. The model of work is parametric in them, so
-a theorem that holds for every `SpecOps` depends on no draft. -/
+a theorem that holds for every `SpecOps` depends on none of the drafts' values; the types of
+`propertyLookup`, `listAppend`, `listContains`, `numberToKey`, `objectCreate` and
+`closureCreate` still fix a draft's shape, on which such a theorem rests (§2.1). -/
 structure SpecOps where
   /-- Looking up one property of one object (`OrdinaryGetOwnProperty`, ECMA-262 §10.1.5.1, as
   `[[Get]]`, `[[Set]]` and `[[DefineOwnProperty]]` reach it, once per object of the prototype
@@ -550,8 +556,13 @@ which `null` and `undefined` conform only to their own types and `any`):
 
 The members an interface or a prototype supplies are admitted without checking their types, and
 symbol-keyed members, which the model's values cannot carry, are not required, so `conforms`
-admits at least every value TypeScript assigns to the type: admission never excludes an
-instance §2.5 admits. -/
+admits at least every value TypeScript assigns to the type.
+
+Admission is narrower than §2.5 in one respect, pending Matt's reading of the axioms: a
+dimension measures only a String or a built-in collection, an Array exotic object, a Map or a
+Set (`Olint.Model.Heap.lengthOf`). An instance whose measured argument or free variable is an
+ordinary object standing in for a collection conforms to its type but is not admitted, so a
+bound over such a dimension covers the built-in collections only. -/
 
 /-- How a value provides a property, for structural typing: the value to check against the
 field's type, present with a type the model does not check, or absent. -/
