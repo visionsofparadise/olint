@@ -610,6 +610,45 @@ fn a_parameter_resized_in_a_loop_leaves_its_input_dimension() {
 }
 
 #[test]
+fn a_parameter_resized_once_by_an_untracked_amount_leaves_its_input_dimension() {
+    // A one-shot site keeps the input dimension only when it adds a constant number of entries in a
+    // function that does not recur: `xs[n] = 0` alone makes the scan run n + 1 times.
+    let scan = "let t = 0; for (const x of xs) t += x; return t;";
+
+    for site in [
+        "xs[n] = 0;",
+        "xs.length = n;",
+        "xs.push(...ys);",
+        "xs.unshift(...ys);",
+        "xs.splice(0, 0, 1);",
+    ] {
+        let source =
+            format!("export function f(xs: number[], ys: number[], n: number) {{ {site} {scan} }}");
+
+        assert!(!size_result_of(&source, "f").1, "{source}");
+    }
+
+    let recursive = format!("export function f(xs: number[], n: number): number {{ xs.push(0); if (n > 0 && n <= 1000) f(xs, n - 1); {scan} }}");
+
+    assert!(!size_result_of(&recursive, "f").1, "{recursive}");
+    assert!(
+        size_result_of(&recursive.replace("xs.push(0); ", ""), "f").1,
+        "{recursive}"
+    );
+
+    for site in ["xs.push(0);", "xs.push(1, 2);", "xs.unshift(0);"] {
+        let source =
+            format!("export function f(xs: number[], ys: number[], n: number) {{ {site} {scan} }}");
+
+        assert_eq!(
+            size_result_of(&source, "f"),
+            (cost("O(N)"), true, false),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn nested_push_loops_track_the_holder_they_grow() {
     // The holder grows by one element per inner visit, so the later scan visits n * m elements.
     let pushed = "export function f(n: number, m: number) { const out: number[] = []; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < m && m >= 0 && m <= 1000000000; j++) out.push(j); let c = 0; for (const v of out) c += v; return c; }";

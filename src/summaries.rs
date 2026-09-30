@@ -2800,6 +2800,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .collect()
     }
 
+    /// Whether `function` belongs to the recurrence being summarised: the active task's recurrence
+    /// or the component the scheduler is solving.
+    pub(crate) fn may_recur(&self, function: FunctionId) -> bool {
+        self.scheduler.active.is_some_and(|active| {
+            self.scheduler.tasks[active.0]
+                .recurrence_members
+                .contains(&function)
+        }) || self
+            .scheduler
+            .component
+            .iter()
+            .any(|id| self.scheduler.tasks[id.0].key.function == function)
+    }
+
     fn active_recurrence_members(&self) -> Option<usize> {
         self.scheduler
             .active

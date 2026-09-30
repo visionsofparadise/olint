@@ -81,6 +81,9 @@ const ITERATED_MEMBERS: [&str; 5] = ["values", "next", "return", "@@iterator", "
 const AWAITED_MEMBERS: [&str; 1] = ["then"];
 const GROWING_METHODS: [&str; 2] = ["push", "unshift"];
 const RESIZING_METHODS: [&str; 5] = ["push", "unshift", "splice", "add", "set"];
+/// The resizing methods that add one entry per argument, so a call with no spread argument adds a
+/// constant number of entries.
+const COUNTED_RESIZING_METHODS: [&str; 4] = ["push", "unshift", "add", "set"];
 const DELETING_METHODS: [&str; 2] = ["delete", "clear"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -135,13 +138,24 @@ enum GrowthSummary {
     Sites { calls: Vec<NodeId>, open: bool },
 }
 
+/// How a function resizes one of its bindings in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resizing {
+    /// No site resizes the binding.
+    Unchanged,
+    /// Every resizing site runs at most once per call and adds a constant number of entries.
+    Bounded,
+    /// A site resizes the binding by an amount or a number of times the size cannot track.
+    Untracked,
+}
+
 #[derive(Default)]
 pub(crate) struct SizeMemory {
     declarations: HashMap<(FileId, NodeId), Option<Measure>>,
     holders: HashMap<(FileId, SymbolId, Shape, bool), HolderSummary>,
     growths: HashMap<(FileId, SymbolId, Shape), GrowthSummary>,
     evaluating: HashMap<FileId, bool>,
-    resized: HashMap<(FileId, SymbolId), bool>,
+    resized: HashMap<(FileId, SymbolId), Resizing>,
     pub(crate) inherited: HashMap<Kind, bool>,
 }
 
@@ -853,20 +867,25 @@ impl<'p, 'a> Analysis<'p, 'a> {
         true
     }
 
-    /// Whether the function that binds `symbol` resizes its value in place where the resizing can
-    /// repeat, inside a loop or a nested function: an intrinsic growing or splicing call on it, or
-    /// a write to one of its members, which can extend an array's `length`. Such a value's size is
-    /// no longer the input dimension it entered with; a site that runs once adds a constant.
+    /// Whether the function that binds `symbol` resizes its value in place by an amount its size
+    /// cannot track: a resizing site that can repeat, inside a loop, a nested function or a
+    /// recursive call of the binding function, or a site that adds a data-dependent number of
+    /// entries or writes a member, which can extend an array's `length` to any value. The one site
+    /// that keeps the input dimension is a non-spread `push`, `unshift`, `add` or `set` call that
+    /// runs once per call of a non-recursive function, adding a constant.
     pub(crate) fn is_resized_in_place(&mut self, file: FileId, symbol: SymbolId) -> bool {
-        if let Some(found) = self.values.sizes.resized.get(&(file, symbol)) {
-            return *found;
-        }
+        let resizing = match self.values.sizes.resized.get(&(file, symbol)) {
+            Some(resizing) => *resizing,
+            None => {
+                let resizing = self.resizing_of(file, symbol, None);
 
-        let found = self.is_resized_outside(file, symbol, None);
+                self.values.sizes.resized.insert((file, symbol), resizing);
 
-        self.values.sizes.resized.insert((file, symbol), found);
+                resizing
+            }
+        };
 
-        found
+        self.is_untracked_resizing(file, symbol, resizing)
     }
 
     /// `is_resized_in_place`, ignoring the resizing sites inside `region` when `region` is entered
@@ -877,13 +896,48 @@ impl<'p, 'a> Analysis<'p, 'a> {
         symbol: SymbolId,
         region: Option<NodeId>,
     ) -> bool {
+        let resizing = self.resizing_of(file, symbol, region);
+
+        self.is_untracked_resizing(file, symbol, resizing)
+    }
+
+    /// Whether `resizing` leaves the size of `symbol` untracked. A bounded site in a function that
+    /// recurs runs once per recursive call, so it adds as many entries as the recursion is deep.
+    /// The recursion is read at each query, since a function joins a recurrence only once the
+    /// scheduler finds its cycle.
+    fn is_untracked_resizing(
+        &mut self,
+        file: FileId,
+        symbol: SymbolId,
+        resizing: Resizing,
+    ) -> bool {
+        match resizing {
+            Resizing::Unchanged => false,
+            Resizing::Untracked => true,
+            Resizing::Bounded => {
+                let scoping = self.project.file(file).semantic.scoping();
+
+                self.enclosing_function_of(file, scoping.symbol_declaration(symbol))
+                    .is_none_or(|node| {
+                        self.may_recur(crate::declarations::FunctionId { file, node })
+                    })
+            }
+        }
+    }
+
+    fn resizing_of(&mut self, file: FileId, symbol: SymbolId, region: Option<NodeId>) -> Resizing {
         let project = self.project;
         let semantic = &project.file(file).semantic;
         let nodes = semantic.nodes();
         let references = value_references_of(semantic.scoping(), symbol);
         let function =
             self.enclosing_function_of(file, semantic.scoping().symbol_declaration(symbol));
-        let mut found = !self.charge_work(Event::SizeStep, references.len() as u64);
+
+        if !self.charge_work(Event::SizeStep, references.len() as u64) {
+            return Resizing::Untracked;
+        }
+
+        let mut resizing = Resizing::Unchanged;
         // A region inside a loop is entered again after its own resizing sites ran.
         let region = region.filter(|region| {
             self.enclosing_function_of(file, *region) == function
@@ -894,21 +948,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         });
 
         for (node, _) in references {
-            if found {
+            if resizing == Resizing::Untracked {
                 break;
             }
 
-            // A site that runs at most once per call adds a constant to the size.
-            let repeated = self.enclosing_function_of(file, node) != function
-                || nodes
-                    .ancestor_ids(node)
-                    .take_while(|ancestor| Some(*ancestor) != function)
-                    .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)));
-
-            if !repeated
-                || region.is_some_and(|region| {
-                    nodes.ancestor_ids(node).any(|ancestor| ancestor == region)
-                })
+            if region
+                .is_some_and(|region| nodes.ancestor_ids(node).any(|ancestor| ancestor == region))
             {
                 continue;
             }
@@ -930,22 +975,45 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let accessed = outermost_of(nodes, member);
             let accessed_span = nodes.kind(accessed).span();
-
-            found = match nodes.parent_kind(accessed) {
+            let (resizes, counted) = match nodes.parent_kind(accessed) {
                 AstKind::CallExpression(call) if call.callee.span() == accessed_span => {
-                    name.is_some_and(|name| RESIZING_METHODS.contains(&name))
-                        && self.is_intrinsic_member(file, call)
+                    let resizes = name.is_some_and(|name| RESIZING_METHODS.contains(&name))
+                        && self.is_intrinsic_member(file, call);
+                    let counted = name.is_some_and(|name| COUNTED_RESIZING_METHODS.contains(&name))
+                        && !call
+                            .arguments
+                            .iter()
+                            .any(|argument| matches!(argument, Argument::SpreadElement(_)));
+
+                    (resizes, counted)
                 }
                 AstKind::AssignmentExpression(assignment) => {
-                    assignment.left.span() == accessed_span
+                    (assignment.left.span() == accessed_span, false)
                 }
-                AstKind::UpdateExpression(_) => true,
-                AstKind::UnaryExpression(unary) => unary.operator == UnaryOperator::Delete,
-                _ => false,
+                AstKind::UpdateExpression(_) => (true, false),
+                AstKind::UnaryExpression(unary) => (unary.operator == UnaryOperator::Delete, false),
+                _ => (false, false),
+            };
+
+            if !resizes {
+                continue;
+            }
+
+            // A site that runs at most once per call adds a constant to the size.
+            let repeated = self.enclosing_function_of(file, node) != function
+                || nodes
+                    .ancestor_ids(node)
+                    .take_while(|ancestor| Some(*ancestor) != function)
+                    .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)));
+
+            resizing = if repeated || !counted {
+                Resizing::Untracked
+            } else {
+                Resizing::Bounded
             };
         }
 
-        found
+        resizing
     }
 
     pub(crate) fn has_deleted_entries(

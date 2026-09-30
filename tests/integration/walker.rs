@@ -842,7 +842,8 @@ export function selected(xs: number[]) {{ (xs as any).__proto__ = {{ includes: (
         format!("{slow}
 export function selected(xs: number[]) {{ Object.setPrototypeOf(xs, {{ includes: () => slow(xs) }}); return xs.includes(0); }}"),
     ];
-    let expected = ["O(1)", "O(1)", "O(N)", "O(N)", "O(1)", "O(N)", "O(N)"];
+    // A write to a member of `xs` can extend its length, so the `includes` scan on it is unproven.
+    let expected = ["O(1)", "O(1)", "O(1)", "O(1)", "O(1)", "O(1)", "O(N)"];
 
     for types in [
         olint::analysis::TypeMode::Syntactic,
