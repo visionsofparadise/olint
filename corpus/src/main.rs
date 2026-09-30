@@ -3,17 +3,21 @@
 //! ```text
 //! olint-corpus snapshot --src <sha|tree> [--out <dir>] [--jobs <n>] [--timeout <seconds>] [--member <prefix>]...
 //!     [--unknown <policy>]
-//! olint-corpus diff <base-sha> <head-sha>
+//! olint-corpus diff <base-sha> <head-sha> [--no-scale]
 //! olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]
+//!     [--refresh true]
 //! olint-corpus scale --src <sha|tree> [--family <name>] [--min-k <k>] [--max-k <k>] [--out <file>] [--jobs <n>]
 //!     [--timeout <seconds>]
 //! ```
+//!
+//! `diff` accepts a change only with the §5.3 scaling comparison, so `--no-scale` is for iteration, never acceptance.
 
 mod alloc;
 mod diff;
 #[path = "../families/mod.rs"]
 mod families;
 mod members;
+mod ranking;
 mod scale;
 mod selftest;
 mod snapshot;
@@ -31,8 +35,8 @@ use snapshot::{MemberArgs, Pass, SnapshotArgs};
 
 const USAGE: &str = "usage:
   olint-corpus snapshot --src <sha|tree> [--out <dir>] [--jobs <n>] [--timeout <seconds>] [--member <prefix>]... [--unknown <policy>]
-  olint-corpus diff <base-sha> <head-sha>
-  olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>]
+  olint-corpus diff <base-sha> <head-sha> [--no-scale]
+  olint-corpus selftest [--member <prefix>]... [--check <n,...>] [--jobs <n>] [--timeout <seconds>] [--work <dir>] [--refresh true]
   olint-corpus scale --src <sha|tree> [--family <name>] [--min-k <k>] [--max-k <k>] [--out <file>] [--jobs <n>] [--timeout <seconds>]";
 
 struct Flags(Vec<(String, String)>);
@@ -116,11 +120,11 @@ fn run(arguments: &[String]) -> Result<(), String> {
     };
 
     if command == "diff" {
-        let [base, head] = rest else {
-            return Err(USAGE.to_string());
+        return match rest {
+            [base, head] => diff::diff(base, head, false),
+            [base, head, flag] if flag == "--no-scale" => diff::diff(base, head, true),
+            _ => Err(USAGE.to_string()),
         };
-
-        return diff::diff(base, head);
     }
 
     let flags = Flags::parse(rest)?;
@@ -139,7 +143,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
             })
         }
         "selftest" => {
-            flags.check(&["member", "check", "jobs", "timeout", "work"])?;
+            flags.check(&["member", "check", "jobs", "timeout", "work", "refresh"])?;
 
             selftest::selftest(SelftestArgs {
                 only: flags.all("member"),
@@ -147,6 +151,13 @@ fn run(arguments: &[String]) -> Result<(), String> {
                 jobs: flags.number("jobs", default_jobs())? as usize,
                 timeout: Duration::from_secs(flags.number("timeout", 900)?),
                 work: flags.optional("work").map(PathBuf::from),
+                refresh: match flags.optional("refresh").as_deref() {
+                    None | Some("false") => false,
+                    Some("true") => true,
+                    Some(other) => {
+                        return Err(format!("--refresh takes true or false, got {other}"))
+                    }
+                },
             })
         }
         "scale" => {

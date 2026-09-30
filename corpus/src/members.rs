@@ -23,13 +23,29 @@ struct Package {
     version: String,
 }
 
-/// Lists the members of the olint tree at `tree`, with packages taken from the corpus cache at `cache`.
-pub fn members(tree: &Path, cache: &Path) -> Result<Vec<Member>, String> {
-    let mut found = packages(cache)?;
+/// The member-id prefix of every package member.
+const PACKAGES: &str = "packages/";
+
+/// Whether a `--member` prefix can select a package member.
+fn selects_packages(prefix: &str) -> bool {
+    PACKAGES.starts_with(prefix) || prefix.starts_with(PACKAGES)
+}
+
+/// Lists the members of the olint tree at `tree` whose ids start with one of the `only` prefixes (all members when
+/// `only` is empty), with packages taken from the corpus cache at `cache`. The package corpus is pinned, so a missing
+/// `packages.json` is an error whenever the selection can include packages.
+pub fn members(tree: &Path, cache: &Path, only: &[String]) -> Result<Vec<Member>, String> {
+    let mut found = match only.is_empty() || only.iter().any(|prefix| selects_packages(prefix)) {
+        true => packages(cache)?,
+        false => Vec::new(),
+    };
 
     found.extend(fixtures(tree)?);
     found.extend(family_members(cache)?);
     found.extend(ceilings(tree));
+    found.retain(|member| {
+        only.is_empty() || only.iter().any(|prefix| member.id.starts_with(prefix))
+    });
     found.sort();
 
     Ok(found)
@@ -37,11 +53,12 @@ pub fn members(tree: &Path, cache: &Path) -> Result<Vec<Member>, String> {
 
 fn packages(cache: &Path) -> Result<Vec<Member>, String> {
     let path = cache.join("packages.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
-    };
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "cannot read {}: {error}; run `npm run corpus` to build the pinned package corpus",
+            path.display()
+        )
+    })?;
     let packages: Vec<Package> = serde_json::from_str(&text)
         .map_err(|error| format!("{} is malformed: {error}", path.display()))?;
 
@@ -51,7 +68,7 @@ fn packages(cache: &Path) -> Result<Vec<Member>, String> {
             let spec = format!("{}@{}", package.name, package.version);
 
             Member {
-                id: format!("packages/{spec}"),
+                id: format!("{PACKAGES}{spec}"),
                 root: cache.join("packages").join(&spec),
             }
         })
@@ -120,7 +137,15 @@ mod tests {
             .parent()
             .expect("the corpus package sits in the olint tree");
         let cache = corpus.join(".cache/absent-for-tests");
-        let found = members(tree, &cache).expect("members list");
+        let found = members(
+            tree,
+            &cache,
+            &["fixtures/".to_string(), "families/".to_string()],
+        )
+        .expect("members list");
+
+        assert!(members(tree, &cache, &[]).is_err());
+        assert!(members(tree, &cache, &["packages/x".to_string()]).is_err());
 
         for name in FIXTURES {
             let member = found

@@ -79,7 +79,12 @@ pub struct TscTotals {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct MemberCounts {
+    /// The hard failure that left the member without rows: the project did not load, the analysis or its process
+    /// failed, or the member timed out.
     pub error: Option<String>,
+    /// Errors the analysis reported while still writing rows; `diff` compares those rows and lists the errors.
+    #[serde(default)]
+    pub errors: Vec<String>,
     pub rows: usize,
     /// Consumed work per scheduler `Event`, in `EVENTS` order.
     pub events: Map<String, Value>,
@@ -95,6 +100,10 @@ pub struct MemberCounts {
     pub nodes: Option<u64>,
     /// Peak live bytes the counting allocator saw from project load through `snapshot_rows`.
     pub peak_bytes: Option<u64>,
+    /// Memory of the tsc and regex sidecar processes, which the counting allocator cannot see. Always `null` until
+    /// Phase 6 action 6.3 attributes delegated checker work and memory per query; `peak_bytes` covers olint's own
+    /// process only.
+    pub sidecar_bytes: Option<u64>,
     pub tsc: Option<TscTotals>,
     pub warnings: Vec<String>,
 }
@@ -303,29 +312,62 @@ pub fn build(source: &Source, cache: &Path) -> Result<PathBuf, String> {
     Ok(binary)
 }
 
-pub fn snapshot(args: SnapshotArgs) -> Result<(), String> {
+/// The corpus cache and the olint tree `src` names, materialized with the head's harness and built.
+pub struct Built {
+    pub cache: PathBuf,
+    pub source: Source,
+    pub binary: PathBuf,
+}
+
+pub fn built(src: &str) -> Result<Built, String> {
     let corpus = head_corpus();
     let repo = corpus
         .parent()
         .expect("the corpus package sits in the olint tree");
     let cache = corpus.join(".cache");
-    let source = materialize(&args.src, repo, &cache)?;
+    let source = materialize(src, repo, &cache)?;
     let binary = build(&source, &cache)?;
+
+    Ok(Built {
+        cache,
+        source,
+        binary,
+    })
+}
+
+/// Runs `work` on every task with its index from `jobs` threads, each taking the next unclaimed task.
+pub fn in_parallel<T: Sync>(tasks: &[T], jobs: usize, work: impl Fn(usize, &T) + Sync) {
+    let next = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(task) = tasks.get(index) else {
+                    break;
+                };
+
+                work(index, task);
+            });
+        }
+    });
+}
+
+pub fn snapshot(args: SnapshotArgs) -> Result<(), String> {
+    let Built {
+        cache,
+        source,
+        binary,
+    } = built(&args.src)?;
     let out = match args.out {
         Some(out) => absolute(&out)?,
         None => cache.join("snap").join(&source.key),
     };
-    let selected: Vec<Member> = members(&source.tree, &cache)?
-        .into_iter()
-        .filter(|member| {
-            args.only.is_empty() || args.only.iter().any(|prefix| member.id.starts_with(prefix))
-        })
-        .collect();
+    let selected: Vec<Member> = members(&source.tree, &cache, &args.only)?;
     let tasks: Vec<(Pass, &Member)> = selected
         .iter()
         .flat_map(|member| PASSES.map(|pass| (pass, member)))
         .collect();
-    let next = AtomicUsize::new(0);
     let results = Mutex::new(BTreeMap::new());
     let started = Instant::now();
 
@@ -336,44 +378,36 @@ pub fn snapshot(args: SnapshotArgs) -> Result<(), String> {
         out.display()
     );
 
-    std::thread::scope(|scope| {
-        for _ in 0..args.jobs.max(1) {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some((pass, member)) = tasks.get(index) else {
-                    break;
-                };
-                let begun = Instant::now();
-                let counts = run_member(
-                    &binary,
-                    &source.tree,
-                    &out,
-                    *pass,
-                    member,
-                    args.timeout,
-                    args.unknown.as_deref(),
-                );
+    in_parallel(&tasks, args.jobs, |index, (pass, member)| {
+        let begun = Instant::now();
+        let counts = run_member(
+            &binary,
+            &source.tree,
+            &out,
+            *pass,
+            member,
+            args.timeout,
+            args.unknown.as_deref(),
+        );
 
-                eprintln!(
-                    "[{}/{}] {} {}: {} rows{} in {:.1}s",
-                    index + 1,
-                    tasks.len(),
-                    pass.name(),
-                    member.id,
-                    counts.rows,
-                    counts
-                        .error
-                        .as_ref()
-                        .map(|error| format!(", error: {error}"))
-                        .unwrap_or_default(),
-                    begun.elapsed().as_secs_f64()
-                );
-                results
-                    .lock()
-                    .expect("results lock")
-                    .insert((*pass, member.id.clone()), counts);
-            });
-        }
+        eprintln!(
+            "[{}/{}] {} {}: {} rows{} in {:.1}s",
+            index + 1,
+            tasks.len(),
+            pass.name(),
+            member.id,
+            counts.rows,
+            counts
+                .error
+                .as_ref()
+                .map(|error| format!(", error: {error}"))
+                .unwrap_or_default(),
+            begun.elapsed().as_secs_f64()
+        );
+        results
+            .lock()
+            .expect("results lock")
+            .insert((*pass, member.id.clone()), counts);
     });
 
     let mut passes: BTreeMap<&'static str, BTreeMap<String, MemberCounts>> = BTreeMap::new();
@@ -505,6 +539,16 @@ pub fn run_member(
         .unwrap_or_else(|error| failed(format!("member counts are malformed: {error}")))
 }
 
+/// Regex classification limits for snapshots: answers are deterministic since action 4.5, and the process `deadline`,
+/// a hard failure, is effectively unlimited so machine load cannot fail a member; the deterministic caps (source
+/// bytes, request count, reply bytes, sidecar heap) keep their defaults.
+fn snapshot_regex_limits() -> RegexLimits {
+    RegexLimits {
+        deadline: Duration::from_secs(7 * 24 * 60 * 60),
+        ..RegexLimits::default()
+    }
+}
+
 fn pinned_typescript(tree: &Path) -> Result<String, String> {
     let path = tree.join("package.json");
     let text = std::fs::read_to_string(&path).map_err(io_error("read", &path))?;
@@ -564,6 +608,7 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
     };
     let mut tsc: Option<TscTotals> = None;
     let mut warnings = Vec::new();
+    let regex_limits = snapshot_regex_limits();
 
     loop {
         let functions = match args.pass {
@@ -600,7 +645,7 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         let classified = analysis.regex_answers.len();
         let unavailable = analysis
             .gather_selected_regex_answers(&functions, |requests| {
-                olint::regex::ask(&helper, requests, &RegexLimits::default())
+                olint::regex::ask(&helper, requests, &regex_limits)
             })
             .map_err(|error: RegexError| format!("regex classification failed: {error:?}"))?;
 
@@ -653,14 +698,8 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
     warnings.extend(analysis.warnings.iter().cloned());
 
     Ok(MemberCounts {
-        error: (!analysis.errors.is_empty()).then(|| {
-            analysis
-                .errors
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("; ")
-        }),
+        error: None,
+        errors: analysis.errors.iter().cloned().collect(),
         rows: rows.len(),
         events,
         exhausted,
@@ -669,6 +708,7 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         maximum_body_passes: stats.maximum_body_passes,
         nodes: Some(nodes),
         peak_bytes: Some(peak_bytes),
+        sidecar_bytes: None,
         tsc,
         warnings,
     })

@@ -1,13 +1,14 @@
 //! `selftest` runs the harness's integrity checks:
 //!
-//! 1. Re-derives `corpus/.cache/packages.json` from the cached registry answers and requires it byte-identical, then
-//!    verifies each selected package's tarball against its recorded integrity and its extracted files against the
-//!    tarball.
+//! 1. Re-derives `corpus/.cache/packages.json` from the cached registry answers, or from fresh registry answers under
+//!    `--refresh true`, and requires it byte-identical, then verifies each selected package's tarball against its
+//!    recorded integrity and its extracted files against the tarball.
 //! 2. Snapshots the working tree twice and requires byte identity.
 //! 3. Diffs a snapshot against itself and requires an empty result.
-//! 4. Plants a weakening (every loop factor forced unresolved in `bounds.rs`) and a tightening
-//!    (`Array.prototype.includes` forced constant) as in-cache edits of a tree copy, and requires them to report as a
-//!    lowering and a raise respectively.
+//! 4. Plants a weakening (every loop factor forced unresolved in `bounds.rs`), a widening (every proven loop factor
+//!    forced to the envelope `N`, which a Partial loop shows only in its floor) and a tightening
+//!    (`Array.prototype.includes` forced constant) as in-cache edits of a tree copy, and requires the first two to
+//!    report only lowerings, the widening including a Partial-to-Partial lowering, and the third only raises.
 //! 5. Requires identical rows under the `ignore`, `warn` and `error` unknown policies.
 //!
 //! Every snapshot runs on a copy of the working tree under the work directory, never on the real `src/`, and
@@ -34,6 +35,8 @@ pub struct SelftestArgs {
     pub jobs: usize,
     pub timeout: Duration,
     pub work: Option<PathBuf>,
+    /// Check 1 re-derives from fresh registry answers (`select.mjs --refresh`) instead of the cached ones.
+    pub refresh: bool,
 }
 
 /// A planted edit: `find` must occur exactly once in `file`, and becomes `replace`.
@@ -49,6 +52,13 @@ const WEAKEN: Plant = Plant {
     file: "src/bounds.rs",
     find: "        let bound = self.inner_bound_of(file, loop_kind);\n",
     replace: "        let _ = self.inner_bound_of(file, loop_kind);\n        let bound = unresolved_bound_of();\n",
+};
+
+const WIDEN: Plant = Plant {
+    name: "widen",
+    file: "src/bounds.rs",
+    find: "        let bound = self.inner_bound_of(file, loop_kind);\n",
+    replace: "        let bound = match self.inner_bound_of(file, loop_kind) {\n            Bound::Proven { proof, .. } => Bound::Proven {\n                factor: crate::cost::Cost::dimension(u64::MAX, crate::cost::Domain::Size),\n                proof,\n            },\n            bound => bound,\n        };\n",
 };
 
 const TIGHTEN: Plant = Plant {
@@ -123,12 +133,19 @@ fn git_lines(repo: &Path, arguments: &[&str]) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Copies the working tree's tracked files, plus untracked unignored files under `src/`, `tests/` and `corpus/`,
-/// into `to`.
-fn copy_working_tree(repo: &Path, to: &Path) -> Result<(), String> {
+/// Removes `to` when it exists.
+fn cleared(to: &Path) -> Result<(), String> {
     if to.exists() {
         std::fs::remove_dir_all(to).map_err(io_error("remove", to))?;
     }
+
+    Ok(())
+}
+
+/// Copies the working tree's tracked files, plus untracked unignored files under `src/`, `tests/` and `corpus/`,
+/// into `to`.
+fn copy_working_tree(repo: &Path, to: &Path) -> Result<(), String> {
+    cleared(to)?;
 
     let mut files: BTreeSet<String> = git_lines(repo, &["ls-files", "--cached"])?
         .into_iter()
@@ -167,9 +184,7 @@ fn copy_working_tree(repo: &Path, to: &Path) -> Result<(), String> {
 
 /// Copies the materialized head tree to `to`, so each plant differs from the head by its edit alone.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
-    if to.exists() {
-        std::fs::remove_dir_all(to).map_err(io_error("remove", to))?;
-    }
+    cleared(to)?;
 
     let mut pending = vec![(from.to_path_buf(), to.to_path_buf())];
 
@@ -347,8 +362,15 @@ fn check_packages(context: &Context) -> Result<String, String> {
     let bands_path = context.cache.join("bands.json");
     let original = std::fs::read(&packages_path).map_err(io_error("read", &packages_path))?;
     let bands = std::fs::read(&bands_path).ok();
-    let status = Command::new("node")
-        .arg("corpus/select.mjs")
+    let mut select = Command::new("node");
+
+    select.arg("corpus/select.mjs");
+
+    if context.args.refresh {
+        select.arg("--refresh");
+    }
+
+    let status = select
         .current_dir(&context.repo)
         .stdin(Stdio::null())
         .status()
@@ -481,7 +503,7 @@ fn check_self_diff(snapshot: &Path) -> Result<String, String> {
 fn check_plants(context: &Context, head_tree: &Path, base: &Path) -> Result<String, String> {
     let mut outcomes = Vec::new();
 
-    for (planted, lowering) in [(&WEAKEN, true), (&TIGHTEN, false)] {
+    for (planted, lowering) in [(&WEAKEN, true), (&WIDEN, true), (&TIGHTEN, false)] {
         let tree = context.tree(planted.name);
 
         copy_tree(head_tree, &tree)?;
@@ -507,7 +529,25 @@ fn check_plants(context: &Context, head_tree: &Path, base: &Path) -> Result<Stri
         }
 
         if lowering && report.passed() {
-            return Err("the weakening's undeclared lowerings did not reject the diff".to_string());
+            return Err(format!(
+                "the {} plant's undeclared lowerings did not reject the diff",
+                planted.name
+            ));
+        }
+
+        let floors = report
+            .unmatched
+            .iter()
+            .filter(|lowering| {
+                lowering.from.starts_with("Partial") && lowering.to.starts_with("Partial")
+            })
+            .count();
+
+        if planted.name == WIDEN.name && floors == 0 {
+            return Err(format!(
+                "the widen plant should lower a Partial loop through its floor, got no Partial-to-Partial lowering:\n{}",
+                report.render()
+            ));
         }
 
         outcomes.push(format!(
@@ -657,7 +697,9 @@ pub fn selftest(args: SelftestArgs) -> Result<(), String> {
             Ok(base) => {
                 if checks.contains(&2) {
                     results.push(timed(2, || {
-                        let again = context.snapshot(&head_tree, "head-again", None)?;
+                        // Peak bytes include the output path the member holds, so the rerun's directory name
+                        // has the length of "head".
+                        let again = context.snapshot(&head_tree, "twin", None)?;
 
                         check_identity(&base, &again)
                     }));

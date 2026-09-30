@@ -6,31 +6,38 @@
 //! bytes from the counting allocator and, in the tsc pass, the checker's `TscCounts`. A size that fails or times out
 //! ends that family and pass: larger sizes are skipped, and the fit uses the sizes below it.
 //!
+//! A size whose run exhausted or reached a scheduler work limit reads the limit instead of olint's unbounded work, so
+//! it and every larger size are left out of the fits; `exhausted_k` records where that began.
+//!
 //! # Fitting
 //!
-//! Each metric y is fitted against x = |G| over the successful sizes, using counts only, never wall-clock time. The
-//! fit assigns the lowest-order class of 1, log n, n, n log n, n², n³ or "above n³" that the sequence reads as:
+//! Each metric y is fitted against x = |G| over every fitted size, using counts only, never wall-clock time. The
+//! candidates are 1, log n, n, n log n, n², n³ and "above n³" (n⁴):
 //!
-//! 1. **Constant.** When max y − min y is at most `CONSTANT_TOLERANCE` of max |y|, the order is 1.
-//! 2. **Growth ratio.** With the first, middle and last sizes i₀ < iₘ < i_K, the observed ratio of finite differences is
-//!    ρ = (y_K − y_m) / (y_m − y₀). Differences cancel any additive constant exactly, and the upper span weighs the
-//!    largest sizes, where lower-order terms matter least. For each candidate g the same ratio ρ_g is computed exactly
-//!    from g at the measured |G| values, and the order is the candidate whose ρ_g is nearest ρ in log distance, the
-//!    lower candidate winning a tie. "Above n³" stands for n⁴.
-//! 3. **Edges.** When y does not rise over the upper span (y_K ≤ y_m) the order is 1. When it rises only there, step 2
-//!    runs on the last three sizes, and failing that the single last ratio y_K / y_{K−1} is matched against every
-//!    candidate's, 1 included. A sequence that is zero until its last size, or has fewer than `MINIMUM_POINTS` sizes,
-//!    has no fit.
+//! 1. **Constant.** When max y − min y is at most `CONSTANT_TOLERANCE` of max |y|, or y does not rise from the middle
+//!    size to the last, the order is 1.
+//! 2. **Leading zeros.** Sizes before the first positive y are dropped; fewer than `MINIMUM_POINTS` remaining sizes
+//!    have no fit.
+//! 3. **Models.** Each candidate g is a least-squares model over g, the two candidates below it (log n and above)
+//!    and a constant, capped at one parameter fewer than the sizes, fitted with each residual taken relative to y so
+//!    the smallest sizes weigh as much as the largest. R_g is the model's root-mean-square relative residual.
+//! 4. **Order.** The order is the lowest candidate whose leading coefficient is positive (for 1, any) and whose
+//!    R_g ≤ `FIT_TOLERANCE` + `FIT_RATIO` · min R. The absolute part rejects a lower order that only approximates
+//!    the data, such as n for x ln x + 50x; the relative part keeps step-shaped counts (allocation doubling) at the
+//!    order every model fits equally badly.
+//! 5. **Ambiguity.** When R of the order exceeds half of `FIT_TOLERANCE`, the fit is marginal, and `upper` is the lowest
+//!    higher candidate whose R is at most half of the order's; otherwise `upper` is the order. §5.3 fails a head whose
+//!    order or upper is higher than the base's.
 //!
-//! The fit is exact arithmetic on the recorded integers followed by fixed comparisons, so it is deterministic. A class
-//! off the candidate list reads as its nearest candidate (log² n as log n, n log² n as n log n).
+//! The fit is fixed floating-point arithmetic (Householder least squares) on the recorded integers followed by fixed
+//! comparisons, so it is deterministic. A class off the candidate list reads as the nearest candidate that fits it
+//! (n log² n as n log n).
 //!
 //! The result is `corpus/.cache/scale/<sha>.json`, which `diff` compares under §5.3.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -39,12 +46,17 @@ use serde::{Deserialize, Serialize};
 use crate::families::{self, Family, FAMILIES};
 use crate::members::Member;
 use crate::snapshot::{
-    absolute, build, head_corpus, materialize, run_member, MemberCounts, Pass, PASSES,
+    absolute, built, in_parallel, run_member, Built, MemberCounts, Pass, PASSES,
 };
 
-pub const SCHEMA: u32 = 1;
+/// Scale file schema. Version 2 adds each metric's `upper` order and excludes limit-reading sizes from the fits.
+pub const SCHEMA: u32 = 2;
 /// The largest spread of y, as a fraction of max |y|, that still reads as constant.
 pub const CONSTANT_TOLERANCE: f64 = 0.005;
+/// The root-mean-square relative residual below which a model fits regardless of the others.
+pub const FIT_TOLERANCE: f64 = 0.002;
+/// How many times the best model's residual a lower model may have and still fit.
+pub const FIT_RATIO: f64 = 2.0;
 /// The fewest successful sizes a fit uses.
 pub const MINIMUM_POINTS: usize = 4;
 /// Metrics recorded for reference but outside §5.3: the program size and the result row count.
@@ -94,7 +106,9 @@ impl Order {
     }
 }
 
-const GROWING: [Order; 6] = [
+/// Every candidate, lowest order first.
+const CANDIDATES: [Order; 7] = [
+    Order::Constant,
     Order::Log,
     Order::Linear,
     Order::Linearithmic,
@@ -103,33 +117,165 @@ const GROWING: [Order; 6] = [
     Order::AboveCubic,
 ];
 
-fn nearest(observed: f64, candidates: &[Order], statistic: impl Fn(Order) -> f64) -> Order {
-    let target = observed.ln();
-    let mut best = candidates[0];
-    let mut distance = f64::INFINITY;
-
-    for &candidate in candidates {
-        let away = (statistic(candidate).ln() - target).abs();
-
-        if away < distance {
-            best = candidate;
-            distance = away;
-        }
-    }
-
-    best
+/// A fitted growth order and the highest order the data leaves plausible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    pub order: Order,
+    pub upper: Order,
 }
 
-/// ρ over the indices `(low, middle, high)`, or `None` when the lower span does not rise.
-fn difference_ratio(values: &[f64], (low, middle, high): (usize, usize, usize)) -> Option<f64> {
-    let lower = values[middle] - values[low];
-    let upper = values[high] - values[middle];
+impl Fit {
+    fn exact(order: Order) -> Fit {
+        Fit {
+            order,
+            upper: order,
+        }
+    }
+}
 
-    (lower > 0.0).then_some(upper / lower)
+/// Reflects `vector` from index `from` on through the Householder `reflector` of squared length `length`.
+fn reflect(vector: &mut [f64], reflector: &[f64], from: usize, length: f64) {
+    let scale = 2.0
+        * vector[from..]
+            .iter()
+            .zip(&reflector[from..])
+            .map(|(value, direction)| value * direction)
+            .sum::<f64>()
+        / length;
+
+    for (value, direction) in vector[from..].iter_mut().zip(&reflector[from..]) {
+        *value -= scale * direction;
+    }
+}
+
+/// Solves the least-squares problem `A · coefficients ≈ target` by Householder reflections, where `columns` holds A
+/// column by column; `None` when the columns are dependent.
+fn least_squares(mut columns: Vec<Vec<f64>>, mut target: Vec<f64>) -> Option<Vec<f64>> {
+    let count = columns.len();
+
+    for column in 0..count {
+        let norm = columns[column][column..]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+
+        if norm == 0.0 {
+            return None;
+        }
+
+        let alpha = match columns[column][column] > 0.0 {
+            true => -norm,
+            false => norm,
+        };
+        let mut reflector = columns[column].clone();
+
+        reflector[..column].fill(0.0);
+
+        reflector[column] -= alpha;
+
+        let length: f64 = reflector.iter().map(|value| value * value).sum();
+
+        if length == 0.0 {
+            continue;
+        }
+
+        for other in columns.iter_mut().skip(column) {
+            reflect(other, &reflector, column, length);
+        }
+
+        reflect(&mut target, &reflector, column, length);
+    }
+
+    let mut solution = vec![0.0; count];
+
+    for column in (0..count).rev() {
+        let pivot = columns[column][column];
+
+        if pivot.abs() < f64::MIN_POSITIVE {
+            return None;
+        }
+
+        let known: f64 = (column + 1..count)
+            .map(|other| columns[other][column] * solution[other])
+            .sum();
+
+        solution[column] = (target[column] - known) / pivot;
+    }
+
+    Some(solution)
+}
+
+/// The terms of candidate `index`'s model: the candidate, up to two candidates below it (log n and above), then the
+/// constant, with at most `points − 1` terms in all.
+fn terms_of(index: usize, points: usize) -> Vec<Order> {
+    if index == 0 {
+        return vec![Order::Constant];
+    }
+
+    let mut terms: Vec<Order> = (1..=index)
+        .rev()
+        .take(3)
+        .map(|lower| CANDIDATES[lower])
+        .collect();
+
+    terms.truncate(points.saturating_sub(2).max(1));
+    terms.push(Order::Constant);
+
+    terms
+}
+
+/// Fits candidate `index`'s model and returns its root-mean-square relative residual and leading coefficient.
+fn residual_of(index: usize, xs: &[f64], ys: &[f64]) -> (f64, f64) {
+    let terms = terms_of(index, xs.len());
+    let columns: Vec<Vec<f64>> = terms
+        .iter()
+        .map(|term| xs.iter().map(|&x| term.at(x)).collect())
+        .collect();
+    let scales: Vec<f64> = columns
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .fold(0.0f64, |most, value| most.max(value.abs()))
+        })
+        .collect();
+    let weights: Vec<f64> = ys.iter().map(|&y| 1.0 / y.max(1.0)).collect();
+    let matrix: Vec<Vec<f64>> = columns
+        .iter()
+        .zip(&scales)
+        .map(|(column, scale)| {
+            column
+                .iter()
+                .zip(&weights)
+                .map(|(value, weight)| value / scale * weight)
+                .collect()
+        })
+        .collect();
+    let target: Vec<f64> = (0..xs.len()).map(|row| ys[row] * weights[row]).collect();
+    let Some(solution) = least_squares(matrix, target) else {
+        return (f64::INFINITY, 0.0);
+    };
+    let coefficients: Vec<f64> = solution
+        .iter()
+        .zip(&scales)
+        .map(|(value, scale)| value / scale)
+        .collect();
+    let squares: f64 = (0..xs.len())
+        .map(|row| {
+            let model: f64 = (0..terms.len())
+                .map(|column| coefficients[column] * columns[column][row])
+                .sum();
+
+            ((ys[row] - model) * weights[row]).powi(2)
+        })
+        .sum();
+
+    ((squares / xs.len() as f64).sqrt(), coefficients[0])
 }
 
 /// Fits the growth order of `ys` against `xs` (strictly increasing program sizes) per the module's method.
-pub fn fit(xs: &[f64], ys: &[f64]) -> Option<Order> {
+pub fn fit(xs: &[f64], ys: &[f64]) -> Option<Fit> {
     let count = xs.len();
 
     if count != ys.len()
@@ -147,41 +293,42 @@ pub fn fit(xs: &[f64], ys: &[f64]) -> Option<Order> {
             (low.min(y), high.max(y))
         });
 
-    if high - low <= CONSTANT_TOLERANCE * largest {
-        return Some(Order::Constant);
+    if high - low <= CONSTANT_TOLERANCE * largest || ys[count - 1] <= ys[(count - 1) / 2] {
+        return Some(Fit::exact(Order::Constant));
     }
 
-    let last = count - 1;
-    let middle = last / 2;
+    let first = ys.iter().position(|&y| y > 0.0)?;
+    let (xs, ys) = (&xs[first..], &ys[first..]);
 
-    if ys[last] <= ys[middle] {
-        return Some(Order::Constant);
-    }
-
-    for indices in [(0, middle, last), (last - 2, last - 1, last)] {
-        if let Some(observed) = difference_ratio(ys, indices) {
-            let statistic = |order: Order| {
-                let gs: Vec<f64> = xs.iter().map(|&x| order.at(x)).collect();
-
-                difference_ratio(&gs, indices).expect("every growing candidate rises")
-            };
-
-            return Some(nearest(observed, &GROWING, statistic));
-        }
-    }
-
-    if ys[last - 1] <= 0.0 {
+    if xs.len() < MINIMUM_POINTS {
         return None;
     }
 
-    let observed = ys[last] / ys[last - 1];
-    let mut candidates = vec![Order::Constant];
+    let models: Vec<(f64, f64)> = (0..CANDIDATES.len())
+        .map(|index| residual_of(index, xs, ys))
+        .collect();
+    let best = models
+        .iter()
+        .fold(f64::INFINITY, |least, (residual, _)| least.min(*residual));
+    let admissible = |index: usize, bar: f64| {
+        let (residual, leading) = models[index];
 
-    candidates.extend(GROWING);
+        residual <= bar && (index == 0 || leading > 0.0)
+    };
+    let order =
+        (0..CANDIDATES.len()).find(|&index| admissible(index, FIT_TOLERANCE + FIT_RATIO * best))?;
+    let residual = models[order].0;
+    let upper = match residual > FIT_TOLERANCE / 2.0 {
+        true => (order + 1..CANDIDATES.len())
+            .find(|&index| admissible(index, residual / 2.0))
+            .unwrap_or(order),
+        false => order,
+    };
 
-    Some(nearest(observed, &candidates, |order| {
-        order.at(xs[last]) / order.at(xs[last - 1])
-    }))
+    Some(Fit {
+        order: CANDIDATES[order],
+        upper: CANDIDATES[upper],
+    })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -197,9 +344,13 @@ pub struct Size {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Metric {
-    /// One value per successful size, in size order.
+    /// One value per successful size, in size order, limit-reading sizes included.
     pub values: Vec<u64>,
+    /// The fitted order over the sizes below `exhausted_k`.
     pub order: Option<Order>,
+    /// The highest order the fit leaves plausible, equal to `order` unless the fit is marginal.
+    #[serde(default)]
+    pub upper: Option<Order>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -333,16 +484,35 @@ pub fn pass_scale(runs: &[(u32, Result<MemberCounts, String>)]) -> PassScale {
         }
     }
 
-    let xs: Vec<f64> = scale.sizes.iter().map(|size| size.nodes as f64).collect();
+    // Sizes at and after the first limit-reading size count the limit, not olint's work, so the fit leaves them out.
+    let fitted = scale
+        .sizes
+        .iter()
+        .take_while(|size| size.exhausted.is_empty())
+        .count();
+    let xs: Vec<f64> = scale.sizes[..fitted]
+        .iter()
+        .map(|size| size.nodes as f64)
+        .collect();
 
     for (name, values) in series {
-        let ys: Vec<f64> = values.iter().map(|&value| value as f64).collect();
-        let order = match values.len() == xs.len() {
+        let ys: Vec<f64> = values[..fitted.min(values.len())]
+            .iter()
+            .map(|&value| value as f64)
+            .collect();
+        let fitted = match values.len() == scale.sizes.len() {
             true => fit(&xs, &ys),
             false => None,
         };
 
-        scale.metrics.insert(name, Metric { values, order });
+        scale.metrics.insert(
+            name,
+            Metric {
+                values,
+                order: fitted.map(|fit| fit.order),
+                upper: fitted.map(|fit| fit.upper),
+            },
+        );
     }
 
     scale
@@ -379,13 +549,11 @@ pub fn scale(args: ScaleArgs) -> Result<(), String> {
     }
 
     let chosen = selected(args.family.as_deref())?;
-    let corpus = head_corpus();
-    let repo = corpus
-        .parent()
-        .expect("the corpus package sits in the olint tree");
-    let cache = corpus.join(".cache");
-    let source = materialize(&args.src, repo, &cache)?;
-    let binary = build(&source, &cache)?;
+    let Built {
+        cache,
+        source,
+        binary,
+    } = built(&args.src)?;
     let out = match args.out {
         Some(out) => absolute(&out)?,
         None => cache.join("scale").join(format!("{}.json", source.key)),
@@ -409,7 +577,6 @@ pub fn scale(args: ScaleArgs) -> Result<(), String> {
         }
     }
 
-    let next = AtomicUsize::new(0);
     let results: Mutex<BTreeMap<(&'static str, Pass, u32), Outcome>> = Mutex::new(BTreeMap::new());
     let timings: Mutex<BTreeMap<(&'static str, Pass, u32), f64>> = Mutex::new(BTreeMap::new());
     let started = Instant::now();
@@ -421,77 +588,72 @@ pub fn scale(args: ScaleArgs) -> Result<(), String> {
         out.display()
     );
 
-    std::thread::scope(|scope| {
-        for _ in 0..args.jobs.max(1) {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(task) = tasks.get(index) else {
-                    break;
-                };
-                let earlier_failed = results.lock().expect("results lock").iter().any(
-                    |((family, pass, k), outcome)| {
-                        *family == task.family.name
-                            && *pass == task.pass
-                            && *k < task.k
-                            && outcome
-                                .as_ref()
-                                .map_or(true, |counts| counts.error.is_some())
-                    },
-                );
-
-                if earlier_failed {
-                    continue;
-                }
-
-                let begun = Instant::now();
-                let member = Member {
-                    id: format!("{}/{}", task.family.name, families::size_of(task.k)),
-                    root: task.root.clone(),
-                };
-                let counts = run_member(
-                    &binary,
-                    &source.tree,
-                    &runs,
-                    task.pass,
-                    &member,
-                    args.timeout,
-                    None,
-                );
-                let seconds = begun.elapsed().as_secs_f64();
-                let outcome = match &counts.error {
-                    Some(error) if counts.nodes.is_none() => Err(error.clone()),
-                    _ => Ok(counts),
-                };
-
-                eprintln!(
-                    "[{}/{}] {} {} k={}: {}{} in {seconds:.1}s",
-                    index + 1,
-                    tasks.len(),
-                    task.pass.name(),
-                    task.family.name,
-                    task.k,
-                    outcome
-                        .as_ref()
-                        .map_or(0, |counts| counts.nodes.unwrap_or_default()),
-                    match &outcome {
-                        Ok(counts) => counts
-                            .error
+    in_parallel(&tasks, args.jobs, |index, task| {
+        let earlier_failed =
+            results
+                .lock()
+                .expect("results lock")
+                .iter()
+                .any(|((family, pass, k), outcome)| {
+                    *family == task.family.name
+                        && *pass == task.pass
+                        && *k < task.k
+                        && outcome
                             .as_ref()
-                            .map(|error| format!(" nodes, error: {error}"))
-                            .unwrap_or(" nodes".to_string()),
-                        Err(error) => format!(" nodes, error: {error}"),
-                    },
-                );
-                timings
-                    .lock()
-                    .expect("timings lock")
-                    .insert((task.family.name, task.pass, task.k), seconds);
-                results
-                    .lock()
-                    .expect("results lock")
-                    .insert((task.family.name, task.pass, task.k), outcome);
-            });
+                            .map_or(true, |counts| counts.error.is_some())
+                });
+
+        if earlier_failed {
+            return;
         }
+
+        let begun = Instant::now();
+        let member = Member {
+            id: format!("{}/{}", task.family.name, families::size_of(task.k)),
+            root: task.root.clone(),
+        };
+        let counts = run_member(
+            &binary,
+            &source.tree,
+            &runs,
+            task.pass,
+            &member,
+            args.timeout,
+            None,
+        );
+        let seconds = begun.elapsed().as_secs_f64();
+        let outcome = match &counts.error {
+            Some(error) if counts.nodes.is_none() => Err(error.clone()),
+            _ => Ok(counts),
+        };
+
+        eprintln!(
+            "[{}/{}] {} {} k={}: {}{} in {seconds:.1}s",
+            index + 1,
+            tasks.len(),
+            task.pass.name(),
+            task.family.name,
+            task.k,
+            outcome
+                .as_ref()
+                .map_or(0, |counts| counts.nodes.unwrap_or_default()),
+            match &outcome {
+                Ok(counts) => counts
+                    .error
+                    .as_ref()
+                    .map(|error| format!(" nodes, error: {error}"))
+                    .unwrap_or(" nodes".to_string()),
+                Err(error) => format!(" nodes, error: {error}"),
+            },
+        );
+        timings
+            .lock()
+            .expect("timings lock")
+            .insert((task.family.name, task.pass, task.k), seconds);
+        results
+            .lock()
+            .expect("results lock")
+            .insert((task.family.name, task.pass, task.k), outcome);
     });
 
     let results = results.into_inner().expect("results lock");
@@ -578,9 +740,15 @@ pub fn render(file: &ScaleFile) -> String {
             }
 
             for (metric, fitted) in &scale.metrics {
+                let upper = match (fitted.order, fitted.upper) {
+                    (Some(order), Some(upper)) if upper != order => {
+                        format!(" (marginal, up to {})", upper.text())
+                    }
+                    _ => String::new(),
+                };
                 let _ = writeln!(
                     text,
-                    "  {metric}: {}",
+                    "  {metric}: {}{upper}",
                     fitted.order.map_or("no fit", Order::text)
                 );
             }
@@ -590,9 +758,14 @@ pub fn render(file: &ScaleFile) -> String {
     text
 }
 
-/// §5.3: every family, pass and compared metric whose fitted order is higher in `head` than in `base`, every family
-/// and pass that failed deterministically (not by timeout) at a smaller size in `head`, and every one that reached a
-/// scheduler work limit at a smaller size.
+/// §5.3, comparing `head` against `base` conservatively:
+///
+/// - a family or pass missing from `head` fails;
+/// - a head that reaches a smaller k, or fewer sizes, fails, whatever ended it: a timeout is wall-clock time, which
+///   §7.5 leaves out, so it cannot excuse a shorter series;
+/// - a head that reaches a scheduler work limit at a smaller k fails;
+/// - per compared metric, a head order or upper order above the base's fails; a metric fitted on one side only, or
+///   missing from the head, fails; a metric fitted on neither side fails unless both sides recorded identical values.
 pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
     let mut problems = Vec::new();
 
@@ -612,20 +785,22 @@ pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
 
         for (pass, old) in &before.passes {
             let Some(new) = after.passes.get(pass) else {
+                problems.push(format!("{name} {pass}: missing from head"));
+
                 continue;
             };
 
-            // A timeout measures wall-clock time, which §7.5 leaves out, so only a deterministic failure counts here.
-            let timed_out = new
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.contains("timed out"));
-
-            if new.max_k < old.max_k && !timed_out {
+            if new.max_k < old.max_k || new.sizes.len() < old.sizes.len() {
                 problems.push(format!(
-                    "{name} {pass}: head reaches k={} where base reached k={}",
+                    "{name} {pass}: head reaches k={} over {} sizes where base reached k={} over {}{}",
                     new.max_k.map_or("none".to_string(), |k| k.to_string()),
-                    old.max_k.map_or("none".to_string(), |k| k.to_string())
+                    new.sizes.len(),
+                    old.max_k.map_or("none".to_string(), |k| k.to_string()),
+                    old.sizes.len(),
+                    new.failure
+                        .as_ref()
+                        .map(|failure| format!(" (head failed {failure})"))
+                        .unwrap_or_default()
                 ));
             }
 
@@ -645,19 +820,36 @@ pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
                     continue;
                 }
 
-                let (Some(was), Some(now)) = (
-                    prior.order,
-                    new.metrics.get(metric).and_then(|metric| metric.order),
-                ) else {
+                let Some(current) = new.metrics.get(metric) else {
+                    problems.push(format!("{name} {pass} {metric}: missing from head"));
+
                     continue;
                 };
 
-                if now > was {
-                    problems.push(format!(
-                        "{name} {pass} {metric}: growth order rose from {} to {}",
-                        was.text(),
-                        now.text()
-                    ));
+                match (prior.order, current.order) {
+                    (Some(was), Some(now)) => {
+                        let upper = |metric: &Metric, order: Order| metric.upper.unwrap_or(order);
+
+                        if now > was {
+                            problems.push(format!(
+                                "{name} {pass} {metric}: growth order rose from {} to {}",
+                                was.text(),
+                                now.text()
+                            ));
+                        } else if upper(current, now) > upper(prior, was) {
+                            problems.push(format!(
+                                "{name} {pass} {metric}: the head fit is marginal and could be {} where the base is at most {}",
+                                upper(current, now).text(),
+                                upper(prior, was).text()
+                            ));
+                        }
+                    }
+                    (None, None) if prior.values == current.values => {}
+                    (was, now) => problems.push(format!(
+                        "{name} {pass} {metric}: no comparable fit (base {}, head {}); a missing fit cannot show the order held",
+                        was.map_or("no fit", Order::text),
+                        now.map_or("no fit", Order::text)
+                    )),
                 }
             }
         }
@@ -696,23 +888,23 @@ mod tests {
         xs.iter().map(|&x| f(x)).collect()
     }
 
+    fn order_of(xs: &[f64], ys: &[f64]) -> Option<Order> {
+        fit(xs, ys).map(|fit| fit.order)
+    }
+
     #[test]
     fn exact_candidates_fit_themselves() {
-        for xs in [sizes(1.0, 0.0), sizes(3.0, 17.0)] {
-            for order in [
-                Order::Log,
-                Order::Linear,
-                Order::Linearithmic,
-                Order::Quadratic,
-                Order::Cubic,
-                Order::AboveCubic,
-            ] {
+        for xs in [sizes(1.0, 0.0), sizes(3.0, 17.0), sizes(20.0, 0.0)] {
+            for order in CANDIDATES[1..].iter().copied() {
                 let ys = through(&xs, |x| 5.0 * order.at(x));
 
-                assert_eq!(fit(&xs, &ys), Some(order), "{order:?}");
+                assert_eq!(fit(&xs, &ys), Some(Fit::exact(order)), "{order:?}");
             }
 
-            assert_eq!(fit(&xs, &through(&xs, |_| 42.0)), Some(Order::Constant));
+            assert_eq!(
+                order_of(&xs, &through(&xs, |_| 42.0)),
+                Some(Order::Constant)
+            );
         }
     }
 
@@ -721,25 +913,50 @@ mod tests {
         let xs = sizes(1.0, 0.0);
 
         assert_eq!(
-            fit(&xs, &through(&xs, |x| x + 10_000.0)),
+            order_of(&xs, &through(&xs, |x| x + 10_000.0)),
             Some(Order::Linear)
         );
-        assert_eq!(fit(&xs, &through(&xs, |x| x.ln() + 50.0)), Some(Order::Log));
         assert_eq!(
-            fit(&xs, &through(&xs, |x| x * x.ln() - 5.0 * x)),
+            order_of(&xs, &through(&xs, |x| x.ln() + 50.0)),
+            Some(Order::Log)
+        );
+        assert_eq!(
+            order_of(&xs, &through(&xs, |x| x * x.ln() - 5.0 * x)),
             Some(Order::Linearithmic)
         );
         assert_eq!(
-            fit(&xs, &through(&xs, |x| x * x + 1000.0 * x)),
+            order_of(&xs, &through(&xs, |x| x * x + 1000.0 * x)),
             Some(Order::Quadratic)
         );
         assert_eq!(
-            fit(&xs, &through(&xs, |x| 2.0 * x + 3.0 * x.ln() + 7.0)),
+            order_of(&xs, &through(&xs, |x| 2.0 * x + 3.0 * x.ln() + 7.0)),
             Some(Order::Linear)
         );
         assert_eq!(
-            fit(&xs, &through(&xs, |x| x * x * x + x * x)),
+            order_of(&xs, &through(&xs, |x| x * x * x + x * x)),
             Some(Order::Cubic)
+        );
+    }
+
+    #[test]
+    fn dominant_lower_terms_leave_the_order_at_twenty_nodes_per_n() {
+        let xs = sizes(20.0, 0.0);
+
+        for linear in [10.0, 50.0] {
+            assert_eq!(
+                fit(&xs, &through(&xs, |x| x * x.ln() + linear * x)),
+                Some(Fit::exact(Order::Linearithmic)),
+                "x ln x + {linear}x"
+            );
+        }
+
+        assert_eq!(
+            fit(&xs, &through(&xs, |x| x * x + 5000.0 * x)),
+            Some(Fit::exact(Order::Quadratic))
+        );
+        assert_eq!(
+            order_of(&xs, &through(&xs, |x| x + 1e-6 * x * x)),
+            Some(Order::Quadratic)
         );
     }
 
@@ -754,41 +971,64 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(fit(&xs, &noisy(&|_| 5_000_000.0)), Some(Order::Constant));
-        assert_eq!(fit(&xs, &noisy(&|x| 40.0 * x)), Some(Order::Linear));
+        assert_eq!(
+            fit(&xs, &noisy(&|_| 5_000_000.0)),
+            Some(Fit::exact(Order::Constant))
+        );
+        assert_eq!(
+            fit(&xs, &noisy(&|x| 40.0 * x)),
+            Some(Fit::exact(Order::Linear))
+        );
         assert_eq!(
             fit(&xs, &noisy(&|x| 40.0 * x * x.ln())),
-            Some(Order::Linearithmic)
+            Some(Fit::exact(Order::Linearithmic))
         );
-        assert_eq!(fit(&xs, &noisy(&|x| x * x)), Some(Order::Quadratic));
+        assert_eq!(
+            fit(&xs, &noisy(&|x| x * x)),
+            Some(Fit::exact(Order::Quadratic))
+        );
+    }
+
+    #[test]
+    fn step_shaped_counts_keep_their_order() {
+        let xs = sizes(1.0, 0.0);
+        let steps: Vec<f64> = xs
+            .iter()
+            .enumerate()
+            .map(|(index, &x)| x * if index % 2 == 0 { 1.0 } else { 1.3 })
+            .collect();
+
+        assert_eq!(order_of(&xs, &steps), Some(Order::Linear));
     }
 
     #[test]
     fn edges() {
         let xs = sizes(1.0, 0.0);
 
-        assert_eq!(fit(&xs, &[0.0; 9]), Some(Order::Constant));
+        assert_eq!(order_of(&xs, &[0.0; 9]), Some(Order::Constant));
         assert_eq!(
-            fit(&xs, &[9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]),
+            order_of(&xs, &[9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]),
             Some(Order::Constant)
         );
         assert_eq!(
-            fit(&xs, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0]),
+            order_of(&xs, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0]),
             None
         );
-        assert_eq!(fit(&xs[..3], &[1.0, 2.0, 3.0]), None);
+        assert_eq!(order_of(&xs[..3], &[1.0, 2.0, 3.0]), None);
         assert_eq!(
-            fit(&[64.0, 64.0, 128.0, 256.0], &[1.0, 2.0, 3.0, 4.0]),
+            order_of(&[64.0, 64.0, 128.0, 256.0], &[1.0, 2.0, 3.0, 4.0]),
             None
         );
 
-        let late: Vec<f64> = xs
-            .iter()
-            .enumerate()
-            .map(|(index, &x)| if index < 6 { 0.0 } else { x })
-            .collect();
+        let late = |zeros: usize| -> Vec<f64> {
+            xs.iter()
+                .enumerate()
+                .map(|(index, &x)| if index < zeros { 0.0 } else { x })
+                .collect()
+        };
 
-        assert_eq!(fit(&xs, &late), Some(Order::Linear));
+        assert_eq!(order_of(&xs, &late(6)), None);
+        assert_eq!(order_of(&xs, &late(3)), Some(Order::Linear));
     }
 
     #[test]
@@ -796,36 +1036,33 @@ mod tests {
         let xs: Vec<f64> = (6..=9).map(|k| f64::from(1u32 << k)).collect();
 
         assert_eq!(
-            fit(&xs, &through(&xs, |x| 7.0 * x + 3.0)),
+            order_of(&xs, &through(&xs, |x| 7.0 * x + 3.0)),
             Some(Order::Linear)
         );
         assert_eq!(
-            fit(&xs, &through(&xs, |x| x * x.ln())),
+            order_of(&xs, &through(&xs, |x| x * x.ln())),
             Some(Order::Linearithmic)
+        );
+        assert_eq!(
+            order_of(&xs, &through(&xs, |x| x * x)),
+            Some(Order::Quadratic)
         );
     }
 
     fn file(order: Order, max_k: u32) -> ScaleFile {
+        let metric = Metric {
+            values: Vec::new(),
+            order: Some(order),
+            upper: Some(order),
+        };
         let pass = PassScale {
             max_k: Some(max_k),
             failure: None,
             exhausted_k: None,
             sizes: Vec::new(),
             metrics: BTreeMap::from([
-                (
-                    "WalkerNode".to_string(),
-                    Metric {
-                        values: Vec::new(),
-                        order: Some(order),
-                    },
-                ),
-                (
-                    "nodes".to_string(),
-                    Metric {
-                        values: Vec::new(),
-                        order: Some(order),
-                    },
-                ),
+                ("WalkerNode".to_string(), metric.clone()),
+                ("nodes".to_string(), metric),
             ]),
         };
 
@@ -841,6 +1078,14 @@ mod tests {
                     passes: BTreeMap::from([("syntactic".to_string(), pass)]),
                 },
             )]),
+        }
+    }
+
+    fn edit(file: &mut ScaleFile, change: impl Fn(&mut PassScale)) {
+        for family in file.families.values_mut() {
+            for pass in family.passes.values_mut() {
+                change(pass);
+            }
         }
     }
 
@@ -862,13 +1107,52 @@ mod tests {
 
         let mut timed_out = file(Order::Linear, 12);
 
-        for family in timed_out.families.values_mut() {
-            for pass in family.passes.values_mut() {
-                pass.failure = Some("k=13: timed out after 900s".to_string());
-            }
-        }
+        edit(&mut timed_out, |pass| {
+            pass.failure = Some("k=13: timed out after 900s".to_string());
+        });
 
-        assert!(raised_orders(&file(Order::Linear, 14), &timed_out).is_empty());
+        assert_eq!(raised_orders(&file(Order::Linear, 14), &timed_out).len(), 1);
+    }
+
+    #[test]
+    fn marginal_and_missing_fits_fail() {
+        let base = file(Order::Linear, 14);
+        let mut marginal = base.clone();
+
+        edit(&mut marginal, |pass| {
+            pass.metrics.get_mut("WalkerNode").expect("metric").upper = Some(Order::Linearithmic);
+        });
+
+        assert_eq!(raised_orders(&base, &marginal).len(), 1);
+        assert!(raised_orders(&marginal, &marginal).is_empty());
+
+        let mut unfitted = base.clone();
+
+        edit(&mut unfitted, |pass| {
+            let metric = pass.metrics.get_mut("WalkerNode").expect("metric");
+
+            metric.order = None;
+            metric.upper = None;
+        });
+
+        assert_eq!(raised_orders(&base, &unfitted).len(), 1);
+        assert!(raised_orders(&unfitted, &unfitted).is_empty());
+
+        let mut different = unfitted.clone();
+
+        edit(&mut different, |pass| {
+            pass.metrics.get_mut("WalkerNode").expect("metric").values = vec![1];
+        });
+
+        assert_eq!(raised_orders(&unfitted, &different).len(), 1);
+
+        let mut missing = base.clone();
+
+        edit(&mut missing, |pass| {
+            pass.metrics.remove("WalkerNode");
+        });
+
+        assert_eq!(raised_orders(&base, &missing).len(), 1);
     }
 
     #[test]
@@ -892,25 +1176,37 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_limits_are_recorded_and_compared() {
-        let counts = |exhausted: &[&str]| MemberCounts {
-            nodes: Some(100),
+    fn exhausted_limits_are_recorded_excluded_and_compared() {
+        let counts = |nodes: u64, exhausted: &[&str]| MemberCounts {
+            nodes: Some(nodes),
             exhausted: exhausted.iter().map(|event| event.to_string()).collect(),
             ..MemberCounts::default()
         };
-        let scale = pass_scale(&[(6, Ok(counts(&[]))), (7, Ok(counts(&["TaskKey"])))]);
+        let runs: Vec<(u32, Outcome)> = (6..=11)
+            .map(|k| {
+                let nodes = 1u64 << k;
 
-        assert_eq!(scale.exhausted_k, Some(7));
-        assert_eq!(scale.sizes[1].exhausted, vec!["TaskKey".to_string()]);
+                (
+                    k,
+                    Ok(counts(nodes, if k >= 10 { &["TaskKey"] } else { &[] })),
+                )
+            })
+            .collect();
+        let scale = pass_scale(&runs);
+
+        assert_eq!(scale.exhausted_k, Some(10));
+        assert_eq!(scale.sizes[4].exhausted, vec!["TaskKey".to_string()]);
+        assert_eq!(scale.metrics["nodes"].values.len(), 6);
+        assert_eq!(scale.metrics["nodes"].order, Some(Order::Linear));
+
+        let short = pass_scale(&runs[..5]);
+
+        assert_eq!(short.metrics["nodes"].order, Some(Order::Linear));
 
         let base = file(Order::Linear, 14);
         let mut head = base.clone();
 
-        for family in head.families.values_mut() {
-            for pass in family.passes.values_mut() {
-                pass.exhausted_k = Some(12);
-            }
-        }
+        edit(&mut head, |pass| pass.exhausted_k = Some(12));
 
         assert_eq!(raised_orders(&base, &head).len(), 1);
         assert!(raised_orders(&head, &base).is_empty());
