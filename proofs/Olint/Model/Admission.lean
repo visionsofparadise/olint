@@ -449,9 +449,10 @@ theorem Admitted.exists (p : Program) (e : Entry) (hwf : e.wf p = true) (d : ℕ
     refine ⟨j, by simpa using hl, by rw [witness_get_cell, hj]; rfl,
       witness_slot N len params scope τ _ (hNs (x, τ) hx) ?_⟩
     rw [witness_get_var N len params scope j hlt, hj]; rfl
-  refine ⟨⟨h, envOf (4 + params.length + scope.length) 0 scope, argVals len 0 params,
+  refine ⟨⟨h, envOf (4 + params.length + scope.length) 0 scope, argVals len 0 params, .undef,
     fun j => (d j : ℝ), 0⟩, ?_, fun j => rfl⟩
-  refine ⟨witness_WF N len params scope, witness_closed N len params scope, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨witness_WF N len params scope, witness_closed N len params scope, ?_, rfl, ?_, ?_, ?_,
+    ?_⟩
   · intro v hv
     obtain ⟨k, hk⟩ := List.getElem?_of_mem hv
     rw [argVals_get] at hk

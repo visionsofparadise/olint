@@ -80,6 +80,28 @@ example : ∃ i, Admitted (unitEntry [("xs", .array .number)] [(0, .arg 0)]) i �
     ∀ j, i.dims j = ((0 : ℕ) : ℝ) :=
   Admitted.exists ⟨[]⟩ (unitEntry [("xs", .array .number)] [(0, .arg 0)]) (by decide) fun _ => 0
 
+/-! ## The entry's receiver -/
+
+/-- `function () { while (this) {} }`: its cost depends on the receiver alone. -/
+def thisEntry : Entry := ⟨.mk [] [.«while» .this (.block [])] false, [], []⟩
+
+/-- An instance calling it on `true`, under which the loop never ends. -/
+def trueReceiver : Instance := ⟨Heap.empty, [], [], .bool true, fun _ => 0, 0⟩
+
+/-- The review found the receiver fixed at `undefined`, which ends the loop at once, so `O(1)`
+held of the entry. The receiver is an input now: admission ranges over every value, `true`
+included, … -/
+theorem true_receiver_admitted : Admitted thisEntry trueReceiver := by
+  refine ⟨fun _ _ => rfl, fun _ _ h => by simp [trueReceiver, Heap.empty] at h,
+    by simp [trueReceiver], rfl, ?_, by simp [thisEntry], by simp [trueReceiver],
+    by simp [thisEntry]⟩
+  intro k x τ h
+  simp at h
+
+/-- … and the entry's root call runs on it. -/
+example : (root ⟨[]⟩ thisEntry trueReceiver).frame = .callFunc thisEntry.fn [] (.bool true) [] :=
+  rfl
+
 /-! ## Uniform constants -/
 
 /-- The review's filter excluded every instance with a measured dimension below `2`, so a bound

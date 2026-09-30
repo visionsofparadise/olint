@@ -36,7 +36,7 @@ A bound quantifies over the admitted instances, so it would say nothing if none 
 facts exclude that:
 
 * admission (`Olint.Model.Admitted`) constrains only the entry's inputs: the heap, the arguments,
-  the free variables and the dimensions. §2.5 during the run is a check at every variable read
+  the receiver, the free variables and the dimensions. §2.5 during the run is a check at every variable read
   (`Olint.Model.readVar`) that aborts the run on a non-conforming value, so a program that
   violates its declared types makes its runs abort, which no bound admits, instead of emptying
   admission;

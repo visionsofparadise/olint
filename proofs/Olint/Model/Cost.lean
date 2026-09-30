@@ -1230,12 +1230,15 @@ structure Node where
   entry : Entry
   site : Site
 
-/-- An instance: the input values entering the entry and their input dimensions. `envelope` is
-the value of olint's legacy size envelope, which §2 does not constrain. -/
+/-- An instance: the input values entering the entry and their input dimensions. `receiver` is
+the `this` value the entry is called with, which a caller outside the program chooses as it
+chooses the arguments. `envelope` is the value of olint's legacy size envelope, which §2 does
+not constrain. -/
 structure Instance where
   heap : Heap
   env : Env
   args : List Value
+  receiver : Value
   dims : ℕ → ℝ
   envelope : ℝ
 
@@ -1331,11 +1334,12 @@ def bindProgram (p : Program) (env : Env) : M Env := do
   pure env
 
 /-- The root configuration of an entry's run in an instance and a world: the call of the entry
-function with the instance's arguments, after the program's definitions are bound. -/
+function with the instance's receiver and arguments, after the program's definitions are
+bound. -/
 def root (p : Program) (e : Entry) (i : Instance) : Cfg :=
   match (bindProgram p i.env).run ⟨i.heap, 0⟩ with
-  | .ok (env, st) => ⟨.callFunc e.fn env .undef i.args, st⟩
-  | .error _ => ⟨.callFunc e.fn i.env .undef i.args, ⟨i.heap, 0⟩⟩
+  | .ok (env, st) => ⟨.callFunc e.fn env i.receiver i.args, st⟩
+  | .error _ => ⟨.callFunc e.fn i.env i.receiver i.args, ⟨i.heap, 0⟩⟩
 
 /-- The configurations the entry's runs reach in an instance and a world. -/
 def Reach (W : World) (p : Program) (e : Entry) (i : Instance) : Cfg → Prop :=
@@ -1350,7 +1354,9 @@ def Cfg.At (p : Program) (e : Entry) (i : Instance) : Site → Cfg → Prop
 
 /-- The instances §2 admits for an entry: a well-formed heap of ECMAScript values; arguments
 conforming to the parameters' declared types and free variables bound to cells of their declared
-types holding conforming values (§2.5); and every dimension equal to the quantity it measures.
+types holding conforming values (§2.5); a receiver that is any ECMAScript value, as a parameter
+of no declared type is, since a caller outside the program may call the entry as a method of any
+object; and every dimension equal to the quantity it measures.
 
 Admission constrains the entry's inputs only. §2.5 during the run is the read check of
 `readVar`: a run that would read a non-conforming value aborts, so it never satisfies a bound,
@@ -1359,6 +1365,7 @@ and no program can make admission empty by violating its types. For a well-forme
 (`Olint.Model.Admitted.exists`). -/
 def Admitted (e : Entry) (i : Instance) : Prop :=
   i.heap.WF ∧ i.heap.Closed ∧ (∀ v ∈ i.args, i.heap.valueOk v = true) ∧
+  i.heap.valueOk i.receiver = true ∧
   (match e.fn with
     | .mk params _ _ =>
       ∀ k (x : Name) (τ : Ty), params[k]? = some (x, τ) → Conforms i.heap (arg0 (i.args.drop k)) τ) ∧

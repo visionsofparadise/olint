@@ -403,7 +403,7 @@ theorem callFunc_succ (f : ℕ) (ps : List (Name × Ty)) (body : List Stmt) (ar 
     · cases c <;> rfl
 
 theorem root_eq (p : Program) (e : Entry) (i : Instance) :
-    ∃ env h, root p e i = ⟨.callFunc e.fn env .undef i.args, ⟨h, 0⟩⟩ := by
+    ∃ env h, root p e i = ⟨.callFunc e.fn env i.receiver i.args, ⟨h, 0⟩⟩ := by
   obtain ⟨env, h, hb⟩ := bindProgram_safe p i.env i.heap
   exact ⟨env, h, by unfold root; rw [hb]⟩
 
@@ -492,7 +492,7 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     subst ha
     rw [hroot] at hr ⊢
     rw [hfn] at hr ⊢
-    obtain ⟨env', h1, n, hn, hsafe⟩ := SafeW.enterFunc W ps body ar env .undef i.args ⟨h0, 0⟩
+    obtain ⟨env', h1, n, hn, hsafe⟩ := SafeW.enterFunc W ps body ar env i.receiver i.args ⟨h0, 0⟩
     have hstmts : Reach W p e i ⟨.stmts env' body, ⟨h1, 0 + n⟩⟩ :=
       hr.tail (Sub.callFunc hsafe)
     obtain ⟨hc, hw⟩ := holds_stmts hB body hbody body (fun t ht => ht) env' _ hstmts
