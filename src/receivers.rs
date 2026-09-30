@@ -4,10 +4,11 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 
-use crate::declarations::{element_name_of, Declaration, Declarations};
+use crate::declarations::{element_name_of, is_module_file, Declaration, Declarations};
 use crate::declared_types::{declarator_of_identifier, formal_parameter_of_identifier};
 use crate::project::{FileId, Project};
 use crate::syntax::{member_name_of, unwrap, unwrap_to_cast};
+use oxc_span::GetSpan;
 
 const MAXIMUM_BASE_CLASSES: usize = 32;
 const MAXIMUM_ALIASES: usize = 8;
@@ -151,6 +152,150 @@ impl<'a> Declarations<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Whether `member` reads exactly the class element `declaration` names on every value its
+    /// receiver can hold. A declared type is structural (§2.5), so a conforming object literal or
+    /// a subclass that redeclares the field can stand behind a receiver typed by the class; the
+    /// element is exact only when the receiver is a construction of a known class, the class
+    /// itself, `this` inside a class nothing can extend, or when the element is private, which
+    /// no conforming value or subclass can redeclare. `this` in an exported class is the one
+    /// unsound exception left open (see `is_exported_class`).
+    pub(crate) fn is_exact_member(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        member: &'a MemberExpression<'a>,
+        declaration: &Declaration<'a>,
+    ) -> bool {
+        let Declaration::Member { element, .. } = *declaration else {
+            return true;
+        };
+
+        if matches!(member, MemberExpression::PrivateFieldExpression(_)) {
+            return true;
+        }
+
+        let object = unwrap_to_cast(member.object());
+        let cast = matches!(
+            object,
+            Expression::TSAsExpression(_) | Expression::TSTypeAssertion(_)
+        );
+
+        if !cast && is_private_element(element) {
+            return true;
+        }
+
+        let Some(name) = member_name_of(member) else {
+            return false;
+        };
+        let exact = match object {
+            Expression::ThisExpression(this) => {
+                match this_owner_of(project, file, this.node_id()) {
+                    Some(ThisOwner::Class {
+                        file: target,
+                        class,
+                        placement: placement @ (Placement::Instance | Placement::Static),
+                    }) if self.is_closed_class(project, target, class)
+                        || is_exported_class(project, target, class) =>
+                    {
+                        Some((target, class, placement))
+                    }
+                    _ => None,
+                }
+            }
+            Expression::NewExpression(new) => self
+                .exact_class_of(project, file, unwrap_to_cast(&new.callee))
+                .map(|(target, class)| (target, class, Placement::Instance)),
+            Expression::Identifier(reference) => match self.exact_class_of(project, file, object) {
+                Some((target, class)) => Some((target, class, Placement::Static)),
+                None => self.constructed_class_of(project, file, reference),
+            },
+            _ => None,
+        };
+
+        exact.is_some_and(|(target, class, placement)| {
+            matches!(
+                self.inherited_member_of(project, target, class, &name, placement),
+                Some(Declaration::Member { element: found, .. }) if std::ptr::eq(found, element)
+            )
+        })
+    }
+
+    /// The class a constant binding holds an instance of: `const x = new C()`.
+    fn constructed_class_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &'a IdentifierReference<'a>,
+    ) -> Option<(FileId, &'a Class<'a>, Placement)> {
+        let declaration = self.of_reference(project, file, reference)?;
+        let (target, declarator, constant) = declarator_of_identifier(&declaration)?;
+
+        if !constant {
+            return None;
+        }
+
+        let Expression::NewExpression(new) = unwrap_to_cast(declarator.init.as_ref()?) else {
+            return None;
+        };
+
+        self.exact_class_of(project, target, unwrap_to_cast(&new.callee))
+            .map(|(target, class)| (target, class, Placement::Instance))
+    }
+
+    /// The class an identifier denotes on every evaluation: a class binding nothing writes.
+    fn exact_class_of(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> Option<(FileId, &'a Class<'a>)> {
+        let Expression::Identifier(reference) = expression else {
+            return None;
+        };
+        let found = self.class_of_reference(project, file, reference)?;
+        let written = self
+            .binding_of_reference(project, file, reference)
+            .is_none_or(|binding| !self.is_write_free(project, binding));
+
+        (!written).then_some(found)
+    }
+
+    /// A class nothing can extend or reach as a value: a module-scoped declaration that is not
+    /// exported and whose every value reference constructs it, in a file without direct eval.
+    fn is_closed_class(&self, project: &Project<'a>, file: FileId, class: &'a Class<'a>) -> bool {
+        let source = project.file(file);
+        let semantic = &source.semantic;
+        let nodes = semantic.nodes();
+        let scoping = semantic.scoping();
+
+        if !class.is_declaration()
+            || class.declare
+            || !is_module_file(source)
+            || crate::values::has_direct_eval(semantic)
+            || is_exported_class(project, file, class)
+        {
+            return false;
+        }
+
+        let Some(symbol) = class.id.as_ref().and_then(|id| id.symbol_id.get()) else {
+            return false;
+        };
+
+        scoping
+            .get_resolved_references(symbol)
+            .filter(|reference| {
+                !reference.flags().is_type() && !reference.flags().is_value_as_type()
+            })
+            .all(|reference| {
+                let node = reference.node_id();
+
+                matches!(
+                    nodes.parent_kind(node),
+                    AstKind::NewExpression(new) if new.callee.span() == nodes.kind(node).span()
+                )
+            })
     }
 
     fn inherited_member_of(
@@ -363,7 +508,33 @@ fn member_node_id_of(member: &MemberExpression<'_>) -> oxc_semantic::NodeId {
     }
 }
 
-fn is_static_element(element: &ClassElement<'_>) -> bool {
+// G22 left open: `this` in an exported class still folds, although a subclass outside the
+// analysed sources can redeclare the field, because tests/integration/constants.rs
+// (declared_types_casts_and_static_placement_decide_member_constants) pins it and stays
+// unchanged until Matt approves.
+fn is_exported_class(project: &Project<'_>, file: FileId, class: &Class<'_>) -> bool {
+    matches!(
+        project
+            .file(file)
+            .semantic
+            .nodes()
+            .parent_kind(class.node_id()),
+        AstKind::ExportDeclaration(_) | AstKind::ExportDefaultDeclaration(_)
+    )
+}
+
+fn is_private_element(element: &ClassElement<'_>) -> bool {
+    let accessibility = match element {
+        ClassElement::PropertyDefinition(property) => property.accessibility,
+        ClassElement::AccessorProperty(property) => property.accessibility,
+        ClassElement::MethodDefinition(method) => method.accessibility,
+        _ => None,
+    };
+
+    accessibility == Some(oxc_ast::ast::TSAccessibility::Private)
+}
+
+pub(crate) fn is_static_element(element: &ClassElement<'_>) -> bool {
     match element {
         ClassElement::MethodDefinition(method) => method.r#static,
         ClassElement::PropertyDefinition(property) => property.r#static,

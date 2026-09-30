@@ -35,6 +35,51 @@ fn assert_selected(cases: &[(&str, &str, &str, bool)]) {
     }
 }
 
+// G21: an imported class named `Set` is the library's, whose `forEach` may cost anything; only
+// the global binding gets the built-in model. G25: a receiver typed `string[] | Foo` may be a
+// `Foo` from outside the analysed sources, so it is no Array.
+#[test]
+fn only_global_and_agreeing_kinds_get_built_in_models() {
+    assert_selected(&[
+        (
+            "import { Set } from \"lib\";",
+            "(s: Set<string>) { s.forEach((x) => {}); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "",
+            "(s: Set<string>) { s.forEach((x) => {}); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "interface Foo { forEach(f: (x: string) => void): void }",
+            "(xs: string[] | Foo) { xs.forEach((x) => {}); }",
+            "O(1)",
+            false,
+        ),
+        (
+            "",
+            "(xs: string[] | undefined) { xs?.forEach((x) => {}); }",
+            "O(N)",
+            true,
+        ),
+    ]);
+}
+
+// G27: a member found through a declared receiver is one candidate, since a structural value
+// such as `{ C: LibraryClass }` conforms to `A` (§2.5).
+#[test]
+fn a_declared_receiver_leaves_its_member_construction_open() {
+    assert_selected(&[(
+        "class A { C = function (this: { v: number }) { this.v = 1; }; }",
+        "(a: A) { return new a.C(); }",
+        "O(1)",
+        false,
+    )]);
+}
+
 #[test]
 fn replacement_callbacks_run_once_per_match_or_once_per_call() {
     assert_selected(&[

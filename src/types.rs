@@ -276,11 +276,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         member: &'a MemberExpression<'a>,
     ) -> ResolvedCallee<'a> {
+        // A declared receiver's member is one candidate: a subclass or a structural value that
+        // conforms to the declared type (§2.5) can supply another, as in
+        // `resolved_expression_callee_of`.
         if let Some(declaration) = self
             .declarations
             .member_of_receiver(self.project, file, member)
         {
-            return self.resolved_of_declaration(Some(declaration), true);
+            return self.resolved_of_declaration(Some(declaration), false);
         }
 
         let answer = match member {

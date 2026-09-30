@@ -7,11 +7,12 @@ use oxc_ast::ast::{
 };
 use oxc_ast::AstKind;
 use oxc_span::GetSpan;
-use oxc_syntax::operator::{BinaryOperator, LogicalOperator};
+use oxc_syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
 
 use crate::analysis::Analysis;
 use crate::declarations::{parameters_of, Binding, Declaration, FunctionNode, ParameterNode};
 use crate::project::FileId;
+use crate::receivers::{is_static_element, this_owner_of, Placement, ThisOwner};
 use crate::syntax::{call_of, is_const_type, is_identifier_pattern, member_expression_of, unwrap};
 use crate::tables::{
     KIND_OF_NAME, STRING_IMPLEMENTATION_DEFINED, STRING_LINEAR, STRING_TO_ARRAY, TYPED_ARRAYS,
@@ -33,22 +34,26 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn rank(self) -> u8 {
-        match self {
-            Kind::Array => 6,
-            Kind::Set | Kind::Map | Kind::WeakSet | Kind::WeakMap => 5,
-            Kind::Unknown => 4,
-            Kind::String => 3,
-            Kind::RegExp => 2,
-            Kind::Other => 1,
+    /// The kind of a value that has one of two kinds (§2.5 gives only that a union's value has
+    /// one of its parts' types), known only when the parts agree.
+    pub fn join(self, other: Kind) -> Kind {
+        if self == other {
+            self
+        } else {
+            Kind::Unknown
         }
     }
 
-    pub fn join(self, other: Kind) -> Kind {
-        if other.rank() > self.rank() {
-            other
-        } else {
-            self
+    /// The kind of a value that has both kinds: an intersection's value conforms to every part,
+    /// so a built-in part decides it unless two built-in parts disagree.
+    pub fn meet(self, other: Kind) -> Kind {
+        match (self, other) {
+            _ if self == other => self,
+            (Kind::Other | Kind::Unknown, Kind::Other | Kind::Unknown) => Kind::Unknown,
+            (Kind::Other | Kind::Unknown, built_in) | (built_in, Kind::Other | Kind::Unknown) => {
+                built_in
+            }
+            _ => Kind::Unknown,
         }
     }
 }
@@ -75,6 +80,7 @@ const NON_STRING_RESULTS: &[&str] = &[
     "codePointAt",
 ];
 const STRING_RESULTS: &[&str] = &["join", "toString", "toLowerCase", "toUpperCase", "trim"];
+const ARRAY_TO_STRING: &[&str] = &["join", "toString"];
 
 #[derive(Clone, Copy)]
 enum Container<'a> {
@@ -137,15 +143,36 @@ fn declared_type_of(kind: Kind) -> DeclaredType {
     DeclaredType { kind }
 }
 
-fn joined_type_of(parts: &[DeclaredType]) -> DeclaredType {
-    if parts.is_empty() {
-        return DeclaredType::default();
-    }
-
+/// The kind of a value that has one of the parts' kinds; an absent part (a nullish alternative,
+/// which has no members to dispatch) is left out.
+fn joined_type_of(parts: &[Option<DeclaredType>]) -> DeclaredType {
     declared_type_of(
         parts
             .iter()
-            .fold(Kind::Other, |joined, part| joined.join(part.kind)),
+            .flatten()
+            .map(|part| part.kind)
+            .reduce(Kind::join)
+            .unwrap_or_default(),
+    )
+}
+
+fn met_type_of(parts: &[DeclaredType]) -> DeclaredType {
+    declared_type_of(
+        parts
+            .iter()
+            .map(|part| part.kind)
+            .reduce(Kind::meet)
+            .unwrap_or_default(),
+    )
+}
+
+fn is_nullish_type(ty: &TSType<'_>) -> bool {
+    matches!(
+        ty,
+        TSType::TSNullKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSVoidKeyword(_)
+            | TSType::TSNeverKeyword(_)
     )
 }
 
@@ -344,10 +371,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             TSType::TSObjectKeyword(_) => declared_type_of(Kind::Other),
             TSType::TSTypeLiteral(_) => declared_type_of(Kind::Other),
             TSType::TSUnionType(union) => {
-                let parts: Vec<DeclaredType> = union
+                let parts: Vec<Option<DeclaredType>> = union
                     .types
                     .iter()
-                    .map(|part| self.declared_type_of_nested_type(file, part, depth + 1))
+                    .map(|part| {
+                        (!is_nullish_type(part))
+                            .then(|| self.declared_type_of_nested_type(file, part, depth + 1))
+                    })
                     .collect();
 
                 joined_type_of(&parts)
@@ -359,7 +389,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .map(|part| self.declared_type_of_nested_type(file, part, depth + 1))
                     .collect();
 
-                joined_type_of(&parts)
+                met_type_of(&parts)
             }
             TSType::TSTypeReference(reference) => {
                 self.declared_type_of_reference(file, reference, depth)
@@ -376,9 +406,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> DeclaredType {
         let name = type_name_text_of(&reference.type_name);
 
-        if let Some(kind) = named_kind_of(name) {
-            if !is_weak_kind(kind) || self.is_global_type_name(file, &reference.type_name) {
-                return declared_type_of(kind);
+        // A built-in kind needs the name to denote the global type; a same-named import or local
+        // declaration is another type, which §2.2 does not describe.
+        if let TSTypeName::IdentifierReference(_) = &reference.type_name {
+            if let Some(kind) = named_kind_of(name) {
+                if self.is_global_type_name(file, &reference.type_name) {
+                    return declared_type_of(kind);
+                }
             }
         }
 
@@ -479,15 +513,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let expression = unwrap(expression);
 
+        // `this` is the class instance only inside an instance member: a non-arrow function
+        // rebinds it, and a static member, heritage clause or computed key sees another value.
         if let Expression::ThisExpression(this) = expression {
-            let nodes = self.project.file(file).semantic.nodes();
-
-            return nodes
-                .ancestors(this.node_id())
-                .find_map(|ancestor| match ancestor.kind() {
-                    AstKind::Class(class) => Some(Container::Class(file, class)),
-                    _ => None,
-                });
+            return match this_owner_of(self.project, file, this.node_id()) {
+                Some(ThisOwner::Class {
+                    file,
+                    class,
+                    placement: Placement::Instance,
+                }) => Some(Container::Class(file, class)),
+                _ => None,
+            };
         }
 
         if let Expression::ObjectExpression(object) = expression {
@@ -1309,7 +1345,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     || self.is_primitive_type(file, part, depth + 1)
             }),
             TSType::TSTypeReference(reference) => {
-                if type_name_text_of(&reference.type_name) == "Promise" {
+                if matches!(&reference.type_name, TSTypeName::IdentifierReference(name) if name.name == "Promise")
+                    && self.is_global_type_name(file, &reference.type_name)
+                {
                     return true;
                 }
 
@@ -1617,7 +1655,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Expression::NewExpression(new) => {
                 if let Expression::Identifier(callee) = &new.callee {
                     if let Some(kind) = named_kind_of(callee.name.as_str()) {
-                        if !is_weak_kind(kind) || self.is_intrinsic_reference(file, callee) {
+                        if self.is_intrinsic_reference(file, callee) {
                             return declared_type_of(kind);
                         }
                     }
@@ -1637,16 +1675,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
             Expression::ConditionalExpression(conditional) => {
                 let parts = [
-                    self.declared_type_of_nested_expression(
-                        file,
-                        &conditional.consequent,
-                        depth + 1,
-                    ),
-                    self.declared_type_of_nested_expression(
-                        file,
-                        &conditional.alternate,
-                        depth + 1,
-                    ),
+                    self.alternative_type_of(file, &conditional.consequent, depth),
+                    self.alternative_type_of(file, &conditional.alternate, depth),
                 ];
 
                 return joined_type_of(&parts);
@@ -1658,8 +1688,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 ) =>
             {
                 let parts = [
-                    self.declared_type_of_nested_expression(file, &logical.left, depth + 1),
-                    self.declared_type_of_nested_expression(file, &logical.right, depth + 1),
+                    self.alternative_type_of(file, &logical.left, depth),
+                    self.alternative_type_of(file, &logical.right, depth),
                 ];
 
                 return joined_type_of(&parts);
@@ -1702,6 +1732,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
         DeclaredType::default()
     }
 
+    /// The kind of one alternative of a conditional or `||`/`??` expression, absent for a
+    /// nullish alternative.
+    fn alternative_type_of(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> Option<DeclaredType> {
+        let nullish = match unwrap(expression) {
+            Expression::NullLiteral(_) => true,
+            Expression::UnaryExpression(unary) => unary.operator == UnaryOperator::Void,
+            Expression::Identifier(reference) => {
+                reference.name == "undefined" && self.is_intrinsic_reference(file, reference)
+            }
+            _ => false,
+        };
+
+        (!nullish).then(|| self.declared_type_of_nested_expression(file, expression, depth + 1))
+    }
+
     fn declared_type_of_call(
         &mut self,
         file: FileId,
@@ -1716,7 +1766,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let receiver = unwrap(&member.object);
 
             if let Expression::Identifier(identifier) = receiver {
-                let text = identifier.name.as_str();
+                let text = if self.is_intrinsic_reference(file, identifier) {
+                    identifier.name.as_str()
+                } else {
+                    ""
+                };
 
                 if (text == "Object" || text == "Array")
                     && matches!(method, "keys" | "values" | "entries" | "from" | "of")
@@ -1747,7 +1801,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return declared_type_of(Kind::Array);
             }
 
-            if STRING_RESULTS.contains(&method) {
+            // Only the built-in String and Array methods are known to return strings; another
+            // receiver's `join` or `toString` is its own method.
+            if (received.kind == Kind::String
+                || (received.kind == Kind::Array && ARRAY_TO_STRING.contains(&method)))
+                && STRING_RESULTS.contains(&method)
+            {
                 return declared_type_of(Kind::String);
             }
 
@@ -1854,10 +1913,6 @@ fn typing_of_member(member: Option<Member<'_>>) -> Option<Typing<'_>> {
     }
 }
 
-fn is_weak_kind(kind: Kind) -> bool {
-    matches!(kind, Kind::WeakSet | Kind::WeakMap)
-}
-
 fn named_kind_of(name: &str) -> Option<Kind> {
     KIND_OF_NAME
         .iter()
@@ -1901,7 +1956,9 @@ fn member_of_container<'a>(container: Option<Container<'a>>, name: &str) -> Opti
         Container::Interface(file, interface) => {
             member_signature_of(file, &interface.body.body, name)
         }
+        // Every class container describes an instance, which has no static members.
         Container::Class(file, class) => class.body.body.iter().find_map(|element| match element {
+            _ if is_static_element(element) => None,
             ClassElement::MethodDefinition(method)
                 if method.kind != MethodDefinitionKind::Constructor
                     && is_named_identifier(&method.key, name) =>

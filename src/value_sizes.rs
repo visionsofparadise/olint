@@ -264,17 +264,25 @@ fn is_reading_context(kind: &AstKind<'_>) -> bool {
 }
 
 pub(crate) fn has_direct_eval(semantic: &oxc_semantic::Semantic<'_>) -> bool {
+    !direct_evals_of(semantic).is_empty()
+}
+
+/// The `eval` references of a file that are direct eval calls.
+pub(crate) fn direct_evals_of(semantic: &oxc_semantic::Semantic<'_>) -> Vec<NodeId> {
     let nodes = semantic.nodes();
     let scoping = semantic.scoping();
 
     scoping
         .root_unresolved_references()
         .get("eval")
-        .is_some_and(|references| {
+        .map(|references| {
             references
                 .iter()
-                .any(|reference| is_direct_call(nodes, scoping.get_reference(*reference).node_id()))
+                .map(|reference| scoping.get_reference(*reference).node_id())
+                .filter(|node| is_direct_call(nodes, *node))
+                .collect()
         })
+        .unwrap_or_default()
 }
 
 pub(crate) fn is_direct_call(nodes: &AstNodes<'_>, node: NodeId) -> bool {

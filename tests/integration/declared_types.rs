@@ -175,3 +175,72 @@ export function f<T extends Shape>(pair: [number, number], rest: [number, ...num
         ]
     );
 }
+
+// G21: a built-in kind needs the name to denote the global; a same-named import or local type is
+// another type, and only the built-in String and Array methods are known to return strings.
+#[test]
+fn built_in_kinds_resolve_only_to_the_global_names() {
+    let found = declared_types_of(
+        "export class Set<T> { forEach(f: (value: T) => void): void {} toString(): number[] { return []; } }",
+        "import { Set } from \"lib\";\nimport { Set as Local } from \"./types\";\ntype Array<T> = { at(index: number): T };\nexport function f(s: Set<string>, local: Local<string>, a: Array<number>, g: ReadonlySet<string>, xs: string[]) {\n\tprobe(s);\n\tprobe(local);\n\tprobe(a);\n\tprobe(g);\n\tprobe(s.toString());\n\tprobe(xs.join());\n\tprobe(new Local());\n}",
+    );
+
+    assert_eq!(
+        found,
+        vec![
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Other),
+            expected_type_of(Kind::Set),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::String),
+            expected_type_of(Kind::Other),
+        ]
+    );
+}
+
+// G25: §2.5 gives a union's value only one of its parts' types, so its kind is known when the
+// non-nullish parts agree; an intersection's value has every part's type.
+#[test]
+fn union_kinds_join_only_when_the_parts_agree() {
+    let found = declared_types_of(
+        "export interface Foo { forEach(f: (value: string) => void): void }",
+        "import type { Foo } from \"./types\";\nexport function f(a: string[] | Foo, b: string[] | undefined, c: Set<string> | Map<string, number>, d: string & { brand: 1 }, flag: boolean, lib: () => any) {\n\tprobe(a);\n\tprobe(b);\n\tprobe(c);\n\tprobe(d);\n\tprobe(flag ? [] : lib());\n\tprobe(b ?? []);\n\tprobe(flag ? [] : null);\n\tprobe(flag ? \"a\" : [\"a\"]);\n}",
+    );
+
+    assert_eq!(
+        found,
+        vec![
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::String),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Unknown),
+        ]
+    );
+}
+
+// G26: `this` is the class instance only in an instance member; a non-arrow function or an
+// object-literal method rebinds it, and a static member sees the constructor.
+#[test]
+fn this_reads_the_class_only_inside_instance_members() {
+    let found = declared_types_of(
+        "export {};",
+        "export class C {\n\titems: number[] = [];\n\tstatic only: number[] = [];\n\tm() {\n\t\tprobe(this.items);\n\t\tconst arrow = () => probe(this.items);\n\t\tfunction inner(this: any) {\n\t\t\tprobe(this.items);\n\t\t}\n\t\tconst object = { items: \"x\", read() {\n\t\t\tprobe(this.items);\n\t\t} };\n\t\tprobe(this.only);\n\t\treturn [arrow, inner, object];\n\t}\n\tstatic s() {\n\t\tprobe(this.items);\n\t}\n}",
+    );
+
+    assert_eq!(
+        found,
+        vec![
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Array),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Unknown),
+            expected_type_of(Kind::Unknown),
+        ]
+    );
+}

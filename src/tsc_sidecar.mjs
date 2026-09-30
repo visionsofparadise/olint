@@ -80,23 +80,28 @@ const TYPED_ARRAYS = new Set([
 	"BigInt64Array",
 	"BigUint64Array",
 ]);
-const rank = { array: 6, set: 5, map: 5, weakset: 5, weakmap: 5, unknown: 4, string: 3, regexp: 2, other: 1 };
+const NULLISH = ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void | ts.TypeFlags.Never;
 const isLibrarySymbol = (symbol) =>
 	(symbol?.getDeclarations() ?? []).some((declaration) =>
 		/(^|\/)lib\.[^/]*\.d\.ts$/.test(declaration.getSourceFile().fileName),
 	);
+// A union's value has one of its parts' types, so its kind is known only when the non-nullish
+// parts agree; a built-in kind needs the type's symbol to be the library's own.
 const kindOfType = (checker, t) => {
 	if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return "unknown";
-	if (t.isUnion())
-		return t.types.map((type) => kindOfType(checker, type)).reduce((a, b) => (rank[b] > rank[a] ? b : a), "other");
+	if (t.isUnion()) {
+		const kinds = new Set(t.types.filter((type) => !(type.flags & NULLISH)).map((type) => kindOfType(checker, type)));
+		return kinds.size === 1 ? [...kinds][0] : "unknown";
+	}
 	if (t.flags & ts.TypeFlags.StringLike) return "string";
 	if (checker.isArrayType?.(t) || checker.isTupleType?.(t)) return "array";
-	const name = t.getSymbol()?.getName() ?? "";
+	const symbol = t.getSymbol();
+	const name = isLibrarySymbol(symbol) ? symbol.getName() : "";
 	if (name === "Array" || name === "ReadonlyArray" || TYPED_ARRAYS.has(name)) return "array";
 	if (name === "Set" || name === "ReadonlySet") return "set";
 	if (name === "Map" || name === "ReadonlyMap") return "map";
-	if (name === "WeakSet") return isLibrarySymbol(t.getSymbol()) ? "weakset" : "other";
-	if (name === "WeakMap") return isLibrarySymbol(t.getSymbol()) ? "weakmap" : "other";
+	if (name === "WeakSet") return "weakset";
+	if (name === "WeakMap") return "weakmap";
 	if (name === "String") return "string";
 	if (name === "RegExp") return "regexp";
 	if (t.isTypeParameter()) {

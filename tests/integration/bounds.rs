@@ -553,6 +553,54 @@ fn a_readonly_field_a_constructor_can_reassign_is_not_a_constant_endpoint() {
     }
 }
 
+// G22: a declared class type is structural (§2.5), so `f({ n: m })` and a subclass that
+// redeclares `n` both stand behind a receiver typed `A`; the field folds only through a receiver
+// that holds exactly an `A`, or when the field is private. `this` in an exported class still
+// folds, the part of G22 left open while tests/integration/constants.rs pins it.
+#[test]
+fn a_readonly_field_folds_only_through_an_exact_receiver() {
+    for (source, expected) in [
+        (
+            "class A { readonly n: number = 1; } export function f(a: A) { for (let i = 0; i < a.n; i++) {} }",
+            "iteration bound",
+        ),
+        (
+            "class A { readonly n: number = 1; run() { for (let i = 0; i < this.n; i++) {} } } class B extends A { readonly n: number; constructor(n: number) { super(); this.n = n; } } export function f(n: number) { new B(n).run(); }",
+            "iteration bound",
+        ),
+        (
+            "class A { readonly n: number = 1; run() { for (let i = 0; i < this.n; i++) {} } } export const make = () => A;",
+            "iteration bound",
+        ),
+        (
+            "class A { readonly n: number = 1; run() { for (let i = 0; i < this.n; i++) {} } } export function f() { new A().run(); }",
+            "constant bound",
+        ),
+        (
+            "class A { readonly n: number = 1; } export function f(a: unknown) { for (let i = 0; i < (a as A).n; i++) {} }",
+            "iteration bound",
+        ),
+        (
+            "class A { readonly n: number = 1; } export function f() { const a = new A(); for (let i = 0; i < a.n; i++) {} }",
+            "constant bound",
+        ),
+        (
+            "class A { readonly n: number = 1; } export function f() { for (let i = 0; i < new A().n; i++) {} }",
+            "constant bound",
+        ),
+        (
+            "export class A { static readonly N: number = 3; } export function f() { for (let i = 0; i < A.N; i++) {} }",
+            "constant bound",
+        ),
+        (
+            "export class A { private readonly n: number = 1; run(a: A) { for (let i = 0; i < a.n; i++) {} } }",
+            "constant bound",
+        ),
+    ] {
+        assert_eq!(first_reason_of(source), expected, "{source}");
+    }
+}
+
 #[test]
 fn a_fresh_local_allocation_cannot_be_reached_through_a_parameter() {
     for (source, unknown) in [

@@ -272,6 +272,8 @@ pub struct Declarations<'a> {
     resolution_epoch: Cell<usize>,
     resolution_stats: Cell<ResolutionStats>,
     module_records: Vec<&'a ModuleRecord<'a>>,
+    evals: RefCell<HashMap<FileId, std::rc::Rc<[NodeId]>>>,
+    project_eval: Cell<Option<bool>>,
 }
 
 impl<'a> Declarations<'a> {
@@ -300,6 +302,8 @@ impl<'a> Declarations<'a> {
                 .iter()
                 .map(|file| file.module_record)
                 .collect(),
+            evals: RefCell::new(HashMap::new()),
+            project_eval: Cell::new(None),
         }
     }
 
@@ -323,6 +327,13 @@ impl<'a> Declarations<'a> {
                 })
                 .unwrap_or((file, reference.node_id()))
         };
+
+        // A reference inside `with` or reachable by a sloppy direct eval's declarations may
+        // denote a binding the resolver never sees.
+        if self.is_dynamically_scoped(project, file, reference) {
+            return (self.of_reference(project, file, reference), false);
+        }
+
         let key = key_of(file, reference);
 
         if let Some(cached) = self.callable.borrow().get(&key) {
@@ -1165,9 +1176,107 @@ impl<'a> Declarations<'a> {
         }
 
         self.resolution_stats.set(stats);
+
+        found = found && !self.is_eval_exposed(project, file, symbol);
+
         self.write_free.borrow_mut().insert(binding, found);
 
         found
+    }
+
+    fn direct_evals_of(&self, project: &Project<'a>, file: FileId) -> std::rc::Rc<[NodeId]> {
+        self.evals
+            .borrow_mut()
+            .entry(file)
+            .or_insert_with(|| crate::values::direct_evals_of(&project.file(file).semantic).into())
+            .clone()
+    }
+
+    fn is_project_evaluating(&self, project: &Project<'a>) -> bool {
+        if let Some(found) = self.project_eval.get() {
+            return found;
+        }
+
+        let found = project
+            .files
+            .iter()
+            .any(|source| !self.direct_evals_of(project, source.id).is_empty());
+
+        self.project_eval.set(Some(found));
+
+        found
+    }
+
+    /// Whether a direct eval can assign a mutable binding without a reference the resolver
+    /// sees: an eval inside the binding's scope, or, for a script's top-level binding, which is
+    /// global, an eval anywhere in the project.
+    fn is_eval_exposed(&self, project: &Project<'a>, file: FileId, symbol: SymbolId) -> bool {
+        let source = project.file(file);
+        let scoping = source.semantic.scoping();
+        let flags = scoping.symbol_flags(symbol);
+
+        if flags.is_const_variable() || flags.is_import() {
+            return false;
+        }
+
+        let scope = scoping.symbol_scope_id(symbol);
+
+        if scope == scoping.root_scope_id() && !is_module_file(source) {
+            return self.is_project_evaluating(project);
+        }
+
+        let nodes = source.semantic.nodes();
+        let owner = scoping.get_node_id(scope);
+
+        self.direct_evals_of(project, file)
+            .iter()
+            .any(|eval| nodes.ancestor_ids(*eval).any(|ancestor| ancestor == owner))
+    }
+
+    /// Whether an identifier reference may resolve to a binding outside the static scope
+    /// chain: inside a `with` body, whose object's properties shadow every name, or inside a
+    /// function whose sloppy direct eval can declare a `var` of that name.
+    fn is_dynamically_scoped(
+        &self,
+        project: &Project<'a>,
+        file: FileId,
+        reference: &IdentifierReference<'a>,
+    ) -> bool {
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let node = reference.node_id();
+        let span = reference.span;
+
+        if nodes.ancestors(node).any(|ancestor| {
+            matches!(ancestor.kind(), AstKind::WithStatement(with) if with.body.span().contains_inclusive(span))
+        }) {
+            return true;
+        }
+
+        let scoping = semantic.scoping();
+
+        // Strict eval code declares its variables in its own environment, so only a sloppy eval
+        // adds a binding to the enclosing function's, which every nested reference sees.
+        self.direct_evals_of(project, file).iter().any(|eval| {
+            if scoping
+                .scope_flags(nodes.get_node(*eval).scope_id())
+                .is_strict_mode()
+            {
+                return false;
+            }
+
+            let owner = nodes
+                .ancestors(*eval)
+                .find(|ancestor| {
+                    matches!(
+                        ancestor.kind(),
+                        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+                    )
+                })
+                .map(|ancestor| ancestor.id());
+
+            owner.is_none_or(|owner| nodes.ancestor_ids(node).any(|ancestor| ancestor == owner))
+        })
     }
 
     fn runtime_declarations_of(
@@ -2678,7 +2787,7 @@ pub(crate) fn surface_write_of(nodes: &AstNodes<'_>, reference: NodeId) -> Optio
     }
 }
 
-fn is_module_file(source: &SourceFile<'_>) -> bool {
+pub(crate) fn is_module_file(source: &SourceFile<'_>) -> bool {
     source.implementation
         || source.module_record.has_module_syntax
         || source.program.body.iter().any(|statement| match statement {

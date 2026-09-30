@@ -680,13 +680,26 @@ fn reading_total_takes_the_largest_part() {
 }
 
 #[test]
-fn kind_join_ranks_array_over_unknown_over_string() {
+fn kind_join_is_known_only_when_the_parts_agree() {
     use crate::declared_types::Kind;
 
-    assert_eq!(Kind::Unknown.join(Kind::Array), Kind::Array);
-    assert_eq!(Kind::Array.join(Kind::Unknown), Kind::Array);
+    assert_eq!(Kind::Array.join(Kind::Array), Kind::Array);
+    assert_eq!(Kind::Unknown.join(Kind::Array), Kind::Unknown);
+    assert_eq!(Kind::Array.join(Kind::Other), Kind::Unknown);
+    assert_eq!(Kind::Set.join(Kind::Map), Kind::Unknown);
     assert_eq!(Kind::String.join(Kind::Unknown), Kind::Unknown);
-    assert_eq!(Kind::Unknown.join(Kind::String), Kind::Unknown);
+    assert_eq!(Kind::Other.join(Kind::Other), Kind::Other);
+}
+
+#[test]
+fn kind_meet_takes_the_built_in_part() {
+    use crate::declared_types::Kind;
+
+    assert_eq!(Kind::String.meet(Kind::Other), Kind::String);
+    assert_eq!(Kind::Unknown.meet(Kind::Array), Kind::Array);
+    assert_eq!(Kind::Array.meet(Kind::Set), Kind::Unknown);
+    assert_eq!(Kind::Other.meet(Kind::Unknown), Kind::Unknown);
+    assert_eq!(Kind::Other.meet(Kind::Other), Kind::Other);
 }
 
 #[test]

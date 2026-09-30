@@ -482,6 +482,57 @@ fn work_targets_of(relative: &str, source: &str) -> (Vec<usize>, bool) {
     found
 }
 
+// G28: a direct eval can assign any mutable binding in scope, a sloppy one can declare a `var`
+// that shadows an outer name, and `with` resolves every name against its object first, so none of
+// them leaves a callable binding closed.
+#[test]
+fn direct_eval_and_with_open_callable_bindings() {
+    for (relative, source, known, open) in [
+        (
+            "index.ts",
+            "function work(){return 1} export function load(code: string){eval(code);} export function run(){work();}",
+            vec![0],
+            true,
+        ),
+        (
+            "index.ts",
+            "const work = function(){return 1}; export function load(code: string){eval(code);} export function run(){work();}",
+            vec![0],
+            false,
+        ),
+        (
+            "index.ts",
+            "export function run(){ function work(){return 1} work(); } export function load(code: string){eval(code);}",
+            vec![0],
+            false,
+        ),
+        (
+            "index.js",
+            "const work = function(){return 1}; function run(code){ eval(code); work(); }",
+            vec![0],
+            true,
+        ),
+        (
+            "index.js",
+            "const work = function(){return 1}; function run(o){ with (o) { work(); } }",
+            vec![0],
+            true,
+        ),
+        (
+            "index.js",
+            "const work = function(){return 1}; function run(){ work(); }",
+            vec![0],
+            false,
+        ),
+    ] {
+        assert_eq!(
+            work_targets_of(relative, source),
+            (known, open),
+            "{relative}: {source}"
+        );
+    }
+}
+
 #[test]
 fn duplicate_function_declarations_target_the_runtime_winner() {
     for (relative, source, known, open) in [

@@ -30,7 +30,7 @@ pub use primitive::{
     CertifiedValues, Failure, Limits, Primitive, PrimitiveAdapter, ValueResult, Work,
 };
 pub use sizes::Cardinality;
-pub(crate) use sizes::{is_direct_call, outermost_of};
+pub(crate) use sizes::{direct_evals_of, has_direct_eval, is_direct_call, outermost_of};
 pub(crate) use targets::{
     protocol_key_of, Construction, ConstructionPlan, Iteration, MemberKey, PrototypeMembers,
 };
@@ -847,6 +847,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let declaration = self
                 .declaration_of_access(file, member)
+                .filter(|declaration| {
+                    self.declarations
+                        .is_exact_member(self.project, file, member, declaration)
+                })
                 .ok_or(Failure::UncertifiedReference)?;
 
             return self.primitive_declaration(declaration, depth);
