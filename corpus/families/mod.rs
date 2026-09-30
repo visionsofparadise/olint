@@ -183,6 +183,13 @@ fn index(text: String) -> Vec<Source> {
     vec![("src/index.ts".to_string(), text)]
 }
 
+/// One `src/index.ts` of n functions, the first exported; `function` writes function `i` after its export prefix.
+fn functions(size: usize, function: impl Fn(usize, &str) -> String) -> Vec<Source> {
+    index(lines(
+        (0..size).map(|i| function(i, if i == 0 { "export " } else { "" })),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
