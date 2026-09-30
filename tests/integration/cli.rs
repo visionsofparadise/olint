@@ -47,9 +47,8 @@ fn public_coverage_policy_survives_filtering_without_a_numeric_surcharge() {
 
                 assert_eq!(
                     exit,
-                    Some(i32::from(
-                        !report && (policy == "error" || mixed == "cubic")
-                    )),
+                    // G41: the coverage origin belongs to no entry, so it fails lint under no policy.
+                    Some(i32::from(!report && mixed == "cubic")),
                     "{policy} {mixed} {report}: {stdout} {stderr}"
                 );
                 assert!(stdout.contains("public coverage [partial]"), "{stdout}");
@@ -267,7 +266,7 @@ fn minimum_filter_preserves_logarithmic_exception_and_unknown_policy() {
                 assert_eq!(
                     stdout
                         .lines()
-                        .any(|line| line.contains(" selected  index.ts:")),
+                        .any(|line| line.contains(" selected [asserted]  index.ts:")),
                     visible,
                     "{expression} {minimum}: {stdout}"
                 );
@@ -275,7 +274,7 @@ fn minimum_filter_preserves_logarithmic_exception_and_unknown_policy() {
                 if visible {
                     let row = stdout
                         .lines()
-                        .find(|line| line.contains(" selected  index.ts:"))
+                        .find(|line| line.contains(" selected [asserted]  index.ts:"))
                         .unwrap();
 
                     assert_eq!(row.contains("[partial]"), unknown, "{row}");
@@ -436,7 +435,12 @@ fn an_absent_channel_neither_cancels_a_cold_cost_nor_hides_an_open_target() {
         let (row, stderr) = reported_row_of(directory.path(), "selected");
 
         assert!(row.starts_with(cost), "{row}");
-        assert_eq!(row.contains("[partial]"), partial, "{row}");
+        // An Unknown row states `unknown` in place of a floor marked partial (§4.7).
+        assert_eq!(
+            row.contains("[partial]") || row.starts_with("unknown "),
+            partial,
+            "{row}"
+        );
         assert_eq!(stderr.contains("unknown call target"), partial, "{stderr}");
 
         lint_diagnostics_of(directory.path(), over_limit);
@@ -454,7 +458,10 @@ fn reported_row_of(directory: &Path, name: &str) -> (String, String) {
 
     let row = stdout
         .lines()
-        .find(|line| line.contains(&format!(" {name}  index.ts:")))
+        .find(|line| {
+            line.contains(&format!(" {name}  index.ts:"))
+                || line.contains(&format!(" {name} [asserted]  index.ts:"))
+        })
         .unwrap_or_else(|| panic!("{stdout}"));
 
     (row.to_owned(), stderr)
@@ -654,7 +661,7 @@ fn lint_walks_package_implementations_statically_and_keeps_boundaries_visible() 
         ("O((xs * xs^2))", false, true),
         ("O(xs)", false, false),
         ("O((xs * xs^2))", false, true),
-        ("O(1)", true, false),
+        ("unknown", true, false),
         ("O((xs * xs^2))", true, true),
     ];
 
@@ -673,7 +680,11 @@ fn lint_walks_package_implementations_statically_and_keeps_boundaries_visible() 
         let (row, stderr) = reported_row_of(directory.path(), "selected");
 
         assert!(row.starts_with(&format!("{cost} ")), "{label}: {row}");
-        assert_eq!(row.contains("[partial]"), partial, "{label}: {row}");
+        assert_eq!(
+            row.contains("[partial]") || row.starts_with("unknown "),
+            partial,
+            "{label}: {row}"
+        );
         assert_eq!(
             stderr.contains("unknown call target"),
             partial,
@@ -709,5 +720,162 @@ fn lint_walks_package_implementations_statically_and_keeps_boundaries_visible() 
                 .exists(),
             "{label}"
         );
+    }
+}
+
+/// The expectation for `label` in `table`, an object keyed by policy label with `*` as the fallback.
+fn expected_for<'v>(table: &'v serde_json::Value, label: &str) -> Option<&'v serde_json::Value> {
+    table.get(label).or_else(|| table.get("*"))
+}
+
+fn strings_of(value: Option<&serde_json::Value>) -> Vec<&str> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| item.as_str().unwrap())
+        .collect()
+}
+
+/// The header and histogram of a report: the lines before its second blank line.
+fn histogram_of(stdout: &str) -> Vec<&str> {
+    let mut blanks = 0;
+
+    stdout
+        .lines()
+        .take_while(|line| {
+            blanks += usize::from(line.is_empty());
+
+            blanks < 2
+        })
+        .collect()
+}
+
+/// Runs one `policy-cases.json` case under each of its policies and modes. Every mode's stdout is identical under
+/// every policy (§3.5, §4.9), and every report mode shows the same header and histogram whatever its `--min`
+/// (§3.5). A policy `"absent"` omits the `unknown` field; any other policy value is written into it as given.
+fn assert_policy_case(case: &serde_json::Value) {
+    let name = case["name"].as_str().unwrap();
+    let mut histograms: Vec<(String, Vec<String>)> = Vec::new();
+
+    for (mode, expected) in case["modes"].as_object().unwrap() {
+        let mut stdouts: Vec<(String, String)> = Vec::new();
+
+        for policy in case["policies"].as_array().unwrap() {
+            let label = policy
+                .as_str()
+                .map_or_else(|| policy.to_string(), str::to_string);
+            let mut config = case["config"].clone();
+
+            if label != "absent" {
+                config["unknown"] = policy.clone();
+            }
+
+            let directory = tempfile::tempdir().unwrap();
+
+            for (file, text) in case["files"].as_object().unwrap() {
+                let path = directory.path().join(file);
+
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(
+                    path,
+                    text.as_str()
+                        .map_or_else(|| text.to_string(), str::to_string),
+                )
+                .unwrap();
+            }
+
+            std::fs::write(
+                directory.path().join("olint.config.json"),
+                config.to_string(),
+            )
+            .unwrap();
+
+            let mut command = Command::new(env!("CARGO_BIN_EXE_olint"));
+
+            for argument in expected["args"].as_array().unwrap() {
+                command.arg(argument.as_str().unwrap());
+            }
+
+            for (variable, value) in case["env"].as_object().into_iter().flatten() {
+                command.env(variable, value.as_str().unwrap());
+            }
+
+            let (exit, stdout, stderr) = captured(command.current_dir(directory.path()));
+            let context = format!("{name} {mode} {label}:\n{stdout}\n{stderr}");
+            let code = match &expected["exit"] {
+                serde_json::Value::Object(_) => expected_for(&expected["exit"], &label).unwrap(),
+                code => code,
+            };
+
+            assert_eq!(exit, Some(code.as_i64().unwrap() as i32), "{context}");
+
+            for (stream, text) in [("stdout", &stdout), ("stderr", &stderr)] {
+                let Some(table) = expected.get(stream) else {
+                    continue;
+                };
+
+                for expectation in [expected_for(table, &label), table.get("all")]
+                    .into_iter()
+                    .flatten()
+                {
+                    for wanted in strings_of(expectation.get("contains")) {
+                        assert!(text.contains(wanted), "missing {wanted:?}: {context}");
+                    }
+
+                    for unwanted in strings_of(expectation.get("absent")) {
+                        assert!(
+                            !text.contains(unwanted),
+                            "unexpected {unwanted:?}: {context}"
+                        );
+                    }
+                }
+            }
+
+            stdouts.push((label, stdout));
+        }
+
+        for (label, stdout) in &stdouts[1..] {
+            assert_eq!(
+                stdout, &stdouts[0].1,
+                "{name} {mode}: stdout under {label} differs from {}",
+                stdouts[0].0
+            );
+        }
+
+        let is_report = expected["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|argument| argument == "--report");
+
+        if is_report {
+            histograms.push((
+                mode.clone(),
+                histogram_of(&stdouts[0].1)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ));
+        }
+    }
+
+    for (mode, histogram) in histograms.iter().skip(1) {
+        assert_eq!(
+            histogram, &histograms[0].1,
+            "{name}: {mode} states differ from {}",
+            histograms[0].0
+        );
+    }
+}
+
+/// §3.3, §3.5 and §4.5-§4.9 with decisions G40-G42, one or more cases per clause (`tests/fixtures/policy-cases.json`).
+#[test]
+fn policy_cases_hold_under_every_policy_mode_and_minimum() {
+    let cases: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/policy-cases.json")).unwrap();
+
+    for case in cases.as_array().unwrap() {
+        assert_policy_case(case);
     }
 }

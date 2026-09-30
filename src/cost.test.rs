@@ -1,19 +1,6 @@
 use super::*;
 
 #[test]
-fn partial_binding_preserves_resource_errors_from_known_children() {
-    let cost = Cost::parse("O(n + m)").unwrap();
-    let error = cost.bind_known(&mut |part| {
-        if part.names().len() > 1 || part.names() == ["n"] {
-            Err(CostError::UnresolvedQuantity("n".into()))
-        } else {
-            Err(CostError::Resource)
-        }
-    });
-
-    assert_eq!(error, Err(CostError::Resource));
-}
-#[test]
 fn grouped_factors_keep_canonical_presentation_order() {
     let x = Cost::dimension(1, Domain::Size);
     let y = Cost::dimension(2, Domain::Size);

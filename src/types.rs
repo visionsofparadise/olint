@@ -350,15 +350,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Ok(())
     }
 
-    pub fn fall_back_to_declarations(&mut self) {
-        self.reset_between_passes();
-        self.needed.clear();
-        self.answers.clear();
-        self.forget_dispatches();
-
-        self.pass = TscPass::Off;
-    }
-
     fn type_answer_of(&mut self, file: FileId, span: Span) -> Option<TypeAnswer> {
         let query = Query::Type {
             file: self.query_path_of(file),

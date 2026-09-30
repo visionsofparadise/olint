@@ -6,11 +6,9 @@ use crate::directives::cost_tag_of;
 use crate::paths::relative_path_of;
 use crate::project::{FileId, Project, Site};
 use crate::public::PublicFunction;
-use crate::summaries::Substitutions;
 use crate::trace::{RenderBudget, TraceArena, TraceId};
-use crate::unknowns::UnknownId;
+use crate::unknowns::{UnknownId, Unknowns};
 use crate::values::Values;
-use oxc_span::GetSpan;
 
 fn padded_text_of(text: &str, width: usize) -> String {
     let length: usize = text.chars().map(char::len_utf16).sum();
@@ -65,21 +63,24 @@ fn lines_of_chain(
     }
 }
 
-fn row_text_of(
-    values: &Values,
-    cost: &Cost,
-    name: &str,
-    mark: Option<&str>,
-    location: &str,
-) -> String {
-    let mark = match mark {
-        Some(mark) => format!(" [@perf {mark}]"),
-        None => String::new(),
+/// A report row: the bound, the floor or `unknown` (§4.7), the name, an `[asserted]` mark when the cost depends on
+/// a `@perf` directive, the location, and a `[partial]` mark after a floor.
+fn row_text_of(values: &Values, row: &ReportRow, location: &str) -> String {
+    let cost = match row.state {
+        State::Unknown => "unknown".to_string(),
+        State::Known | State::Partial => row.cost.text_with(&|id| values.label(id)),
+    };
+    let asserted = if row.asserted { " [asserted]" } else { "" };
+    let partial = if row.state == State::Partial {
+        " [partial]"
+    } else {
+        ""
     };
 
     format!(
-        "{} {name}{mark}  {location}",
-        padded_text_of(&cost.text_with(&|id| values.label(id)), 14)
+        "{} {}{asserted}  {location}{partial}",
+        padded_text_of(&cost, 14),
+        row.name
     )
 }
 
@@ -133,12 +134,38 @@ impl Finding<'_> {
     }
 }
 
+/// Lint's reading of each public entry: its summary, the one the report reads (§3.5).
+pub fn findings_of<'a>(
+    analysis: &mut Analysis<'_, 'a>,
+    public: Vec<PublicFunction<'a>>,
+) -> Vec<Finding<'a>> {
+    public
+        .into_iter()
+        .map(|public| {
+            let part = analysis
+                .summarize(public.file, public.function)
+                .total(&mut analysis.unknowns, &mut analysis.traces);
+
+            Finding {
+                name: analysis.name_of(public.file, public.function),
+                site: analysis.function_site_of(public.file, public.function),
+                public,
+                part,
+            }
+        })
+        .collect()
+}
+
 pub struct ReportRow {
     pub envelope: Option<Cost>,
     pub unknowns: Option<UnknownId>,
+    pub state: State,
+    /// The cost depends on a `@perf` directive (spec Terms, Asserted).
+    pub asserted: bool,
     pub cost: Cost,
     pub latent: Option<Part>,
     pub name: String,
+    /// The text of the function's own `@perf O(...)` directive.
     pub mark: Option<String>,
     pub site: Site,
     pub trace: Option<TraceId>,
@@ -167,30 +194,21 @@ pub fn report_rows_of<'a>(
 
             text
         });
-        let reading = match mark {
-            Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
-            None => analysis.summarize(file, function),
-        };
-        let mut part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
+        // The row reads the summary lint reads, so a function whose cost a directive sets shows that cost (§3.3,
+        // §3.5), and a directive applied anywhere beneath it marks the row asserted.
+        let assertions = analysis.assertions;
+        let reading = analysis.summarize(file, function);
+        let part = reading.total(&mut analysis.unknowns, &mut analysis.traces);
         let latent = reading.latent(&mut analysis.unknowns, &mut analysis.traces);
-
-        let envelope = match analysis.bind_function_cost(file, function, &Cost::N) {
-            Ok(cost) => Some(cost),
-            Err(_) => {
-                let origin = analysis
-                    .source_span(file, analysis.kind_of_node(file, function.node_id()).span());
-                let unknown = analysis
-                    .unknowns
-                    .origin(origin, crate::unknowns::UnknownReason::ResourceExhaustion);
-                part.unknowns = analysis.unknowns.join(part.unknowns, Some(unknown));
-
-                None
-            }
-        };
+        let asserted = mark.is_some() || analysis.assertions != assertions;
+        // The envelope only filters rows under `--min`; a row whose envelope cannot be bound keeps its state (§3.5).
+        let envelope = analysis.bind_function_cost(file, function, &Cost::N).ok();
 
         rows.push(ReportRow {
             envelope,
             unknowns: part.unknowns,
+            state: part.state(),
+            asserted,
             cost: part.cost,
             latent: (!latent.is_absent()).then_some(latent),
             name: analysis.name_of(file, function),
@@ -293,6 +311,7 @@ pub fn report_lines(
     values: &Values,
     traces: &TraceArena,
     project: &Project<'_>,
+    unknowns: &Unknowns,
     rows: &[ReportRow],
     minimum_exponent: u32,
 ) -> Vec<String> {
@@ -303,7 +322,31 @@ pub fn report_lines(
         rows,
         minimum_exponent,
         &|site, out| write!(out, "{}:{}", project.file(site.file).relative, site.line),
+        &|root| unknowns.lines_with(project, root, &|id, out| values.write_label(id, out)),
     )
+}
+
+/// §4.7: the source origin of every unknown contribution of a row, one `unknown origin:` line each, whatever the
+/// policy, since the policy governs diagnostics only (§4.9).
+fn origin_lines(
+    roots: impl IntoIterator<Item = UnknownId>,
+    origins: &dyn Fn(UnknownId) -> Vec<String>,
+    out: &mut Vec<String>,
+) {
+    let mut shown = std::collections::HashSet::new();
+
+    for root in roots {
+        for line in origins(root) {
+            let line = match line.strip_prefix("unknown ") {
+                Some(origin) => format!("    unknown origin: {origin}"),
+                None => format!("    {line}"),
+            };
+
+            if shown.insert(line.clone()) {
+                out.push(line);
+            }
+        }
+    }
 }
 
 fn lines_of_report(
@@ -313,6 +356,7 @@ fn lines_of_report(
     rows: &[ReportRow],
     minimum_exponent: u32,
     location: &dyn Fn(Site, &mut dyn std::fmt::Write) -> std::fmt::Result,
+    origins: &dyn Fn(UnknownId) -> Vec<String>,
 ) -> Vec<String> {
     let mut files: Vec<FileId> = rows.iter().map(|row| row.site.file).collect();
 
@@ -322,7 +366,7 @@ fn lines_of_report(
     let mut buckets: Vec<(String, usize)> = Vec::new();
 
     for row in rows {
-        let text = partial_text(values, &row.cost, row.unknowns);
+        let text = text_of_state(values, &row.cost, row.state);
 
         match buckets.iter_mut().find(|(known, _)| *known == text) {
             Some(bucket) => bucket.1 += 1,
@@ -332,11 +376,15 @@ fn lines_of_report(
 
     buckets.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
+    let count_of = |state: State| rows.iter().filter(|row| row.state == state).count();
     let mut lines = vec![
         format!(
-            "# {tsconfig}  ({} functions in {} files)",
+            "# {tsconfig}  ({} functions in {} files: {} known, {} partial, {} unknown)",
             rows.len(),
-            files.len()
+            files.len(),
+            count_of(State::Known),
+            count_of(State::Partial),
+            count_of(State::Unknown)
         ),
         String::new(),
     ];
@@ -382,26 +430,22 @@ fn lines_of_report(
     });
 
     for row in flagged {
-        let row_text = row_text_of(
-            values,
-            &row.cost,
-            &row.name,
-            row.mark.as_deref(),
-            &location_text(row.site, location),
-        );
-
-        lines.push(if row.unknowns.is_some() {
-            format!("{row_text} [partial]")
-        } else {
-            row_text
-        });
+        lines.push(row_text_of(values, row, &location_text(row.site, location)));
 
         if let Some(latent) = &row.latent {
             lines.push(format!(
                 "    lazy {} when consumed",
-                partial_text(values, &latent.cost, latent.unknowns)
+                text_of_state(values, &latent.cost, latent.state())
             ));
         }
+
+        origin_lines(
+            row.unknowns
+                .into_iter()
+                .chain(row.latent.as_ref().and_then(|latent| latent.unknowns)),
+            origins,
+            &mut lines,
+        );
 
         lines_of_chain(values, traces, row.trace, 1, &mut lines, location);
 
@@ -411,12 +455,18 @@ fn lines_of_report(
     lines
 }
 
-fn partial_text(values: &Values, cost: &Cost, unknowns: Option<UnknownId>) -> String {
-    if unknowns.is_some() {
-        format!("{} [partial]", cost.text_with(&|id| values.label(id)))
-    } else {
-        cost.text_with(&|id| values.label(id))
+/// A reading's state as the report renders it (§4.7): its bound, its floor marked `[partial]`, or `unknown`.
+fn text_of_state(values: &Values, cost: &Cost, state: State) -> String {
+    match state {
+        State::Known => cost.text_with(&|id| values.label(id)),
+        State::Partial => format!("{} [partial]", cost.text_with(&|id| values.label(id))),
+        State::Unknown => "unknown".into(),
     }
+}
+
+/// An entry's state as the report renders it, for diagnostics that name it.
+pub fn state_text(values: &Values, part: &Part) -> String {
+    text_of_state(values, &part.cost, part.state())
 }
 
 /// §4.4: an Exceeds line states what olint proves, a bound or a floor, which an instance's work may fall below.

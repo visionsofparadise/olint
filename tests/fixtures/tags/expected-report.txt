@@ -1,6 +1,6 @@
-# tsconfig.json  (27 functions in 3 files)
+# tsconfig.json  (27 functions in 3 files: 3 known, 24 partial, 0 unknown)
 
-O(xs) [partial]    20
+O(xs) [partial]    19
 O(1) [partial]      5
-O(xs)               2
+O(xs)               3
 

@@ -15,7 +15,8 @@ use olint::project::{FileId, Project, ProjectError};
 use olint::public::{public_functions, public_roots};
 use olint::regex::{companion_of, RegexError, RegexLimits};
 use olint::report::{
-    lint_lines, order_by_cost_descending, report_lines, report_rows_of, Finding, Verdict,
+    findings_of, lint_lines, order_by_cost_descending, report_lines, report_rows_of, state_text,
+    Finding, Verdict,
 };
 use olint::tsc::{ask, Query, TscError, TscReply};
 use olint::unknowns::{SourceSpan, UnknownReason};
@@ -197,7 +198,7 @@ fn run_with_ask(
         record_nodes: false,
     };
     let mut analysis = Analysis::new(&project, options);
-    let mut assisted = analysis.options.types != TypeMode::Syntactic;
+    let assisted = analysis.options.types != TypeMode::Syntactic;
     let mut rounds = 0;
     let mut sites = 0;
     let helper = std::env::current_exe().map(|executable| companion_of(&executable));
@@ -209,28 +210,14 @@ fn run_with_ask(
                 |queries| compiler(&project.root, &project.tsconfig_path, queries),
             );
 
-            match gathered {
-                Ok((gathered, functions)) => {
-                    rounds += gathered.rounds;
-                    sites += gathered.sites;
+            // G42: an unavailable checker fails the run in `auto` as in `tsc`, so node states never depend on
+            // whether node or typescript is installed (§3.4); declaration-only typing is the explicit `syntactic`.
+            let (gathered, functions) = gathered?;
 
-                    functions
-                }
-                Err(Failure::Tsc(
-                    error @ (TscError::NodeUnavailable(_) | TscError::TypescriptUnavailable(_)),
-                )) if analysis.options.types == TypeMode::Auto => {
-                    eprintln!(
-                        "olint: types from declarations only ({})",
-                        reason_of(&error)
-                    );
-                    analysis.fall_back_to_declarations();
+            rounds += gathered.rounds;
+            sites += gathered.sites;
 
-                    assisted = false;
-
-                    roots_of(&mut analysis, &config, cli.report)?
-                }
-                Err(error) => return Err(error),
-            }
+            functions
         } else {
             roots_of(&mut analysis, &config, cli.report)?
         };
@@ -282,55 +269,60 @@ fn run_with_ask(
             &analysis.values,
             &analysis.traces,
             &project,
+            &analysis.unknowns,
             &rows,
             analysis.options.minimum_exponent,
         ));
 
         0
     } else {
-        let mut checked = Vec::with_capacity(public.len());
+        let checked = findings_of(&mut analysis, public);
 
-        for public in public {
-            let part = analysis
-                .summarize(public.file, public.function)
-                .total(&mut analysis.unknowns, &mut analysis.traces);
+        // §4.9: every Inconclusive verdict draws a diagnostic under its policy. An incomparable limit is named as such,
+        // and its Comparison origin joins the diagnosed origins without joining the entry's reading, so the entry's
+        // state stays as report shows it (§3.5).
+        for finding in &checked {
+            let span = project
+                .file(finding.public.file)
+                .semantic
+                .nodes()
+                .kind(finding.public.function.node_id())
+                .span();
+            let location = format!(
+                "{}:{}",
+                project.file(finding.public.file).relative,
+                project.line_of(finding.public.file, span.start)
+            );
 
-            for applicable in public.limits.iter().filter(|applicable| {
-                part.cost.compare(&applicable.limit.cost) == CostComparison::Inconclusive
-            }) {
-                let span = project
-                    .file(public.file)
-                    .semantic
-                    .nodes()
-                    .kind(public.function.node_id())
-                    .span();
-                let unknown = analysis.unknowns.origin(
-                    SourceSpan {
-                        file: public.file,
-                        start: span.start,
-                        end: span.end,
-                    },
-                    UnknownReason::Comparison,
-                );
+            for (applicable, verdict) in finding.public.limits.iter().zip(finding.verdicts()) {
+                if verdict != Verdict::Inconclusive {
+                    continue;
+                }
 
-                // An incomparable limit makes the entry's verdict Inconclusive (§4.3) and leaves its state as it is.
-                selected_unknowns.push(unknown);
-                selected_comparisons.push(format!(
-                    "unknown comparison for {} against {} via {} at {}:{}",
-                    analysis.name_of(public.file, public.function),
-                    applicable.limit.text,
-                    applicable.entry,
-                    project.file(public.file).relative,
-                    project.line_of(public.file, span.start)
-                ));
+                if finding.part.cost.compare(&applicable.limit.cost) == CostComparison::Inconclusive
+                {
+                    selected_unknowns.push(analysis.unknowns.origin(
+                        SourceSpan {
+                            file: finding.public.file,
+                            start: span.start,
+                            end: span.end,
+                        },
+                        UnknownReason::Comparison,
+                    ));
+                    selected_comparisons.push(format!(
+                        "unknown comparison for {} against {} via {} at {location}",
+                        finding.name, applicable.limit.text, applicable.entry
+                    ));
+                } else {
+                    selected_comparisons.push(format!(
+                        "inconclusive {} against {} via {} at {location}: reported as {}",
+                        finding.name,
+                        applicable.limit.text,
+                        applicable.entry,
+                        state_text(&analysis.values, &finding.part)
+                    ));
+                }
             }
-
-            checked.push(Finding {
-                name: analysis.name_of(public.file, public.function),
-                site: analysis.function_site_of(public.file, public.function),
-                public,
-                part,
-            });
         }
 
         let mut over: Vec<&Finding> = checked
@@ -358,13 +350,9 @@ fn run_with_ask(
 
         selected_unknowns.extend(checked.iter().filter_map(|finding| finding.part.unknowns));
 
-        // §4.5 fails on Exceeds and §4.6 on Inconclusive under "error". Every unknown origin still fails under "error"
-        // until action 4.6 narrows it to Inconclusive entries (G41).
-        i32::from(
-            !over.is_empty()
-                || (config.unknown == UnknownPolicy::Error
-                    && (inconclusive || !selected_unknowns.is_empty())),
-        )
+        // §4.5 fails on Exceeds, and §4.6 under "error" on an Inconclusive entry only (G41): an unknown origin outside
+        // every Inconclusive entry draws its diagnostic (§4.9) without failing lint.
+        i32::from(!over.is_empty() || (config.unknown == UnknownPolicy::Error && inconclusive))
     };
 
     if config.unknown != UnknownPolicy::Ignore {

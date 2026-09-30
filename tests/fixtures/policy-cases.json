@@ -1,0 +1,944 @@
+[
+  {
+    "name": "a directive-set cost is Known with that cost in report and lint",
+    "clause": "§3.3 §3.5 G32",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "declare function opaque(): void;\n/** @perf O(xs^2) */\nexport function tagged(xs: number[]) { opaque(); }\nexport function caller(ys: number[]) { return tagged(ys); }\nexport function statement(xs: number[], cb: () => void) {\n  // @perf O(xs)\n  cb();\n}\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": 1,
+        "stdout": {
+          "all": {
+            "contains": [
+              "olint proves O(xs^2), above the limit O(N)  tagged  index.ts:3",
+              "olint proves O(ys^2), above the limit O(N)  caller  index.ts:4",
+              "2 over limit"
+            ],
+            "absent": [
+              "partial results",
+              "statement  index.ts"
+            ]
+          }
+        },
+        "stderr": {
+          "all": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O(xs^2)        tagged [asserted]  index.ts:3",
+              "O(ys^2)        caller [asserted]  index.ts:4",
+              "O(xs)          statement [asserted]  index.ts:5",
+              "(3 functions in 1 files: 3 known, 0 partial, 0 unknown)"
+            ],
+            "absent": [
+              "[partial]",
+              "unknown origin"
+            ]
+          }
+        },
+        "stderr": {
+          "all": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O(xs^2)        tagged [asserted]  index.ts:3"
+            ],
+            "absent": [
+              "statement [asserted]"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "an unresolvable directive quantity is a directive error and an Unknown node",
+    "clause": "§3.3 G40",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "/** @perf O(n) */\nfunction sized(n: number) {}\nexport function unresolved(o: { a: number }) { sized(o.a); }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N^2)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": {
+          "ignore": 0,
+          "warn": 0,
+          "error": 1
+        },
+        "stdout": {
+          "all": {
+            "contains": [
+              "0 over limit",
+              "1 partial results"
+            ]
+          }
+        },
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: warning: @perf O(n) at index.ts:2 names n, whose size this call leaves unresolved"
+            ]
+          },
+          "ignore": {
+            "absent": [
+              "unknown input size relation",
+              "inconclusive"
+            ]
+          },
+          "warn": {
+            "contains": [
+              "olint: warning: inconclusive unresolved against O(N^2) via index.ts at index.ts:3: reported as unknown"
+            ]
+          },
+          "error": {
+            "contains": [
+              "olint: error: inconclusive unresolved against O(N^2) via index.ts at index.ts:3: reported as unknown"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "unknown        unresolved [asserted]  index.ts:3",
+              "    unknown origin: input size relation at index.ts:2"
+            ]
+          }
+        },
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: warning: @perf O(n) at index.ts:2 names n, whose size this call leaves unresolved"
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0
+      }
+    }
+  },
+  {
+    "name": "an overflowing directive binding is Known with the directive's cost",
+    "clause": "§3.3 G40",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "/** @perf O(2^n) */\nfunction big(n: number) {}\nexport function overflow() { big(100); }\nexport function statement(n: number) {\n  /** @perf O(2^n) */\n  void n;\n}\nexport function statementCaller() { statement(100); }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(2^N)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": {
+          "ignore": 0,
+          "warn": 0,
+          "error": 1
+        },
+        "stdout": {
+          "all": {
+            "contains": [
+              "0 over limit"
+            ],
+            "absent": [
+              "partial results"
+            ]
+          }
+        },
+        "stderr": {
+          "ignore": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          },
+          "warn": {
+            "contains": [
+              "olint: warning: unknown comparison for overflow against O(2^N) via index.ts at index.ts:3"
+            ],
+            "absent": [
+              "analysis resource limit"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O((2)^(n))     overflow [asserted]  index.ts:3",
+              "O((2)^(n))     statementCaller [asserted]  index.ts:8"
+            ],
+            "absent": [
+              "[partial]",
+              "unknown origin",
+              "unknown   "
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0
+      }
+    }
+  },
+  {
+    "name": "an incomparable limit leaves the entry's state as report shows it",
+    "clause": "§3.5 §4.3",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "/** @perf O(n^2) */ export function f(n: number, m: number) {}\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(m)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": {
+          "ignore": 0,
+          "warn": 0,
+          "error": 1
+        },
+        "stdout": {
+          "all": {
+            "contains": [
+              "0 over limit"
+            ],
+            "absent": [
+              "partial results"
+            ]
+          }
+        },
+        "stderr": {
+          "ignore": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          },
+          "warn": {
+            "contains": [
+              "olint: warning: unknown comparison for f against O(m) via index.ts at index.ts:1"
+            ]
+          },
+          "error": {
+            "contains": [
+              "olint: error: unknown comparison for f against O(m) via index.ts at index.ts:1"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O(n^2)         f [asserted]  index.ts:1"
+            ],
+            "absent": [
+              "[partial]",
+              "unknown origin"
+            ]
+          }
+        },
+        "stderr": {
+          "all": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0
+      }
+    }
+  },
+  {
+    "name": "lint fails on a bound or floor that exceeds its limit under every policy",
+    "clause": "§4.2 §4.4 §4.5",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function cube(xs: number[]) { let c = 0; for (const a of xs) for (const b of xs) for (const d of xs) c += a + b + d; return c; }\nexport function floor(xs: number[]): number { let k = 1; while (k !== xs.length) { k = (k * 3) % 7; } let c = 0; for (const a of xs) for (const b of xs) c += a * b; return c; }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": 1,
+        "stdout": {
+          "all": {
+            "contains": [
+              "olint proves O((xs * xs^2)), above the limit O(N)  cube  index.ts:1",
+              "olint proves at least O(xs^2), above the limit O(N)  floor  index.ts:2",
+              "2 over limit",
+              "each cost over its limit is what olint proves; an instance's work may fall below it"
+            ]
+          }
+        },
+        "stderr": {
+          "ignore": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O((xs * xs^2)) cube  index.ts:1",
+              "O(xs^2)        floor  index.ts:2 [partial]",
+              "    unknown origin: iteration bound at index.ts:2"
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0
+      }
+    }
+  },
+  {
+    "name": "under error lint fails for Inconclusive entries, and each draws a diagnostic under its policy",
+    "clause": "§4.3 §4.6 §4.9 G41",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "declare function opaque(): void;\nexport function f(xs: number[]) { opaque(); let c = 0; for (const a of xs) c += a; return c; }\nexport function g(cb: () => void) { cb(); }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N^2)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": {
+          "ignore": 0,
+          "warn": 0,
+          "error": 1
+        },
+        "stdout": {
+          "all": {
+            "contains": [
+              "0 over limit",
+              "2 partial results"
+            ]
+          }
+        },
+        "stderr": {
+          "ignore": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          },
+          "warn": {
+            "contains": [
+              "olint: warning: inconclusive f against O(N^2) via index.ts at index.ts:2: reported as O(xs) [partial]",
+              "olint: warning: inconclusive g against O(N^2) via index.ts at index.ts:3: reported as unknown",
+              "olint: warning: unknown call target at index.ts:2",
+              "olint: warning: unknown call target at index.ts:3"
+            ]
+          },
+          "error": {
+            "contains": [
+              "olint: error: inconclusive f against O(N^2) via index.ts at index.ts:2: reported as O(xs) [partial]",
+              "olint: error: inconclusive g against O(N^2) via index.ts at index.ts:3: reported as unknown",
+              "olint: error: unknown call target at index.ts:2",
+              "olint: error: unknown call target at index.ts:3"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O(xs)          f  index.ts:2 [partial]",
+              "unknown        g  index.ts:3",
+              "    unknown origin: call target at index.ts:2",
+              "    unknown origin: call target at index.ts:3",
+              "(2 functions in 1 files: 0 known, 1 partial, 1 unknown)"
+            ],
+            "absent": [
+              "O(1) [partial]"
+            ]
+          }
+        },
+        "stderr": {
+          "ignore": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          },
+          "warn": {
+            "contains": [
+              "olint: warning: unknown call target at index.ts:2"
+            ]
+          },
+          "error": {
+            "contains": [
+              "olint: error: unknown call target at index.ts:2"
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0
+      }
+    }
+  },
+  {
+    "name": "an unknown origin outside every Inconclusive entry draws its diagnostic without failing lint",
+    "clause": "§4.6 §4.9 G41",
+    "files": {
+      "tsconfig.json": {},
+      "index.ts": "declare const unavailable: () => void;\nexport { unavailable };\nexport function known() { void 0; }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(1)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "public coverage [partial]",
+              "0 over limit"
+            ]
+          }
+        },
+        "stderr": {
+          "ignore": {
+            "absent": [
+              "olint: warning",
+              "olint: error"
+            ]
+          },
+          "warn": {
+            "contains": [
+              "olint: warning: unknown call target at index.ts:1"
+            ]
+          },
+          "error": {
+            "contains": [
+              "olint: error: unknown call target at index.ts:1"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O(1)           known  index.ts:3"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "the report shows each state, its partial and asserted marks and every unknown origin",
+    "clause": "§4.7 G33 G34 G44",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function caught(xs: number[]) { try { xs.forEach((x) => { throw x; }); } catch (e) { (e as any)(); } }\nexport function serialized(value: object) { return JSON.stringify(value); }\nexport function frequency(xs: number[], o: { n: number }) { for (const x of xs) { o.n = x; } return o; }\nexport function opaqueCall(cb: () => void) { cb(); }\n// @perf ignore\nfunction ignored(cb: () => void) { cb(); }\nexport function callsIgnored(cb: () => void) { ignored(cb); }\nexport function ignoredStatement(cb: () => void) {\n  // @perf ignore\n  cb();\n}\nexport function bounded(cb: () => boolean) {\n  // @perf bounded\n  while (cb()) {}\n}\nexport function dependent() { return bounded(() => false); }\n// @perf cold\nfunction cold(xs: number[]) { for (const a of xs) for (const b of xs) void b; }\nexport function selectsCold(xs: number[], f: boolean) { if (f) cold(xs); else plain(xs); }\nexport function hot(xs: number[], f: boolean) {\n  if (f) {\n    // @perf hot\n    for (const a of xs) void a;\n  } else { for (const a of xs) for (const b of xs) void b; }\n}\nexport function statementCost(xs: number[], cb: () => void) {\n  // @perf O(xs)\n  cb();\n}\n/** @perf O(n^2) */\nexport function functionCost(n: number, cb: () => void) { cb(); }\nexport function plain(xs: number[]) { for (const a of xs) void a; }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N^2)"
+    },
+    "policies": [
+      "ignore",
+      "warn",
+      "error"
+    ],
+    "modes": {
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "O(xs)          caught  index.ts:1 [partial]",
+              "    unknown origin: call target at index.ts:1",
+              "O(value)       serialized  index.ts:2 [partial]",
+              "    unknown origin: input size relation at index.ts:2",
+              "O(1)           frequency  index.ts:3 [partial]",
+              "    unknown origin: iteration bound at index.ts:3",
+              "unknown        opaqueCall  index.ts:4",
+              "    unknown origin: call target at index.ts:4",
+              "O(1)           callsIgnored [asserted]  index.ts:7",
+              "O(1)           ignoredStatement [asserted]  index.ts:8",
+              "unknown        bounded [asserted]  index.ts:12",
+              "O(1)           dependent [asserted]  index.ts:16",
+              "O(xs)          selectsCold [asserted]  index.ts:19",
+              "O(xs)          hot [asserted]  index.ts:20",
+              "O(xs)          statementCost [asserted]  index.ts:26",
+              "O(n^2)         functionCost [asserted]  index.ts:31",
+              "O(xs)          plain  index.ts:32"
+            ],
+            "absent": [
+              "unknown call target"
+            ]
+          }
+        }
+      },
+      "report-min": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report"
+        ],
+        "exit": 0
+      }
+    }
+  },
+  {
+    "name": "the unknown setting rejects any value but ignore, warn or error",
+    "clause": "§4.8",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "declare function opaque(): void;\nexport function f(xs: number[]) { opaque(); let c = 0; for (const a of xs) c += a; return c; }\nexport function g(cb: () => void) { cb(); }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N^2)"
+    },
+    "policies": [
+      "strict",
+      "Warn",
+      "",
+      null,
+      3,
+      true,
+      [
+        "warn"
+      ],
+      {
+        "policy": "warn"
+      }
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": 2,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: unknown must be ignore, warn or error, got "
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 2,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: unknown must be ignore, warn or error, got "
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "an absent unknown setting behaves as warn",
+    "clause": "§4.8",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "declare function opaque(): void;\nexport function f(xs: number[]) { opaque(); let c = 0; for (const a of xs) c += a; return c; }\nexport function g(cb: () => void) { cb(); }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N^2)"
+    },
+    "policies": [
+      "absent",
+      "warn"
+    ],
+    "modes": {
+      "lint": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": 0,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: warning: inconclusive f against O(N^2) via index.ts at index.ts:2: reported as O(xs) [partial]",
+              "olint: warning: unknown call target at index.ts:2"
+            ],
+            "absent": [
+              "olint: error"
+            ]
+          }
+        }
+      },
+      "report": {
+        "args": [
+          "--types",
+          "syntactic",
+          "--report",
+          "--min",
+          "0"
+        ],
+        "exit": 0,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: warning: unknown call target at index.ts:2"
+            ],
+            "absent": [
+              "olint: error"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "auto types exit 2 without a checker, and syntactic typing stays an explicit flag",
+    "clause": "§3.4 G42",
+    "files": {
+      "tsconfig.json": {
+        "files": [
+          "index.ts"
+        ]
+      },
+      "index.ts": "export function f(xs: number[]) { for (const a of xs) void a; }\n"
+    },
+    "config": {
+      "entrypoints": [
+        "index.ts"
+      ],
+      "max": "O(N^2)"
+    },
+    "policies": [
+      "warn"
+    ],
+    "env": {
+      "PATH": ""
+    },
+    "modes": {
+      "default": {
+        "args": [],
+        "exit": 2,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: tsc unavailable: node did not start"
+            ],
+            "absent": [
+              "declarations only"
+            ]
+          }
+        }
+      },
+      "auto": {
+        "args": [
+          "--types",
+          "auto"
+        ],
+        "exit": 2,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: tsc unavailable: node did not start"
+            ]
+          }
+        }
+      },
+      "auto-report": {
+        "args": [
+          "--types",
+          "auto",
+          "--report"
+        ],
+        "exit": 2,
+        "stderr": {
+          "all": {
+            "contains": [
+              "olint: tsc unavailable: node did not start"
+            ]
+          }
+        }
+      },
+      "syntactic": {
+        "args": [
+          "--types",
+          "syntactic"
+        ],
+        "exit": 0,
+        "stdout": {
+          "all": {
+            "contains": [
+              "0 over limit"
+            ]
+          }
+        }
+      }
+    }
+  }
+]

@@ -600,15 +600,37 @@ impl<'p, 'a> Analysis<'p, 'a> {
         for (_, _, part) in &mut reading.completions {
             part.origin = part.origin.or(Some(origin));
 
-            match self.bind_cost_in(&part.cost, inputs) {
-                Ok(cost) => part.cost = cost,
-                Err(error) => part.cost_error = Some(error),
-            }
+            let reason = match self.bind_cost_in(&part.cost, inputs) {
+                Ok(cost) => {
+                    part.cost = cost;
 
-            if part.cost_error.is_some() {
-                let failure = self
-                    .unknowns
-                    .origin(origin, UnknownReason::ResourceExhaustion);
+                    part.cost_error
+                        .is_some()
+                        .then_some(UnknownReason::ResourceExhaustion)
+                }
+                // G35: a channel whose cost the caller's inputs cannot express is an unknown contribution named for
+                // its cause, and its callee-scope cost leaves the floor.
+                Err(error) => {
+                    let reason = match &error {
+                        CostError::Resource | CostError::Overflow => {
+                            UnknownReason::ResourceExhaustion
+                        }
+                        CostError::UnresolvedQuantity(_) | CostError::UnknownName(_) => {
+                            UnknownReason::SizeRelation
+                        }
+                        _ => UnknownReason::UnsupportedModel,
+                    };
+
+                    part.cost = Cost::ONE;
+                    part.trace = None;
+                    part.cost_error = Some(error);
+
+                    Some(reason)
+                }
+            };
+
+            if let Some(reason) = reason {
+                let failure = self.unknowns.origin(origin, reason);
                 part.unknowns = self.unknowns.join(part.unknowns, Some(failure));
             }
         }
@@ -1389,7 +1411,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let record = self.store_summary(key, reading, effects, produced, deferred, storage);
         self.scheduler.tasks[id.0].state = TaskState::Ready(record);
 
-        if self.options.record_nodes && self.scheduler.tasks[id.0].asserted {
+        if self.scheduler.tasks[id.0].asserted {
             self.asserted_summaries.insert(record);
         }
 
@@ -2477,54 +2499,57 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 self.assertions += 1;
 
-                let (cost, unresolved) =
-                    match cost.bind_known(&mut |cost| self.bind_cost_in(cost, substitutions)) {
-                        Ok(bound) => bound,
-                        Err(CostError::Resource | CostError::Overflow) => {
-                            let reading = self.unknown_reading(
-                                file,
-                                self.kind_of_node(file, function.node_id()).span(),
-                                UnknownReason::ResourceExhaustion,
-                            );
+                let span = self.kind_of_node(file, function.node_id()).span();
+                let site = self.function_site_of(file, function);
+                let location = format!("{}:{}", self.project.file(file).relative, site.line);
+                let cost = match self.bind_cost_in(&cost, substitutions) {
+                    Ok(bound) => bound,
+                    // G40: an overflowing binding leaves the node Known with the directive's cost (§3.3), read at the
+                    // function's own inputs.
+                    Err(CostError::Resource | CostError::Overflow) => {
+                        match self.bind_function_cost(file, function, &cost) {
+                            Ok(own) => own,
+                            Err(_) => {
+                                let reading = self.unknown_reading(
+                                    file,
+                                    span,
+                                    UnknownReason::ResourceExhaustion,
+                                );
 
-                            self.current_effects = Effects::unknown();
+                                self.current_effects = Effects::unknown();
 
-                            return reading;
+                                return reading;
+                            }
                         }
-                        Err(error) => {
-                            self.errors.insert(format!(
-                                "invalid {text} at {}:{}: {error:?}",
-                                self.project.file(file).relative,
-                                self.function_site_of(file, function).line
-                            ));
+                    }
+                    // G40: a quantity the specialization cannot resolve is a directive error, a diagnostic and an
+                    // Unknown node.
+                    Err(CostError::UnresolvedQuantity(name)) => {
+                        self.warnings.insert(format!(
+                            "@perf {text} at {location} names {name}, whose size this call leaves unresolved"
+                        ));
 
-                            return self.unknown_reading(
-                                file,
-                                self.kind_of_node(file, function.node_id()).span(),
-                                UnknownReason::UnsupportedModel,
-                            );
-                        }
-                    };
-                let mut reading = tagged_reading_of(
-                    cost.unwrap_or(Cost::ONE),
+                        let reading = self.unknown_reading(file, span, UnknownReason::SizeRelation);
+
+                        self.current_effects = Effects::unknown();
+
+                        return reading;
+                    }
+                    Err(error) => {
+                        self.errors
+                            .insert(format!("invalid {text} at {location}: {error:?}"));
+
+                        return self.unknown_reading(file, span, UnknownReason::UnsupportedModel);
+                    }
+                };
+                let reading = tagged_reading_of(
+                    cost,
                     &text,
-                    self.function_site_of(file, function),
-                    self.source_span(file, self.kind_of_node(file, function.node_id()).span()),
+                    site,
+                    self.source_span(file, span),
                     &mut self.traces,
                     &mut self.unknowns,
                 );
-
-                if unresolved {
-                    let unknown = self.unknown_reading(
-                        file,
-                        self.kind_of_node(file, function.node_id()).span(),
-                        UnknownReason::SizeRelation,
-                    );
-                    let mut main = reading.main();
-                    main.unknowns = self.unknowns.join(main.unknowns, unknown.main().unknowns);
-                    reading = reading.with_main(main);
-                }
-
                 let reading = self.finish_reading(file, function, reading, substitutions);
 
                 self.current_effects = Effects::unknown();
@@ -2758,7 +2783,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.scheduler.constructions.clear();
     }
 
-    fn enclosing_functions_of(&self, file: FileId, node: NodeId) -> Vec<FunctionNode<'a>> {
+    pub(crate) fn enclosing_functions_of(
+        &self,
+        file: FileId,
+        node: NodeId,
+    ) -> Vec<FunctionNode<'a>> {
         let nodes = self.project.file(file).semantic.nodes();
 
         nodes

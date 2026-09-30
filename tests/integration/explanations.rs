@@ -72,15 +72,15 @@ fn oversized_dimension_labels_stop_at_the_output_sink() {
 }
 
 #[test]
-fn unresolved_statement_keeps_trace_resource_origin() {
-    let source="function kernel(n:number){\n/** @perf O(n^2+N^3) */\nvoid 0;} function root(n:number){kernel(n-n);}";
+fn directive_statement_keeps_trace_resource_origin() {
+    // The directive resolves, so its statement explains a cost; an unresolvable one is Unknown with no trace (G40).
+    let source="function kernel(n:number){\n/** @perf O(n^2+N^3) */\nvoid 0;} function root(n:number){kernel(n);}";
 
     support::run_with_source(source, |analysis, file| {
         let root = support::function_of_name(analysis.project, file, "root");
         let part = limited_trace(analysis, file, root);
         let reasons = support::unknown_reasons(analysis, part.unknowns);
 
-        assert!(reasons.contains(&UnknownReason::SizeRelation));
         assert!(reasons.contains(&UnknownReason::ResourceExhaustion));
 
         let mut pending: Vec<_> = part.unknowns.into_iter().collect();

@@ -482,7 +482,7 @@ fn structural_length_properties_do_not_supply_an_argument_size_proof() {
 }
 
 #[test]
-fn high_report_minimum_keeps_size_relation_diagnostics_and_partial_histogram() {
+fn high_report_minimum_keeps_size_relation_diagnostics_and_unknown_histogram() {
     let project = support::project_of(&[("tsconfig.json", "{}"), ("index.ts", "/** @perf O(n^2) */ function kernel(n:number) {}\nexport function work(n:number) { kernel(n-n); }")]);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_olint"))
         .current_dir(project.path())
@@ -491,12 +491,16 @@ fn high_report_minimum_keeps_size_relation_diagnostics_and_partial_histogram() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("[partial]"));
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.starts_with("unknown ")));
     assert!(String::from_utf8_lossy(&output.stderr).contains("input size relation"));
 }
 
+/// G40: a directive naming a quantity the call leaves unresolved is a directive error, a diagnostic under every
+/// policy and an Unknown node, whatever known terms it adds beside that quantity.
 #[test]
-fn unresolved_additive_assumptions_preserve_independent_known_work() {
+fn unresolved_directive_quantities_are_unknown_whatever_their_known_terms() {
     for annotation in ["n^2+N^3", "max(n^2,N^3)", "max(n^2+N^3,N^2)"] {
         for policy in ["ignore", "warn", "error"] {
             let config =
@@ -509,16 +513,21 @@ fn unresolved_additive_assumptions_preserve_independent_known_work() {
             ]);
             let stdout = String::from_utf8_lossy(&output.stdout);
 
-            assert_eq!(output.status.code(), Some(1), "{annotation}: {stdout}");
-            assert!(stdout.contains("1 over limit"), "{annotation}: {stdout}");
-            assert!(
-                stdout.contains("olint proves at least "),
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(policy == "error")),
                 "{annotation}: {stdout}"
             );
-            assert_eq!(
-                String::from_utf8_lossy(&output.stderr).contains("input size relation"),
-                policy != "ignore"
+            assert!(stdout.contains("0 over limit"), "{annotation}: {stdout}");
+            assert!(
+                stderr.contains(&format!(
+                    "olint: warning: @perf O({annotation}) at index.ts:1 names n, whose size this call leaves unresolved"
+                )),
+                "{annotation}: {stderr}"
             );
+            assert_eq!(stderr.contains("input size relation"), policy != "ignore");
         }
     }
 }
@@ -536,13 +545,20 @@ fn unresolved_dependent_branches_do_not_invent_a_known_factor() {
     }
 }
 
+/// G40: a statement directive naming a quantity the call leaves unresolved is Unknown, whatever its known terms.
 #[test]
-fn partial_statement_annotations_keep_known_root_terms() {
+fn unresolved_statement_annotations_are_unknown() {
     let output = lint(&[("tsconfig.json", "{}"), ("olint.config.json", r#"{"entrypoints":["index.ts"],"max":"O(N^2)"}"#), ("index.ts", "function kernel(n:number) {\n/** @perf O(n^2 + N^3) */\nvoid 0;\n}\nexport function work(n:number) { kernel(n-n); }")]);
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 over limit"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("input size relation"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0 over limit"));
+    assert!(stderr.contains("input size relation"), "{stderr}");
+    assert!(
+        stderr.contains("names n, whose size this call leaves unresolved"),
+        "{stderr}"
+    );
 }
 
 #[test]

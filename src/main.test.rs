@@ -241,12 +241,63 @@ fn empty_selected_batches_preserve_explicit_type_availability() {
 
         assert_eq!(calls, usize::from(types != TypeMode::Syntactic));
 
+        // G42: `auto` fails without a checker as `tsc` does; declaration-only typing is the explicit `syntactic`.
         match types {
-            TypeMode::Tsc => assert!(matches!(
+            TypeMode::Tsc | TypeMode::Auto => assert!(matches!(
                 result,
                 Err(Failure::Tsc(TscError::TypescriptUnavailable(_)))
             )),
-            _ => assert!(matches!(result, Ok(0))),
+            TypeMode::Syntactic => assert!(matches!(result, Ok(0))),
+        }
+    }
+}
+
+/// G42: `auto`, the default, exits 2 when node or typescript is unavailable rather than analysing with
+/// declaration-only types, so node states never depend on the environment (§3.4).
+#[test]
+fn auto_types_fail_the_run_when_the_checker_is_unavailable() {
+    let unavailable: [fn() -> TscError; 2] = [
+        || TscError::NodeUnavailable(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        || TscError::TypescriptUnavailable("Cannot find module 'typescript'".into()),
+    ];
+
+    for error_of in unavailable {
+        for report in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+
+            std::fs::write(
+                root.join("index.ts"),
+                "export function selected(value: any) { return value.method(); }",
+            )
+            .unwrap();
+            std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
+            std::fs::write(
+                root.join("olint.config.json"),
+                r#"{"entrypoints":["index.ts"]}"#,
+            )
+            .unwrap();
+
+            let result = run_with_ask(
+                Cli {
+                    min: 0,
+                    report,
+                    types: TypeMode::Auto,
+                    config: None,
+                    tsconfig: root.join("tsconfig.json"),
+                },
+                |_, _, _| Err(error_of()),
+            );
+
+            assert!(
+                matches!(
+                    result,
+                    Err(Failure::Tsc(
+                        TscError::NodeUnavailable(_) | TscError::TypescriptUnavailable(_)
+                    ))
+                ),
+                "{report}"
+            );
         }
     }
 }

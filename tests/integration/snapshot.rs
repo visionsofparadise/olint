@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 
 use olint::analysis::{Analysis, Options};
 use olint::config::{read_config, unknown_policy_of};
-use olint::cost::Cost;
+use olint::cost::{Cost, State};
 use olint::project::Project;
 use olint::public::public_functions;
-use olint::report::{lint_lines, report_lines, report_rows_of, Finding};
+use olint::report::{findings_of, lint_lines, report_lines, report_rows_of, Finding};
 use olint::snapshot::{snapshot_rows, Labels, NodeKey, NodeRow, NodeState};
 use oxc_allocator::Allocator;
 use oxc_span::GetSpan;
@@ -81,25 +81,13 @@ fn rows_after_diagnostics(policy: &str, minimum_exponent: u32, report: bool) -> 
                     &analysis.values,
                     &analysis.traces,
                     project,
+                    &analysis.unknowns,
                     &rows,
                     minimum_exponent,
                 )
             }
             false => {
-                let mut checked = Vec::new();
-
-                for public in public.functions {
-                    let part = analysis
-                        .summarize(public.file, public.function)
-                        .total(&mut analysis.unknowns, &mut analysis.traces);
-
-                    checked.push(Finding {
-                        name: analysis.name_of(public.file, public.function),
-                        site: analysis.function_site_of(public.file, public.function),
-                        public,
-                        part,
-                    });
-                }
+                let checked = findings_of(analysis, public.functions);
 
                 // Every finding renders as over its limit, so the lint path formats each one.
                 let over: Vec<&Finding> = checked.iter().collect();
@@ -342,4 +330,71 @@ fn unresolved_loops_leave_their_repeated_work_out_of_floors_and_contributions() 
         ["VariableDeclaration"],
         "{row:?}"
     );
+}
+
+/// Each public entry's state and cost text as lint reads it (`report` false: only the entries are summarized) or as
+/// the report reads it (every reportable function summarized first, as `olint --report` does).
+fn entry_readings(root: &Path, report: bool) -> Vec<(String, u32, String, State)> {
+    let allocator = Allocator::default();
+    let project = Project::load(&allocator, &root.join("tsconfig.json")).expect("fixture loads");
+    let mut analysis = Analysis::new(&project, SYNTACTIC);
+    let config = read_config(&project, Some(&root.join("olint.config.json"))).expect("config");
+    let public = public_functions(&mut analysis, &config).expect("public functions resolve");
+    let rows = match report {
+        true => {
+            let functions = analysis.reportable();
+
+            report_rows_of(&mut analysis, &functions)
+        }
+        false => Vec::new(),
+    };
+    let mut readings = Vec::new();
+
+    for public in public.functions {
+        let name = analysis.name_of(public.file, public.function);
+        let site = analysis.function_site_of(public.file, public.function);
+        let (cost, state) = match report {
+            true => {
+                let row = rows
+                    .iter()
+                    .find(|row| row.site == site && row.name == name)
+                    .unwrap_or_else(|| panic!("{name} has a report row"));
+
+                (row.cost.clone(), row.state)
+            }
+            false => {
+                let part = analysis
+                    .summarize(public.file, public.function)
+                    .total(&mut analysis.unknowns, &mut analysis.traces);
+
+                (part.cost.clone(), part.state())
+            }
+        };
+
+        readings.push((
+            name,
+            site.line,
+            cost.text_with(&|id| analysis.values.label(id)),
+            state,
+        ));
+    }
+
+    readings.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+
+    readings
+}
+
+/// §3.5 (G32): lint summarizes the public entries alone while the report summarizes every reportable function, and a
+/// function whose cost a directive sets reads that cost in both, so each entry has one state and cost in both modes.
+#[test]
+fn entries_read_the_same_state_and_cost_in_lint_and_report() {
+    for fixture in ["model", "tags"] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
+        let lint = entry_readings(&root, false);
+
+        assert!(!lint.is_empty(), "{fixture}");
+        assert_eq!(lint, entry_readings(&root, true), "{fixture}");
+    }
 }

@@ -125,39 +125,6 @@ impl Cost {
     pub fn compare(&self, limit: &Self) -> CostComparison {
         self.0.compare(&limit.0)
     }
-    pub(crate) fn bind_known(
-        &self,
-        bind: &mut impl FnMut(&Self) -> Result<Self, CostError>,
-    ) -> Result<(Option<Self>, bool), CostError> {
-        match bind(self) {
-            Ok(cost) => return Ok((Some(cost), false)),
-            Err(CostError::UnresolvedQuantity(_)) => {}
-            Err(error) => return Err(error),
-        }
-
-        let (Expression::Sum(children) | Expression::Maximum(children)) = &self.0 else {
-            return Ok((None, true));
-        };
-        let mut known = Vec::new();
-
-        for child in children.iter() {
-            if let (Some(cost), _) = Self(child.clone()).bind_known(bind)? {
-                known.push(cost);
-            }
-        }
-
-        if known.is_empty() {
-            return Ok((None, true));
-        }
-
-        let known = if matches!(self.0, Expression::Sum(_)) {
-            Self::sum(known)?
-        } else {
-            Self::maximum(known)?
-        };
-
-        Ok((Some(known), true))
-    }
     pub fn text(&self) -> String {
         self.0.text()
     }

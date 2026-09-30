@@ -68,7 +68,7 @@ fn policies_preserve_partial_results_and_change_only_diagnostics_and_lint_failur
 }
 
 #[test]
-fn filtered_report_preserves_unknown_diagnostics_and_partial_histogram() {
+fn filtered_report_preserves_unknown_diagnostics_and_unknown_histogram() {
     for policy in ["ignore", "warn", "error"] {
         let output = cli(
             "export function f(callback: () => void) { callback(); }",
@@ -83,7 +83,10 @@ fn filtered_report_preserves_unknown_diagnostics_and_partial_histogram() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("O(1) [partial]"));
+        // §4.7 (G34): an entry with no proven contribution reads as its own Unknown state.
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("unknown ")));
         assert_eq!(
             String::from_utf8_lossy(&output.stderr).contains("unknown call target"),
             policy != "ignore"

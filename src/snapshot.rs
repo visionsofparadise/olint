@@ -273,18 +273,17 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
     let mut reportable = HashSet::with_capacity(functions.len());
 
     for (file, function) in functions {
-        let assertions = analysis.assertions;
         let row = report_rows_of(analysis, &[(file, function)])
             .pop()
             .expect("one report row per function");
-        let asserted = row.mark.is_some() || analysis.assertions != assertions;
-        let reading = match row.mark {
-            Some(_) => analysis.summarize_with(file, function, Substitutions::new(), true),
-            None => analysis.summarize(file, function),
-        };
-        let absent = reading
-            .total(&mut analysis.unknowns, &mut analysis.traces)
-            .is_absent();
+
+        // A function whose cost a directive sets reads that cost (§3.3); its body's nodes record in the raw
+        // summarization only.
+        if row.mark.is_some() {
+            analysis.summarize_with(file, function, Substitutions::new(), true);
+        }
+
+        let absent = row.state == State::Unknown;
         let kind = analysis.kind_of_node(file, function.node_id());
         let key = node_key_of(analysis, analysis.source_span(file, kind.span()), kind.ty());
 
@@ -300,7 +299,7 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
             cost: row.cost,
             unknowns: row.unknowns,
             absent,
-            asserted,
+            asserted: row.asserted,
             function: true,
             once: None,
             children: Vec::new(),

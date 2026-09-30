@@ -478,22 +478,41 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let site = self.site_of_node(file, kind.node_id());
 
-            let (cost, unresolved) = match cost.bind_known(&mut |cost| self.bind_current_cost(cost))
-            {
+            let location = format!("{}:{}", self.project.file(file).relative, site.line);
+            let cost = match self.bind_current_cost(&cost) {
                 Ok(bound) => bound,
+                // G40: an overflowing binding leaves the node Known with the directive's cost (§3.3), read at the
+                // enclosing function's own inputs.
                 Err(crate::cost::CostError::Resource | crate::cost::CostError::Overflow) => {
-                    return self.unknown_reading(
-                        file,
-                        kind.span(),
-                        UnknownReason::ResourceExhaustion,
-                    );
+                    let own = self
+                        .enclosing_functions_of(file, kind.node_id())
+                        .first()
+                        .copied()
+                        .map(|function| self.bind_function_cost(file, function, &cost));
+
+                    match own {
+                        Some(Ok(own)) => own,
+                        _ => {
+                            return self.unknown_reading(
+                                file,
+                                kind.span(),
+                                UnknownReason::ResourceExhaustion,
+                            );
+                        }
+                    }
+                }
+                // G40: a quantity the specialization cannot resolve is a directive error, a diagnostic and an
+                // Unknown node.
+                Err(crate::cost::CostError::UnresolvedQuantity(name)) => {
+                    self.warnings.insert(format!(
+                        "@perf {text} at {location} names {name}, whose size this call leaves unresolved"
+                    ));
+
+                    return self.unknown_reading(file, kind.span(), UnknownReason::SizeRelation);
                 }
                 Err(error) => {
-                    self.errors.insert(format!(
-                        "invalid {text} at {}:{}: {error:?}",
-                        self.project.file(file).relative,
-                        site.line
-                    ));
+                    self.errors
+                        .insert(format!("invalid {text} at {location}: {error:?}"));
 
                     return self.unknown_reading(
                         file,
@@ -503,23 +522,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
             };
 
-            let mut reading = tagged_reading_of(
-                cost.unwrap_or(Cost::ONE),
+            return tagged_reading_of(
+                cost,
                 &text,
                 site,
                 self.source_span(file, kind.span()),
                 &mut self.traces,
                 &mut self.unknowns,
             );
-
-            if unresolved {
-                let unknown = self.unknown_reading(file, kind.span(), UnknownReason::SizeRelation);
-                let mut main = reading.main();
-                main.unknowns = self.unknowns.join(main.unknowns, unknown.main().unknowns);
-                reading = reading.with_main(main);
-            }
-
-            return reading;
         }
 
         match kind {
