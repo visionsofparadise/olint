@@ -190,11 +190,19 @@ def binop (W : World) : BinOp → Value → Value → M Value
       | .ushr => .num (Double.ofNat (x.toUint32 >>> (y.toUint32 % 32)))
       | _ => .undef
 
+/-- ECMAScript `typeof` of an object (ECMA-262 §13.5.3.1, Table 41): `"function"` when the object
+implements `[[Call]]`, which a closure and a class constructor do (§10.2), and `"object"`
+otherwise. -/
+def typeofObj : Obj → String
+  | .closure _ _ | .klass _ _ _ _ => "function"
+  | _ => "object"
+
 /-- Unary operators on the modelled values (ECMA-262 §13.5). -/
 def unop : UnOp → Value → M Value
   | .not, v => pure (.bool !(truthy v))
   | .neg, v => do pure (.num (← toNumeric v).neg)
   | .bitNot, v => do pure (.num (Double.ofInt (-(← toNumeric v).toInt32 - 1)))
+  | .typeof, .ref l => do pure (.str (typeofObj (← load l)))
   | .typeof, v => pure (.str (match v with
       | .undef => "undefined"
       | .null => "object"

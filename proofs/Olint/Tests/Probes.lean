@@ -104,6 +104,19 @@ example : evalIn W0 (.member (.object []) "toString") = .inl .unmodelled := by d
 example : evalIn W0 (.unary .typeof (.member (.object []) "toString")) = .inl .unmodelled := by
   decide
 
+/-- `typeof function () {}` is `"function"`: a closure implements `[[Call]]` (§13.5.3.1). -/
+example : evalIn W0 (.unary .typeof (.func (.mk [] [] false))) = .inr (.str "function") := by
+  decide
+
+/-- `typeof class {}` is `"function"`: a class constructor implements `[[Call]]`. -/
+example : evalIn W0 (.unary .typeof (.klass (.mk none []))) = .inr (.str "function") := by
+  decide
+
+/-- `typeof {}` and `typeof []` stay `"object"`. -/
+example : evalIn W0 (.unary .typeof (.object [])) = .inr (.str "object") ∧
+    evalIn W0 (.unary .typeof (.array [])) = .inr (.str "object") := by
+  decide
+
 /-- `({}).missing` is `undefined`: no object of the chain has it. -/
 example : evalIn W0 (.member (.object []) "missing") = .inr .undef := by decide
 
