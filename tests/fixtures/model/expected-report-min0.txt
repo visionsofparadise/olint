@@ -1,11 +1,11 @@
 public coverage [partial]
-# tsconfig.json  (164 functions in 15 files: 59 known, 80 partial, 25 unknown)
+# tsconfig.json  (164 functions in 15 files: 58 known, 81 partial, 25 unknown)
 
 O(1) [partial]     33
 O(1)               31
 unknown            25
+O(rows) [partial]   18
 O(xs) [partial]    17
-O(rows) [partial]   17
 O(xs)              13
 O(matrix) [partial]    7
 O(o)                4
@@ -18,7 +18,6 @@ O(args)             1
 O(obj) [partial]    1
 O(strings) [partial]    1
 O(items) [partial]    1
-O(rows)             1
 
 O((xs * log(xs))) nlognExpressionStatementTagged [asserted]  src/branches.ts:103
     reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))
@@ -252,7 +251,8 @@ O(rows)        spreadRestKeys  src/methods.ts:90 [partial]
     unknown origin: input size relation at src/methods.ts:91 [2218..2238]; multiplicity unknown
     does spread ...rows                                   src/methods.ts:90  x rows
 
-O(rows)        spreadRestTupleSet  src/methods.ts:86
+O(rows)        spreadRestTupleSet  src/methods.ts:86 [partial]
+    unknown origin: input size relation at src/methods.ts:87 [2119..2135]; multiplicity O(1)
     does spread ...rows                                   src/methods.ts:86  x rows
 
 O(rows)        newSetNonConst  src/methods.ts:59 [partial]

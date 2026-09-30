@@ -1930,7 +1930,7 @@ fn standard_api_callbacks_run_inside_their_native_operation() {
             vec!["call quadratic()", "s.replace() [string search]"],
         ),
         (
-            "export function f(xs: number[]) { return Object.groupBy(xs, () => quadratic(xs)); }",
+            "export function f(xs: number[]) { return Object.groupBy(xs, () => { quadratic(xs); return 0; }); }",
             "O(N^3)",
             vec!["Object.groupBy(xs)", "call quadratic()"],
         ),

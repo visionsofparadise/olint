@@ -2,4 +2,4 @@ public coverage [partial]
 # tsconfig.json  olint.config.json: max O(N^2), 1 entrypoint (src/index.ts), 135 public functions
 
 0 over limit
-90 partial results
+91 partial results

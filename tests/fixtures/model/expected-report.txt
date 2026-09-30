@@ -1,11 +1,11 @@
 public coverage [partial]
-# tsconfig.json  (164 functions in 15 files: 59 known, 80 partial, 25 unknown)
+# tsconfig.json  (164 functions in 15 files: 58 known, 81 partial, 25 unknown)
 
 O(1) [partial]     33
 O(1)               31
 unknown            25
+O(rows) [partial]   18
 O(xs) [partial]    17
-O(rows) [partial]   17
 O(xs)              13
 O(matrix) [partial]    7
 O(o)                4
@@ -18,7 +18,6 @@ O(args)             1
 O(obj) [partial]    1
 O(strings) [partial]    1
 O(items) [partial]    1
-O(rows)             1
 
 O((xs * log(xs))) nlognExpressionStatementTagged [asserted]  src/branches.ts:103
     reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))

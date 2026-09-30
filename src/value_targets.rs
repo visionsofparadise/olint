@@ -3551,6 +3551,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    /// Whether `expression` holds a Number or BigInt, never a String: a numeric literal, an
+    /// update or arithmetic result, or a binding every value of which is one.
+    pub(crate) fn is_numeric_value(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        self.index_targets();
+
+        self.is_numeric_key(file, expression, 0)
+    }
+
     fn is_numeric_key(
         &mut self,
         file: FileId,

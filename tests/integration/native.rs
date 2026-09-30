@@ -191,16 +191,30 @@ export function selected{body}"
 
 #[test]
 fn grouping_callbacks_run_once_per_element() {
+    // A key returned by an unannotated call may be a String of untracked length, so its
+    // comparisons with the earlier groups' keys are an unknown contribution.
     assert_selected(&[
         (
             "",
             "(xs: number[]) { return Object.groupBy(xs, () => quadratic(xs)); }",
             "O(N^3)",
-            true,
+            false,
         ),
         (
             "",
             "(xs: number[]) { return Map.groupBy(xs, () => quadratic(xs)); }",
+            "O(N^3)",
+            false,
+        ),
+        (
+            "",
+            "(xs: number[]) { return Object.groupBy(xs, () => { quadratic(xs); return 0; }); }",
+            "O(N^3)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return Map.groupBy(xs, () => { quadratic(xs); return 0; }); }",
             "O(N^3)",
             true,
         ),
@@ -208,7 +222,7 @@ fn grouping_callbacks_run_once_per_element() {
             "",
             "(xs: number[]) { return Object.groupBy([1, 2], () => quadratic(xs)); }",
             "O(N^2)",
-            true,
+            false,
         ),
     ]);
 }
@@ -1057,6 +1071,83 @@ fn keyed_collection_methods_scan_their_entries() {
             "",
             "(values: Set<string>) { return values.has(\"key\"); }",
             "O(N)",
+            true,
+        ),
+    ]);
+}
+
+// Keyed collections and array searches compare keys by SameValueZero or IsStrictlyEqual, which
+// the proof record charges by String length (`valueEqWork`), so a key that may be a String
+// multiplies each scan by its text length, and an untracked one leaves an unknown contribution.
+#[test]
+fn string_keys_charge_their_length_per_comparison() {
+    assert_selected(&[
+        (
+            "",
+            "(table: Map<string, number>, key: string) { return table.get(key); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(values: Set<string>, key: string) { values.add(key); return values.has(key); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(table: Map<string, number>, key: any) { return table.has(key); }",
+            "O(N)",
+            false,
+        ),
+        (
+            "",
+            "(table: Map<number, number>, key: number) { return table.get(key); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(table: Map<object, number>, key: number[]) { return table.has(key); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(xs: string[], key: string) { return xs.includes(key) || xs.indexOf(key) > xs.lastIndexOf(key); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[], key: number) { return xs.indexOf(key); }",
+            "O(N)",
+            true,
+        ),
+        ("", "(xs: string[]) { return new Set(xs); }", "O(N^2)", false),
+        ("", "(xs: number[]) { return new Set(xs); }", "O(N^2)", true),
+        (
+            "",
+            "(xs: string[]) { return Map.groupBy(xs, (x) => x); }",
+            "O(N^2)",
+            false,
+        ),
+        (
+            "",
+            "(xs: string[]) { return Object.groupBy(xs, () => \"key\"); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(a: Set<string>, b: Set<string>) { return a.union(b); }",
+            "O(N^2)",
+            false,
+        ),
+        (
+            "",
+            "(a: Set<number>, b: Set<number>) { return a.union(b); }",
+            "O(N^2)",
             true,
         ),
     ]);

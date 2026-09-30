@@ -714,6 +714,29 @@ fn scans_entries_per_element(site: &NativeSite<'_>, model: &NativeModel) -> bool
     }
 }
 
+/// Whether `model` looks one key up in its receiver's `[[SetData]]` or `[[MapData]]`: Set
+/// `add`, `delete` and `has` (ECMA-262 §24.2.4.1, §24.2.4.4, §24.2.4.8) and Map `delete`, `get`,
+/// `has` and `set` (§24.1.3.3, §24.1.3.6, §24.1.3.9, §24.1.3.11). The weak collections hold only
+/// objects and symbols, whose comparison is one step.
+fn probes_key(site: &NativeSite<'_>, model: &NativeModel) -> bool {
+    match model.identity {
+        Identity::Receiver(Kind::Set) => matches!(site.name.as_str(), "add" | "delete" | "has"),
+        Identity::Receiver(Kind::Map) => {
+            matches!(site.name.as_str(), "delete" | "get" | "has" | "set")
+        }
+        _ => false,
+    }
+}
+
+/// Whether a value of declared kind `kind` is never a String: a String lacks the members of each
+/// of these built-in kinds, so it conforms to none of them even structurally (§2.5).
+pub(crate) fn excludes_strings(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Array | Kind::Set | Kind::Map | Kind::WeakSet | Kind::WeakMap | Kind::RegExp
+    )
+}
+
 const STRING_SEARCHES: &[&str] = &[
     "includes",
     "indexOf",
@@ -1039,10 +1062,34 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         inner = inner.merge(conversions, &mut self.unknowns, &mut self.traces);
 
-        if scans_entries_per_element(site, model) && !bounded {
-            let scanned = Part::unmarked(charge.length.clone(), None);
+        // Each element scans the entries added before it, one key comparison per entry, so the
+        // scan of a constant-sized source still costs the comparisons of its keys.
+        if scans_entries_per_element(site, model) && !unresolved {
+            let scanned = match self.scanned_key_size_of(site, model) {
+                Some(key) => charge.length.multiply(&key),
+                None => {
+                    let unknown = self.unknown_part(file, site.span, UnknownReason::SizeRelation);
 
-            inner = inner.merge(scanned, &mut self.unknowns, &mut self.traces);
+                    beside = beside.merge(unknown, &mut self.unknowns, &mut self.traces);
+
+                    Ok(charge.length.clone())
+                }
+            };
+
+            match scanned {
+                Ok(scanned) if scanned.is_one() => {}
+                Ok(scanned) => {
+                    let scanned = Part::unmarked(scanned, None);
+
+                    inner = inner.merge(scanned, &mut self.unknowns, &mut self.traces);
+                }
+                Err(_) => {
+                    let unknown =
+                        self.unknown_part(file, site.span, UnknownReason::ResourceExhaustion);
+
+                    beside = beside.merge(unknown, &mut self.unknowns, &mut self.traces);
+                }
+            }
         }
 
         if model.identity == Identity::Receiver(Kind::Array) && site.name == "concat" {
@@ -1110,6 +1157,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let searched = self.charged_by(&charge, searched);
 
             beside = beside.merge(searched, &mut self.unknowns, &mut self.traces);
+        }
+
+        if probes_key(site, model) {
+            let key = match site.arguments.first() {
+                None => Some(Cost::ONE),
+                Some(argument) => argument
+                    .as_expression()
+                    .and_then(|key| self.key_comparison_size_of(file, key)),
+            };
+            let label = self.string_label_of(site, "key comparison");
+            let compared =
+                self.key_comparisons_reading_of((file, site.span), label, &charge.length, key);
+            let compared = self.charged_by(&charge, compared);
+
+            beside = beside.merge(compared, &mut self.unknowns, &mut self.traces);
         }
 
         if model.identity == Identity::Namespace("JSON") && site.name == "stringify" {
@@ -1400,6 +1462,164 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         reading
+    }
+
+    /// The work of one `SameValueZero` or `IsStrictlyEqual` comparison with `key`, the proof
+    /// record's `valueEqWork`: two Strings compare in the shorter length plus one (G52 String
+    /// equality), so a key that may be a String costs at most its text length, and any other key
+    /// one step. `None` when the key may be a String of untracked length.
+    pub(crate) fn key_comparison_size_of(
+        &mut self,
+        file: FileId,
+        key: &'a Expression<'a>,
+    ) -> Option<Cost> {
+        let object = matches!(
+            unwrap(key),
+            Expression::NewExpression(_)
+                | Expression::ObjectExpression(_)
+                | Expression::ArrayExpression(_)
+                | Expression::ArrowFunctionExpression(_)
+                | Expression::FunctionExpression(_)
+                | Expression::ClassExpression(_)
+                | Expression::RegExpLiteral(_)
+        ) || excludes_strings(self.declared_kind_of(file, key))
+            || !matches!(self.proven_kind(file, key), Kind::String | Kind::Unknown)
+            || self.is_numeric_value(file, key);
+
+        match object {
+            true => Some(Cost::ONE),
+            false => self.text_size_of(file, key),
+        }
+    }
+
+    /// The key comparison of each element of `source` taken as a key: one when every element
+    /// has constant text or is never a String, else the largest of the known elements' key
+    /// comparisons. An element's tracked size counts a String as one entry rather than its
+    /// length, so it bounds no comparison.
+    pub(crate) fn element_comparison_size_of(
+        &mut self,
+        file: FileId,
+        source: &'a Expression<'a>,
+    ) -> Option<Cost> {
+        if self.has_bounded_text_elements(file, source)
+            || excludes_strings(self.declared_element_kind_of(file, source))
+        {
+            return Some(Cost::ONE);
+        }
+
+        let (elements, open) = self.iterable_elements_of(file, source, 0);
+
+        if open || elements.is_empty() {
+            return None;
+        }
+
+        let mut sizes = Vec::new();
+
+        for (owner, element) in elements {
+            sizes.push(self.key_comparison_size_of(owner, element)?);
+        }
+
+        Cost::maximum(sizes).ok()
+    }
+
+    /// `entries` key comparisons with a key whose comparison costs `key`, traced under `label`;
+    /// an untracked key is an unknown `SizeRelation` contribution.
+    pub(crate) fn key_comparisons_reading_of(
+        &mut self,
+        (file, span): (FileId, Span),
+        label: String,
+        entries: &Cost,
+        key: Option<Cost>,
+    ) -> Reading {
+        match key {
+            Some(key) if key.is_one() => Reading::empty(),
+            Some(key) => self.charged_reading_of((file, span), label, &[entries, &key]),
+            None => Reading::of_part(self.unknown_part(file, span, UnknownReason::SizeRelation)),
+        }
+    }
+
+    /// The key comparison of the keys a collection constructor or `groupBy` adds: a Set's
+    /// elements, a Map's entry keys (ECMA-262 §24.1.1.2 reads each entry's `0`), and the
+    /// callback's results for `groupBy` (§7.3.35 GroupBy), which `Object.groupBy` converts to
+    /// property keys. The weak collections hold only objects and symbols.
+    fn scanned_key_size_of(&mut self, site: &NativeSite<'a>, model: &NativeModel) -> Option<Cost> {
+        let file = site.file;
+        // ECMA-262 §24.1.1.1 step 3 and §24.2.2.1 step 3 add nothing from undefined or null.
+        let empty = match site.arguments.first().map(Argument::as_expression) {
+            None => true,
+            Some(Some(source)) => match unwrap(source) {
+                Expression::NullLiteral(_) => true,
+                Expression::Identifier(reference) => {
+                    reference.name == "undefined" && self.is_intrinsic_reference(file, reference)
+                }
+                _ => false,
+            },
+            Some(None) => false,
+        };
+
+        match (model.identity, site.name.as_str()) {
+            (Identity::Constructor, _) if empty => Some(Cost::ONE),
+            (Identity::Constructor, "WeakSet" | "WeakMap") => Some(Cost::ONE),
+            (Identity::Constructor, "Set") => {
+                let source = site.expression_at(0)?;
+
+                self.element_comparison_size_of(file, source)
+            }
+            (Identity::Constructor, _) => {
+                let (entries, open) = self.constructor_elements_of(site);
+
+                if open || entries.is_empty() {
+                    return None;
+                }
+
+                let mut sizes = Vec::new();
+
+                for (source, entry) in entries {
+                    let (keys, unresolved) = self.entry_values_of(source, entry, 0);
+
+                    if unresolved || keys.is_empty() {
+                        return None;
+                    }
+
+                    for (owner, key) in keys {
+                        sizes.push(self.key_comparison_size_of(owner, key)?);
+                    }
+                }
+
+                Cost::maximum(sizes).ok()
+            }
+            (namespace, _) => {
+                let callback = site.expression_at(1)?;
+                let targets = self
+                    .resolved_expression_callee_of(file, callback, callback.node_id())
+                    .targets;
+
+                if targets.open {
+                    return None;
+                }
+
+                let mut sizes = vec![Cost::ONE];
+
+                for target in targets.known {
+                    for key in self.returned_expressions_of(target) {
+                        let size = match namespace {
+                            // A Number key converts to at most 25 characters.
+                            Identity::Namespace("Object") => {
+                                match self.is_numeric_value(target.file, key) {
+                                    true => Some(Cost::ONE),
+                                    false => self.text_size_of(target.file, key),
+                                }
+                            }
+                            _ => self.key_comparison_size_of(target.file, key),
+                        };
+
+                        sizes.push(size?);
+                    }
+                }
+
+                Cost::maximum(sizes).ok()
+            }
+        }
     }
 
     fn replaces_once(&mut self, site: &NativeSite<'a>, pattern: &'a Expression<'a>) -> bool {

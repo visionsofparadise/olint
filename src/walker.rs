@@ -2919,12 +2919,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Reading::of_part(callback.executed()),
                 )
             };
-            let written = match (joined, factor, self.joined_text_of(file, receiver, first)) {
+            let written = match (
+                joined,
+                factor.as_ref(),
+                self.joined_text_of(file, receiver, first),
+            ) {
                 (false, _, _) => Reading::empty(),
                 (true, Some(length), Some(text)) => self.charged_reading_of(
                     (file, call.span),
                     label(" [joined text]"),
-                    &[&length, &text],
+                    &[length, &text],
                 ),
                 (true, _, _) => Reading::of_part(self.unknown_part(
                     file,
@@ -2941,7 +2945,31 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 true => self.species_reading_of((file, call.span), receiver, &method),
                 false => Reading::empty(),
             };
+            // ECMA-262 §23.1.3.16, §23.1.3.17 and §23.1.3.20 compare the search element with each
+            // element by SameValueZero or IsStrictlyEqual, which compares two Strings by length.
+            let compared = match (
+                matches!(method.as_str(), "includes" | "indexOf" | "lastIndexOf"),
+                &factor,
+            ) {
+                (true, Some(entries)) => {
+                    let key = match first {
+                        None => Some(Cost::ONE),
+                        Some(argument) => argument
+                            .as_expression()
+                            .and_then(|key| self.key_comparison_size_of(file, key)),
+                    };
+
+                    self.key_comparisons_reading_of(
+                        (file, call.span),
+                        label(" [key comparison]"),
+                        entries,
+                        key,
+                    )
+                }
+                _ => Reading::empty(),
+            };
             let part = part
+                .merge(compared, &mut self.unknowns, &mut self.traces)
                 .merge(written, &mut self.unknowns, &mut self.traces)
                 .merge(coerced, &mut self.unknowns, &mut self.traces)
                 .merge(species, &mut self.unknowns, &mut self.traces);
@@ -3130,8 +3158,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     _ => Ok(receiver_size),
                 };
 
+                // Every comparison SetDataHas makes pairs an element of `other` with another key,
+                // so the text size of `other`'s elements bounds each String comparison.
+                let key = self.element_comparison_size_of(file, other);
+
                 match scanned.and_then(|scanned| scanned.multiply(&other_size)) {
-                    Ok(factor) => self.charged_reading_of((file, call.span), label, &[&factor]),
+                    Ok(factor) => match key {
+                        Some(key) => {
+                            self.charged_reading_of((file, call.span), label, &[&factor, &key])
+                        }
+                        None => self
+                            .charged_reading_of((file, call.span), label, &[&factor])
+                            .merge(
+                                Reading::of_part(self.unknown_part(
+                                    file,
+                                    call.span,
+                                    UnknownReason::SizeRelation,
+                                )),
+                                &mut self.unknowns,
+                                &mut self.traces,
+                            ),
+                    },
                     Err(_) => Reading::of_part(self.unknown_part(
                         file,
                         call.span,
