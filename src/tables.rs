@@ -63,6 +63,23 @@ pub static SET_LINEAR: &[&str] = &[
     "isDisjointFrom",
 ];
 
+// ECMA-262 §24.2.4.2-5, §24.2.4.9-11, §24.2.4.14: each reads its argument through GetSetRecord
+// (§24.2.1.2) and scans [[SetData]] once per element of one operand.
+pub static SET_OPERATIONS: &[&str] = &[
+    "union",
+    "intersection",
+    "difference",
+    "symmetricDifference",
+    "isSubsetOf",
+    "isSupersetOf",
+    "isDisjointFrom",
+];
+
+// ECMA-262 §23.1.3.10, §23.1.3.21, §23.1.3.28, §23.1.3.31: these construct their result through
+// ArraySpeciesCreate (§10.4.2.3), and the typed-array forms through TypedArraySpeciesCreate
+// (§23.2.4.1).
+pub static SPECIES_METHODS: &[&str] = &["map", "filter", "slice", "splice"];
+
 pub static MAP_LINEAR: &[&str] = &["forEach"];
 
 pub static STRING_LINEAR: &[&str] = &[
@@ -212,6 +229,22 @@ pub static REFLECTIVE_WRITES: &[&str] = &[
     "set",
     "setPrototypeOf",
 ];
+
+/// The argument indices an array method converts with ToIntegerOrInfinity or ToString, each of
+/// which may call the analysed program's `valueOf`, `toString` or @@toPrimitive: ECMA-262
+/// §23.1.3.16, §23.1.3.17, §23.1.3.20 (fromIndex), §23.1.3.28 and §23.1.3.31 (start, end and
+/// deleteCount), §23.1.3.7 (start, end), §23.1.3.4 (target, start, end), §23.1.3.39 (index),
+/// §23.1.3.35 (start, skipCount), §23.1.3.18 (separator) and §23.2.3.26 (offset).
+pub fn coerced_arguments_of(method: &str) -> &'static [usize] {
+    match method {
+        "includes" | "indexOf" | "lastIndexOf" | "set" => &[1],
+        "slice" | "splice" | "toSpliced" => &[0, 1],
+        "fill" => &[1, 2],
+        "copyWithin" => &[0, 1, 2],
+        "with" | "join" => &[0],
+        _ => &[],
+    }
+}
 
 pub fn method_matters(method: &str) -> bool {
     [

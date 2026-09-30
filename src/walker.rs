@@ -30,8 +30,9 @@ use crate::syntax::{
     member_expression_of, unwrap, Root,
 };
 use crate::tables::{
-    ARRAY_IMPLEMENTATION_DEFINED, ARRAY_LINEAR, CALLBACK_METHODS, LINEAR_CONSTRUCTORS, MAP_LINEAR,
-    REGEXP_LINEAR, SET_LINEAR,
+    coerced_arguments_of, ARRAY_IMPLEMENTATION_DEFINED, ARRAY_LINEAR, CALLBACK_METHODS,
+    LINEAR_CONSTRUCTORS, MAP_LINEAR, REGEXP_LINEAR, SET_LINEAR, SET_OPERATIONS, SPECIES_METHODS,
+    TYPED_ARRAYS,
 };
 use crate::types::ResolvedCallee;
 use crate::unknowns::{SourceSpan, UnknownId, UnknownReason};
@@ -2117,24 +2118,50 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if let Some(model) = self.construction_model_of(file, new) {
             let native = self.construction_site_of(file, new);
-
-            if self.intrinsic_replaced_of(file, &new.callee) {
-                let unknown =
-                    self.unknown_invocation(file, new.span, &new.arguments, UnknownReason::Target);
-
-                reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
-            }
+            let reading = self.replaced_constructor_reading_of(file, new, reading);
 
             return self.native_reading_of(&native, model, reading, true);
         }
 
         self.record_unknown_reach(file, Some(&new.callee), &new.arguments, new.span);
 
+        // Only the real global constructors run the built-in steps; any other binding of the
+        // name is an unresolved target.
         let constructor = match &new.callee {
-            Expression::Identifier(reference) => reference.name.as_str(),
+            Expression::Identifier(reference) if self.is_intrinsic_reference(file, reference) => {
+                reference.name.as_str()
+            }
             _ => "",
         };
         let first = new.arguments.first();
+
+        if is_listed(LINEAR_CONSTRUCTORS, constructor) {
+            reading = self.replaced_constructor_reading_of(file, new, reading);
+        }
+
+        // ECMA-262 §25.1.4.1 and §25.2.3.1 allocate a zeroed data block of the requested byte
+        // length (CreateByteDataBlock, §6.2.9.1), and a TypedArray given a length (§23.2.5.1 step
+        // 6) allocates its buffer the same way (AllocateTypedArrayBuffer, §23.2.5.1.6): work in a
+        // numeric value, which is no input dimension.
+        if let Some(first) = first.filter(|_| allocates_by_value(constructor)) {
+            let by_value = match constructor {
+                "ArrayBuffer" | "SharedArrayBuffer" => true,
+                _ => first
+                    .as_expression()
+                    .is_some_and(|argument| self.is_primitive_operand(file, argument)),
+            };
+
+            let constant = self.is_numeric_constant_argument(file, first)
+                || first
+                    .as_expression()
+                    .is_some_and(|argument| self.known_value(file, argument).value.is_ok());
+
+            if by_value && !constant {
+                let unknown = self.unknown_part(file, new.span, UnknownReason::SizeRelation);
+
+                return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+            }
+        }
 
         if is_listed(LINEAR_CONSTRUCTORS, constructor) {
             if let Some(first) = first {
@@ -2168,6 +2195,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if is_listed(LINEAR_CONSTRUCTORS, constructor) {
+            return reading;
+        }
+
+        let unknown =
+            self.unknown_invocation(file, new.span, &new.arguments, UnknownReason::Target);
+
+        reading.merge(unknown, &mut self.unknowns, &mut self.traces)
+    }
+
+    /// A built-in constructor the analysed program replaced runs its code, an unresolved target.
+    fn replaced_constructor_reading_of(
+        &mut self,
+        file: FileId,
+        new: &'a NewExpression<'a>,
+        reading: Reading,
+    ) -> Reading {
+        if !self.intrinsic_replaced_of(file, &new.callee) {
             return reading;
         }
 
@@ -2801,6 +2845,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 true => self.callback_part_of(file, first),
                 false => Reading::empty(),
             };
+            let joined = method == "join";
+            let callback = match joined {
+                true => {
+                    let converted = self.element_coercion_reading_of(file, receiver, call.span);
+
+                    callback.merge(converted, &mut self.unknowns, &mut self.traces)
+                }
+                false => callback,
+            };
+            let length = match bounded {
+                true => Cost::ONE,
+                false => factor.clone(),
+            };
             let part = if bounded {
                 callback
             } else {
@@ -2813,8 +2870,39 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 )
             };
             let part = part.merge(unresolved, &mut self.unknowns, &mut self.traces);
+            let written = match joined {
+                true => {
+                    let text = self.joined_text_of(file, receiver, first);
 
-            return reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces);
+                    self.charged_reading_of(
+                        (file, call.span),
+                        label(" [joined text]"),
+                        &[&length, &text],
+                    )
+                }
+                false => Reading::empty(),
+            };
+            let coerced = self.coerced_arguments_part_of(
+                file,
+                &call.arguments,
+                coerced_arguments_of(&method),
+            );
+            let species = match is_listed(SPECIES_METHODS, &method) {
+                true => self.species_reading_of((file, call.span), receiver, &method),
+                false => Reading::empty(),
+            };
+            let part = part
+                .merge(written, &mut self.unknowns, &mut self.traces)
+                .merge(coerced, &mut self.unknowns, &mut self.traces)
+                .merge(species, &mut self.unknowns, &mut self.traces);
+
+            return reading.merge(part, &mut self.unknowns, &mut self.traces);
+        }
+
+        if kind == Kind::Set && is_listed(SET_OPERATIONS, &method) {
+            let operated = self.set_operation_reading_of(file, call, receiver, &method, label(""));
+
+            return reading.merge(operated, &mut self.unknowns, &mut self.traces);
         }
 
         if (kind == Kind::Set && is_listed(SET_LINEAR, &method))
@@ -2846,9 +2934,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
             let pattern = Pattern {
                 keys: &[],
-                matching: Matching::Once,
+                matching: Matching::Resumed,
                 compiles: false,
             };
+            // ECMA-262 §22.2.6.16 step 3 and §22.2.6.2 step 3 apply ToString to the argument, and
+            // RegExp test reaches RegExpExec's Get of `exec` (§22.2.7.1).
+            let coerced = self.coerced_arguments_part_of(file, &call.arguments, &[0]);
+            let protocol = self.regexp_protocol_part_of(file, receiver.span(), &[]);
+            let reading = reading
+                .merge(coerced, &mut self.unknowns, &mut self.traces)
+                .merge(protocol, &mut self.unknowns, &mut self.traces);
             let matched = self.matching_part_of((file, call.span), receiver, pattern, &subject);
             let reading = match subject.is_one() {
                 true => reading,
@@ -2880,6 +2975,114 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         reading.merge(unknown, &mut self.unknowns, &mut self.traces)
     }
+}
+
+impl<'p, 'a> Analysis<'p, 'a> {
+    fn coerced_arguments_part_of(
+        &mut self,
+        file: FileId,
+        arguments: &'a [Argument<'a>],
+        indices: &[usize],
+    ) -> Reading {
+        let mut reading = Reading::empty();
+        let spread = arguments
+            .iter()
+            .position(|argument| matches!(argument, Argument::SpreadElement(_)));
+
+        for index in indices {
+            if let Some(spread) = spread.filter(|spread| spread <= index) {
+                let unknown =
+                    self.unknown_part(file, arguments[spread].span(), UnknownReason::Target);
+
+                return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+            }
+
+            let Some(expression) = arguments.get(*index).and_then(Argument::as_expression) else {
+                continue;
+            };
+            let converted = self.operand_coercion_part_of(file, expression);
+
+            reading = reading.merge(converted, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    /// Array.prototype.join (ECMA-262 §23.1.3.18) builds a string of every element's ToString
+    /// joined by the separator: its length is the element count times the longer of an element
+    /// string and the separator.
+    fn joined_text_of(
+        &mut self,
+        file: FileId,
+        receiver: &'a Expression<'a>,
+        separator: Option<&'a Argument<'a>>,
+    ) -> Cost {
+        let elements = self.has_bounded_text_elements(file, receiver);
+        let separated = match separator.map(Argument::as_expression) {
+            None => true,
+            Some(Some(separator)) => self.is_constant_text(file, separator),
+            Some(None) => false,
+        };
+
+        match elements && separated {
+            true => Cost::ONE,
+            false => Cost::N,
+        }
+    }
+
+    /// The Set methods of ECMA-262 §24.2.4 read `size`, `has` and `keys` from their argument
+    /// through GetSetRecord (§24.2.1.2) and then call `has` or the `keys` iterator once per
+    /// element, and each element they keep or test scans [[SetData]] (SetDataHas, §24.2.1.5).
+    /// union and symmetricDifference scan the growing result once per element of the argument;
+    /// the others scan one operand once per element of the other.
+    fn set_operation_reading_of(
+        &mut self,
+        file: FileId,
+        call: &'a CallExpression<'a>,
+        receiver: &'a Expression<'a>,
+        method: &str,
+        label: String,
+    ) -> Reading {
+        let Some(first) = call.arguments.first() else {
+            return Reading::empty();
+        };
+        let Some(other) = first.as_expression() else {
+            return Reading::of_part(self.unknown_part(file, first.span(), UnknownReason::Target));
+        };
+        let receiver_sized =
+            !(self.is_constant_sized(file, receiver) || self.is_share_sized(file, receiver));
+        let other_sized = !self.is_constant_sized(file, other);
+        let factor = match (receiver_sized, other_sized) {
+            (_, true) if receiver_sized || matches!(method, "union" | "symmetricDifference") => {
+                Cost::N.multiply(&Cost::N)
+            }
+            (false, false) => Ok(Cost::ONE),
+            _ => Ok(Cost::N),
+        };
+        let mut reading = match factor {
+            Ok(factor) => self.charged_reading_of((file, call.span), label, &[&factor]),
+            Err(_) => Reading::of_part(self.unknown_part(
+                file,
+                call.span,
+                UnknownReason::ResourceExhaustion,
+            )),
+        };
+        let builtin = self.receiver_kind_of(file, other, method) == Kind::Set
+            && !self.builtin_members_replaced(Kind::Set, &["size", "has", "keys"]);
+
+        if !builtin {
+            let unknown = self.unknown_part(file, other.span(), UnknownReason::Target);
+
+            reading = reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+}
+
+fn allocates_by_value(constructor: &str) -> bool {
+    matches!(constructor, "ArrayBuffer" | "SharedArrayBuffer")
+        || is_listed(TYPED_ARRAYS, constructor)
 }
 
 fn is_modelled(native: Native, method: &str) -> bool {

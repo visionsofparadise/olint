@@ -461,7 +461,7 @@ fn dynamic_patterns_stay_unknown_even_for_constant_subjects() {
         ("(s: string) { return s.includes(\"x\"); }", "O(N)", true),
         (
             "(s: string, pattern: any) { return s.includes(pattern); }",
-            "O(N)",
+            "O(N^2)",
             true,
         ),
     ]);
@@ -1154,4 +1154,75 @@ fn selected_regex_gathering_keeps_ignored_dependency_calls() {
         }).unwrap();
         assert_eq!(asked, requests_of(&[("^a+$", "")]));
     });
+}
+
+#[test]
+fn replaced_regexp_protocol_members_are_unknown_targets() {
+    // G19: String replace reaches RegExp.prototype[@@replace] (ECMA-262 §22.2.6.11) and RegExp
+    // test reaches RegExpExec (§22.2.7.1), which Get `exec` and the flags, and the analysed
+    // program may replace them (spec §2.2).
+    assert_classified(&[
+        (
+            r#"(s: string) { return s.replace(/a+/g, "b"); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            r#"(s: string) { RegExp.prototype.exec = function () { return null; }; return s.replace(/a+/g, "b"); }"#,
+            "O(N^2)",
+            false,
+        ),
+        (
+            r#"(s: string) { RegExp.prototype.exec = function () { return null; }; const re = /a+/g; return s.replace(re, "b"); }"#,
+            "O(N^2)",
+            false,
+        ),
+        ("(s: string) { return /^a*$/.test(s); }", "O(N)", true),
+        (
+            r#"(s: string) { Object.defineProperty(RegExp.prototype, "flags", { get() { return "g"; } }); return /^a*$/.test(s); }"#,
+            "O(N)",
+            false,
+        ),
+    ]);
+}
+
+#[test]
+fn single_matches_from_last_index_need_a_context_free_pattern() {
+    // G20: RegExpBuiltinExec (ECMA-262 §22.2.7.2) starts a `g` or `y` regex at `lastIndex`, where
+    // `\b`, lookbehind and multiline `^` read the prefix. A literal at the call is a fresh object
+    // whose `lastIndex` is 0 (§13.2.7.3), while a bound regex keeps it between calls.
+    assert_classified(&[
+        (r#"(s: string) { return /\bx*y/g.exec(s); }"#, "O(N)", true),
+        (
+            r#"(s: string) { const re = /\bx*y/g; return re.exec(s); }"#,
+            "O(N)",
+            false,
+        ),
+        (
+            r#"(s: string) { const re = /x*y/g; return re.exec(s); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            r#"(s: string) { const re = /^x*y/my; return re.test(s); }"#,
+            "O(N)",
+            false,
+        ),
+        (
+            r#"(s: string) { const re = /^a*a*$/y; return re.test(s); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            r#"(s: string) { const re = /^a*a*$/; return re.test(s); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            r#"(s: string) { const re = /\bx*y/y; return s.match(re); }"#,
+            "O(N)",
+            false,
+        ),
+        (r#"(s: string) { return s.match(/\bx*y/y); }"#, "O(N)", true),
+    ]);
 }

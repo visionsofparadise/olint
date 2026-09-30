@@ -1,9 +1,9 @@
 use oxc_ast::ast::{
-    Class, ClassElement, Expression, ForStatementLeft, FormalParameter, FormalParameterRest,
-    MemberExpression, MethodDefinition, MethodDefinitionKind, ObjectExpression, ObjectProperty,
-    ObjectPropertyKind, PropertyKey, PropertyKind, TSInterfaceDeclaration, TSLiteral,
-    TSMethodSignatureKind, TSSignature, TSType, TSTypeAnnotation, TSTypeLiteral, TSTypeName,
-    TSTypeReference, VariableDeclarator,
+    ArrayExpression, ArrayExpressionElement, Class, ClassElement, Expression, ForStatementLeft,
+    FormalParameter, FormalParameterRest, MemberExpression, MethodDefinition, MethodDefinitionKind,
+    ObjectExpression, ObjectProperty, ObjectPropertyKind, PropertyKey, PropertyKind,
+    TSInterfaceDeclaration, TSLiteral, TSMethodSignatureKind, TSSignature, TSType,
+    TSTypeAnnotation, TSTypeLiteral, TSTypeName, TSTypeReference, VariableDeclarator,
 };
 use oxc_ast::AstKind;
 use oxc_span::GetSpan;
@@ -910,6 +910,108 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    /// Whether every element of `expression` converts by ToString to a string of constant length:
+    /// numbers, booleans, null, undefined and literal types, but not strings, template types or
+    /// bigints, whose text grows with the value.
+    pub(crate) fn has_bounded_text_elements(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+    ) -> bool {
+        if let Expression::ArrayExpression(array) = unwrap(expression) {
+            return every_element(array, |element| self.is_bounded_text(file, element, 0));
+        }
+
+        match self.element_type_of(file, expression, 0) {
+            Some((source, element)) => self.is_bounded_text_type(source, element, 1),
+            None => false,
+        }
+    }
+
+    pub(crate) fn is_bounded_text(
+        &mut self,
+        file: FileId,
+        expression: &'a Expression<'a>,
+        depth: u32,
+    ) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        match unwrap(expression) {
+            Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::StringLiteral(_) => true,
+            Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+            Expression::Identifier(reference) => {
+                let Some(declaration) =
+                    self.declarations
+                        .of_reference(self.project, file, reference)
+                else {
+                    return false;
+                };
+
+                if let Some((target, Some(annotation), _)) = binding_parts_of(&declaration) {
+                    return self.is_bounded_text_type(target, annotation, depth + 1);
+                }
+
+                match self.stable_initializer_of(declaration) {
+                    Some((target, initializer)) => {
+                        self.is_bounded_text(target, initializer, depth + 1)
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn is_bounded_text_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
+        self.every_type_part(file, ty, depth, is_bounded_text_keyword)
+    }
+
+    /// Whether every part of `ty`, through parentheses, unions and non-generic aliases, is an
+    /// enum or a type `leaf` accepts.
+    fn every_type_part(
+        &mut self,
+        file: FileId,
+        ty: &'a TSType<'a>,
+        depth: u32,
+        leaf: fn(&TSType<'_>) -> bool,
+    ) -> bool {
+        if depth > MAXIMUM_DEPTH {
+            return false;
+        }
+
+        if leaf(ty) {
+            return true;
+        }
+
+        match ty {
+            TSType::TSParenthesizedType(parenthesized) => {
+                self.every_type_part(file, &parenthesized.type_annotation, depth + 1, leaf)
+            }
+            TSType::TSUnionType(union) => union
+                .types
+                .iter()
+                .all(|part| self.every_type_part(file, part, depth + 1, leaf)),
+            TSType::TSTypeReference(reference) if reference.type_arguments.is_none() => {
+                match self.declaration_of_type_name(file, &reference.type_name) {
+                    Some(Declaration::TypeAlias {
+                        file: target,
+                        declaration,
+                    }) if declaration.type_parameters.is_none() => {
+                        self.every_type_part(target, &declaration.type_annotation, depth + 1, leaf)
+                    }
+                    Some(Declaration::Enum { .. }) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn excludes_bigint(
         &mut self,
         file: FileId,
@@ -958,15 +1060,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         match ty {
-            TSType::TSStringKeyword(_)
-            | TSType::TSNumberKeyword(_)
-            | TSType::TSBooleanKeyword(_)
-            | TSType::TSSymbolKeyword(_)
-            | TSType::TSNullKeyword(_)
-            | TSType::TSUndefinedKeyword(_)
-            | TSType::TSVoidKeyword(_)
-            | TSType::TSNeverKeyword(_)
-            | TSType::TSTemplateLiteralType(_) => true,
+            // A literal type may be a bigint literal.
+            TSType::TSLiteralType(_) => false,
+            ty if is_primitive_keyword(ty) && !matches!(ty, TSType::TSBigIntKeyword(_)) => true,
             TSType::TSParenthesizedType(inner) => {
                 self.type_excludes_bigint(file, &inner.type_annotation, depth + 1)
             }
@@ -1434,43 +1530,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     fn is_primitive_type(&mut self, file: FileId, ty: &'a TSType<'a>, depth: u32) -> bool {
-        if depth > MAXIMUM_DEPTH {
-            return false;
-        }
-
-        match ty {
-            TSType::TSStringKeyword(_)
-            | TSType::TSNumberKeyword(_)
-            | TSType::TSBooleanKeyword(_)
-            | TSType::TSBigIntKeyword(_)
-            | TSType::TSSymbolKeyword(_)
-            | TSType::TSNullKeyword(_)
-            | TSType::TSUndefinedKeyword(_)
-            | TSType::TSVoidKeyword(_)
-            | TSType::TSNeverKeyword(_)
-            | TSType::TSLiteralType(_)
-            | TSType::TSTemplateLiteralType(_) => true,
-            TSType::TSParenthesizedType(parenthesized) => {
-                self.is_primitive_type(file, &parenthesized.type_annotation, depth + 1)
-            }
-            TSType::TSUnionType(union) => union
-                .types
-                .iter()
-                .all(|part| self.is_primitive_type(file, part, depth + 1)),
-            TSType::TSTypeReference(reference) if reference.type_arguments.is_none() => {
-                match self.declaration_of_type_name(file, &reference.type_name) {
-                    Some(Declaration::TypeAlias {
-                        file: target,
-                        declaration,
-                    }) if declaration.type_parameters.is_none() => {
-                        self.is_primitive_type(target, &declaration.type_annotation, depth + 1)
-                    }
-                    Some(Declaration::Enum { .. }) => true,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+        self.every_type_part(file, ty, depth, is_primitive_keyword)
     }
 
     fn return_type_of_member(&mut self, member: Option<Member<'a>>, depth: u32) -> DeclaredType {
@@ -1896,6 +1956,43 @@ fn member_signature_of<'a>(
         };
 
         named.then_some(Member::Signature(file, signature))
+    })
+}
+
+/// ToString of these types has a constant length.
+fn is_bounded_text_keyword(ty: &TSType<'_>) -> bool {
+    matches!(
+        ty,
+        TSType::TSNumberKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+            | TSType::TSNullKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSVoidKeyword(_)
+            | TSType::TSNeverKeyword(_)
+            | TSType::TSLiteralType(_)
+    )
+}
+
+fn is_primitive_keyword(ty: &TSType<'_>) -> bool {
+    is_bounded_text_keyword(ty)
+        || matches!(
+            ty,
+            TSType::TSStringKeyword(_)
+                | TSType::TSBigIntKeyword(_)
+                | TSType::TSTemplateLiteralType(_)
+        )
+}
+
+/// Whether `test` holds for every element of `array`, where a spread fails and a hole passes.
+pub(crate) fn every_element<'a>(
+    array: &'a ArrayExpression<'a>,
+    mut test: impl FnMut(&'a Expression<'a>) -> bool,
+) -> bool {
+    array.elements.iter().all(|element| match element {
+        ArrayExpressionElement::SpreadElement(_) => false,
+        ArrayExpressionElement::Elision(_) => true,
+        element => element.as_expression().is_some_and(&mut test),
     })
 }
 

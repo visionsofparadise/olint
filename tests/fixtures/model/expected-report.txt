@@ -28,7 +28,7 @@ O(obj) [partial]    1
 O(N^2)              1
 O(rows^2)           1
 O(max(xs, needle))    1
-O(max(1, (strings * max(strings, needle))))    1
+O(max(1, (strings * (max(strings, needle))^(2))))    1
 O(max(re, needles)) [partial]    1
 O(items^2) [partial]    1
 O(max(1, (rows * rows^2)))    1
@@ -76,6 +76,10 @@ O(max(1, (matrix * matrix^2))) tripleNestedOverLimit  src/types.ts:70
 O(max(1, (rows * rows^2))) newSetNonConst  src/methods.ts:59
     in loop for-of                                           src/methods.ts:61  x rows
         calls Set()                                        src/methods.ts:61  = O(N)
+
+O(max(1, (strings * (max(strings, needle))^(2)))) stringLinearCall  src/methods.ts:17
+    in loop for-of                                           src/methods.ts:19  x strings
+        does s.indexOf() [string search]                  src/methods.ts:19  x N^2
 
 O(max(1, rows^2)) WithStaticMethod.compute  src/classes.ts:54
     in loop for-of                                           src/classes.ts:56  x rows

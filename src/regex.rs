@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use indexmap::IndexSet;
-use oxc_ast::ast::{Argument, Expression};
+use oxc_ast::ast::{Argument, Expression, IdentifierReference, RegExpLiteral};
 use oxc_ast::AstKind;
 use oxc_span::{GetSpan, Span};
 use serde::{Deserialize, Serialize};
@@ -86,13 +86,35 @@ impl RegexRequest {
 
     fn repeats(&self, matching: Matching) -> bool {
         let repeated = match matching {
-            Matching::Rejected | Matching::Once => false,
+            Matching::Rejected | Matching::Once | Matching::Resumed => false,
             Matching::Flagged => self.flags.contains('g'),
             Matching::Repeated => true,
         };
 
         repeated && !is_matched_once(&self.source, &self.flags)
     }
+
+    /// ECMA-262 §22.2.7.2 RegExpBuiltinExec step 4 starts a `g` or `y` regex at `lastIndex`. RegExp
+    /// test and exec (§22.2.6.16, §22.2.6.2) keep `lastIndex`, and so does the non-global
+    /// RegExp.prototype[@@match] and [@@replace] (§22.2.6.8, §22.2.6.11) for a sticky regex, while
+    /// [@@search] (§22.2.6.12) and the global paths reset it to 0.
+    fn resumes(&self, matching: Matching) -> bool {
+        let global = self.flags.contains('g');
+        let sticky = self.flags.contains('y');
+
+        match matching {
+            Matching::Resumed => global || sticky,
+            Matching::Flagged => sticky && !global,
+            _ => false,
+        }
+    }
+}
+
+/// A match started at `lastIndex` does the work of a match of the suffix when every attempt reads
+/// only the suffix (no lookbehind, `\b`, `\B` or multiline `^`), or when a leading
+/// non-multiline `^` fails every attempt after index 0 in one step.
+pub fn is_resumable(source: &str, flags: &str) -> bool {
+    is_context_free(source, flags) || is_matched_once(source, flags)
 }
 
 pub fn is_matched_once(source: &str, flags: &str) -> bool {
@@ -609,6 +631,10 @@ fn classified_of(complexity: Complexity) -> Result<RegexAnswer, RegexError> {
 
 enum PatternSource {
     Classified(RegexRequest),
+    /// A regex object bound once and reused across calls, so its `lastIndex` persists; a regex
+    /// literal at the call evaluates to a fresh object whose `lastIndex` is 0 (ECMA-262
+    /// §13.2.7.3, §22.2.3.1 step 3 RegExpInitialize).
+    Shared(RegexRequest),
     Primitive,
     Dynamic,
 }
@@ -752,6 +778,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         expression: &'a Expression<'a>,
         pattern: Pattern,
     ) -> PatternSource {
+        if let Expression::Identifier(reference) = unwrap(expression) {
+            if let Some(literal) = self.bound_regex_literal_of(file, reference) {
+                return PatternSource::Shared(RegexRequest::qualified(
+                    literal.regex.pattern.text.as_str(),
+                    &literal.regex.flags.to_string(),
+                ));
+            }
+
+            // A non-callable object reads as primitive to the operand check, so a RegExp binding
+            // must not reach it.
+            if self.declared_kind_of(file, expression) == Kind::RegExp {
+                return PatternSource::Dynamic;
+            }
+        }
+
         match unwrap(expression) {
             Expression::RegExpLiteral(literal) => {
                 PatternSource::Classified(RegexRequest::qualified(
@@ -766,6 +807,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 PatternSource::Primitive
             }
             _ => PatternSource::Dynamic,
+        }
+    }
+
+    /// The regex literal a binding is initialized with once and never reassigned.
+    pub(crate) fn bound_regex_literal_of(
+        &mut self,
+        file: FileId,
+        reference: &'a IdentifierReference<'a>,
+    ) -> Option<&'a RegExpLiteral<'a>> {
+        let declaration = self
+            .declarations
+            .of_reference(self.project, file, reference)?;
+        let (_, initializer) = self.stable_initializer_of(declaration)?;
+
+        match unwrap(initializer) {
+            Expression::RegExpLiteral(literal) => Some(literal),
+            _ => None,
         }
     }
 
@@ -790,16 +848,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return Part::none();
         }
 
-        let request = match self.pattern_source_of(file, expression, pattern) {
+        let (request, shared) = match self.pattern_source_of(file, expression, pattern) {
             PatternSource::Primitive => return Part::none(),
             PatternSource::Dynamic => {
                 return self.unknown_part(file, expression.span(), UnknownReason::UnsupportedModel)
             }
-            PatternSource::Classified(request) => request,
+            PatternSource::Classified(request) => (request, false),
+            PatternSource::Shared(request) => (request, true),
         };
 
         if subject.is_one() {
             return Part::none();
+        }
+
+        if shared
+            && request.resumes(pattern.matching)
+            && !is_resumable(&request.source, &request.flags)
+        {
+            return self.unknown_part(file, expression.span(), UnknownReason::UnsupportedModel);
         }
 
         self.needed_regex.insert(request.clone());

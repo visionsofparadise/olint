@@ -251,7 +251,10 @@ fn set_union_uses_a_callable_set_like_object_as_data() {
         "f",
     );
 
-    assert_eq!(reading.total().cost, Cost::N);
+    // union scans its growing result once per element of the set-like argument (ECMA-262
+    // §24.2.4.20), and the function's own members are the analysed program's code.
+    assert_eq!(reading.total().cost, Cost::parse("O(N^2)").unwrap());
+    assert!(!reading.total().is_complete());
 }
 
 #[test]
@@ -1897,12 +1900,20 @@ fn standard_api_callbacks_run_inside_their_native_operation() {
         (
             "export function f(s: string, xs: number[]) { return s.replaceAll(\"x\", () => `${quadratic(xs)}`); }",
             "O(N^3)",
-            vec!["s.replaceAll() [string]", "call quadratic()"],
+            vec![
+                "s.replaceAll() [string]",
+                "call quadratic()",
+                "s.replaceAll() [substitution]",
+            ],
         ),
         (
             "export function f(s: string, xs: number[]) { return s.replace(\"x\", () => `${quadratic(xs)}`); }",
             "O(N^2)",
-            vec!["s.replace() [string]", "call quadratic()"],
+            vec![
+                "s.replace() [string]",
+                "call quadratic()",
+                "s.replace() [string search]",
+            ],
         ),
         (
             "export function f(xs: number[]) { return Object.groupBy(xs, () => quadratic(xs)); }",
@@ -1912,7 +1923,11 @@ fn standard_api_callbacks_run_inside_their_native_operation() {
         (
             "export function f(xs: number[]) { return JSON.stringify(xs, (_, value) => { quadratic(xs); return value; }); }",
             "O(N^3)",
-            vec!["JSON.stringify(xs)", "call quadratic()"],
+            vec![
+                "JSON.stringify(xs)",
+                "call quadratic()",
+                "JSON.stringify(xs) [nesting depth]",
+            ],
         ),
         (
             "export function f(xs: number[]) { return new Promise<number>(resolve => resolve(quadratic(xs))); }",
@@ -2001,4 +2016,78 @@ fn jsx_expressions_are_evaluated_and_stay_visible() {
     ];
 
     support::assert_project_cases("src/index.tsx", &flows);
+}
+
+#[test]
+fn set_operations_charge_the_other_operand() {
+    // G15: the Set methods of ECMA-262 §24.2.4 read their argument through GetSetRecord
+    // (§24.2.1.2) and scan [[SetData]] once per element of one operand.
+    for (source, expected, complete) in [
+        (
+            "export function f(a: Set<number>, b: Set<number>) { return a.union(b); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "export function f(a: Set<number>, b: Set<number>) { return a.intersection(b); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "export function f(a: Set<number>, b: Set<number>) { return a.isDisjointFrom(b); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "export function f(a: Set<number>, b: { size: number; has(x: number): boolean; keys(): IterableIterator<number> }) { return a.isSubsetOf(b); }",
+            "O(N^2)",
+            false,
+        ),
+    ] {
+        let (reading, _) = reading_of(source, "f");
+        let total = reading.total();
+
+        assert_eq!(total.cost, Cost::parse(expected).unwrap(), "{source}");
+        assert_eq!(total.is_complete(), complete, "{source}");
+    }
+}
+
+#[test]
+fn constructor_fallback_matches_only_the_global_constructors() {
+    // G18: a parameter named like a built-in constructor is an unresolved target, WeakSet and
+    // WeakMap iterate their argument like Set and Map (ECMA-262 §24.3.1.1, §24.4.1.1), and a
+    // buffer allocated from a numeric length does work in that value (§25.1.4.1, §23.2.5.1).
+    for (source, expected, complete) in [
+        (
+            "export function f(Map: MapConstructor, xs: [string, number][]) { return new Map(xs); }",
+            None,
+            false,
+        ),
+        (
+            "export function f(xs: object[]) { return new WeakSet(xs); }",
+            Some("O(N^2)"),
+            true,
+        ),
+        (
+            "export function f(xs: [object, number][]) { return new WeakMap(xs); }",
+            Some("O(N^2)"),
+            true,
+        ),
+        ("export function f(n: number) { return new ArrayBuffer(n); }", None, false),
+        ("export function f(n: number) { return new Uint8Array(n); }", None, false),
+        (
+            "export function f() { return new ArrayBuffer(8); }",
+            Some("O(1)"),
+            true,
+        ),
+    ] {
+        let (reading, _) = reading_of(source, "f");
+        let total = reading.total();
+
+        if let Some(expected) = expected {
+            assert_eq!(total.cost, Cost::parse(expected).unwrap(), "{source}");
+        }
+
+        assert_eq!(total.is_complete(), complete, "{source}");
+    }
 }

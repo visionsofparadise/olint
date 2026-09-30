@@ -77,7 +77,7 @@ fn replacement_callbacks_run_once_per_match_or_once_per_call() {
         (
             "",
             r#"(s: string, t: string) { return s.replace(/x/g, t); }"#,
-            "O(N)",
+            "O(N^3)",
             false,
         ),
     ]);
@@ -262,7 +262,7 @@ fn serialization_reads_properties_through_getters() {
         (
             getter,
             "(items: object[]) { return JSON.stringify(items); }",
-            "O(N)",
+            "O(N^2)",
             false,
         ),
         (
@@ -303,7 +303,7 @@ fn unknown_callbacks_keep_known_work_and_stay_partial() {
     for (body, expected) in [
         (
             "(s: string, replacer: (match: string) => string) { return s.replace(/a/g, replacer); }",
-            "O(N)",
+            "O(N^2)",
         ),
         (
             "(s: string, reviver: (key: string, value: unknown) => unknown) { return JSON.parse(s, reviver); }",
@@ -543,7 +543,7 @@ fn modelled_natives_keep_the_loop_bounds_they_cannot_affect() {
         (
             "",
             "(s: string, needle: string, n: number) { let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) total += s.indexOf(needle); return total; }",
-            "O(N^2)",
+            "O(N^3)",
             true,
         ),
         (
@@ -2289,4 +2289,235 @@ fn concat_size_exhaustion_retains_independent_known_work() {
         );
         support::assert_scheduler_terminal(analysis.scheduler_stats());
     });
+}
+
+#[test]
+fn string_search_charges_the_receiver_times_the_needle() {
+    // G10: StringIndexOf (ECMA-262 §6.1.4.1) compares up to the needle's length at every
+    // candidate index.
+    assert_selected(&[
+        (
+            "",
+            "(s: string, t: string) { return s.includes(t); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(s: string, t: string) { return s.indexOf(t); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(s: string, t: string) { return s.lastIndexOf(t); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(s: string, t: string) { return s.split(t); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            r#"(s: string) { return s.includes("x"); }"#,
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(s: string, t: string) { return s.startsWith(t); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            r#"(t: string) { return "abc".includes(t); }"#,
+            "O(1)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn replacement_charges_each_match_its_substitution() {
+    // G11: GetSubstitution (ECMA-262 §22.1.3.19.1) runs per match, and each `$` pattern of the
+    // template expands to at most the receiver's length.
+    assert_selected(&[
+        (
+            "",
+            r#"(s: string, r: string) { return s.replaceAll("a", r); }"#,
+            "O(N^3)",
+            true,
+        ),
+        (
+            "",
+            r#"(s: string) { return s.replaceAll("a", "b"); }"#,
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            r#"(s: string) { return s.replaceAll("a", "$&$&"); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            r#"(s: string, r: string) { return s.replace("a", r); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            r#"(s: string) { return s.replaceAll("a", () => "b"); }"#,
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            r#"(s: string, xs: number[]) { return s.replaceAll("a", () => ({ toString() { scan(xs); return "b"; } })); }"#,
+            "O(N^2)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn join_charges_its_output_and_element_conversions() {
+    // G12: Array.prototype.join (ECMA-262 §23.1.3.18) converts each element by ToString and
+    // concatenates the results with the separator.
+    assert_selected(&[
+        (
+            "",
+            r#"(xs: number[]) { return xs.join(","); }"#,
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            r#"(xs: string[]) { return xs.join(","); }"#,
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[], separator: string) { return xs.join(separator); }",
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            r#"(xs: number[]) { const a = { toString() { quadratic(xs); return "a"; } }; return [a, a].join(); }"#,
+            "O(N^2)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn species_creating_array_methods_read_the_species_constructor() {
+    // G13: map, filter, slice, splice, flat and flatMap construct their result through
+    // ArraySpeciesCreate (ECMA-262 §10.4.2.3).
+    for method in [
+        "map(x => x)",
+        "filter(x => x)",
+        "slice()",
+        "splice(0)",
+        "flat()",
+        "flatMap(x => [x])",
+    ] {
+        assert_native_property_work(&[(
+            &format!(
+                r#"(xs: number[]) {{const items: number[]=[0];Object.defineProperty(items,"constructor",{{value:{{get [Symbol.species](){{cube(xs);return Array}}}}}});return items.{method};}}"#
+            ),
+            "O(N^3)",
+        )]);
+    }
+
+    assert_selected(&[(
+        "",
+        "(xs: number[]) { return xs.map(x => x); }",
+        "O(N)",
+        true,
+    )]);
+}
+
+#[test]
+fn index_arguments_are_converted_by_the_analysed_program() {
+    // G14: ToIntegerOrInfinity (ECMA-262 §7.1.5) on an index argument calls `valueOf`.
+    let index = "const index: any = { valueOf() { quadratic(xs); return 0; } };";
+
+    assert_selected(&[
+        (
+            "",
+            &format!("(xs: number[]) {{ {index} return xs.includes(1, index); }}"),
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            &format!("(xs: number[]) {{ {index} return xs.slice(index); }}"),
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            &format!("(xs: number[]) {{ {index} return xs.fill(0, index); }}"),
+            "O(N^2)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return xs.slice(1, 2); }",
+            "O(N)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn stringify_charges_the_nesting_depth_of_its_value() {
+    // G16: SerializeJSONObject and SerializeJSONArray (ECMA-262 §25.5.2.5, §25.5.2.6) scan the
+    // stack and emit the indent per line, both proportional to the depth.
+    assert_selected(&[
+        (
+            "",
+            "(xs: number[]) { return JSON.stringify(xs); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(xs: number[]) { return JSON.stringify(xs, null, 2); }",
+            "O(N)",
+            true,
+        ),
+        (
+            "",
+            "(items: object[]) { return JSON.stringify(items, null, 2); }",
+            "O(N^2)",
+            false,
+        ),
+        (
+            "",
+            "() { return JSON.stringify({ a: { b: [1, 2] } }, null, 2); }",
+            "O(N)",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn a_reviver_writing_its_holder_leaves_json_parse_unknown() {
+    // G17: InternalizeJSONProperty (ECMA-262 §25.5.1.1) reads each key after earlier siblings'
+    // reviver calls, so a reviver can graft values; the parse is already an unknown contribution
+    // (§2.4) whose reviver runs an unknown number of times.
+    assert_implementation_defined(&[(
+        "",
+        "(s: string) { return JSON.parse(s, function (this: any, key: string, value: unknown) { this[key + \"x\"] = value; return value; }); }",
+        "O(1)",
+    )]);
 }

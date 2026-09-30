@@ -16,4 +16,4 @@ O(max(1, (matrix * matrix^2))) > O(N^2)  tripleNestedOverLimit  src/types.ts:70 
             in loop for-of                                   src/types.ts:72  x N
 
 3 over limit
-61 partial results
+62 partial results

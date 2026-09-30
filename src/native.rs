@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use oxc_ast::ast::{
-    Argument, CallExpression, Expression, MemberExpression, NewExpression, RegExpFlags,
+    Argument, CallExpression, Expression, MemberExpression, NewExpression, ObjectPropertyKind,
+    PropertyKind, RegExpFlags,
 };
 use oxc_ast::AstKind;
 use oxc_span::{GetSpan, Span};
@@ -10,8 +11,8 @@ use crate::analysis::Analysis;
 use crate::bounds::short;
 use crate::budgets::Visits;
 use crate::cost::{Cost, ExecutionPhase, Part, Reading};
-use crate::declarations::{Declaration, TargetSet};
-use crate::declared_types::Kind;
+use crate::declarations::{Declaration, FunctionId, TargetSet};
+use crate::declared_types::{every_element, Kind};
 use crate::invocations::{coercion_keys, iteration_keys};
 use crate::project::FileId;
 use crate::syntax::{body_root_of, identifier_of, member_expression_of, unwrap};
@@ -65,6 +66,10 @@ pub enum Count {
 pub enum Matching {
     Rejected,
     Once,
+    /// One match that starts at the regex's `lastIndex` when its flags hold `g` or `y`: RegExp
+    /// test and exec (ECMA-262 §22.2.6.16, §22.2.6.2) reach RegExpBuiltinExec (§22.2.7.2), which
+    /// reads `lastIndex` in step 4 and starts matching there.
+    Resumed,
     Flagged,
     Repeated,
 }
@@ -149,6 +154,21 @@ const SPLIT_KEYS: &[&str] = &["@@split"];
 const MATCH_KEYS: &[&str] = &["@@match"];
 const MATCH_ALL_KEYS: &[&str] = &["@@match", "@@matchAll"];
 const SEARCH_KEYS: &[&str] = &["@@search"];
+pub(crate) const REGEXP_PROTOCOL: &[&str] = &[
+    "exec",
+    "flags",
+    "global",
+    "ignoreCase",
+    "multiline",
+    "dotAll",
+    "unicode",
+    "unicodeSets",
+    "sticky",
+    "hasIndices",
+    "lastIndex",
+    "constructor",
+    "@@species",
+];
 
 const fn pattern_of(keys: &'static [&'static str], matching: Matching, compiles: bool) -> Role {
     Role::Pattern(Pattern {
@@ -214,10 +234,12 @@ pub static MODELS: &[NativeModel] = &[
         ),
         Output::Copied,
     ),
+    // ECMA-262 §24.1.1.1, §24.2.1.1, §24.3.1.1, §24.4.1.1: each constructor iterates its argument
+    // and calls the adder (§24.1.1.2 AddEntriesFromIterable) once per element.
     producing(
         model_of(
             Identity::Constructor,
-            &["Set", "Map"],
+            &["Set", "Map", "WeakSet", "WeakMap"],
             Work::Linear(Operand::First),
             &[Role::Iterated],
             Role::Read,
@@ -684,10 +706,26 @@ impl<'a> NativeSite<'a> {
 
 fn scans_entries_per_element(site: &NativeSite<'_>, model: &NativeModel) -> bool {
     match model.identity {
-        Identity::Constructor => matches!(site.name.as_str(), "Set" | "Map"),
+        Identity::Constructor => {
+            matches!(site.name.as_str(), "Set" | "Map" | "WeakSet" | "WeakMap")
+        }
         Identity::Namespace("Object" | "Map") => site.name == "groupBy",
         _ => false,
     }
+}
+
+const STRING_SEARCHES: &[&str] = &[
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "split",
+    "replace",
+    "replaceAll",
+];
+const MAXIMUM_SHALLOW_DEPTH: usize = 4;
+
+fn is_set_constructor(name: &str) -> bool {
+    matches!(name, "Set" | "WeakSet")
 }
 
 fn global_flag_of(pattern: &Expression<'_>) -> Option<bool> {
@@ -996,6 +1034,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
             beside = beside.merge(copied, &mut self.unknowns, &mut self.traces);
         }
 
+        if model.identity == Identity::Receiver(Kind::Array)
+            && matches!(site.name.as_str(), "flat" | "flatMap")
+        {
+            if let Some(receiver) = site.receiver {
+                let species = self.species_reading_of((file, site.span), receiver, &site.name);
+
+                beside = beside.merge(species, &mut self.unknowns, &mut self.traces);
+            }
+        }
+
         for (index, argument) in site.arguments.iter().enumerate() {
             let role = site.role_of(model, index);
             let (part, count) = if model.identity == Identity::Namespace("Object")
@@ -1038,6 +1086,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 beside = beside.merge(matched, &mut self.unknowns, &mut self.traces);
             }
+        }
+
+        if model.identity == Identity::Receiver(Kind::String) {
+            let searched = self.string_search_reading_of(site, &charge.length);
+
+            beside = beside.merge(searched, &mut self.unknowns, &mut self.traces);
+        }
+
+        if model.identity == Identity::Namespace("JSON") && site.name == "stringify" {
+            let nested = self.serialized_depth_reading_of(site, &charge.length);
+
+            beside = beside.merge(nested, &mut self.unknowns, &mut self.traces);
         }
 
         if model.output == Output::Produced {
@@ -1161,6 +1221,335 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         reading.merge(part, &mut self.unknowns, &mut self.traces)
+    }
+
+    /// A step that does `factors` work once, traced under `label`.
+    pub(crate) fn charged_reading_of(
+        &mut self,
+        (file, span): (FileId, Span),
+        label: String,
+        factors: &[&Cost],
+    ) -> Reading {
+        let cost = Cost::product(factors.iter().map(|factor| (*factor).clone()).collect());
+
+        match cost {
+            Ok(cost) if cost.is_one() => Reading::empty(),
+            Ok(cost) => Reading::of_part(crate::cost::nest(
+                label,
+                self.project.site_of(file, span),
+                self.source_span(file, span),
+                cost,
+                Part::unmarked(Cost::ONE, None),
+                &mut self.unknowns,
+                &mut self.traces,
+            )),
+            Err(_) => {
+                Reading::of_part(self.unknown_part(file, span, UnknownReason::ResourceExhaustion))
+            }
+        }
+    }
+
+    /// ToString of each element of `receiver` (ECMA-262 §23.1.3.18 step 7.c), which calls the
+    /// analysed program's `toString`, `valueOf` or @@toPrimitive for an object element.
+    pub(crate) fn element_coercion_reading_of(
+        &mut self,
+        file: FileId,
+        receiver: &'a Expression<'a>,
+        span: Span,
+    ) -> Reading {
+        if self.has_primitive_elements(file, receiver) || !self.may_implement_any(&coercion_keys())
+        {
+            return Reading::empty();
+        }
+
+        let (elements, mut open) = self.iterable_elements_of(file, receiver, 0);
+        let mut reading = Reading::empty();
+
+        for (source, element) in elements {
+            if !self.charge_work(crate::analysis::work::Event::TraversalEdge, 1) {
+                open = true;
+
+                break;
+            }
+
+            let converted = self.operand_coercion_part_of(source, element);
+
+            reading = reading.merge(converted, &mut self.unknowns, &mut self.traces);
+        }
+
+        if open {
+            let targets = TargetSet {
+                known: Vec::new(),
+                open: true,
+            };
+            let converted =
+                self.implicit_call_reading_of((file, span), &targets, "coercion", &[receiver]);
+
+            reading = reading.merge(converted, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    /// Whether ToString of `text` has a constant length: a constant-sized primitive, since an
+    /// object's constant size counts its keys rather than the text its `toString` returns.
+    pub(crate) fn is_constant_text(&mut self, file: FileId, text: &'a Expression<'a>) -> bool {
+        self.is_bounded_text(file, text, 0)
+            || (self.is_primitive_operand(file, text) && self.is_constant_sized(file, text))
+    }
+
+    /// The length of ToString of a string operand: one when constant, else its produced length,
+    /// else the input envelope.
+    fn text_size_of(&mut self, file: FileId, text: &'a Expression<'a>) -> Cost {
+        if self.is_constant_text(file, text) {
+            return Cost::ONE;
+        }
+
+        match self.produced_size_of(file, text) {
+            Some(size) if size.exceeds && size.length_resolved => size.length,
+            _ => Cost::N,
+        }
+    }
+
+    fn string_label_of(&self, site: &NativeSite<'a>, suffix: &str) -> String {
+        let receiver = site
+            .receiver
+            .map(|receiver| short(self.text_of(site.file, receiver.span())))
+            .unwrap_or_default();
+
+        format!("{receiver}.{}() [{suffix}]", site.name)
+    }
+
+    /// ECMA-262 §22.1.3.8, §22.1.3.9, §22.1.3.11, §22.1.3.23 and §22.1.3.19-20 search a string
+    /// needle with StringIndexOf (§6.1.4.1), the lastIndexOf loop or SplitMatcher, each of which
+    /// compares up to the needle's length at every candidate index: receiver times needle.
+    /// Replacement then runs GetSubstitution (§22.1.3.19.1) or the replacer once per match.
+    fn string_search_reading_of(&mut self, site: &NativeSite<'a>, receiver: &Cost) -> Reading {
+        if !STRING_SEARCHES.contains(&site.name.as_str()) {
+            return Reading::empty();
+        }
+
+        let Some(needle) = site.expression_at(0) else {
+            return Reading::empty();
+        };
+        let mut reading = Reading::empty();
+
+        // A RegExp needle dispatches to its @@-method, whose matching the pattern role charges.
+        let searched = !matches!(unwrap(needle), Expression::RegExpLiteral(_))
+            && self.declared_kind_of(site.file, needle) != Kind::RegExp;
+
+        if searched && !receiver.is_one() {
+            let length = self.text_size_of(site.file, needle);
+            let label = self.string_label_of(site, "string search");
+            let searched =
+                self.charged_reading_of((site.file, site.span), label, &[receiver, &length]);
+
+            reading = reading.merge(searched, &mut self.unknowns, &mut self.traces);
+        }
+
+        if matches!(site.name.as_str(), "replace" | "replaceAll") {
+            let matches = match self.replaces_once(site, needle) {
+                true => Cost::ONE,
+                false => receiver.clone(),
+            };
+            let substituted = self.substitution_reading_of(site, receiver, &matches);
+
+            reading = reading.merge(substituted, &mut self.unknowns, &mut self.traces);
+        }
+
+        reading
+    }
+
+    fn replaces_once(&mut self, site: &NativeSite<'a>, pattern: &'a Expression<'a>) -> bool {
+        if self.is_matched_once_pattern(pattern) {
+            return true;
+        }
+
+        site.name == "replace"
+            && match global_flag_of(pattern) {
+                Some(global) => !global,
+                None => self.is_primitive_operand(site.file, pattern),
+            }
+    }
+
+    /// Each match appends its replacement: GetSubstitution (ECMA-262 §22.1.3.19.1) scans the
+    /// template and expands `$&`, `` $` ``, `$'` and captures, each up to the receiver's length,
+    /// and a replacer's result is converted by ToString (§22.1.3.19 step 11, §22.2.6.11 step
+    /// 14.k) and appended.
+    fn substitution_reading_of(
+        &mut self,
+        site: &NativeSite<'a>,
+        receiver: &Cost,
+        matches: &Cost,
+    ) -> Reading {
+        let file = site.file;
+        let mut reading = Reading::empty();
+        let per_match = match site.expression_at(1) {
+            None => Cost::ONE,
+            Some(replacer) if !self.is_non_callable_argument(file, replacer) => {
+                let targets = self
+                    .resolved_expression_callee_of(file, replacer, replacer.node_id())
+                    .targets;
+                let mut bounded = !targets.open;
+                let mut coerced = Reading::empty();
+
+                for target in &targets.known {
+                    for returned in self.returned_expressions_of(*target) {
+                        let converted = self.operand_coercion_part_of(target.file, returned);
+
+                        coerced = coerced.merge(converted, &mut self.unknowns, &mut self.traces);
+                        bounded &= self.is_constant_text(target.file, returned);
+                    }
+                }
+
+                let coerced = match matches.is_one() {
+                    true => coerced,
+                    false => {
+                        let label = self.string_label_of(site, "replacement result");
+                        let site_of = self.project.site_of(file, site.span);
+                        let origin = self.source_span(file, site.span);
+
+                        coerced.executed().map_parts(|part| {
+                            crate::cost::nest(
+                                label.clone(),
+                                site_of,
+                                origin,
+                                matches.clone(),
+                                part,
+                                &mut self.unknowns,
+                                &mut self.traces,
+                            )
+                        })
+                    }
+                };
+
+                reading = reading.merge(coerced, &mut self.unknowns, &mut self.traces);
+
+                match bounded {
+                    true => Cost::ONE,
+                    false => Cost::N,
+                }
+            }
+            // The template is converted once (§22.1.3.19 step 6), and each of its `$`
+            // patterns expands to at most the receiver's length.
+            Some(template) => match unwrap(template) {
+                Expression::StringLiteral(literal) if !literal.value.contains('$') => Cost::ONE,
+                _ => {
+                    let length = self.text_size_of(file, template);
+
+                    match receiver.multiply(&length) {
+                        Ok(cost) => cost,
+                        Err(_) => {
+                            let unknown = self.unknown_part(
+                                file,
+                                site.span,
+                                UnknownReason::ResourceExhaustion,
+                            );
+
+                            return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
+                        }
+                    }
+                }
+            },
+        };
+        let label = self.string_label_of(site, "substitution");
+        let substituted =
+            self.charged_reading_of((site.file, site.span), label, &[matches, &per_match]);
+
+        reading.merge(substituted, &mut self.unknowns, &mut self.traces)
+    }
+
+    /// JSON.stringify's SerializeJSONObject and SerializeJSONArray (ECMA-262 §25.5.2.5,
+    /// §25.5.2.6) scan `state.[[Stack]]` for the value before descending and, with a `space`
+    /// argument, emit the indent once per line, both proportional to the nesting depth, which
+    /// the graph's size bounds: the graph's size squared unless the value is shallow.
+    fn serialized_depth_reading_of(&mut self, site: &NativeSite<'a>, graph: &Cost) -> Reading {
+        let Some(value) = site.expression_at(0) else {
+            return Reading::empty();
+        };
+        let replaced = site
+            .expression_at(1)
+            .is_some_and(|replacer| !self.is_non_callable_argument(site.file, replacer));
+
+        if !replaced && self.is_shallow_serialized(site.file, value, 0) {
+            return Reading::empty();
+        }
+
+        let label = format!(
+            "JSON.stringify({}) [nesting depth]",
+            short(self.text_of(site.file, value.span()))
+        );
+
+        self.charged_reading_of((site.file, site.span), label, &[graph, graph])
+    }
+
+    fn is_shallow_serialized(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAXIMUM_SHALLOW_DEPTH {
+            return false;
+        }
+
+        if self.is_primitive_operand(file, value) || self.has_primitive_elements(file, value) {
+            return true;
+        }
+
+        match unwrap(value) {
+            Expression::ArrayExpression(array) => every_element(array, |element| {
+                self.is_shallow_serialized(file, element, depth + 1)
+            }),
+            Expression::ObjectExpression(object) => {
+                object.properties.iter().all(|property| match property {
+                    ObjectPropertyKind::ObjectProperty(property) => {
+                        let Some(name) = property.key.static_name() else {
+                            return false;
+                        };
+
+                        // SerializeJSONProperty (§25.5.2.2) serializes what `toJSON` and a
+                        // getter return.
+                        match property.kind {
+                            PropertyKind::Init if name == "toJSON" => {
+                                self.returns_shallow(file, &property.value, depth + 1)
+                            }
+                            PropertyKind::Init => {
+                                property.method
+                                    || self.is_shallow_serialized(file, &property.value, depth + 1)
+                            }
+                            PropertyKind::Get => {
+                                name != "toJSON"
+                                    && self.returns_shallow(file, &property.value, depth + 1)
+                            }
+                            PropertyKind::Set => true,
+                        }
+                    }
+                    ObjectPropertyKind::SpreadProperty(_) => false,
+                })
+            }
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether every value the function `function` returns serializes shallowly.
+    fn returns_shallow(
+        &mut self,
+        file: FileId,
+        function: &'a Expression<'a>,
+        depth: usize,
+    ) -> bool {
+        let node = match unwrap(function) {
+            Expression::FunctionExpression(function) => function.node_id(),
+            Expression::ArrowFunctionExpression(arrow) => arrow.node_id(),
+            _ => return false,
+        };
+        let target = FunctionId { file, node };
+
+        self.returned_expressions_of(target)
+            .into_iter()
+            .all(|returned| self.is_shallow_serialized(file, returned, depth))
     }
 
     /// Spec §2.4: the call's own work is an unknown contribution, and the callback work in `inner`
@@ -1340,7 +1729,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         source: &'a Expression<'a>,
     ) -> bool {
         if model.identity == Identity::Constructor
-            && matches!(site.name.as_str(), "Set" | "Map")
+            && matches!(site.name.as_str(), "Set" | "Map" | "WeakSet" | "WeakMap")
             && matches!(
                 self.known_value(site.file, source).value.as_deref(),
                 Ok(crate::values::Primitive::Null | crate::values::Primitive::Undefined)
@@ -1630,9 +2019,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
         pattern: &'a Expression<'a>,
         names: &[&str],
     ) -> Reading {
-        if matches!(unwrap(pattern), Expression::RegExpLiteral(_))
-            || self.is_primitive_operand(file, pattern)
-        {
+        let bound = match unwrap(pattern) {
+            Expression::RegExpLiteral(_) => true,
+            Expression::Identifier(reference) => {
+                self.bound_regex_literal_of(file, reference).is_some()
+            }
+            _ => false,
+        };
+
+        if bound {
+            return self.regexp_protocol_part_of(file, pattern.span(), names);
+        }
+
+        if self.is_primitive_operand(file, pattern) {
             return Reading::empty();
         }
 
@@ -1644,6 +2043,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let targets = self.protocol_targets_of(file, pattern, &keys);
 
         self.implicit_call_reading_of((file, pattern.span()), &targets, "pattern", &[pattern])
+    }
+
+    /// A RegExp search reaches the RegExp protocol: String replace, split, match, matchAll and
+    /// search call the regex's @@-method (ECMA-262 §22.1.3.19-22, §22.1.3.23), and those methods
+    /// and RegExp test (§22.2.6.16) Get `exec`, `flags`, the flag accessors, `lastIndex` and, for
+    /// split and matchAll, SpeciesConstructor's `constructor` and @@species (§22.2.7.1,
+    /// §22.2.6.14, §22.2.6.9). Spec §2.2 lets the analysed program replace any of them, and a
+    /// replacement's work is an unknown contribution.
+    pub(crate) fn regexp_protocol_part_of(
+        &mut self,
+        file: FileId,
+        span: Span,
+        names: &[&str],
+    ) -> Reading {
+        let names: Vec<&str> = names.iter().chain(REGEXP_PROTOCOL).copied().collect();
+
+        match self.builtin_members_replaced(Kind::RegExp, &names) {
+            true => Reading::of_part(self.unknown_part(file, span, UnknownReason::Target)),
+            false => Reading::empty(),
+        }
     }
 
     fn record_receiver_write(&mut self, site: &NativeSite<'a>) {
@@ -1790,7 +2209,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return (arguments, true);
             }
 
-            if site.name == "Set" {
+            if is_set_constructor(&site.name) {
                 if !self.charge_work(crate::analysis::work::Event::CallbackDescriptor, 1) {
                     open = true;
 
@@ -1830,7 +2249,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         open |= arguments.is_empty();
 
         if open {
-            arguments.push(vec![None; if site.name == "Set" { 1 } else { 2 }]);
+            arguments.push(vec![
+                None;
+                if is_set_constructor(&site.name) { 1 } else { 2 }
+            ]);
         }
 
         (arguments, open)
@@ -1877,7 +2299,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         site: &NativeSite<'a>,
         model: &NativeModel,
     ) -> Reading {
-        if !((model.identity == Identity::Constructor && site.name == "Map")
+        if !((model.identity == Identity::Constructor
+            && matches!(site.name.as_str(), "Map" | "WeakMap"))
             || (model.identity == Identity::Namespace("Object") && site.name == "fromEntries"))
         {
             return Reading::empty();
@@ -1980,6 +2403,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let (kind, name) = match site.name.as_str() {
             "Set" => (Kind::Set, "add"),
             "Map" => (Kind::Map, "set"),
+            "WeakSet" => (Kind::WeakSet, "add"),
+            "WeakMap" => (Kind::WeakMap, "set"),
             _ => return None,
         };
         let source = site.expression_at(0)?;
@@ -2101,6 +2526,28 @@ impl<'p, 'a> Analysis<'p, 'a> {
         Some(self.live_visits_of(file, receiver, &bodies))
     }
 
+    /// ArraySpeciesCreate (ECMA-262 §10.4.2.3) and TypedArraySpeciesCreate (§23.2.4.1) Get the
+    /// receiver's `constructor` and its @@species and Construct the result, which runs the
+    /// analysed program's code for a subclass instance; an unresolved species constructor is an
+    /// unknown contribution.
+    pub(crate) fn species_reading_of(
+        &mut self,
+        (file, span): (FileId, Span),
+        receiver: &'a Expression<'a>,
+        method: &str,
+    ) -> Reading {
+        let site = NativeSite {
+            file,
+            span,
+            call: None,
+            receiver: Some(receiver),
+            name: method.to_string(),
+            arguments: &[],
+        };
+
+        self.concat_species_reading_of(&site)
+    }
+
     fn concat_species_reading_of(&mut self, site: &NativeSite<'a>) -> Reading {
         let Some(receiver) = site.receiver else {
             return Reading::empty();
@@ -2112,7 +2559,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut reading = self.implicit_call_reading_of(
             (site.file, site.span),
             &accessors,
-            "concat constructor getter",
+            &format!("{} constructor getter", site.name),
             &[receiver],
         );
         let (mut values, mut open) = self.property_values_of((site.file, receiver), &constructor);
@@ -2150,7 +2597,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let called = self.implicit_call_reading_of(
                 (file, constructor.span()),
                 &getters,
-                "concat species getter",
+                &format!("{} species getter", site.name),
                 &[constructor],
             );
             reading = reading.merge(called, &mut self.unknowns, &mut self.traces);
@@ -2184,7 +2631,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let called = self.supplied_implicit_reading_of(
                     (site.file, site.span),
                     &construction.targets,
-                    "concat species constructor",
+                    &format!("{} species constructor", site.name),
                     None,
                     &[receiver],
                 );
