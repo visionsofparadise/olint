@@ -2,11 +2,17 @@
 // Derives the package corpus deterministically from the selection parameters below and the exact-pinned
 // npm-high-impact list, writing corpus/.cache/packages.json.
 //
-// Each listed package resolves to its highest release version published on or before CUTOFF, read from the
-// registry packument's `time` field. A package enters the size population when that version's metadata points at
-// JavaScript or TypeScript sources: it is outside `@types/`, its `dist.unpackedSize` is recorded, and its declared
-// entries (`exports`, `main`, `module`, `bin`) include a source-extension or extensionless target, or it declares
-// none and so defaults to `index.js`. The population is sorted by unpacked size and cut into BAND_COUNT
+// Each listed package resolves to its highest release version published at or before CUTOFF, an explicit UTC instant,
+// and never after the moment this run started, read from the registry packument's `time` field. A run that starts
+// before CUTOFF is provisional: bands.json records it, and a re-derivation after CUTOFF with `--refresh` settles it.
+//
+// A listed package the registry answers 404 for fails selection, since dropping it would shift every band boundary
+// after it, unless it is one of UNPUBLISHED, the names already gone when the selection parameters were approved; a
+// name in UNPUBLISHED that resolves again fails too. A selected version whose tarball answers 404 fails likewise.
+//
+// A package enters the size population when that version's metadata points at JavaScript or TypeScript sources: it
+// is outside `@types/`, its `dist.unpackedSize` is recorded, and its declared entries (`exports`, `main`, `module`,
+// `bin`) include a source-extension or extensionless target, or it declares none and so defaults to `index.js`. The population is sorted by unpacked size and cut into BAND_COUNT
 // equal-count quantile bands. Each band then takes its BAND_SIZE highest-impact packages whose tarball file listing
 // ships a source file, so selection confirms "ships sources" against the tarball itself.
 //
@@ -28,14 +34,25 @@ import {
 	withRetries,
 } from "./common.mjs";
 
-const CUTOFF = "2026-09-29";
+const CUTOFF = "2026-09-29T23:59:59.999Z";
+const UNPUBLISHED = [
+	"@contenthook/browser",
+	"@contenthook/cli",
+	"@contenthook/node",
+	"@deca-ui/react",
+	"@gbulls-org/gbulls-sdk",
+];
 const BAND_COUNT = 5;
 const BAND_SIZE = 200;
 
 const REGISTRY = "https://registry.npmjs.org/";
 const CONCURRENCY = 24;
 const ATTEMPTS = 6;
-const cutoffEnd = Date.parse(`${CUTOFF}T00:00:00.000Z`) + 24 * 60 * 60 * 1000;
+const NOT_IN_REGISTRY = "not in the registry";
+const runStart = Date.now();
+const cutoffTime = Date.parse(CUTOFF);
+const admittedUntil = Math.min(cutoffTime, runStart);
+const provisional = runStart <= cutoffTime;
 const listVersion = JSON.parse(readFileSync(path.join(corpusDir, "..", "package.json"), "utf8")).devDependencies[
 	"npm-high-impact"
 ];
@@ -72,11 +89,11 @@ function recordOf(packument) {
 	for (const [version, manifest] of Object.entries(packument.versions ?? {})) {
 		const match = RELEASE.exec(version);
 		const published = Date.parse(packument.time?.[version] ?? "");
-		if (!match || !(published < cutoffEnd)) continue;
+		if (!match || !(published <= admittedUntil)) continue;
 		const key = match.slice(1).map(Number);
 		if (!best || compareRelease(key, best.key) > 0) best = { key, version, manifest };
 	}
-	if (!best) return { missing: `no release published on or before ${CUTOFF}` };
+	if (!best) return { missing: `no release published on or before ${CUTOFF.slice(0, 10)}` };
 	const { manifest } = best;
 	const dist = manifest.dist ?? {};
 	const targets =
@@ -98,7 +115,7 @@ async function packumentRecord(name) {
 			headers: { accept: "application/json" },
 			signal: AbortSignal.timeout(180_000),
 		});
-		if (response.status === 404) return { missing: "not in the registry" };
+		if (response.status === 404) return { missing: NOT_IN_REGISTRY };
 		if (!response.ok) throw new Error(`registry answered ${response.status}`);
 		return recordOf(await response.json());
 	});
@@ -152,16 +169,24 @@ async function shipsSources(name, record) {
 				throw error;
 			}),
 	).catch((error) => {
-		if (error.code === "E404") return undefined;
+		if (error.code === "E404")
+			throw new Error(
+				`${name}@${record.version}: the tarball is unpublished (404), so the band cannot be re-derived`,
+			);
 		throw error;
 	});
-	if (!tarball) return false;
 	return tarFiles(tarball).some((file) => isSourcePath(file.split("/").slice(1).join("/")));
 }
 
 mkdirSync(cacheDir, { recursive: true });
 
-const registryKey = `npm-high-impact@${listVersion} cutoff ${CUTOFF}`;
+// The key names the UTC day whose last millisecond is CUTOFF, the form the cache was first written under.
+const registryKey = `npm-high-impact@${listVersion} cutoff ${CUTOFF.slice(0, 10)}`;
+if (!CUTOFF.endsWith("T23:59:59.999Z")) throw new Error(`CUTOFF ${CUTOFF} must be the last millisecond of a UTC day`);
+if (provisional)
+	console.error(
+		`WARNING: this run starts before the cutoff ${CUTOFF}; the selection is provisional until re-derived after it with --refresh`,
+	);
 const records = readCache(registryCachePath, registryKey);
 const names = [...new Set(npmHighImpact)];
 const unresolved = names.filter((name) => !(name in records));
@@ -175,6 +200,18 @@ await mapPool(unresolved, CONCURRENCY, async (name) => {
 	}
 });
 writeCache(registryCachePath, registryKey, records);
+
+const unpublished = names.filter((name) => records[name].missing === NOT_IN_REGISTRY);
+const surprises = [
+	...unpublished.filter((name) => !UNPUBLISHED.includes(name)).map((name) => `${name} is unpublished (404)`),
+	...UNPUBLISHED.filter((name) => names.includes(name) && !unpublished.includes(name)).map(
+		(name) => `${name} is listed in UNPUBLISHED but resolves`,
+	),
+];
+if (surprises.length > 0)
+	throw new Error(
+		`the registry changed under the pinned list, which would shift the size bands: ${surprises.join("; ")}`,
+	);
 
 const rank = new Map(names.map((name, index) => [name, index]));
 const population = names
@@ -228,6 +265,6 @@ const packages = selected
 writeFileSync(packagesPath, stableJson(packages));
 writeFileSync(
 	bandsPath,
-	stableJson({ listVersion, cutoff: CUTOFF, bandCount: BAND_COUNT, bandSize: BAND_SIZE, bands }),
+	stableJson({ listVersion, cutoff: CUTOFF, provisional, bandCount: BAND_COUNT, bandSize: BAND_SIZE, bands }),
 );
 console.error(`wrote ${packages.length} packages to ${path.relative(process.cwd(), packagesPath)}`);
