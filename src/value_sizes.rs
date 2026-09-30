@@ -156,6 +156,7 @@ pub(crate) struct SizeMemory {
     growths: HashMap<(FileId, SymbolId, Shape), GrowthSummary>,
     evaluating: HashMap<FileId, bool>,
     resized: HashMap<(FileId, SymbolId), Resizing>,
+    deleted: HashMap<(FileId, SymbolId), bool>,
     pub(crate) inherited: HashMap<Kind, bool>,
 }
 
@@ -1016,6 +1017,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         resizing
     }
 
+    /// Whether a reference of the binding `reference` names calls a deleting method on it. The
+    /// scan reads every reference of the binding, so it runs and is charged once per binding.
     pub(crate) fn has_deleted_entries(
         &mut self,
         file: FileId,
@@ -1030,15 +1033,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
         else {
             return false;
         };
+
+        if let Some(deleted) = self.values.sizes.deleted.get(&(file, symbol)) {
+            return *deleted;
+        }
+
         let references = value_references_of(semantic.scoping(), symbol);
 
+        // A refused charge answers conservatively without a cached entry, since a fallback task
+        // charges its own credit and a later task may admit the scan.
         if !self.charge_work(Event::SizeStep, references.len() as u64) {
             return true;
         }
 
         let nodes = semantic.nodes();
-
-        references.into_iter().any(|(node, _)| {
+        let deleted = references.into_iter().any(|(node, _)| {
             let current = outermost_of(nodes, node);
             let member = nodes.parent_id(current);
             let AstKind::StaticMemberExpression(access) = nodes.kind(member) else {
@@ -1057,7 +1066,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 nodes.parent_kind(callee),
                 AstKind::CallExpression(call) if call.callee.span() == nodes.kind(callee).span()
             )
-        })
+        });
+
+        self.values.sizes.deleted.insert((file, symbol), deleted);
+
+        deleted
     }
 
     fn growing_call_of(&mut self, file: FileId, node: NodeId) -> Option<&'a CallExpression<'a>> {

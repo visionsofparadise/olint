@@ -1469,6 +1469,53 @@ fn size_stability_work_grows_linearly_with_aliased_holders() {
     );
 }
 
+fn switch_source(count: usize) -> String {
+    let mut lines = vec![
+        "export function pick(code: number, xs: number[]): number {".to_string(),
+        "\tswitch (code) {".to_string(),
+    ];
+
+    lines.extend((0..count).map(|index| {
+        format!("\t\tcase {index}: {{ let total = 0; for (const x of xs) {{ total += x * {index}; }} return total; }}")
+    }));
+    lines.push("\t\tdefault: return -1;".to_string());
+    lines.push("\t}".to_string());
+    lines.push("}".to_string());
+
+    lines.join("\n")
+}
+
+fn switch_size_steps_of(count: usize) -> u64 {
+    let mut found = None;
+
+    run_with_source(&switch_source(count), |analysis, file| {
+        summary_of(analysis, file, "pick");
+
+        let stats = analysis.scheduler_stats();
+
+        assert_terminal(stats);
+        assert!(!stats.work.exhausted(Event::SizeStep), "{count}: {stats:?}");
+
+        found = Some(stats.work.consumed(Event::SizeStep));
+    });
+
+    found.expect("size steps")
+}
+
+#[test]
+fn deleted_entry_scans_charge_each_binding_once() {
+    let base = switch_size_steps_of(32);
+    let single = switch_size_steps_of(64);
+    let double = switch_size_steps_of(96);
+
+    assert!(single > base, "{base} {single}");
+    assert_eq!(
+        double - base,
+        2 * (single - base),
+        "{base} {single} {double}"
+    );
+}
+
 fn pattern_source(callers: usize, alias: bool) -> String {
     let body = match alias {
         true => "const f = run; f(xs);",
