@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -149,13 +150,30 @@ enum Resizing {
     Untracked,
 }
 
+/// The resizing sites of one binding, split by the class each gives the binding.
+struct ResizingSites {
+    untracked: Vec<NodeId>,
+    bounded: Vec<NodeId>,
+}
+
+impl ResizingSites {
+    fn whole(&self) -> Resizing {
+        match (self.untracked.is_empty(), self.bounded.is_empty()) {
+            (false, _) => Resizing::Untracked,
+            (true, false) => Resizing::Bounded,
+            (true, true) => Resizing::Unchanged,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SizeMemory {
     declarations: HashMap<(FileId, NodeId), Option<Measure>>,
     holders: HashMap<(FileId, SymbolId, Shape, bool), HolderSummary>,
     growths: HashMap<(FileId, SymbolId, Shape), GrowthSummary>,
     evaluating: HashMap<FileId, bool>,
-    resized: HashMap<(FileId, SymbolId), Resizing>,
+    resizings: HashMap<(FileId, SymbolId), Rc<ResizingSites>>,
+    unstable: HashMap<(FileId, SymbolId), Rc<[NodeId]>>,
     deleted: HashMap<(FileId, SymbolId), bool>,
     pub(crate) inherited: HashMap<Kind, bool>,
 }
@@ -836,6 +854,54 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return false;
         }
 
+        let Some(unstable) = self.unstable_references_of(file, symbol, function) else {
+            return false;
+        };
+
+        self.any_outside(file, &unstable, region) == Some(false)
+    }
+
+    /// Whether a node of `list` lies outside `region`, charging one step per node read up to the
+    /// first one outside, so a query pays for the entries inside its region; `None` when the
+    /// charge is refused.
+    fn any_outside(&mut self, file: FileId, list: &[NodeId], region: NodeId) -> Option<bool> {
+        let nodes = self.project.file(file).semantic.nodes();
+
+        for node in list {
+            if !self.charge_work(Event::SizeStep, 1) {
+                return None;
+            }
+
+            if !nodes.ancestor_ids(*node).any(|ancestor| ancestor == region) {
+                return Some(true);
+            }
+        }
+
+        Some(false)
+    }
+
+    /// The references of the local holder `symbol` that can change its size: a write, a use in
+    /// another function, or a use `is_stable_use` rejects. The list depends only on the program,
+    /// so it is formed and charged once per holder, and each region's query reads it. A scan that
+    /// ends with the task's work exhausted can hold refusals, so it is dropped and the query
+    /// answers unstable.
+    fn unstable_references_of(
+        &mut self,
+        file: FileId,
+        symbol: SymbolId,
+        function: Option<NodeId>,
+    ) -> Option<Rc<[NodeId]>> {
+        if let Some(unstable) = self.values.sizes.unstable.get(&(file, symbol)) {
+            return Some(unstable.clone());
+        }
+
+        let scoping = self.project.file(file).semantic.scoping();
+        let references = value_references_of(scoping, symbol);
+
+        if !self.charge_work(Event::SizeStep, references.len() as u64) {
+            return None;
+        }
+
         let holder = Holder {
             function,
             shape: Shape::Array,
@@ -847,25 +913,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
             local: true,
             function,
         };
+        let mut unstable = Vec::new();
 
-        for (node, written) in value_references_of(scoping, symbol) {
-            if !self.charge_work(Event::SizeStep, 1) {
-                return false;
-            }
-
-            if nodes.ancestor_ids(node).any(|ancestor| ancestor == region) {
-                continue;
-            }
-
+        for (node, written) in references {
             if written
                 || self.enclosing_function_of(file, node) != function
                 || !self.is_stable_use(file, node, holder, &mut summary, 0)
             {
-                return false;
+                unstable.push(node);
             }
         }
 
-        true
+        if self.work_exhausted() {
+            return None;
+        }
+
+        let unstable: Rc<[NodeId]> = unstable.into();
+
+        self.values
+            .sizes
+            .unstable
+            .insert((file, symbol), unstable.clone());
+
+        Some(unstable)
     }
 
     /// Whether the function that binds `symbol` resizes its value in place by an amount its size
@@ -875,16 +945,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     /// that keeps the input dimension is a non-spread `push`, `unshift`, `add` or `set` call that
     /// runs once per call of a non-recursive function, adding a constant.
     pub(crate) fn is_resized_in_place(&mut self, file: FileId, symbol: SymbolId) -> bool {
-        let resizing = match self.values.sizes.resized.get(&(file, symbol)) {
-            Some(resizing) => *resizing,
-            None => {
-                let resizing = self.resizing_of(file, symbol, None);
-
-                self.values.sizes.resized.insert((file, symbol), resizing);
-
-                resizing
-            }
-        };
+        let resizing = self.resizing_of(file, symbol, None);
 
         self.is_untracked_resizing(file, symbol, resizing)
     }
@@ -926,7 +987,48 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    /// The joined class of the resizing sites of `symbol` outside `region`. A region inside a loop
+    /// of the binding function is entered again after its own sites ran, so it ignores none.
     fn resizing_of(&mut self, file: FileId, symbol: SymbolId, region: Option<NodeId>) -> Resizing {
+        let Some(sites) = self.resizing_sites_of(file, symbol) else {
+            return Resizing::Untracked;
+        };
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let function =
+            self.enclosing_function_of(file, semantic.scoping().symbol_declaration(symbol));
+        let region = region.filter(|region| {
+            self.enclosing_function_of(file, *region) == function
+                && !nodes
+                    .ancestor_ids(*region)
+                    .take_while(|ancestor| Some(*ancestor) != function)
+                    .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)))
+        });
+        let Some(region) = region else {
+            return sites.whole();
+        };
+
+        match self.any_outside(file, &sites.untracked, region) {
+            Some(false) => match self.any_outside(file, &sites.bounded, region) {
+                Some(false) => Resizing::Unchanged,
+                Some(true) => Resizing::Bounded,
+                None => Resizing::Untracked,
+            },
+            _ => Resizing::Untracked,
+        }
+    }
+
+    /// The resizing sites of `symbol`, each classed `Bounded` when it runs at most once per call
+    /// of the binding function and adds a counted constant, else `Untracked`. The sites depend
+    /// only on the program, so they are found and charged once per binding. A scan that ends with
+    /// the task's work exhausted can miss an intrinsic resizing call, since `is_intrinsic_member`
+    /// then answers false, so it is dropped and the query answers untracked.
+    fn resizing_sites_of(&mut self, file: FileId, symbol: SymbolId) -> Option<Rc<ResizingSites>> {
+        if let Some(sites) = self.values.sizes.resizings.get(&(file, symbol)) {
+            return Some(sites.clone());
+        }
+
         let project = self.project;
         let semantic = &project.file(file).semantic;
         let nodes = semantic.nodes();
@@ -935,30 +1037,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.enclosing_function_of(file, semantic.scoping().symbol_declaration(symbol));
 
         if !self.charge_work(Event::SizeStep, references.len() as u64) {
-            return Resizing::Untracked;
+            return None;
         }
 
-        let mut resizing = Resizing::Unchanged;
-        // A region inside a loop is entered again after its own resizing sites ran.
-        let region = region.filter(|region| {
-            self.enclosing_function_of(file, *region) == function
-                && !nodes
-                    .ancestor_ids(*region)
-                    .take_while(|ancestor| Some(*ancestor) != function)
-                    .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)))
-        });
+        let mut sites = ResizingSites {
+            untracked: Vec::new(),
+            bounded: Vec::new(),
+        };
 
         for (node, _) in references {
-            if resizing == Resizing::Untracked {
-                break;
-            }
-
-            if region
-                .is_some_and(|region| nodes.ancestor_ids(node).any(|ancestor| ancestor == region))
-            {
-                continue;
-            }
-
             let current = outermost_of(nodes, node);
             let span = nodes.kind(current).span();
             let member = nodes.parent_id(current);
@@ -1007,14 +1094,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .take_while(|ancestor| Some(*ancestor) != function)
                     .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)));
 
-            resizing = if repeated || !counted {
-                Resizing::Untracked
-            } else {
-                Resizing::Bounded
-            };
+            match repeated || !counted {
+                true => sites.untracked.push(node),
+                false => sites.bounded.push(node),
+            }
         }
 
-        resizing
+        if self.work_exhausted() {
+            return None;
+        }
+
+        let sites = Rc::new(sites);
+
+        self.values
+            .sizes
+            .resizings
+            .insert((file, symbol), sites.clone());
+
+        Some(sites)
     }
 
     /// Whether a reference of the binding `reference` names calls a deleting method on it. The

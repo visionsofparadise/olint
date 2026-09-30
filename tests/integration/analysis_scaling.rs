@@ -1485,16 +1485,16 @@ fn switch_source(count: usize) -> String {
     lines.join("\n")
 }
 
-fn switch_size_steps_of(count: usize) -> u64 {
+fn size_steps_of(source: &str, name: &str) -> u64 {
     let mut found = None;
 
-    run_with_source(&switch_source(count), |analysis, file| {
-        summary_of(analysis, file, "pick");
+    run_with_source(source, |analysis, file| {
+        summary_of(analysis, file, name);
 
         let stats = analysis.scheduler_stats();
 
         assert_terminal(stats);
-        assert!(!stats.work.exhausted(Event::SizeStep), "{count}: {stats:?}");
+        assert!(!stats.work.exhausted(Event::SizeStep), "{stats:?}");
 
         found = Some(stats.work.consumed(Event::SizeStep));
     });
@@ -1502,11 +1502,8 @@ fn switch_size_steps_of(count: usize) -> u64 {
     found.expect("size steps")
 }
 
-#[test]
-fn deleted_entry_scans_charge_each_binding_once() {
-    let base = switch_size_steps_of(32);
-    let single = switch_size_steps_of(64);
-    let double = switch_size_steps_of(96);
+fn assert_linear_size_steps(source: fn(usize) -> String, name: &str) {
+    let [base, single, double] = [32, 64, 96].map(|count| size_steps_of(&source(count), name));
 
     assert!(single > base, "{base} {single}");
     assert_eq!(
@@ -1514,6 +1511,42 @@ fn deleted_entry_scans_charge_each_binding_once() {
         2 * (single - base),
         "{base} {single} {double}"
     );
+}
+
+fn forwarding_chain_source(count: usize) -> String {
+    (0..count)
+        .map(|index| match index + 1 == count {
+            true => format!("export function f{index}(xs: number[]): number {{ let total = 0; for (const x of xs) {{ total += x; }} return total; }}"),
+            false => format!("export function f{index}(xs: number[]): number {{ return f{}(xs) + {index}; }}", index + 1),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn supplied_holder_source(count: usize) -> String {
+    let mut lines = vec![
+        "function g(a: number[]): number { let total = 0; for (const x of a) { total += x; } return total; }".to_string(),
+        "export function f(xs: number[]): number {".to_string(),
+        "\tconst ys = xs.slice();".to_string(),
+        "\tlet total = 0;".to_string(),
+    ];
+
+    lines.extend((0..count).map(|_| "\ttotal += g(ys) + g(xs);".to_string()));
+    lines.push("\treturn total;".to_string());
+    lines.push("}".to_string());
+
+    lines.join("\n")
+}
+
+#[test]
+fn supplied_sizes_charge_each_binding_scan_once() {
+    assert_linear_size_steps(forwarding_chain_source, "f0");
+    assert_linear_size_steps(supplied_holder_source, "f");
+}
+
+#[test]
+fn deleted_entry_scans_charge_each_binding_once() {
+    assert_linear_size_steps(switch_source, "pick");
 }
 
 fn pattern_source(callers: usize, alias: bool) -> String {

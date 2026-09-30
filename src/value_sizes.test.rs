@@ -85,3 +85,49 @@ fn value_facts_receive_only_constant_cardinality() {
     assert_eq!(sizes[0], Some(Cost::ONE));
     assert_eq!(sizes[1..], [None, None, None]);
 }
+
+#[test]
+fn resizing_scans_ended_by_exhausted_work_answer_untracked_and_stay_unkept() {
+    let directory = tempfile::tempdir().unwrap();
+
+    std::fs::write(directory.path().join("tsconfig.json"), "{}").unwrap();
+    std::fs::write(
+        directory.path().join("index.ts"),
+        "export function f(xs: number[]) {\n\tfor (const v of [1, 2]) xs.push(v);\n}",
+    )
+    .unwrap();
+
+    let allocator = oxc_allocator::Allocator::default();
+    let project =
+        crate::project::Project::load(&allocator, &directory.path().join("tsconfig.json")).unwrap();
+    let file = project
+        .file_by_path(&directory.path().join("index.ts"))
+        .unwrap();
+    let scoping = project.file(file).semantic.scoping();
+    let symbol = scoping
+        .symbol_ids()
+        .find(|symbol| scoping.symbol_name(*symbol) == "xs")
+        .unwrap();
+    let options = crate::analysis::Options {
+        minimum_exponent: 2,
+        types: crate::analysis::TypeMode::Syntactic,
+        record_nodes: false,
+    };
+    let mut exhausted = Analysis::new(&project, options);
+
+    exhausted
+        .set_scheduler_limits(crate::summaries::SchedulerLimits {
+            work: crate::analysis::work::Limits::uniform(100_000).with(Event::QueuePush, 0),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(!exhausted.charge_work(Event::QueuePush, 1));
+    assert!(exhausted.is_resized_in_place(file, symbol));
+    assert!(exhausted.values.sizes.resizings.is_empty());
+
+    let mut admitted = Analysis::new(&project, options);
+
+    assert!(admitted.is_resized_in_place(file, symbol));
+    assert_eq!(admitted.values.sizes.resizings.len(), 1);
+}
