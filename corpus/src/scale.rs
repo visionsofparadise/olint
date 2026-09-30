@@ -1,10 +1,11 @@
 //! `scale` measures how olint's work and memory grow on the scaling families (spec §7.5).
 //!
-//! It materializes and builds `--src` as `snapshot` does, generates each family at n = 2^k for k in
-//! `--min-k..=--max-k`, and snapshots every size and pass in its own `snapshot-member` subprocess. Each run records
-//! |G| (`MemberCounts::nodes`), the 26 scheduler `Event` counts, the scheduler task and body-pass counts, peak live
-//! bytes from the counting allocator and, in the tsc pass, the checker's `TscCounts`. A size that fails or times out
-//! ends that family and pass: larger sizes are skipped, and the fit uses the sizes below it.
+//! It materializes and builds `--src` as `snapshot` does, generates each family at n = 2^k for k from the family's
+//! own `min_k` (or `--min-k`, which replaces it for every family) to `--max-k`, and snapshots every size and pass in
+//! its own `snapshot-member` subprocess. Each run records |G| (`MemberCounts::nodes`), the 26 scheduler `Event`
+//! counts, the scheduler task and body-pass counts, peak live bytes from the counting allocator and, in the tsc pass,
+//! the checker's `TscCounts`. A size that fails or times out ends that family and pass: larger sizes are skipped, and
+//! the fit uses the sizes below it.
 //!
 //! A size whose run exhausted or reached a scheduler work limit reads the limit instead of olint's unbounded work, so
 //! it and every larger size are left out of the fits; `exhausted_k` records where that began.
@@ -49,8 +50,9 @@ use crate::snapshot::{
     absolute, built, in_parallel, run_member, Built, MemberCounts, Pass, PASSES,
 };
 
-/// Scale file schema. Version 2 adds each metric's `upper` order and excludes limit-reading sizes from the fits.
-pub const SCHEMA: u32 = 2;
+/// Scale file schema. Version 2 adds each metric's `upper` order and excludes limit-reading sizes from the fits;
+/// version 3 runs each family from its own `min_k`, which a version 2 file, run from one k for every family, lacks.
+pub const SCHEMA: u32 = 3;
 /// The largest spread of y, as a fraction of max |y|, that still reads as constant.
 pub const CONSTANT_TOLERANCE: f64 = 0.005;
 /// The root-mean-square relative residual below which a model fits regardless of the others.
@@ -61,6 +63,13 @@ pub const FIT_RATIO: f64 = 2.0;
 pub const MINIMUM_POINTS: usize = 4;
 /// Metrics recorded for reference but outside §5.3: the program size and the result row count.
 pub const UNCOMPARED: [&str; 2] = ["nodes", "rows"];
+/// Metrics measured from the allocator, whose values vary between runs by more than a fit's tolerance, so §5.3 reads
+/// them size by size under `MEMORY_TOLERANCE` instead of by fitted order.
+pub const MEMORY_METRICS: [&str; 1] = ["peak_bytes"];
+/// How far above the base's a memory metric may read at a size, as a fraction of the base's value.
+pub const MEMORY_TOLERANCE: f64 = 0.05;
+/// How far above the base's a count may read at a size when neither side fits it, as a fraction of the base's value.
+pub const POINTWISE_TOLERANCE: f64 = 0.005;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Order {
@@ -368,6 +377,8 @@ pub struct PassScale {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FamilyScale {
     pub shape: String,
+    /// The smallest k run: `--min-k` when given, else the family's own.
+    pub min_k: u32,
     pub passes: BTreeMap<String, PassScale>,
 }
 
@@ -375,7 +386,8 @@ pub struct FamilyScale {
 pub struct ScaleFile {
     pub schema: u32,
     pub source: String,
-    pub min_k: u32,
+    /// `--min-k`, when it replaced every family's own smallest k.
+    pub min_k: Option<u32>,
     pub max_k: u32,
     pub families: BTreeMap<String, FamilyScale>,
 }
@@ -383,7 +395,8 @@ pub struct ScaleFile {
 pub struct ScaleArgs {
     pub src: String,
     pub family: Option<String>,
-    pub min_k: u32,
+    /// Replaces every family's own smallest k.
+    pub min_k: Option<u32>,
     pub max_k: u32,
     pub out: Option<PathBuf>,
     pub jobs: usize,
@@ -541,14 +554,18 @@ struct Task {
 type Outcome = Result<MemberCounts, String>;
 
 pub fn scale(args: ScaleArgs) -> Result<(), String> {
-    if args.min_k > args.max_k || args.max_k > 24 {
+    let chosen = selected(args.family.as_deref())?;
+    let first = |family: &Family| args.min_k.unwrap_or(family.min_k);
+
+    if chosen.iter().any(|family| first(family) > args.max_k) || args.max_k > 24 {
         return Err(format!(
-            "--min-k {} and --max-k {} must satisfy min <= max <= 24",
-            args.min_k, args.max_k
+            "every family's smallest k (--min-k {}) and --max-k {} must satisfy min <= max <= 24",
+            args.min_k
+                .map_or("unset, so each family's own".to_string(), |k| k.to_string()),
+            args.max_k
         ));
     }
 
-    let chosen = selected(args.family.as_deref())?;
     let Built {
         cache,
         source,
@@ -562,8 +579,10 @@ pub fn scale(args: ScaleArgs) -> Result<(), String> {
     let mut tasks = Vec::new();
 
     // Sizes run smallest first, so a failed size can cancel the larger ones of its family and pass.
-    for k in args.min_k..=args.max_k {
-        for &family in &chosen {
+    let lowest = chosen.iter().map(|family| first(family)).min().unwrap_or(0);
+
+    for k in lowest..=args.max_k {
+        for &family in chosen.iter().filter(|family| first(family) <= k) {
             let root = families::ensure(&cache, family, families::size_of(k))?;
 
             for pass in PASSES {
@@ -682,6 +701,7 @@ pub fn scale(args: ScaleArgs) -> Result<(), String> {
             family.name.to_string(),
             FamilyScale {
                 shape: family.shape.to_string(),
+                min_k: first(family),
                 passes,
             },
         );
@@ -764,16 +784,42 @@ pub fn render(file: &ScaleFile) -> String {
 /// - a head that reaches a smaller k, or fewer sizes, fails, whatever ended it: a timeout is wall-clock time, which
 ///   §7.5 leaves out, so it cannot excuse a shorter series;
 /// - a head that reaches a scheduler work limit at a smaller k fails;
-/// - per compared metric, a head order or upper order above the base's fails; a metric fitted on one side only, or
-///   missing from the head, fails; a metric fitted on neither side fails unless both sides recorded identical values.
+/// - a head pass with fewer than `MINIMUM_POINTS` sizes before its first work limit or failure is a harness gap,
+///   which fails: its family's `min_k` must fall until the fit has the sizes it needs;
+/// - per compared count, a head order or upper order above the base's fails; a count fitted on one side only, or
+///   missing from the head, fails;
+/// - a count fitted on neither side is a harness gap, which passes only when the head reads at most the base's
+///   value, within `POINTWISE_TOLERANCE`, at every size both sides ran before either side's first work limit; an
+///   excess, or no such size, fails;
+/// - a memory metric (`MEMORY_METRICS`) is read the same way size by size under `MEMORY_TOLERANCE`, whatever its fits,
+///   since allocator peaks vary between runs by more than a fit's tolerance.
 pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
     let mut problems = Vec::new();
 
     if (base.min_k, base.max_k) != (head.min_k, head.max_k) {
+        let range = |file: &ScaleFile| match file.min_k {
+            Some(k) => format!("k={k}..={}", file.max_k),
+            None => format!("each family's own k..={}", file.max_k),
+        };
+
         problems.push(format!(
-            "scaling runs cover different sizes: base k={}..={}, head k={}..={}",
-            base.min_k, base.max_k, head.min_k, head.max_k
+            "scaling runs cover different sizes: base {}, head {}",
+            range(base),
+            range(head)
         ));
+    }
+
+    for (name, after) in &head.families {
+        for (pass, new) in &after.passes {
+            let fitted = fitted_sizes(new).len();
+
+            if fitted < MINIMUM_POINTS {
+                problems.push(format!(
+                    "{name} {pass}: harness gap, the head runs {fitted} sizes from k={} before its first work limit or failure where a fit needs {MINIMUM_POINTS}; lower the family's min_k",
+                    after.min_k
+                ));
+            }
+        }
     }
 
     for (name, before) in &base.families {
@@ -782,6 +828,13 @@ pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
 
             continue;
         };
+
+        if before.min_k != after.min_k {
+            problems.push(format!(
+                "scaling family {name} starts at k={} in the base and k={} in the head",
+                before.min_k, after.min_k
+            ));
+        }
 
         for (pass, old) in &before.passes {
             let Some(new) = after.passes.get(pass) else {
@@ -826,6 +879,17 @@ pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
                     continue;
                 };
 
+                if MEMORY_METRICS.contains(&metric.as_str()) {
+                    if let Err(excess) = pointwise(old, new, metric, MEMORY_TOLERANCE) {
+                        problems.push(format!(
+                            "{name} {pass} {metric}: {excess}, beyond the {}% memory tolerance",
+                            MEMORY_TOLERANCE * 100.0
+                        ));
+                    }
+
+                    continue;
+                }
+
                 match (prior.order, current.order) {
                     (Some(was), Some(now)) => {
                         let upper = |metric: &Metric, order: Order| metric.upper.unwrap_or(order);
@@ -844,7 +908,13 @@ pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
                             ));
                         }
                     }
-                    (None, None) if prior.values == current.values => {}
+                    (None, None) => {
+                        if let Err(excess) = pointwise(old, new, metric, POINTWISE_TOLERANCE) {
+                            problems.push(format!(
+                                "{name} {pass} {metric}: harness gap, no fit on either side, and {excess}"
+                            ));
+                        }
+                    }
                     (was, now) => problems.push(format!(
                         "{name} {pass} {metric}: no comparable fit (base {}, head {}); a missing fit cannot show the order held",
                         was.map_or("no fit", Order::text),
@@ -856,6 +926,58 @@ pub fn raised_orders(base: &ScaleFile, head: &ScaleFile) -> Vec<String> {
     }
 
     problems
+}
+
+/// The k and index of each size before a pass's first limit-reading size, the sizes its fits use.
+fn fitted_sizes(scale: &PassScale) -> BTreeMap<u32, usize> {
+    scale
+        .sizes
+        .iter()
+        .enumerate()
+        .take_while(|(_, size)| size.exhausted.is_empty())
+        .map(|(index, size)| (size.k, index))
+        .collect()
+}
+
+/// Whether the head's `metric` reads at most the base's, within `tolerance` of it, at every size both sides ran before
+/// either side's first work limit; the first excess, or the absence of any such size, is the error.
+fn pointwise(
+    base: &PassScale,
+    head: &PassScale,
+    metric: &str,
+    tolerance: f64,
+) -> Result<(), String> {
+    let before = fitted_sizes(base);
+    let after = fitted_sizes(head);
+    let value = |scale: &PassScale, index: usize| {
+        scale
+            .metrics
+            .get(metric)
+            .and_then(|metric| metric.values.get(index).copied())
+    };
+    let mut compared = 0;
+
+    for (k, &old) in &before {
+        let Some(&new) = after.get(k) else {
+            continue;
+        };
+        let (Some(was), Some(now)) = (value(base, old), value(head, new)) else {
+            return Err(format!("k={k} lacks a value on one side"));
+        };
+
+        if now as f64 > was as f64 * (1.0 + tolerance) {
+            return Err(format!(
+                "the head reads {now} at k={k} where the base reads {was}"
+            ));
+        }
+
+        compared += 1;
+    }
+
+    match compared {
+        0 => Err("no size runs on both sides before a work limit".to_string()),
+        _ => Ok(()),
+    }
 }
 
 pub fn read_scale(path: &Path) -> Result<ScaleFile, String> {
@@ -1051,7 +1173,7 @@ mod tests {
 
     fn file(order: Order, max_k: u32) -> ScaleFile {
         let metric = Metric {
-            values: Vec::new(),
+            values: vec![10, 20, 30, 40],
             order: Some(order),
             upper: Some(order),
         };
@@ -1059,7 +1181,14 @@ mod tests {
             max_k: Some(max_k),
             failure: None,
             exhausted_k: None,
-            sizes: Vec::new(),
+            sizes: (6..=9)
+                .map(|k| Size {
+                    k,
+                    n: families::size_of(k),
+                    nodes: 1 << k,
+                    exhausted: Vec::new(),
+                })
+                .collect(),
             metrics: BTreeMap::from([
                 ("WalkerNode".to_string(), metric.clone()),
                 ("nodes".to_string(), metric),
@@ -1069,12 +1198,13 @@ mod tests {
         ScaleFile {
             schema: SCHEMA,
             source: "s".to_string(),
-            min_k: 6,
+            min_k: None,
             max_k: 14,
             families: BTreeMap::from([(
                 "flat".to_string(),
                 FamilyScale {
                     shape: String::new(),
+                    min_k: 6,
                     passes: BTreeMap::from([("syntactic".to_string(), pass)]),
                 },
             )]),
@@ -1153,6 +1283,130 @@ mod tests {
         });
 
         assert_eq!(raised_orders(&base, &missing).len(), 1);
+    }
+
+    #[test]
+    fn fewer_fitted_sizes_than_a_fit_needs_are_a_harness_gap() {
+        let base = file(Order::Linear, 14);
+        let mut limited = base.clone();
+
+        edit(&mut limited, |pass| {
+            pass.exhausted_k = Some(9);
+            pass.sizes[3].exhausted = vec!["TaskKey".to_string()];
+        });
+
+        let problems = raised_orders(&limited, &limited);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("harness gap"), "{problems:?}");
+        assert!(
+            problems[0].contains("runs 3 sizes from k=6"),
+            "{problems:?}"
+        );
+
+        let mut restarted = base.clone();
+
+        for family in restarted.families.values_mut() {
+            family.min_k = 5;
+        }
+
+        assert_eq!(raised_orders(&base, &restarted).len(), 1);
+
+        for family in FAMILIES.iter() {
+            assert!(
+                family.min_k as usize + MINIMUM_POINTS <= families::MAX_K as usize + 1,
+                "{}",
+                family.name
+            );
+        }
+    }
+
+    #[test]
+    fn memory_is_read_size_by_size_within_its_tolerance() {
+        let memory = |values: Vec<u64>, order: Order| {
+            let mut file = file(Order::Linear, 14);
+
+            edit(&mut file, |pass| {
+                pass.metrics.insert(
+                    "peak_bytes".to_string(),
+                    Metric {
+                        values: values.clone(),
+                        order: Some(order),
+                        upper: Some(order),
+                    },
+                );
+            });
+
+            file
+        };
+        let base = memory(vec![1000, 2000, 4000, 8000], Order::Linear);
+
+        // A noisier head whose fit reads a higher order passes while every size stays within the tolerance.
+        assert!(raised_orders(
+            &base,
+            &memory(vec![1040, 2000, 4100, 8300], Order::Quadratic)
+        )
+        .is_empty());
+
+        let grown = raised_orders(&base, &memory(vec![1000, 2000, 4000, 8500], Order::Linear));
+
+        assert_eq!(grown.len(), 1, "{grown:?}");
+        assert!(grown[0].contains("reads 8500 at k=9"), "{grown:?}");
+    }
+
+    #[test]
+    fn no_fit_on_either_side_passes_only_pointwise() {
+        let unfitted = |values: Vec<u64>| {
+            let mut file = file(Order::Linear, 14);
+
+            edit(&mut file, |pass| {
+                let metric = pass.metrics.get_mut("WalkerNode").expect("metric");
+
+                metric.values = values.clone();
+                metric.order = None;
+                metric.upper = None;
+            });
+
+            file
+        };
+        let base = unfitted(vec![10, 20, 30, 40]);
+
+        assert!(raised_orders(&base, &unfitted(vec![10, 19, 30, 40])).is_empty());
+
+        let excess = raised_orders(&base, &unfitted(vec![10, 20, 31, 40]));
+
+        assert_eq!(excess.len(), 1, "{excess:?}");
+        assert!(
+            excess[0].contains("harness gap, no fit on either side"),
+            "{excess:?}"
+        );
+        assert!(excess[0].contains("reads 31 at k=8"), "{excess:?}");
+
+        // A size past either side's first work limit is left out, and no shared size before one fails.
+        let mut late = unfitted(vec![10, 20, 30, 99]);
+
+        edit(&mut late, |pass| {
+            pass.sizes[3].exhausted = vec!["TaskKey".to_string()]
+        });
+
+        let late = raised_orders(&base, &late);
+
+        assert!(
+            late.iter().all(|problem| !problem.contains("WalkerNode")),
+            "{late:?}"
+        );
+
+        let mut disjoint = base.clone();
+
+        edit(&mut disjoint, |pass| {
+            for size in &mut pass.sizes {
+                size.k += 10;
+            }
+        });
+
+        assert!(raised_orders(&base, &disjoint)
+            .iter()
+            .any(|problem| problem.contains("no size runs on both sides")));
     }
 
     #[test]

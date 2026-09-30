@@ -1,5 +1,5 @@
 //! The scaling families: generators of TypeScript programs indexed by a size n = 2^k, which `scale` analyses at
-//! k = `MIN_K..=MAX_K` to measure how olint's work and memory grow (spec §7.5).
+//! k = `Family::min_k..=MAX_K` to measure how olint's work and memory grow (spec §7.5).
 //!
 //! Each family writes its program into `corpus/.cache/families/<family>/<n>/` with a `tsconfig.json` and an
 //! `olint.config.json` whose entrypoint is `src/index.ts`. The programs are analysed and never executed. Every family is
@@ -17,6 +17,8 @@ mod switch;
 
 use std::path::{Path, PathBuf};
 
+/// The smallest k of a family whose work limits and failures begin late enough to leave `scale::MINIMUM_POINTS`
+/// sizes from there.
 pub const MIN_K: u32 = 6;
 pub const MAX_K: u32 = 14;
 /// The size at which each family is an evaluation corpus member.
@@ -30,6 +32,9 @@ pub struct Family {
     /// What the size n counts.
     pub shape: &'static str,
     pub generate: fn(usize) -> Vec<Source>,
+    /// The smallest k `scale` runs, low enough that `scale::MINIMUM_POINTS` sizes run before the family first reads a
+    /// scheduler work limit or fails.
+    pub min_k: u32,
 }
 
 pub const FAMILIES: [Family; 9] = [
@@ -37,46 +42,58 @@ pub const FAMILIES: [Family; 9] = [
         name: "flat",
         shape: "n independent exported functions, each with one loop",
         generate: flat::generate,
+        min_k: MIN_K,
     },
     Family {
         name: "chains",
         shape: "one call chain of n functions",
         generate: chains::generate,
+        // Every function is a root, so the chain's task keys grow as n^2 and reach their limit at k=8.
+        min_k: 3,
     },
     Family {
         name: "nesting",
         shape: "one function whose if statements nest n deep",
         generate: nesting::generate,
+        // k=8 overflows the member process's stack.
+        min_k: 3,
     },
     Family {
         name: "objects",
         shape: "one object literal with n function-valued properties, read by key and iterated",
         generate: objects::generate,
+        min_k: MIN_K,
     },
     Family {
         name: "switch",
         shape: "one switch with n cases, each with one loop",
         generate: switch::generate,
+        min_k: MIN_K,
     },
     Family {
         name: "recursion",
         shape: "one strongly connected component of n mutually recursive functions",
         generate: recursion::generate,
+        // Recurrence contexts grow as n^3 and reach their limit at k=4.
+        min_k: 0,
     },
     Family {
         name: "regex",
         shape: "n functions, each testing or replacing with its own regex literal",
         generate: regex::generate,
+        min_k: MIN_K,
     },
     Family {
         name: "generics",
         shape: "n generic functions over generic interfaces, each chaining array methods on a type parameter",
         generate: generics::generate,
+        min_k: MIN_K,
     },
     Family {
         name: "files",
         shape: "n modules importing along a binary tree, re-exported from one index",
         generate: files::generate,
+        min_k: MIN_K,
     },
 ];
 

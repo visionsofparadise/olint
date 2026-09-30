@@ -166,7 +166,10 @@ fn run(arguments: &[String]) -> Result<(), String> {
             scale::scale(scale::ScaleArgs {
                 src: flags.required("src")?,
                 family: flags.optional("family"),
-                min_k: flags.number("min-k", u64::from(families::MIN_K))? as u32,
+                min_k: match flags.optional("min-k") {
+                    Some(_) => Some(flags.number("min-k", 0)? as u32),
+                    None => None,
+                },
                 max_k: flags.number("max-k", u64::from(families::MAX_K))? as u32,
                 out: flags.optional("out").map(PathBuf::from),
                 jobs: flags.number("jobs", default_jobs())? as usize,
