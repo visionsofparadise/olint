@@ -11,6 +11,14 @@
 //!
 //! - A key present in the base and absent from the head fails; an added key is reported and allowed, since it adds
 //!   coverage.
+//! - The one exemption is a function whose own walk a resource limit cut short on either side: its row carries an
+//!   `analysis resource limit` unknown whose origin lies in that function and in no function nested inside it (a
+//!   refused root, or a WalkerNode or TraversalEdge refusal within it). Its row is ranked as usual, so its lowering
+//!   still needs a trailer (§5.1), and keys of its descendants present on both sides are ranked as usual, but a
+//!   descendant key present on one side only is skipped and counted per member. olint records a row for each node its
+//!   walker visits, and the walker's per-kind handlers choose which children it visits, so the key set of a walk that
+//!   a limit stopped cannot be rebuilt without that walk. The harness therefore owns this exemption, and applies it
+//!   only to descendants of such a function.
 //! - A member present in the base and absent from the head fails.
 //! - A member that fails hard (no rows) in the head fails unless it also failed hard in the base, in which case it is
 //!   skipped and listed under "failed on both sides". A member whose analysis reported errors but wrote rows is
@@ -40,6 +48,10 @@ use crate::snapshot::{Pass, PASSES};
 
 /// Unmatched lowerings printed before the rest are summarized as a count.
 const PRINTED_LOWERINGS: usize = 200;
+/// The node kinds of the rows olint emits for reportable functions and constructions.
+const FUNCTION_KINDS: [&str; 3] = ["Function", "ArrowFunctionExpression", "Class"];
+/// `UnknownReason::ResourceExhaustion`'s text.
+const RESOURCE_LIMIT: &str = "analysis resource limit";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
@@ -195,11 +207,13 @@ pub struct Totals {
     pub lowers: usize,
     pub added: usize,
     pub removed: usize,
+    /// Descendant keys of a resource-limited function present on one side only, left out of `added` and `removed`.
+    pub skipped: usize,
 }
 
 impl Totals {
     fn changed(&self) -> bool {
-        self.raises + self.asserted + self.lowers + self.added + self.removed > 0
+        self.raises + self.asserted + self.lowers + self.added + self.removed + self.skipped > 0
     }
 
     fn add(&mut self, other: &Totals) {
@@ -209,6 +223,7 @@ impl Totals {
         self.lowers += other.lowers;
         self.added += other.added;
         self.removed += other.removed;
+        self.skipped += other.skipped;
     }
 }
 
@@ -269,28 +284,29 @@ impl Report {
 
         let _ = writeln!(
             out,
-            "{:<48} {:>8} {:>8} {:>8} {:>8} {:>8}",
-            "member", "raises", "asserted", "lowers", "added", "removed"
+            "{:<48} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "member", "raises", "asserted", "lowers", "added", "removed", "skipped"
         );
 
         for ((pass, member), counts) in &self.members {
             if counts.changed() {
                 let _ = writeln!(
                     out,
-                    "{:<48} {:>8} {:>8} {:>8} {:>8} {:>8}",
+                    "{:<48} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
                     format!("{}{member}", prefix(*pass)),
                     counts.raises,
                     counts.asserted,
                     counts.lowers,
                     counts.added,
-                    counts.removed
+                    counts.removed,
+                    counts.skipped
                 );
             }
         }
 
         let _ = writeln!(
             out,
-            "{:<48} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "{:<48} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
             format!(
                 "total ({} runs, {} unchanged)",
                 self.members.len(),
@@ -300,7 +316,8 @@ impl Report {
             totals.asserted,
             totals.lowers,
             totals.added,
-            totals.removed
+            totals.removed,
+            totals.skipped
         );
 
         for member in &self.failed {
@@ -397,6 +414,75 @@ impl Report {
         );
 
         out
+    }
+}
+
+/// The function rows of one member's two snapshots, and those whose own walk a resource limit cut short on either
+/// side.
+struct Functions {
+    spans: BTreeMap<String, Vec<(u32, u32)>>,
+    limited: BTreeSet<(String, u32, u32)>,
+}
+
+impl Functions {
+    fn of(old: &BTreeMap<NodeKey, NodeRow>, new: &BTreeMap<NodeKey, NodeRow>) -> Functions {
+        let rows = || {
+            old.values()
+                .chain(new.values())
+                .filter(|row| FUNCTION_KINDS.contains(&row.key.kind.as_str()))
+        };
+        let mut spans: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+
+        for row in rows() {
+            spans
+                .entry(row.key.path.clone())
+                .or_default()
+                .push((row.key.start, row.key.end));
+        }
+
+        for list in spans.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+
+        let mut functions = Functions {
+            spans,
+            limited: BTreeSet::new(),
+        };
+        let limited: Vec<(String, u32, u32)> = rows()
+            .filter(|row| {
+                row.unknowns.iter().any(|(origin, reason)| {
+                    reason == RESOURCE_LIMIT
+                        && origin.path == row.key.path
+                        && functions.enclosing(&origin.path, origin.start, origin.end)
+                            == Some((row.key.start, row.key.end))
+                })
+            })
+            .map(|row| (row.key.path.clone(), row.key.start, row.key.end))
+            .collect();
+
+        functions.limited.extend(limited);
+
+        functions
+    }
+
+    /// The smallest function span of `path` that contains `start..end`, the span itself included.
+    fn enclosing(&self, path: &str, start: u32, end: u32) -> Option<(u32, u32)> {
+        self.spans
+            .get(path)?
+            .iter()
+            .filter(|(from, to)| *from <= start && end <= *to)
+            .min_by_key(|(from, to)| to - from)
+            .copied()
+    }
+
+    /// Whether `key` is a descendant of a function whose own walk a resource limit cut short, so its presence on one
+    /// side only is skipped. A function row itself is never exempt.
+    fn exempts(&self, key: &NodeKey) -> bool {
+        !FUNCTION_KINDS.contains(&key.kind.as_str())
+            && self
+                .enclosing(&key.path, key.start, key.end)
+                .is_some_and(|(start, end)| self.limited.contains(&(key.path.clone(), start, end)))
     }
 }
 
@@ -585,6 +671,7 @@ pub fn compare(base: &Path, head: &Path, trailers: &[Trailer]) -> Result<Report,
             (None, None) => continue,
         };
         let mut totals = Totals::default();
+        let functions = Functions::of(&old, &new);
 
         ruled |= old
             .values()
@@ -593,6 +680,12 @@ pub fn compare(base: &Path, head: &Path, trailers: &[Trailer]) -> Result<Report,
 
         for (key, prior) in &old {
             let Some(current) = new.get(key) else {
+                if functions.exempts(key) {
+                    totals.skipped += 1;
+
+                    continue;
+                }
+
                 totals.removed += 1;
 
                 if report.removed.len() < PRINTED_LOWERINGS {
@@ -647,7 +740,12 @@ pub fn compare(base: &Path, head: &Path, trailers: &[Trailer]) -> Result<Report,
             }
         }
 
-        totals.added = new.keys().filter(|key| !old.contains_key(*key)).count();
+        for key in new.keys().filter(|key| !old.contains_key(*key)) {
+            match functions.exempts(key) {
+                true => totals.skipped += 1,
+                false => totals.added += 1,
+            }
+        }
 
         report.members.insert((pass, member), totals);
     }
@@ -1226,6 +1324,103 @@ mod tests {
         assert_eq!(warned.totals().lowers, 1);
         assert_eq!(warned.errors.len(), 1);
         assert!(!warned.passed());
+    }
+
+    /// A function row over `start..end` of `a.ts`, Known, or Unknown with one unknown of `reason` whose origin spans
+    /// `origin`.
+    fn function(start: u32, end: u32, unknown: Option<(&str, (u32, u32))>) -> NodeRow {
+        let span = NodeKey {
+            end,
+            ..key("a.ts", start, "Function")
+        };
+
+        match unknown {
+            None => NodeRow {
+                key: span,
+                ..row(NodeState::Known, Some("O(1)"))
+            },
+            Some((reason, (from, to))) => NodeRow {
+                key: span,
+                unknowns: vec![(
+                    NodeKey {
+                        end: to,
+                        ..key("a.ts", from, "CallExpression")
+                    },
+                    reason.to_string(),
+                )],
+                ..row(NodeState::Unknown, None)
+            },
+        }
+    }
+
+    fn lowered_function_diff(name: &str, head: NodeRow, trailers: &[Trailer]) -> Report {
+        let base = [function(0, 100, None), keyed(10, "O(1)"), keyed(20, "O(1)")];
+        let head = [head, keyed(10, "O(1)")];
+
+        compared(
+            name,
+            &[("m", Run::Rows(&base, &[]))],
+            &[("m", Run::Rows(&head, &[]))],
+            trailers,
+        )
+    }
+
+    #[test]
+    fn removed_descendants_of_a_resource_limited_function_are_skipped() {
+        let any = Trailer::parse("member=m path=a.ts kind=Function rule=*; uncertified; x")
+            .expect("parses");
+
+        for origin in [(0, 100), (20, 21)] {
+            let report = lowered_function_diff(
+                "limited",
+                function(0, 100, Some((RESOURCE_LIMIT, origin))),
+                std::slice::from_ref(&any),
+            );
+            let totals = report.totals();
+
+            assert_eq!((totals.removed, totals.skipped, totals.lowers), (0, 1, 1));
+            assert_eq!(totals.unchanged, 1);
+            assert!(report.passed(), "{}", report.render());
+            assert!(report.render().contains("skipped"));
+        }
+    }
+
+    #[test]
+    fn removed_descendants_of_a_normal_function_still_fail() {
+        let any = Trailer::parse("member=m path=a.ts kind=Function rule=*; uncertified; x")
+            .expect("parses");
+
+        // Another reason, and a resource limit whose origin lies in a callee outside the function, leave the walk
+        // complete.
+        for head in [
+            function(0, 100, Some(("unsupported model", (0, 100)))),
+            function(0, 100, Some((RESOURCE_LIMIT, (200, 300)))),
+        ] {
+            let report = lowered_function_diff("normal", head, std::slice::from_ref(&any));
+            let totals = report.totals();
+
+            assert_eq!((totals.removed, totals.skipped), (1, 0));
+            assert!(!report.passed());
+        }
+
+        let report = lowered_function_diff("known", function(0, 100, None), &[]);
+
+        assert_eq!(report.totals().removed, 1);
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn a_resource_limited_function_row_still_needs_a_trailer() {
+        let report = lowered_function_diff(
+            "untrailed",
+            function(0, 100, Some((RESOURCE_LIMIT, (0, 100)))),
+            &[],
+        );
+
+        assert_eq!(report.totals().skipped, 1);
+        assert_eq!(report.unmatched_count, 1);
+        assert_eq!(report.unmatched[0].key.kind, "Function");
+        assert!(!report.passed());
     }
 
     #[test]
