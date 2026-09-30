@@ -6,10 +6,22 @@ import Lean
 Run from `proofs/` with `lake env lean scripts/axioms.lean` after `lake build` (and after the
 corpus generator has written `Olint/Corpus/`, when it has).
 
-It imports `Olint.Certificate` and every module under `Olint/Rules/`, `Olint/Corpus/` and
-`Olint/Tests/`, then prints the axioms of `Olint.check_sound` and of every theorem those
-modules declare, as `#print axioms` does. It fails, so `lean` exits non-zero, when any axiom
-lies outside `propext`, `Classical.choice` and `Quot.sound`.
+It imports every module under `Olint/` and prints the axioms of every theorem those modules
+declare, as `#print axioms` does, skipping only the equation lemmas Lean generates for
+definitions (`f.eq_1`, `f.eq_def`, `f.eq_unfold`). It fails, so `lean` exits non-zero, when:
+
+* any audited theorem depends on an axiom outside `propext`, `Classical.choice` and
+  `Quot.sound`;
+* any source file (`Olint.lean`, `Olint/**`, `lakefile.toml`) mentions the kernel-check bypass
+  option `debug.skipKernelTC`;
+* a generated certificate theorem (`Olint.Corpus.*`, and the `c_…` theorems of
+  `Olint.Tests.Certificate`, which follow the generator's shape) states anything but
+  `∀ W : World, NoReplacement W xs → Bound W <program> <node> <bound>`, optionally with the
+  draft premise `W.ops = SpecOps.draft` before `Bound`.
+
+A theorem whose statement or proof reaches `Olint.Model.SpecOps.draft` rests on the G52 step
+cost drafts, which are not yet signed into §2; the audit lists it as pending Matt's signature
+(§2.1), and a certificate resting on the drafts does not count as accepted until he signs.
 -/
 
 open Lean System
@@ -19,8 +31,9 @@ namespace OlintAxioms
 /-- The axioms §6.3 admits. -/
 def allowed : Array Name := #[``propext, ``Classical.choice, ``Quot.sound]
 
-/-- The directories whose modules' theorems are audited. -/
-def auditedDirs : Array FilePath := #["Olint/Rules", "Olint/Corpus", "Olint/Tests"]
+/-- The G52 draft step costs, tracked like an axiom so the audit can report what rests on
+them. -/
+def draft : Name := `Olint.Model.SpecOps.draft
 
 /-- The `.lean` files under a directory, recursively; none when it does not exist. -/
 partial def leanFiles (dir : FilePath) : IO (Array FilePath) := do
@@ -38,8 +51,9 @@ def moduleOf (p : FilePath) : Name :=
   (p.withExtension "").components.foldl
     (fun n c => if c == "." || c.isEmpty then n else Name.str n c) .anonymous
 
-/-- The axioms a constant depends on, memoised across constants, following the same edges as
-`#print axioms` (`Lean.collectAxioms`): types, values, and an inductive's constructors. -/
+/-- The axioms, and the draft, a constant depends on, memoised across constants, following the
+same edges as `#print axioms` (`Lean.collectAxioms`): types, values, and an inductive's
+constructors. -/
 partial def axiomsOf (env : Environment) (c : Name) : StateM (NameMap (Array Name)) (Array Name) := do
   if let some r := (← get).find? c then return r
   modify (·.insert c #[])
@@ -49,7 +63,7 @@ partial def axiomsOf (env : Environment) (c : Name) : StateM (NameMap (Array Nam
       let mut deps := info.type.getUsedConstants
       if let some v := info.value? (allowOpaque := true) then deps := deps ++ v.getUsedConstants
       if let .inductInfo i := info then deps := deps ++ i.ctors.toArray
-      let mut acc : Array Name := #[]
+      let mut acc : Array Name := if c == draft then #[draft] else #[]
       for d in deps do
         for a in ← axiomsOf env d do
           if !acc.contains a then acc := acc.push a
@@ -58,40 +72,93 @@ partial def axiomsOf (env : Environment) (c : Name) : StateM (NameMap (Array Nam
   modify (·.insert c r)
   return r
 
-/-- A theorem declared in the source, not an equation lemma Lean generates for a definition. -/
-def isDeclared (n : Name) : Bool :=
+/-- An equation lemma Lean generates for a definition: `eq_<n>`, `eq_def` or `eq_unfold`. -/
+def isEquationLemma (n : Name) : Bool :=
   match n with
-  | .str _ s => !(s.startsWith "eq_" || s.startsWith "_") && !n.isInternalDetail
+  | .str _ s =>
+    s == "eq_def" || s == "eq_unfold" ||
+      (s.startsWith "eq_" && !(s.drop 3).isEmpty && (s.drop 3).all Char.isDigit)
   | _ => false
 
-/-- The audit: print every audited theorem's axioms and fail on any outside `allowed`. -/
+/-- `e` is `∀ W : World, NoReplacement W xs → [W.ops = SpecOps.draft →] Bound W p n c` with closed
+`xs`, `p`, `n` and `c`. -/
+def isCertificateStatement (e : Expr) : Bool :=
+  match e with
+  | .forallE _ (.const `Olint.Model.World []) (.forallE _ hyp body _) _ =>
+    let noReplacement := hyp.isAppOfArity `Olint.Model.NoReplacement 2 &&
+      hyp.appFn!.appArg! == .bvar 0 && !hyp.appArg!.hasLooseBVars
+    let bound (b : Expr) (w : Nat) : Bool :=
+      b.isAppOfArity `Olint.Bound 4 && b.getAppArgs[0]! == .bvar w &&
+        (b.getAppArgs.extract 1 4).all (!·.hasLooseBVars)
+    let isDraft (d : Expr) : Bool :=
+      d.isAppOfArity `Eq 3 && d.appArg!.isConstOf draft &&
+        d.appFn!.appArg! == mkApp (.const `Olint.Model.World.ops []) (.bvar 1)
+    noReplacement && (bound body 1 || match body with
+      | .forallE _ d b _ => isDraft d && bound b 2
+      | _ => false)
+  | _ => false
+
+/-- A generated certificate theorem: one in `Olint.Corpus`, or a `c_…` theorem of
+`Olint.Tests.Certificate`. -/
+def isCertificate (m n : Name) : Bool :=
+  (`Olint.Corpus).isPrefixOf m ||
+    (m == `Olint.Tests.Certificate && match n with
+      | .str _ s => s.startsWith "c_"
+      | _ => false)
+
+/-- The source files the kernel-check bypass must not appear in. -/
+def sources : IO (Array FilePath) := do
+  return (#["Olint.lean", "lakefile.toml"] : Array FilePath) ++ (← leanFiles "Olint")
+
+/-- The audit. -/
 def audit : IO Unit := do
+  let needle := "skipKernel" ++ "TC"
+  let mut bypass : Array FilePath := #[]
+  for f in ← sources do
+    if (← f.pathExists) && ((← IO.FS.readFile f).splitOn needle).length > 1 then
+      bypass := bypass.push f
   initSearchPath (← findSysroot)
-  let mut mods : Array Name := #[]
-  for dir in auditedDirs do
-    for f in ← leanFiles dir do
-      mods := mods.push (moduleOf f)
-  let imports := (#[`Olint.Certificate] ++ mods).map fun m => ({ module := m } : Import)
+  let mods := (← leanFiles "Olint").map moduleOf
+  let imports := mods.map fun m => ({ module := m } : Import)
   let env ← importModules imports {} (loadExts := false)
-  let mut targets : Array Name := #[`Olint.check_sound]
+  let mut targets : Array (Name × Name) := #[]
   for m in mods do
     let some idx := env.getModuleIdx? m | throw <| IO.userError s!"module {m} not imported"
     for n in env.header.moduleData[idx.toNat]!.constNames do
       if let some (.thmInfo _) := env.find? n then
-        if isDeclared n then targets := targets.push n
-  let sorted := targets.qsort Name.lt
+        if !isEquationLemma n then targets := targets.push (n, m)
+  let sorted := targets.qsort (fun a b => Name.lt a.1 b.1)
   let mut memo : NameMap (Array Name) := {}
   let mut bad : Array (Name × Array Name) := #[]
-  for n in sorted do
-    let (axs, memo') := (axiomsOf env n).run memo
+  let mut pending : Array Name := #[]
+  let mut shapes : Array Name := #[]
+  let mut certificates := 0
+  for (n, m) in sorted do
+    let (deps, memo') := (axiomsOf env n).run memo
     memo := memo'
-    let axs := axs.qsort Name.lt
+    let axs := (deps.filter (· != draft)).qsort Name.lt
     IO.println s!"'{n}' depends on axioms: {axs.toList}"
     let extra := axs.filter fun a => !allowed.contains a
     if !extra.isEmpty then bad := bad.push (n, extra)
-  IO.println s!"audited {sorted.size} theorems in {mods.size + 1} modules"
+    if deps.contains draft then pending := pending.push n
+    if isCertificate m n then
+      certificates := certificates + 1
+      if let some (.thmInfo info) := env.find? n then
+        if !isCertificateStatement info.type then shapes := shapes.push n
+  IO.println s!"audited {sorted.size} theorems in {mods.size} modules"
+  IO.println s!"checked the statement of {certificates} certificate theorems"
+  for n in pending do
+    IO.println s!"pending signature (rests on the G52 drafts, SpecOps.draft): '{n}'"
+  let mut errors : Array String := #[]
+  if !bypass.isEmpty then
+    errors := errors.push s!"kernel-check bypass `debug.{needle}` in {bypass.toList}"
   if !bad.isEmpty then
-    throw <| IO.userError s!"axioms outside propext, Classical.choice, Quot.sound: {bad.toList}"
+    errors := errors.push s!"axioms outside propext, Classical.choice, Quot.sound: {bad.toList}"
+  if !shapes.isEmpty then
+    errors := errors.push
+      s!"certificate theorems not stating `∀ W, NoReplacement W xs → Bound W p n c`: {shapes.toList}"
+  if !errors.isEmpty then
+    throw <| IO.userError ("; ".intercalate errors.toList)
 
 end OlintAxioms
 

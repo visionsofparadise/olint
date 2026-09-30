@@ -2,9 +2,11 @@ import Olint.Model.Syntax
 import Olint.Model.Value
 import Olint.Axioms
 import Olint.Model.Cost
+import Olint.Model.Admission
 import Olint.Bound
 import Olint.Rules.Algebra
 import Olint.Certificate
 import Olint.Tests.Certificate
 import Olint.Tests.Encoded
 import Olint.Tests.Number
+import Olint.Tests.Probes

@@ -4,9 +4,22 @@
 //! over it cites. It encodes as a `Program` holding every named function of the scope and the
 //! entry `Node`: the entry function with its typed parameters and input dimensions, at the
 //! entry's own site. Numeric literals encode as their exact IEEE-754 binary64 values. A
-//! construct outside the model
-//! is an [`EncodeError::Unsupported`] naming its oxc node kind, so its bound stays uncertified:
-//! the encoder never approximates.
+//! construct outside the model is an [`EncodeError::Unsupported`] naming its oxc node kind, so
+//! its bound stays uncertified: the encoder never approximates.
+//!
+//! The encoder refuses what would make the encoded program mean something else than the source:
+//!
+//! - type assertions (`x as T`, `x!`, `<T>x`), which the model's §2.5 read check would take at
+//!   their word; `x satisfies T` checks without asserting and encodes as `x`;
+//! - an identifier the model would resolve to another binding than oxc does
+//!   (`Encoder::resolve`): each reference must resolve to a binding declared inside the function
+//!   being encoded, to the scope function it names, or, unresolved, to a global no scope
+//!   function shadows;
+//! - a function declaration outside a function body's top level, where sloppy code's Annex B
+//!   semantics differ from the model's block-scoped one;
+//! - an object literal `__proto__` key, which sets the new object's prototype (§13.2.5.5);
+//! - a dimension over a free variable, since the encoded entry's scope holds no free variables
+//!   and `Olint.check` rejects a dimension outside it.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -20,14 +33,12 @@ use oxc_ast::ast::{
     VariableDeclarationKind,
 };
 use oxc_ast::{AstKind, AstType};
-use oxc_semantic::{NodeId, Semantic};
+use oxc_semantic::{NodeId, Semantic, SymbolId};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{
     AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
 };
 use oxc_syntax::GetNodeId;
-
-use crate::syntax::unwrap;
 
 /// A function of a program scope: a `Function` or `ArrowFunctionExpression` node in a file's
 /// semantic.
@@ -37,12 +48,17 @@ pub struct FunctionRef<'s, 'a> {
     pub node: NodeId,
 }
 
-/// The quantity an input dimension measures (`Olint.Model.Measure`).
+/// The quantity an input dimension measures (`Olint.Model.Measure`): the length of a String in
+/// UTF-16 code units or of an Array, or, for a Map or Set, the length `|D|` of its `[[MapData]]`
+/// or `[[SetData]]` List, deleted entries included (`Olint.Model.Heap.lengthOf`). olint's
+/// tracked size of a collection is that `|D|`: any `delete` or `clear` makes the size untracked
+/// (G36), so a tracked size counts every entry ever added, as `|D|` does.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Measure {
     /// The length of the entry's `k`-th argument.
     Arg(usize),
-    /// The length of a variable of the node's scope.
+    /// The length of a variable of the node's scope. The encoder refuses it
+    /// ([`EncodeError::UnscopedDimension`]): the encoded scope holds no free variables.
     Var(String),
 }
 
@@ -76,6 +92,8 @@ pub enum EncodeError {
     Anonymous { span: Span },
     /// Two scope functions under one name.
     DuplicateName { name: String },
+    /// A dimension over a free variable, which the encoded entry's empty scope does not hold.
+    UnscopedDimension { name: String },
 }
 
 impl fmt::Display for EncodeError {
@@ -110,6 +128,9 @@ impl fmt::Display for EncodeError {
                 )
             }
             Self::DuplicateName { name } => write!(f, "two scope functions are named `{name}`"),
+            Self::UnscopedDimension { name } => {
+                write!(f, "a dimension measures the free variable `{name}`")
+            }
         }
     }
 }
@@ -126,21 +147,19 @@ pub fn encode_scope(
     cited: &[FunctionRef<'_, '_>],
     dimensions: &[Dimension],
 ) -> Result<Encoding, EncodeError> {
-    let (entry_name, entry_term) = definition(entry)?;
-    let mut definitions = BTreeMap::new();
+    let mut named = BTreeMap::new();
 
-    if let Some(name) = entry_name {
-        definitions.insert(name, (key(entry), entry_term.clone()));
+    if let Some((name, symbol)) = binding(entry)? {
+        named.insert(name, (key(entry), symbol, entry));
     }
 
     for function in cited {
-        let (name, term) = definition(*function)?;
         let span = function.semantic.nodes().kind(function.node).span();
-        let name = name.ok_or(EncodeError::Anonymous { span })?;
+        let (name, symbol) = binding(*function)?.ok_or(EncodeError::Anonymous { span })?;
 
-        match definitions.entry(name) {
+        match named.entry(name) {
             Entry::Vacant(slot) => {
-                slot.insert((key(*function), term));
+                slot.insert((key(*function), symbol, *function));
             }
             Entry::Occupied(slot) if slot.get().0 == key(*function) => {}
             Entry::Occupied(slot) => {
@@ -151,30 +170,51 @@ pub fn encode_scope(
         }
     }
 
-    let program = list(
-        definitions
-            .iter()
-            .map(|(name, (_, term))| format!("({}, {term})", string(name))),
-    );
+    if let Some(Dimension {
+        measure: Measure::Var(name),
+        ..
+    }) = dimensions
+        .iter()
+        .find(|dimension| matches!(dimension.measure, Measure::Var(_)))
+    {
+        return Err(EncodeError::UnscopedDimension { name: name.clone() });
+    }
+
+    let definitions = named
+        .iter()
+        .map(|(name, (key, symbol, _))| (name.clone(), (key.0, *symbol)))
+        .collect::<BTreeMap<_, _>>();
+    let entry_term = term(entry, &definitions)?;
+    let mut program = Vec::with_capacity(named.len());
+
+    for (name, (_, _, function)) in &named {
+        program.push(format!(
+            "({}, {})",
+            string(name),
+            term(*function, &definitions)?
+        ));
+    }
+
     let mut dimensions = dimensions.to_vec();
 
     dimensions.sort();
 
+    // A Map or Set dimension measures `|D|`, deleted entries included (see `Measure`).
     let dims = list(dimensions.iter().map(|dimension| {
-        let measure = match &dimension.measure {
-            Measure::Arg(k) => format!(".arg {k}"),
-            Measure::Var(name) => format!(".var {}", string(name)),
+        let Measure::Arg(k) = &dimension.measure else {
+            unreachable!("free-variable dimensions are refused above");
         };
 
-        format!("({}, {measure})", dimension.id)
+        format!("({}, .arg {k})", dimension.id)
     }));
 
     Ok(Encoding {
-        program: format!("⟨{program}⟩"),
+        program: format!("⟨{}⟩", list(program)),
         node: format!("⟨⟨{entry_term}, [], {dims}⟩, .entry⟩"),
     })
 }
 
+/// A scope function's identity: its file's semantic and its node.
 fn key(function: FunctionRef<'_, '_>) -> (usize, NodeId) {
     (
         std::ptr::from_ref(function.semantic) as usize,
@@ -182,25 +222,64 @@ fn key(function: FunctionRef<'_, '_>) -> (usize, NodeId) {
     )
 }
 
-fn definition(function: FunctionRef<'_, '_>) -> Result<(Option<String>, String), EncodeError> {
-    let encoder = Encoder {
-        semantic: function.semantic,
-    };
+/// The scope functions by the name the program defines them under: their semantic and the
+/// symbol of that name's binding.
+type Definitions = BTreeMap<String, (usize, SymbolId)>;
+
+/// The name a scope function is defined under and its binding's symbol: a declaration's own
+/// name, or the declarator a function expression initializes.
+fn binding(function: FunctionRef<'_, '_>) -> Result<Option<(String, SymbolId)>, EncodeError> {
     let nodes = function.semantic.nodes();
 
     match nodes.kind(function.node) {
-        AstKind::Function(inner) => {
-            let name = match inner.is_declaration() {
-                true => inner.id.as_ref().map(|id| id.name.to_string()),
-                false => encoder.declarator_name(function.node),
-            };
-
-            Ok((name, encoder.function(inner)?))
+        AstKind::Function(inner) if inner.is_declaration() => Ok(inner
+            .id
+            .as_ref()
+            .map(|id| (id.name.to_string(), id.symbol_id()))),
+        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => {
+            Ok(declarator_binding(function.semantic, function.node))
         }
-        AstKind::ArrowFunctionExpression(arrow) => Ok((
-            encoder.declarator_name(function.node),
-            encoder.arrow(arrow)?,
-        )),
+        kind => Err(EncodeError::NotAFunction {
+            kind: kind.ty(),
+            span: kind.span(),
+        }),
+    }
+}
+
+/// The binding a `const f = …` style declarator gives a function expression.
+fn declarator_binding(semantic: &Semantic<'_>, node: NodeId) -> Option<(String, SymbolId)> {
+    let nodes = semantic.nodes();
+    let mut parent = nodes.parent_id(node);
+
+    loop {
+        match nodes.kind(parent) {
+            AstKind::ParenthesizedExpression(_)
+            | AstKind::TSAsExpression(_)
+            | AstKind::TSSatisfiesExpression(_)
+            | AstKind::TSNonNullExpression(_)
+            | AstKind::TSTypeAssertion(_) => parent = nodes.parent_id(parent),
+            AstKind::VariableDeclarator(declarator) => {
+                return declarator
+                    .id
+                    .get_binding_identifier()
+                    .map(|id| (id.name.to_string(), id.symbol_id()))
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The `Func` term of a scope function.
+fn term(function: FunctionRef<'_, '_>, definitions: &Definitions) -> Encoded {
+    let encoder = Encoder {
+        semantic: function.semantic,
+        root: function.node,
+        definitions,
+    };
+
+    match function.semantic.nodes().kind(function.node) {
+        AstKind::Function(inner) => encoder.function(inner),
+        AstKind::ArrowFunctionExpression(arrow) => encoder.arrow(arrow),
         kind => Err(EncodeError::NotAFunction {
             kind: kind.ty(),
             span: kind.span(),
@@ -210,6 +289,9 @@ fn definition(function: FunctionRef<'_, '_>) -> Result<(Option<String>, String),
 
 struct Encoder<'s, 'a> {
     semantic: &'s Semantic<'a>,
+    /// The scope function being encoded.
+    root: NodeId,
+    definitions: &'s Definitions,
 }
 
 impl<'a> Encoder<'_, 'a> {
@@ -227,35 +309,44 @@ impl<'a> Encoder<'_, 'a> {
         Err(self.unsupported(node, Some(detail)))
     }
 
-    /// The name a `const f = …` style declarator binds a function expression to.
-    fn declarator_name(&self, node: NodeId) -> Option<String> {
-        let nodes = self.semantic.nodes();
-        let mut parent = nodes.parent_id(node);
-
-        loop {
-            match nodes.kind(parent) {
-                AstKind::ParenthesizedExpression(_)
-                | AstKind::TSAsExpression(_)
-                | AstKind::TSSatisfiesExpression(_)
-                | AstKind::TSNonNullExpression(_)
-                | AstKind::TSTypeAssertion(_) => parent = nodes.parent_id(parent),
-                AstKind::VariableDeclarator(declarator) => {
-                    return declarator
-                        .id
-                        .get_binding_identifier()
-                        .map(|id| id.name.to_string())
-                }
-                _ => return None,
-            }
-        }
-    }
-
     fn is_global(&self, reference: &oxc_ast::ast::IdentifierReference<'_>) -> bool {
         self.semantic
             .scoping()
             .get_reference(reference.reference_id())
             .symbol_id()
             .is_none()
+    }
+
+    /// The name of a reference, when the model resolves it to the binding oxc does: a binding
+    /// declared inside the scope function being encoded (the model binds every such binding
+    /// but a function or class expression's own name), the binding of the scope function it
+    /// names, or, when oxc leaves it unresolved, a global that no scope function shadows.
+    fn resolve(&self, reference: &oxc_ast::ast::IdentifierReference<'a>) -> Encoded {
+        let scoping = self.semantic.scoping();
+        let name = reference.name.as_str();
+        let semantic = std::ptr::from_ref(self.semantic) as usize;
+        let resolved = match scoping.get_reference(reference.reference_id()).symbol_id() {
+            None => !self.definitions.contains_key(name),
+            Some(symbol) if self.definitions.get(name) == Some(&(semantic, symbol)) => true,
+            Some(symbol) => {
+                let nodes = self.semantic.nodes();
+                let declaration = scoping.symbol_declaration(symbol);
+                let inside = declaration != self.root
+                    && nodes.ancestor_ids(declaration).any(|id| id == self.root);
+                let own_name = match nodes.kind(declaration) {
+                    AstKind::Function(function) => !function.is_declaration(),
+                    AstKind::Class(class) => !class.is_declaration(),
+                    _ => false,
+                };
+
+                inside && !own_name
+            }
+        };
+
+        match resolved {
+            true => Ok(string(name)),
+            false => self.reject(reference, "binding"),
+        }
     }
 
     fn function(&self, function: &Function<'a>) -> Encoded {
@@ -293,12 +384,33 @@ impl<'a> Encoder<'_, 'a> {
         self.func(&arrow.params, body, true)
     }
 
+    /// A function body's statements; its top-level function declarations, which strict and
+    /// sloppy code instantiate alike, are the only ones the encoder accepts.
     fn body(&self, body: &FunctionBody<'a>) -> Encoded {
         if let Some(directive) = body.directives.first() {
             return Err(self.unsupported(directive, None));
         }
 
-        self.statements(&body.statements)
+        let terms = body
+            .statements
+            .iter()
+            .map(|statement| match statement {
+                Statement::FunctionDeclaration(function) => {
+                    let Some(id) = &function.id else {
+                        return self.reject(statement, "no name");
+                    };
+
+                    Ok(format!(
+                        ".funDecl {} ({})",
+                        string(&id.name),
+                        self.function(function)?
+                    ))
+                }
+                statement => self.statement(statement),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(list(terms))
     }
 
     fn func(&self, params: &FormalParameters<'a>, body: String, arrow: bool) -> Encoded {
@@ -469,17 +581,7 @@ impl<'a> Encoder<'_, 'a> {
             Statement::BreakStatement(_) | Statement::ContinueStatement(_) => {
                 return self.reject(statement, "label")
             }
-            Statement::FunctionDeclaration(function) => {
-                let Some(id) = &function.id else {
-                    return self.reject(statement, "no name");
-                };
-
-                format!(
-                    ".funDecl {} ({})",
-                    string(&id.name),
-                    self.function(function)?
-                )
-            }
+            Statement::FunctionDeclaration(_) => return self.reject(statement, "block function"),
             Statement::ClassDeclaration(class) => {
                 let Some(id) = &class.id else {
                     return self.reject(statement, "no name");
@@ -589,9 +691,9 @@ impl<'a> Encoder<'_, 'a> {
     }
 
     fn expression(&self, expression: &Expression<'a>) -> Encoded {
-        let expression = unwrap(expression);
-
         Ok(match expression {
+            Expression::ParenthesizedExpression(inner) => self.expression(&inner.expression)?,
+            Expression::TSSatisfiesExpression(inner) => self.expression(&inner.expression)?,
             Expression::BooleanLiteral(literal) => format!(".lit (.bool {})", literal.value),
             Expression::NullLiteral(_) => ".lit .null".into(),
             Expression::NumericLiteral(literal) => format!(".lit (.num {})", number(literal.value)),
@@ -605,7 +707,7 @@ impl<'a> Encoder<'_, 'a> {
             Expression::Identifier(reference) => {
                 match reference.name == "undefined" && self.is_global(reference) {
                     true => ".lit .undefined".into(),
-                    false => format!(".ident {}", string(&reference.name)),
+                    false => format!(".ident {}", self.resolve(reference)?),
                 }
             }
             Expression::ThisExpression(_) => ".«this»".into(),
@@ -753,7 +855,7 @@ impl<'a> Encoder<'_, 'a> {
     fn target(&self, target: &SimpleAssignmentTarget<'a>) -> Result<Target, EncodeError> {
         Ok(match target {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(reference) => {
-                Target::Identifier(string(&reference.name))
+                Target::Identifier(self.resolve(reference)?)
             }
             SimpleAssignmentTarget::StaticMemberExpression(member) => Target::Member(
                 self.expression(&member.object)?,
@@ -786,6 +888,10 @@ impl<'a> Encoder<'_, 'a> {
                 }
                 _ => return self.reject(property, "key"),
             };
+
+            if name == "__proto__" {
+                return self.reject(property, "__proto__");
+            }
 
             properties.push(format!(
                 "({}, {})",

@@ -8,7 +8,12 @@ side conditions `Olint.check` evaluates for them by kernel reduction.
 
 The decidable side conditions are plain structural recursions over `Cost` and the syntax with
 `ℕ` and `Bool` arithmetic only, so `decide` evaluates them; each has a soundness lemma here
-stating what it establishes about `Cost.eval` on the large admitted instances of an entry.
+stating what it establishes about `Cost.eval` on every admitted instance of an entry, with one
+constant for all of them: every dimension reads as at least `1`, so the monomial comparison of
+`within` holds uniformly, small dimensions included (`monoWithin_le`).
+
+Every lemma holds in every world `W`, whatever its spec-internal step costs `W.ops` and the
+intrinsics it modifies: the family A rules rest on no G52 draft and consult no intrinsic.
 
 **Composition.** `seq-max`, `branch-join` and `channel-total` compose child certificates: a
 child's bound holds at every configuration its entry's run reaches at the child
@@ -28,11 +33,17 @@ use the `Sub` edges from the parent to each child.
 | `product-normalise` | cost.rs:288-380 (kind 1) | `prodMatches` over the expanded factors | `productNormalise_sound` |
 | `expr-validity` | cost.rs:383-475 | `valid` | `valid_nonneg` |
 | `limit-compare` | cost.rs:863-898, main.rs:290-316 | `within` | `limitCompare_sound` |
+
+The family A rules `nest-product` (cost.rs:2150-2191), `partial-bind-known` (cost.rs:124-156)
+and `preference-rank` (cost.rs:1788-1798) are pending their soundness proofs; `Olint.check`
+rejects them until they land.
 -/
 
 namespace Olint.Rules
 
 open Olint Olint.Model Filter Asymptotics
+
+variable {W : World}
 
 /-! ## Syntactic equality of costs -/
 
@@ -155,30 +166,30 @@ end
 /-! ## Unfolding frames -/
 
 theorem runs_stmt {env : Env} {s : Stmt} {st : St} {f : ℕ} {o : Outcome} {st' : St} :
-    Cfg.Runs ⟨.stmt env s, st⟩ f o st' ↔
-      ∃ r, (execStmt f env s).run st = .ok (r, st') ∧ o = .stmt r.1 r.2 := by
+    Cfg.Runs W ⟨.stmt env s, st⟩ f o st' ↔
+      ∃ r, (execStmt W f env s).run st = .ok (r, st') ∧ o = .stmt r.1 r.2 := by
   simp only [Cfg.Runs, Frame.run, run_map]
-  rcases (execStmt f env s).run st with e | ⟨r, st1⟩
+  rcases (execStmt W f env s).run st with e | ⟨r, st1⟩
   · simp
   · constructor
     · intro h; cases h; exact ⟨r, rfl, rfl⟩
     · rintro ⟨r', h1, rfl⟩; cases h1; rfl
 
 theorem runs_stmts {env : Env} {ss : List Stmt} {st : St} {f : ℕ} {o : Outcome} {st' : St} :
-    Cfg.Runs ⟨.stmts env ss, st⟩ f o st' ↔
-      ∃ r, (execStmts f env ss).run st = .ok (r, st') ∧ o = .stmt r.1 r.2 := by
+    Cfg.Runs W ⟨.stmts env ss, st⟩ f o st' ↔
+      ∃ r, (execStmts W f env ss).run st = .ok (r, st') ∧ o = .stmt r.1 r.2 := by
   simp only [Cfg.Runs, Frame.run, run_map]
-  rcases (execStmts f env ss).run st with e | ⟨r, st1⟩
+  rcases (execStmts W f env ss).run st with e | ⟨r, st1⟩
   · simp
   · constructor
     · intro h; cases h; exact ⟨r, rfl, rfl⟩
     · rintro ⟨r', h1, rfl⟩; cases h1; rfl
 
 theorem runs_expr {env : Env} {x : Expr} {st : St} {f : ℕ} {o : Outcome} {st' : St} :
-    Cfg.Runs ⟨.expr env x, st⟩ f o st' ↔
-      ∃ v, (evalExpr f env x).run st = .ok (v, st') ∧ o = .val v := by
+    Cfg.Runs W ⟨.expr env x, st⟩ f o st' ↔
+      ∃ v, (evalExpr W f env x).run st = .ok (v, st') ∧ o = .val v := by
   simp only [Cfg.Runs, Frame.run, run_map]
-  rcases (evalExpr f env x).run st with e | ⟨r, st1⟩
+  rcases (evalExpr W f env x).run st with e | ⟨r, st1⟩
   · simp
   · constructor
     · intro h; cases h; exact ⟨r, rfl, rfl⟩
@@ -186,10 +197,10 @@ theorem runs_expr {env : Env} {x : Expr} {st : St} {f : ℕ} {o : Outcome} {st' 
 
 theorem runs_callFunc {fn : Func} {env : Env} {self : Value} {args : List Value} {st : St}
     {f : ℕ} {o : Outcome} {st' : St} :
-    Cfg.Runs ⟨.callFunc fn env self args, st⟩ f o st' ↔
-      ∃ v, (callFunc f fn env self args).run st = .ok (v, st') ∧ o = .val v := by
+    Cfg.Runs W ⟨.callFunc fn env self args, st⟩ f o st' ↔
+      ∃ v, (callFunc W f fn env self args).run st = .ok (v, st') ∧ o = .val v := by
   simp only [Cfg.Runs, Frame.run, run_map]
-  rcases (callFunc f fn env self args).run st with e | ⟨r, st1⟩
+  rcases (callFunc W f fn env self args).run st with e | ⟨r, st1⟩
   · simp
   · constructor
     · intro h; cases h; exact ⟨r, rfl, rfl⟩
@@ -198,29 +209,29 @@ theorem runs_callFunc {fn : Func} {env : Env} {self : Value} {args : List Value}
 /-! ## Statement lists -/
 
 theorem execStmts_zero (env : Env) (ss : List Stmt) (st : St) :
-    (execStmts 0 env ss).run st = .error .fuel := by
+    (execStmts W 0 env ss).run st = .error .fuel := by
   rw [execStmts]; rfl
 
 theorem execStmts_nil (f : ℕ) (env : Env) (st : St) :
-    (execStmts (f + 1) env []).run st = .ok ((env, .normal), st) := by
+    (execStmts W (f + 1) env []).run st = .ok ((env, .normal), st) := by
   rw [execStmts]; rfl
 
 theorem execStmts_cons (f : ℕ) (env : Env) (s : Stmt) (ss : List Stmt) (st : St) :
-    (execStmts (f + 1) env (s :: ss)).run st =
-      match (execStmt f env s).run st with
-      | .ok ((env', .normal), st1) => (execStmts f env' ss).run st1
+    (execStmts W (f + 1) env (s :: ss)).run st =
+      match (execStmt W f env s).run st with
+      | .ok ((env', .normal), st1) => (execStmts W f env' ss).run st1
       | .ok ((env', c), st1) => .ok ((env', c), st1)
       | .error e => .error e := by
   simp only [execStmts, run_bind]
-  rcases (execStmt f env s).run st with e | ⟨⟨env', c⟩, st1⟩
+  rcases (execStmt W f env s).run st with e | ⟨⟨env', c⟩, st1⟩
   · rfl
   · cases c <;> rfl
 
 theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} (hB : 0 ≤ B)
-    (ss0 : List Stmt) (h : ∀ s ∈ ss0, Holds p e i (.stmt s) allChannels F B) :
-    ∀ ss : List Stmt, (∀ s ∈ ss, s ∈ ss0) → ∀ env st, Reach p e i ⟨.stmts env ss, st⟩ →
-      (∀ f, F + ss.length + 1 ≤ f → ∃ o st', Cfg.Runs ⟨.stmts env ss, st⟩ f o st') ∧
-      (∀ f o st', Cfg.Runs ⟨.stmts env ss, st⟩ f o st' → (st'.work : ℝ) - st.work ≤ ss.length * B)
+    (ss0 : List Stmt) (h : ∀ s ∈ ss0, Holds W p e i (.stmt s) allChannels F B) :
+    ∀ ss : List Stmt, (∀ s ∈ ss, s ∈ ss0) → ∀ env st, Reach W p e i ⟨.stmts env ss, st⟩ →
+      (∀ f, F + ss.length + 1 ≤ f → ∃ o st', Cfg.Runs W ⟨.stmts env ss, st⟩ f o st') ∧
+      (∀ f o st', Cfg.Runs W ⟨.stmts env ss, st⟩ f o st' → (st'.work : ℝ) - st.work ≤ ss.length * B)
   | [], _, env, st, _ => by
     refine ⟨fun f hf => ?_, fun f o st' hc => ?_⟩
     · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
@@ -233,7 +244,7 @@ theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ}
         cases hr; simp
   | s :: ss, hss, env, st, hr => by
     have hs0 : s ∈ ss0 := hss s (by simp)
-    have hhead : Reach p e i ⟨.stmt env s, st⟩ := hr.tail Sub.stmtsHead
+    have hhead : Reach W p e i ⟨.stmt env s, st⟩ := hr.tail Sub.stmtsHead
     obtain ⟨hcomp, hwork⟩ := h s hs0 _ hhead ⟨env, rfl⟩
     refine ⟨fun f hf => ?_, fun f o st' hc => ?_⟩
     · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
@@ -241,7 +252,7 @@ theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ}
       obtain ⟨⟨env', c⟩, h1', rfl⟩ := runs_stmt.1 h1
       cases c with
       | normal =>
-        have htail : Reach p e i ⟨.stmts env' ss, st1⟩ :=
+        have htail : Reach W p e i ⟨.stmts env' ss, st1⟩ :=
           hr.tail (Sub.stmtsTail ⟨f', h1⟩)
         obtain ⟨o2, st2, h2⟩ := (holds_stmts hB ss0 h ss (fun s' hs' => hss s' (by simp [hs']))
           env' st1 htail).1 f' (by simp at hf; omega)
@@ -258,14 +269,14 @@ theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ}
         have hlen : ((s :: ss).length : ℝ) * B = B + ss.length * B := by
           simp only [List.length_cons, Nat.cast_add, Nat.cast_one]; ring
         rw [hlen]
-        rcases h1 : (execStmt f env s).run st with err | ⟨⟨env', c⟩, st1⟩
+        rcases h1 : (execStmt W f env s).run st with err | ⟨⟨env', c⟩, st1⟩
         · rw [h1] at hr'; cases hr'
         · rw [h1] at hr'
           have w1 := hwork f _ st1 (runs_stmt.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
           have hlB : (0 : ℝ) ≤ ss.length * B := mul_nonneg (Nat.cast_nonneg _) hB
           cases c with
           | normal =>
-            have htail : Reach p e i ⟨.stmts env' ss, st1⟩ :=
+            have htail : Reach W p e i ⟨.stmts env' ss, st1⟩ :=
               hr.tail (Sub.stmtsTail ⟨f, runs_stmt.2 ⟨_, h1, rfl⟩⟩)
             have w2 := (holds_stmts hB ss0 h ss (fun s' hs' => hss s' (by simp [hs']))
               env' st1 htail).2 f _ st' (runs_stmts.2 ⟨r, hr', rfl⟩)
@@ -279,117 +290,122 @@ theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ}
 theorem run_tick1 (st : St) : (tick 1).run st = .ok ((), st.tick) := rfl
 
 theorem execStmt_zero (env : Env) (s : Stmt) (st : St) :
-    (execStmt 0 env s).run st = .error .fuel := by
+    (execStmt W 0 env s).run st = .error .fuel := by
   rw [execStmt]; rfl
 
 theorem evalExpr_zero (env : Env) (x : Expr) (st : St) :
-    (evalExpr 0 env x).run st = .error .fuel := by
+    (evalExpr W 0 env x).run st = .error .fuel := by
   rw [evalExpr]; rfl
 
 theorem callFunc_zero (fn : Func) (env : Env) (self : Value) (args : List Value) (st : St) :
-    (callFunc 0 fn env self args).run st = .error .fuel := by
+    (callFunc W 0 fn env self args).run st = .error .fuel := by
   rw [callFunc]; rfl
 
 theorem execStmt_block (f : ℕ) (env : Env) (ss : List Stmt) (st : St) :
-    (execStmt (f + 1) env (.block ss)).run st =
-      match (execStmts f env ss).run st.tick with
-      | .ok ((_, c), st1) => .ok ((env, c), st1)
+    (execStmt W (f + 1) env (.block ss)).run st =
+      match (instantiate W env ss).run st.tick with
+      | .ok (env', st1) => match (execStmts W f env' ss).run st1 with
+        | .ok ((_, c), st2) => .ok ((env, c), st2)
+        | .error e => .error e
       | .error e => .error e := by
   simp only [execStmt, run_bind, run_tick1]
-  rcases (execStmts f env ss).run st.tick with e | ⟨⟨env', c⟩, st1⟩ <;> rfl
+  rcases (instantiate W env ss).run st.tick with e | ⟨env', st1⟩
+  · rfl
+  · simp only
+    rcases (execStmts W f env' ss).run st1 with e | ⟨⟨env'', c⟩, st2⟩ <;> rfl
 
 theorem execStmt_expr (f : ℕ) (env : Env) (x : Expr) (st : St) :
-    (execStmt (f + 1) env (.expr x)).run st =
-      match (evalExpr f env x).run st.tick with
+    (execStmt W (f + 1) env (.expr x)).run st =
+      match (evalExpr W f env x).run st.tick with
       | .ok (_, st1) => .ok ((env, .normal), st1)
       | .error e => .error e := by
   simp only [execStmt, run_bind, run_tick1]
-  rcases (evalExpr f env x).run st.tick with e | ⟨v, st1⟩ <;> rfl
+  rcases (evalExpr W f env x).run st.tick with e | ⟨v, st1⟩ <;> rfl
 
 theorem execStmt_ret (f : ℕ) (env : Env) (x : Expr) (st : St) :
-    (execStmt (f + 1) env (.ret (some x))).run st =
-      match (evalExpr f env x).run st.tick with
+    (execStmt W (f + 1) env (.ret (some x))).run st =
+      match (evalExpr W f env x).run st.tick with
       | .ok (v, st1) => .ok ((env, .ret v), st1)
       | .error e => .error e := by
   simp only [execStmt, run_bind, run_tick1]
-  rcases (evalExpr f env x).run st.tick with e | ⟨v, st1⟩ <;> rfl
+  rcases (evalExpr W f env x).run st.tick with e | ⟨v, st1⟩ <;> rfl
 
 theorem execStmt_decl (f : ℕ) (env : Env) (k : DeclKind) (y : Name) (τ : Ty) (x : Expr)
     (st : St) :
-    (execStmt (f + 1) env (.decl k y τ (some x))).run st =
-      match (evalExpr f env x).run st.tick with
-      | .ok (v, st1) => match (bindCell env y v τ).run st1 with
+    (execStmt W (f + 1) env (.decl k y τ (some x))).run st =
+      match (evalExpr W f env x).run st.tick with
+      | .ok (v, st1) => match (initBinding env k y τ (some v)).run st1 with
         | .ok (env', st2) => .ok ((env', .normal), st2)
         | .error e => .error e
       | .error e => .error e := by
   simp only [execStmt, run_bind, run_tick1]
-  rcases (evalExpr f env x).run st.tick with e | ⟨v, st1⟩
+  rcases (evalExpr W f env x).run st.tick with e | ⟨v, st1⟩
   · rfl
-  · simp only
-    rcases (bindCell env y v τ).run st1 with e | ⟨env', st2⟩ <;> rfl
+  · simp only [run_pure]
+    rcases (initBinding env k y τ (some v)).run st1 with e | ⟨env', st2⟩ <;> rfl
 
 theorem execStmt_ite (f : ℕ) (env : Env) (c : Expr) (t : Stmt) (el : Option Stmt) (st : St) :
-    (execStmt (f + 1) env (.ite c t el)).run st =
-      match (evalExpr f env c).run st.tick with
+    (execStmt W (f + 1) env (.ite c t el)).run st =
+      match (evalExpr W f env c).run st.tick with
       | .ok (v, st1) =>
         if truthy v then
-          match (execStmt f env t).run st1 with
+          match (execStmt W f env t).run st1 with
           | .ok ((_, c'), st2) => .ok ((env, c'), st2)
           | .error e => .error e
         else match el with
-          | some g => match (execStmt f env g).run st1 with
+          | some g => match (execStmt W f env g).run st1 with
             | .ok ((_, c'), st2) => .ok ((env, c'), st2)
             | .error e => .error e
           | none => .ok ((env, .normal), st1)
       | .error e => .error e := by
   simp only [execStmt, run_bind, run_tick1]
-  rcases (evalExpr f env c).run st.tick with e | ⟨v, st1⟩
+  rcases (evalExpr W f env c).run st.tick with e | ⟨v, st1⟩
   · rfl
   · simp only
     split
     · simp only [run_bind]
-      rcases (execStmt f env t).run st1 with e | ⟨⟨env', c'⟩, st2⟩ <;> rfl
+      rcases (execStmt W f env t).run st1 with e | ⟨⟨env', c'⟩, st2⟩ <;> rfl
     · cases el with
       | none => rfl
       | some g =>
         simp only [run_bind]
-        rcases (execStmt f env g).run st1 with e | ⟨⟨env', c'⟩, st2⟩ <;> rfl
+        rcases (execStmt W f env g).run st1 with e | ⟨⟨env', c'⟩, st2⟩ <;> rfl
 
 theorem evalExpr_cond (f : ℕ) (env : Env) (c t g : Expr) (st : St) :
-    (evalExpr (f + 1) env (.cond c t g)).run st =
-      match (evalExpr f env c).run st.tick with
-      | .ok (v, st1) => if truthy v then (evalExpr f env t).run st1 else (evalExpr f env g).run st1
+    (evalExpr W (f + 1) env (.cond c t g)).run st =
+      match (evalExpr W f env c).run st.tick with
+      | .ok (v, st1) => if truthy v then (evalExpr W f env t).run st1 else (evalExpr W f env g).run st1
       | .error e => .error e := by
   simp only [evalExpr, run_bind, run_tick1]
-  rcases (evalExpr f env c).run st.tick with e | ⟨v, st1⟩
+  rcases (evalExpr W f env c).run st.tick with e | ⟨v, st1⟩
   · rfl
   · simp only
     split <;> rfl
 
 theorem evalExpr_lit (f : ℕ) (env : Env) (l : Lit) (st : St) :
-    (evalExpr (f + 1) env (.lit l)).run st = .ok (l.value, st.tick) := by
+    (evalExpr W (f + 1) env (.lit l)).run st = .ok (l.value, st.tick) := by
   simp only [evalExpr, run_bind, run_tick1]; rfl
 
 theorem callFunc_succ (f : ℕ) (ps : List (Name × Ty)) (body : List Stmt) (ar : Bool) (env : Env)
     (self : Value) (args : List Value) (st : St) :
-    (callFunc (f + 1) (.mk ps body ar) env self args).run st =
-      match (enterFunc (.mk ps body ar) env self args).run st with
-      | .ok (env', st1) => match (execStmts f env' body).run st1 with
+    (callFunc W (f + 1) (.mk ps body ar) env self args).run st =
+      match (enterFunc W (.mk ps body ar) env self args).run st with
+      | .ok (env', st1) => match (execStmts W f env' body).run st1 with
         | .ok ((_, c), st2) => .ok ((match c with | .ret v => v | _ => .undef), st2)
         | .error e => .error e
       | .error e => .error e := by
   simp only [callFunc, run_bind]
-  rcases (enterFunc (.mk ps body ar) env self args).run st with e | ⟨env', st1⟩
+  rcases (enterFunc W (.mk ps body ar) env self args).run st with e | ⟨env', st1⟩
   · rfl
   · simp only
-    rcases (execStmts f env' body).run st1 with e | ⟨⟨env'', c⟩, st2⟩
+    rcases (execStmts W f env' body).run st1 with e | ⟨⟨env'', c⟩, st2⟩
     · rfl
     · cases c <;> rfl
 
 theorem root_eq (p : Program) (e : Entry) (i : Instance) :
-    ∃ env st, root p e i = ⟨.callFunc e.fn env .undef i.args, st⟩ := by
+    ∃ env h, root p e i = ⟨.callFunc e.fn env .undef i.args, ⟨h, 0⟩⟩ := by
   obtain ⟨env, h, hb⟩ := bindProgram_safe p i.env i.heap
-  exact ⟨env, ⟨h, 0⟩, by unfold root; rw [hb]⟩
+  exact ⟨env, h, by unfold root; rw [hb]⟩
 
 /-- The children a node runs in sequence, each at most once (`seq-max`): an entry's body
 statements, a block's statements, and the expression of an expression statement, an
@@ -415,13 +431,13 @@ work that cannot abort: the statement completes one fuel unit after its child an
 more unit of work. -/
 theorem holds_stmt_single {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ}
     {s : Stmt} {x : Expr}
-    (hsub : ∀ env st, Sub ⟨.stmt env s, st⟩ ⟨.expr env x, st.tick⟩)
-    (hdec : ∀ f env st o st', (execStmt (f + 1) env s).run st = .ok (o, st') →
-      ∃ v st1, (evalExpr f env x).run st.tick = .ok (v, st1) ∧ st'.work = st1.work)
-    (henc : ∀ f env st v st1, (evalExpr f env x).run st.tick = .ok (v, st1) →
-      ∃ o st', (execStmt (f + 1) env s).run st = .ok (o, st'))
-    (h : Holds p e i (.expr x) allChannels F B) :
-    Holds p e i (.stmt s) allChannels (F + 1) (1 + B) := by
+    (hsub : ∀ env st, Sub W ⟨.stmt env s, st⟩ ⟨.expr env x, st.tick⟩)
+    (hdec : ∀ f env st o st', (execStmt W (f + 1) env s).run st = .ok (o, st') →
+      ∃ v st1, (evalExpr W f env x).run st.tick = .ok (v, st1) ∧ st'.work = st1.work)
+    (henc : ∀ f env st v st1, (evalExpr W f env x).run st.tick = .ok (v, st1) →
+      ∃ o st', (execStmt W (f + 1) env s).run st = .ok (o, st'))
+    (h : Holds W p e i (.expr x) allChannels F B) :
+    Holds W p e i (.stmt s) allChannels (F + 1) (1 + B) := by
   rintro ⟨fr, st⟩ hr ⟨env, hc⟩
   simp only at hc
   subst hc
@@ -442,10 +458,25 @@ theorem holds_stmt_single {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B 
       rw [hw1]
       linarith
 
+/-- The work a sequence node does besides its children's: one unit, and for a function body or
+a block, the creation of the function objects its declaration instantiation hoists. -/
+def seqK (W : World) (e : Entry) : Site → ℝ
+  | .entry => match e.fn with
+    | .mk _ body _ => 1 + ((funDecls body).length * W.ops.closureCreate : ℕ)
+  | .stmt (.block ss) => 1 + ((funDecls ss).length * W.ops.closureCreate : ℕ)
+  | _ => 1
+
+theorem one_le_seqK (W : World) (e : Entry) (s : Site) : 1 ≤ seqK W e s := by
+  unfold seqK
+  split
+  · split; simp only [le_add_iff_nonneg_right]; positivity
+  · simp only [le_add_iff_nonneg_right]; positivity
+  · exact le_rfl
+
 theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {s : Site}
     {sites : List Site} (hs : seqSites e s = some sites) (hB : 0 ≤ B)
-    (h : ∀ x ∈ sites, Holds p e i x allChannels F B) :
-    Holds p e i s allChannels (F + sites.length + 2) (1 + sites.length * B) := by
+    (h : ∀ x ∈ sites, Holds W p e i x allChannels F B) :
+    Holds W p e i s allChannels (F + sites.length + 2) (seqK W e s + sites.length * B) := by
   have hlB : (0 : ℝ) ≤ sites.length * B := mul_nonneg (Nat.cast_nonneg _) hB
   cases s with
   | expr x => simp [seqSites] at hs
@@ -453,19 +484,20 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     rcases hfn : e.fn with ⟨ps, body, ar⟩
     simp only [seqSites, hfn, Option.some.injEq] at hs
     subst hs
-    have hbody : ∀ t ∈ body, Holds p e i (.stmt t) allChannels F B := fun t ht =>
+    have hbody : ∀ t ∈ body, Holds W p e i (.stmt t) allChannels F B := fun t ht =>
       h _ (List.mem_map.2 ⟨t, ht, rfl⟩)
     intro c hr ha
-    obtain ⟨env, st, hroot⟩ := root_eq p e i
+    obtain ⟨env, h0, hroot⟩ := root_eq p e i
     simp only [Cfg.At] at ha
     subst ha
     rw [hroot] at hr ⊢
     rw [hfn] at hr ⊢
-    obtain ⟨env', h1, hsafe⟩ := Safe.enterFunc (.mk ps body ar) env .undef i.args st
-    have hstmts : Reach p e i ⟨.stmts env' body, ⟨h1, st.work⟩⟩ :=
+    obtain ⟨env', h1, n, hn, hsafe⟩ := SafeW.enterFunc W ps body ar env .undef i.args ⟨h0, 0⟩
+    have hstmts : Reach W p e i ⟨.stmts env' body, ⟨h1, 0 + n⟩⟩ :=
       hr.tail (Sub.callFunc hsafe)
     obtain ⟨hc, hw⟩ := holds_stmts hB body hbody body (fun t ht => ht) env' _ hstmts
-    simp only [List.length_map] at hlB ⊢
+    have hn' : (n : ℝ) ≤ ((funDecls body).length * W.ops.closureCreate : ℕ) := by exact_mod_cast hn
+    simp only [List.length_map, seqK, hfn] at hlB ⊢
     refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
     · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
       obtain ⟨o2, st2, h2⟩ := hc f' (by omega)
@@ -477,38 +509,42 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
       | succ f =>
         rw [callFunc_succ, hsafe] at hv
         simp only at hv
-        rcases h2 : (execStmts f env' body).run ⟨h1, st.work⟩ with err | ⟨⟨env2, c2⟩, st2⟩
+        rcases h2 : (execStmts W f env' body).run ⟨h1, 0 + n⟩ with err | ⟨⟨env2, c2⟩, st2⟩
         · rw [h2] at hv; cases hv
         · rw [h2] at hv
           simp only [Except.ok.injEq, Prod.mk.injEq] at hv
           obtain ⟨_, rfl⟩ := hv
           have := hw f _ st2 (runs_stmts.2 ⟨_, h2, rfl⟩)
-          simp only at this ⊢
+          simp only [zero_add, Nat.cast_zero, sub_zero] at this ⊢
           linarith
   | stmt st0 =>
   cases st0 with
   | block ss =>
     simp only [seqSites, Option.some.injEq] at hs
     subst hs
-    have hss : ∀ t ∈ ss, Holds p e i (.stmt t) allChannels F B := fun t ht =>
+    have hss : ∀ t ∈ ss, Holds W p e i (.stmt t) allChannels F B := fun t ht =>
       h _ (List.mem_map.2 ⟨t, ht, rfl⟩)
     rintro ⟨fr, st⟩ hr ⟨env, hc⟩
     simp only at hc
     subst hc
-    have hstmts : Reach p e i ⟨.stmts env ss, st.tick⟩ := hr.tail Sub.block
-    obtain ⟨hcomp, hw⟩ := holds_stmts hB ss hss ss (fun t ht => ht) env _ hstmts
-    simp only [List.length_map] at hlB ⊢
+    obtain ⟨env', h1, n, hn, hinst⟩ := SafeW.instantiate W env ss st.tick
+    have hstmts : Reach W p e i ⟨.stmts env' ss, ⟨h1, st.tick.work + n⟩⟩ :=
+      hr.tail (Sub.block hinst)
+    obtain ⟨hcomp, hw⟩ := holds_stmts hB ss hss ss (fun t ht => ht) env' _ hstmts
+    have hn' : (n : ℝ) ≤ ((funDecls ss).length * W.ops.closureCreate : ℕ) := by exact_mod_cast hn
+    simp only [List.length_map, seqK] at hlB ⊢
     refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
     · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
       obtain ⟨o2, st2, h2⟩ := hcomp f' (by omega)
       obtain ⟨⟨env2, c2⟩, h2', rfl⟩ := runs_stmts.1 h2
-      exact ⟨_, _, runs_stmt.2 ⟨_, by rw [execStmt_block, h2'], rfl⟩⟩
+      exact ⟨_, _, runs_stmt.2 ⟨_, by rw [execStmt_block, hinst]; simp only; rw [h2'], rfl⟩⟩
     · obtain ⟨r, hv, _⟩ := runs_stmt.1 hrun
       cases f with
       | zero => rw [execStmt_zero] at hv; cases hv
       | succ f =>
-        rw [execStmt_block] at hv
-        rcases h2 : (execStmts f env ss).run st.tick with err | ⟨⟨env2, c2⟩, st2⟩
+        rw [execStmt_block, hinst] at hv
+        simp only at hv
+        rcases h2 : (execStmts W f env' ss).run ⟨h1, st.tick.work + n⟩ with err | ⟨⟨env2, c2⟩, st2⟩
         · rw [h2] at hv; cases hv
         · rw [h2] at hv
           simp only [Except.ok.injEq, Prod.mk.injEq] at hv
@@ -522,12 +558,12 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     have := holds_stmt_single (s := .expr x) (x := x) (fun env st => Sub.exprStmt)
       (fun f env st o st' hv => by
         rw [execStmt_expr] at hv
-        rcases h1 : (evalExpr f env x).run st.tick with err | ⟨v, st1⟩
+        rcases h1 : (evalExpr W f env x).run st.tick with err | ⟨v, st1⟩
         · rw [h1] at hv; cases hv
         · rw [h1] at hv; cases hv; exact ⟨v, _, rfl, rfl⟩)
       (fun f env st v st1 h1 => ⟨_, _, by rw [execStmt_expr, h1]⟩)
       (h (.expr x) (by simp))
-    refine this.mono (by simp) (by simp)
+    refine this.mono (by simp) (by simp [seqK])
   | ret init =>
     cases init with
     | none => simp [seqSites] at hs
@@ -537,12 +573,12 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     have := holds_stmt_single (s := .ret (some x)) (x := x) (fun env st => Sub.retExpr)
       (fun f env st o st' hv => by
         rw [execStmt_ret] at hv
-        rcases h1 : (evalExpr f env x).run st.tick with err | ⟨v, st1⟩
+        rcases h1 : (evalExpr W f env x).run st.tick with err | ⟨v, st1⟩
         · rw [h1] at hv; cases hv
         · rw [h1] at hv; cases hv; exact ⟨v, _, rfl, rfl⟩)
       (fun f env st v st1 h1 => ⟨_, _, by rw [execStmt_ret, h1]⟩)
       (h (.expr x) (by simp))
-    refine this.mono (by simp) (by simp)
+    refine this.mono (by simp) (by simp [seqK])
   | decl k y τ init =>
     cases init with
     | none => simp [seqSites] at hs
@@ -552,25 +588,25 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     have := holds_stmt_single (s := .decl k y τ (some x)) (x := x) (fun env st => Sub.declInit)
       (fun f env st o st' hv => by
         rw [execStmt_decl] at hv
-        rcases h1 : (evalExpr f env x).run st.tick with err | ⟨v, st1⟩
+        rcases h1 : (evalExpr W f env x).run st.tick with err | ⟨v, st1⟩
         · rw [h1] at hv; cases hv
         · rw [h1] at hv
-          obtain ⟨env', h3, hb⟩ := Safe.bindCell env y v τ st1
+          obtain ⟨env', h3, hb⟩ := Safe.initBinding env k y τ (some v) st1
           simp only [hb] at hv
           cases hv
           exact ⟨v, st1, rfl, rfl⟩)
       (fun f env st v st1 h1 => by
-        obtain ⟨env', h3, hb⟩ := Safe.bindCell env y v τ st1
+        obtain ⟨env', h3, hb⟩ := Safe.initBinding env k y τ (some v) st1
         exact ⟨(env', .normal), ⟨h3, st1.work⟩, by rw [execStmt_decl, h1]; simp only [hb]⟩)
       (h (.expr x) (by simp))
-    refine this.mono (by simp) (by simp)
+    refine this.mono (by simp) (by simp [seqK])
   | ite | forLoop | forOf | forIn | «while» | doWhile | brk | cont | funDecl | classDecl =>
     simp [seqSites] at hs
 
 theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {s : Site}
     {sites : List Site} (hs : branchSites s = some sites) (hB : 0 ≤ B)
-    (h : ∀ x ∈ sites, Holds p e i x allChannels F B) :
-    Holds p e i s allChannels (F + sites.length + 2) (1 + sites.length * B) := by
+    (h : ∀ x ∈ sites, Holds W p e i x allChannels F B) :
+    Holds W p e i s allChannels (F + sites.length + 2) (1 + sites.length * B) := by
   cases s with
   | entry => simp [branchSites] at hs
   | expr x =>
@@ -582,12 +618,12 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
       simp only at hc
       subst hc
       obtain ⟨hcc, hcw⟩ := h (.expr c) (by simp) _ (hr.tail Sub.condTest) ⟨env, rfl⟩
-      have hbr : ∀ v st1, (evalExpr_run : ∃ f, (evalExpr f env c).run st.tick = .ok (v, st1)) →
+      have hbr : ∀ v st1, (evalExpr_run : ∃ f, (evalExpr W f env c).run st.tick = .ok (v, st1)) →
           ∀ y, (truthy v = true ∧ y = t ∨ truthy v = false ∧ y = g) →
-          (∀ f, F ≤ f → ∃ o st', Cfg.Runs ⟨.expr env y, st1⟩ f o st') ∧
-          ∀ f o st', Cfg.Runs ⟨.expr env y, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
+          (∀ f, F ≤ f → ∃ o st', Cfg.Runs W ⟨.expr env y, st1⟩ f o st') ∧
+          ∀ f o st', Cfg.Runs W ⟨.expr env y, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
         rintro v st1 ⟨f0, h0⟩ y hy
-        have hev : Ev (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
+        have hev : Ev W (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
         rcases hy with ⟨hv, rfl⟩ | ⟨hv, rfl⟩
         · obtain ⟨a, b⟩ := h (.expr y) (by simp) _ (hr.tail (Sub.condThen hev hv)) ⟨env, rfl⟩
           exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
@@ -611,7 +647,7 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
         | zero => rw [evalExpr_zero] at hv'; cases hv'
         | succ f =>
           rw [evalExpr_cond] at hv'
-          rcases h1 : (evalExpr f env c).run st.tick with err | ⟨v, st1⟩
+          rcases h1 : (evalExpr W f env c).run st.tick with err | ⟨v, st1⟩
           · rw [h1] at hv'; cases hv'
           · rw [h1] at hv'
             have w1 := hcw f _ st1 (runs_expr.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
@@ -639,20 +675,20 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
       simp only at hc
       subst hc
       obtain ⟨hcc, hcw⟩ := h (.expr c) (by simp) _ (hr.tail Sub.iteTest) ⟨env, rfl⟩
-      have hthen : ∀ v st1, (∃ f, (evalExpr f env c).run st.tick = .ok (v, st1)) →
+      have hthen : ∀ v st1, (∃ f, (evalExpr W f env c).run st.tick = .ok (v, st1)) →
           truthy v = true →
-          (∀ f, F ≤ f → ∃ o st', Cfg.Runs ⟨.stmt env t, st1⟩ f o st') ∧
-          ∀ f o st', Cfg.Runs ⟨.stmt env t, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
+          (∀ f, F ≤ f → ∃ o st', Cfg.Runs W ⟨.stmt env t, st1⟩ f o st') ∧
+          ∀ f o st', Cfg.Runs W ⟨.stmt env t, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
         rintro v st1 ⟨f0, h0⟩ hv
-        have hev : Ev (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
+        have hev : Ev W (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
         obtain ⟨a, b⟩ := h (.stmt t) (by simp) _ (hr.tail (Sub.iteThen hev hv)) ⟨env, rfl⟩
         exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
-      have helse : ∀ g v st1, el = some g → (∃ f, (evalExpr f env c).run st.tick = .ok (v, st1)) →
+      have helse : ∀ g v st1, el = some g → (∃ f, (evalExpr W f env c).run st.tick = .ok (v, st1)) →
           truthy v = false →
-          (∀ f, F ≤ f → ∃ o st', Cfg.Runs ⟨.stmt env g, st1⟩ f o st') ∧
-          ∀ f o st', Cfg.Runs ⟨.stmt env g, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
+          (∀ f, F ≤ f → ∃ o st', Cfg.Runs W ⟨.stmt env g, st1⟩ f o st') ∧
+          ∀ f o st', Cfg.Runs W ⟨.stmt env g, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
         rintro g v st1 rfl ⟨f0, h0⟩ hv
-        have hev : Ev (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
+        have hev : Ev W (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
         obtain ⟨a, b⟩ := h (.stmt g) (by simp) _ (hr.tail (Sub.iteElse hev hv)) ⟨env, rfl⟩
         exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
       have hlen : (2 : ℝ) ≤ (([Site.expr c, .stmt t] ++ el.toList.map Site.stmt).length : ℕ) := by
@@ -683,7 +719,7 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
         | zero => rw [execStmt_zero] at hv'; cases hv'
         | succ f =>
           rw [execStmt_ite] at hv'
-          rcases h1 : (evalExpr f env c).run st.tick with err | ⟨v, st1⟩
+          rcases h1 : (evalExpr W f env c).run st.tick with err | ⟨v, st1⟩
           · rw [h1] at hv'; cases hv'
           · rw [h1] at hv'
             have w1 := hcw f _ st1 (runs_expr.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
@@ -697,7 +733,7 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
                 linarith
               | some g =>
                 simp only at hv'
-                rcases h2 : (execStmt f env g).run st1 with err | ⟨⟨env2, c2⟩, st2⟩
+                rcases h2 : (execStmt W f env g).run st1 with err | ⟨⟨env2, c2⟩, st2⟩
                 · rw [h2] at hv'; cases hv'
                 · rw [h2] at hv'
                   simp only [Except.ok.injEq, Prod.mk.injEq] at hv'
@@ -705,7 +741,7 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
                   have w2 := (helse g v st1 rfl ⟨f, h1⟩ hv).2 f _ st2 (runs_stmt.2 ⟨_, h2, rfl⟩)
                   linarith
             · simp only [hv, ↓reduceIte] at hv'
-              rcases h2 : (execStmt f env t).run st1 with err | ⟨⟨env2, c2⟩, st2⟩
+              rcases h2 : (execStmt W f env t).run st1 with err | ⟨⟨env2, c2⟩, st2⟩
               · rw [h2] at hv'; cases hv'
               · rw [h2] at hv'
                 simp only [Except.ok.injEq, Prod.mk.injEq] at hv'
@@ -785,18 +821,26 @@ theorem unitDepthList_pos (ss : List Stmt) : 0 < unitDepthList ss := by
   cases ss <;> simp [unitDepthList]
 
 theorem execStmt_decl_none (f : ℕ) (env : Env) (k : DeclKind) (y : Name) (τ : Ty) (st : St) :
-    (execStmt (f + 1) env (.decl k y τ none)).run st =
-      match (bindCell env y .undef τ).run st.tick with
+    (execStmt W (f + 1) env (.decl k y τ none)).run st =
+      match (initBinding env k y τ none).run st.tick with
       | .ok (env', st2) => .ok ((env', .normal), st2)
       | .error e => .error e := by
   simp only [execStmt, run_bind, run_tick1, run_pure]
-  rcases (bindCell env y .undef τ).run st.tick with e | ⟨env', st2⟩ <;> rfl
+  rcases (initBinding env k y τ none).run st.tick with e | ⟨env', st2⟩ <;> rfl
+
+/-- A statement list of the fragment declares no function. -/
+theorem funDecls_unit : ∀ ss : List Stmt, unitStmts ss = true → funDecls ss = []
+  | [], _ => rfl
+  | s :: ss, h => by
+    simp only [unitStmts, Bool.and_eq_true] at h
+    have ih := funDecls_unit ss h.2
+    cases s <;> simp_all [unitStmt, funDecls]
 
 theorem unit_run : ∀ f : ℕ,
     (∀ s env st, unitStmt s = true →
-      UnitRun ((execStmt f env s).run st) st.work (unitTicks s) (unitDepth s) f) ∧
+      UnitRun ((execStmt W f env s).run st) st.work (unitTicks s) (unitDepth s) f) ∧
     (∀ ss env st, unitStmts ss = true →
-      UnitRun ((execStmts f env ss).run st) st.work (unitTicksList ss) (unitDepthList ss) f)
+      UnitRun ((execStmts W f env ss).run st) st.work (unitTicksList ss) (unitDepthList ss) f)
   | 0 => ⟨fun s env st _ => by rw [execStmt_zero]; exact unitDepth_pos s,
       fun ss env st _ => by rw [execStmts_zero]; exact unitDepthList_pos ss⟩
   | f + 1 => by
@@ -810,7 +854,7 @@ theorem unit_run : ∀ f : ℕ,
         | succ f => rw [evalExpr_lit]; simp [UnitRun, unitTicks, St.tick]
       | .decl k x τ none, _ =>
         rw [execStmt_decl_none]
-        obtain ⟨env', h, hb⟩ := Safe.bindCell env x .undef τ st.tick
+        obtain ⟨env', h, hb⟩ := Safe.initBinding env k x τ none st.tick
         rw [hb]
         simp [UnitRun, unitTicks, St.tick]
       | .decl k x τ (some (.lit l)), _ =>
@@ -819,14 +863,20 @@ theorem unit_run : ∀ f : ℕ,
         | zero => rw [evalExpr_zero]; simp [UnitRun, unitDepth]
         | succ f =>
           rw [evalExpr_lit]
-          obtain ⟨env', h, hb⟩ := Safe.bindCell env x l.value τ st.tick.tick
+          obtain ⟨env', h, hb⟩ := Safe.initBinding env k x τ (some l.value) st.tick.tick
           simp only [hb]
           simp only [UnitRun, unitTicks, St.tick]
       | .block ss, hs =>
-        rw [execStmt_block]
-        have h := ih.2 ss env st.tick (by simpa [unitStmt] using hs)
+        have hu : unitStmts ss = true := by simpa [unitStmt] using hs
+        obtain ⟨env', h1, n, hn, hinst⟩ := SafeW.instantiate W env ss st.tick
+        rw [funDecls_unit ss hu] at hn
+        simp only [List.length_nil, zero_mul, Nat.le_zero] at hn
+        subst hn
+        rw [execStmt_block, hinst]
+        simp only [Nat.add_zero]
+        have h := ih.2 ss env' ⟨h1, st.tick.work⟩ hu
         revert h
-        rcases (execStmts f env ss).run st.tick with e | ⟨⟨env', c⟩, st'⟩
+        rcases (execStmts W f env' ss).run ⟨h1, st.tick.work⟩ with e | ⟨⟨env'', c⟩, st'⟩
         · cases e <;> simp [UnitRun, unitDepth]; omega
         · cases c <;> simp [UnitRun, unitTicks, St.tick]; omega
     · match ss, hs with
@@ -838,7 +888,7 @@ theorem unit_run : ∀ f : ℕ,
         rw [execStmts_cons]
         have h1 := ih.1 s env st hs.1
         revert h1
-        rcases (execStmt f env s).run st with e | ⟨⟨env', c⟩, st'⟩
+        rcases (execStmt W f env s).run st with e | ⟨⟨env', c⟩, st'⟩
         · cases e <;> simp [UnitRun, unitDepthList]; omega
         · cases c with
           | normal =>
@@ -847,7 +897,7 @@ theorem unit_run : ∀ f : ℕ,
             simp only [UnitRun] at h1
             dsimp only
             revert h2
-            rcases (execStmts f env' ss).run st' with e | ⟨⟨env'', c⟩, st''⟩
+            rcases (execStmts W f env' ss).run st' with e | ⟨⟨env'', c⟩, st''⟩
             · cases e <;> simp [UnitRun, unitDepthList]; omega
             · cases c <;> simp [UnitRun, unitTicksList]; omega
           | _ => simp [UnitRun]
@@ -855,15 +905,15 @@ theorem unit_run : ∀ f : ℕ,
 /-- `seq-max`, unit base: a fragment statement completes from its depth on, doing exactly its
 ticks of work, from every state. -/
 theorem holds_unit {p : Program} {e : Entry} {i : Instance} {s : Stmt} (hu : unitStmt s = true) :
-    Holds p e i (.stmt s) allChannels (unitDepth s) (unitTicks s) := by
+    Holds W p e i (.stmt s) allChannels (unitDepth s) (unitTicks s) := by
   rintro ⟨fr, st⟩ _ ⟨env, hc⟩
   simp only at hc
   subst hc
-  have hr := fun f => (unit_run f).1 s env st hu
+  have hr := fun f => (unit_run (W := W) f).1 s env st hu
   refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
   · have h := hr f
     revert h
-    rcases hres : (execStmt f env s).run st with e | ⟨⟨env', c⟩, st'⟩
+    rcases hres : (execStmt W f env s).run st with e | ⟨⟨env', c⟩, st'⟩
     · cases e with
       | fuel => simp [UnitRun]; omega
       | _ => simp [UnitRun]
@@ -878,7 +928,7 @@ theorem holds_unit {p : Program} {e : Entry} {i : Instance} {s : Stmt} (hu : uni
 
 /-- A literal expression completes from fuel `1`, doing one unit of work, from every state. -/
 theorem holds_lit {p : Program} {e : Entry} {i : Instance} {l : Lit} :
-    Holds p e i (.expr (.lit l)) allChannels 1 1 := by
+    Holds W p e i (.expr (.lit l)) allChannels 1 1 := by
   rintro ⟨fr, st⟩ _ ⟨env, hc⟩
   simp only at hc
   subst hc
@@ -895,9 +945,9 @@ theorem holds_lit {p : Program} {e : Entry} {i : Instance} {l : Lit} :
 
 /-- A bound of every configuration by a fixed work from fixed fuel is a bound by the constant
 `1`. -/
-theorem bound_of_holds {p : Program} {n : Node} {F : ℕ} {w : ℝ}
-    (h : ∀ i, Holds p n.entry i n.site allChannels F w) : Bound p n (.constant 1) :=
-  ⟨w, Eventually.of_forall fun i => ⟨F, (h i).mono le_rfl (by
+theorem bound_of_holds {p : Program} {n : Node} {F : ℕ} {w : ℝ} (hwf : n.entry.wf p = true)
+    (h : ∀ i, Holds W p n.entry i n.site allChannels F w) : Bound W p n (.constant 1) :=
+  ⟨hwf, w, Eventually.of_forall fun i => ⟨F, (h i).mono le_rfl (by
     simp [Cost.eval, Cost.raw])⟩⟩
 
 /-! ## Combining children's bounds -/
@@ -930,9 +980,9 @@ theorem mem_zip_left {α β : Type} : ∀ (as : List α) (bs : List β), as.leng
 one constant and one fuel. -/
 theorem combine {p : Program} {e : Entry} {M : Cost} :
     ∀ l : List (Site × List Channel × Cost),
-      (∀ x ∈ l, BoundOn p ⟨e, x.1⟩ x.2.1 x.2.2) → (∀ x ∈ l, ∀ v, x.2.2.eval v ≤ M.eval v) →
-      ∃ C, 0 ≤ C ∧ ∀ᶠ i in Admits p e, ∃ F, ∀ x ∈ l,
-        Holds p e i x.1 x.2.1 F (C * M.eval i.valuation)
+      (∀ x ∈ l, BoundOn W p ⟨e, x.1⟩ x.2.1 x.2.2) → (∀ x ∈ l, ∀ v, x.2.2.eval v ≤ M.eval v) →
+      ∃ C, 0 ≤ C ∧ ∀ᶠ i in Admits e, ∃ F, ∀ x ∈ l,
+        Holds W p e i x.1 x.2.1 F (C * M.eval i.valuation)
   | [], _, _ => ⟨0, le_rfl, Eventually.of_forall fun _ => ⟨0, fun x hx => absurd hx (by simp)⟩⟩
   | x :: l, hb, hle => by
     obtain ⟨C1, hC1, h1⟩ := (hb x (by simp)).nonneg
@@ -950,14 +1000,14 @@ theorem combine {p : Program} {e : Entry} {M : Cost} :
     · exact (hF2 y hy).mono (le_max_right _ _)
         (mul_le_mul_of_nonneg_right (le_max_right _ _) (le_of_lt (Cost.eval_pos _ _)))
 
-/-- A node whose run is its children's runs, each at most once, after one unit of work, is
-bounded by the maximum of the children's bounds. -/
-theorem bound_compose {p : Program} {n : Node} {sites : List Site} {cs : List Cost}
-    (hlen : sites.length = cs.length)
-    (hchild : ∀ x ∈ sites.zip cs, Bound p ⟨n.entry, x.1⟩ x.2)
-    (hcomp : ∀ i F B, 0 ≤ B → (∀ s ∈ sites, Holds p n.entry i s allChannels F B) →
-      Holds p n.entry i n.site allChannels (F + sites.length + 2) (1 + sites.length * B)) :
-    Bound p n (.maximum cs) := by
+/-- A node whose run is its children's runs, each at most once, after a fixed amount `K` of
+work, is bounded by the maximum of the children's bounds. -/
+theorem bound_compose {p : Program} {n : Node} {sites : List Site} {cs : List Cost} {K : ℝ}
+    (hwf : n.entry.wf p = true) (hK : 0 ≤ K) (hlen : sites.length = cs.length)
+    (hchild : ∀ x ∈ sites.zip cs, Bound W p ⟨n.entry, x.1⟩ x.2)
+    (hcomp : ∀ i F B, 0 ≤ B → (∀ s ∈ sites, Holds W p n.entry i s allChannels F B) →
+      Holds W p n.entry i n.site allChannels (F + sites.length + 2) (K + sites.length * B)) :
+    Bound W p n (.maximum cs) := by
   obtain ⟨C, hC, h⟩ := combine (e := n.entry) (M := .maximum cs)
     ((sites.zip cs).map fun x => (x.1, allChannels, x.2))
     (fun y hy => by
@@ -966,7 +1016,7 @@ theorem bound_compose {p : Program} {n : Node} {sites : List Site} {cs : List Co
     (fun y hy v => by
       obtain ⟨x, hx, rfl⟩ := List.mem_map.1 hy
       exact eval_le_maximum v cs x.2 (List.of_mem_zip hx).2)
-  refine ⟨1 + sites.length * C, h.mono fun i ⟨F, hF⟩ => ⟨F + sites.length + 2, ?_⟩⟩
+  refine ⟨hwf, K + sites.length * C, h.mono fun i ⟨F, hF⟩ => ⟨F + sites.length + 2, ?_⟩⟩
   have hM := Cost.one_le_eval i.valuation (.maximum cs)
   refine (hcomp i F _ (mul_nonneg hC (by linarith)) fun s hs => ?_).mono le_rfl ?_
   · obtain ⟨c, hc⟩ := mem_zip_left sites cs hlen s hs
@@ -977,8 +1027,9 @@ theorem bound_compose {p : Program} {n : Node} {sites : List Site} {cs : List Co
 /-- `channel-total`: bounds of one node on channel sets that cover every channel compose into a
 bound by their maximum. -/
 theorem channelTotal_sound {p : Program} {n : Node} {parts : List (List Channel × Cost)}
-    (hparts : ∀ x ∈ parts, BoundOn p n x.1 x.2) (hcover : ∀ k, ∃ x ∈ parts, k ∈ x.1) :
-    Bound p n (.maximum (parts.map Prod.snd)) := by
+    (hwf : n.entry.wf p = true) (hparts : ∀ x ∈ parts, BoundOn W p n x.1 x.2)
+    (hcover : ∀ k, ∃ x ∈ parts, k ∈ x.1) :
+    Bound W p n (.maximum (parts.map Prod.snd)) := by
   obtain ⟨C, _, h⟩ := combine (e := n.entry) (M := .maximum (parts.map Prod.snd))
     (parts.map fun x => (n.site, x.1, x.2))
     (fun y hy => by
@@ -987,7 +1038,7 @@ theorem channelTotal_sound {p : Program} {n : Node} {parts : List (List Channel 
     (fun y hy v => by
       obtain ⟨x, hx, rfl⟩ := List.mem_map.1 hy
       exact eval_le_maximum v _ x.2 (List.mem_map.2 ⟨x, hx, rfl⟩))
-  refine ⟨C, h.mono fun i ⟨F, hF⟩ => ⟨F, fun c hr ha => ⟨?_, fun f o st' hc _ => ?_⟩⟩⟩
+  refine ⟨hwf, C, h.mono fun i ⟨F, hF⟩ => ⟨F, fun c hr ha => ⟨?_, fun f o st' hc _ => ?_⟩⟩⟩
   · obtain ⟨x, hx, _⟩ := hcover .normal
     exact (hF (n.site, x.1, x.2) (List.mem_map.2 ⟨x, hx, rfl⟩) c hr ha).1
   · obtain ⟨x, hx, hk⟩ := hcover o.channel
@@ -995,27 +1046,30 @@ theorem channelTotal_sound {p : Program} {n : Node} {parts : List (List Channel 
 
 /-- `seq-max`: a sequence node is bounded by the maximum of its children's bounds. -/
 theorem seqMax_sound {p : Program} {n : Node} {sites : List Site} {cs : List Cost}
-    (hs : seqSites n.entry n.site = some sites) (hlen : sites.length = cs.length)
-    (hchild : ∀ x ∈ sites.zip cs, Bound p ⟨n.entry, x.1⟩ x.2) : Bound p n (.maximum cs) :=
-  bound_compose hlen hchild fun _ _ _ hB h => holds_seq hs hB h
+    (hwf : n.entry.wf p = true) (hs : seqSites n.entry n.site = some sites)
+    (hlen : sites.length = cs.length)
+    (hchild : ∀ x ∈ sites.zip cs, Bound W p ⟨n.entry, x.1⟩ x.2) : Bound W p n (.maximum cs) :=
+  bound_compose hwf (le_trans zero_le_one (one_le_seqK W n.entry n.site)) hlen hchild
+    fun _ _ _ hB h => holds_seq hs hB h
 
 /-- `branch-join`: a branch node is bounded by the maximum of its test's and branches'
 bounds. -/
 theorem branchJoin_sound {p : Program} {n : Node} {sites : List Site} {cs : List Cost}
-    (hs : branchSites n.site = some sites) (hlen : sites.length = cs.length)
-    (hchild : ∀ x ∈ sites.zip cs, Bound p ⟨n.entry, x.1⟩ x.2) : Bound p n (.maximum cs) :=
-  bound_compose hlen hchild fun _ _ _ hB h => holds_branch hs hB h
+    (hwf : n.entry.wf p = true) (hs : branchSites n.site = some sites)
+    (hlen : sites.length = cs.length)
+    (hchild : ∀ x ∈ sites.zip cs, Bound W p ⟨n.entry, x.1⟩ x.2) : Bound W p n (.maximum cs) :=
+  bound_compose hwf zero_le_one hlen hchild fun _ _ _ hB h => holds_branch hs hB h
 
 /-- `seq-max`, unit base, on bounds. -/
-theorem unit_bound {p : Program} {n : Node} {s : Stmt} (hn : n.site = .stmt s)
-    (hu : unitStmt s = true) : Bound p n (.constant 1) :=
-  bound_of_holds (F := unitDepth s) (w := (unitTicks s : ℝ)) fun i => by
+theorem unit_bound {p : Program} {n : Node} {s : Stmt} (hwf : n.entry.wf p = true)
+    (hn : n.site = .stmt s) (hu : unitStmt s = true) : Bound W p n (.constant 1) :=
+  bound_of_holds (F := unitDepth s) (w := (unitTicks s : ℝ)) hwf fun i => by
     rw [hn]; exact holds_unit hu
 
 /-- A literal expression is bounded by the unit cost. -/
-theorem lit_bound {p : Program} {n : Node} {l : Lit} (hn : n.site = .expr (.lit l)) :
-    Bound p n (.constant 1) :=
-  bound_of_holds (F := 1) (w := 1) fun i => by rw [hn]; exact holds_lit
+theorem lit_bound {p : Program} {n : Node} {l : Lit} (hwf : n.entry.wf p = true)
+    (hn : n.site = .expr (.lit l)) : Bound W p n (.constant 1) :=
+  bound_of_holds (F := 1) (w := 1) hwf fun i => by rw [hn]; exact holds_lit
 
 /-! ## `expr-validity`
 
@@ -1114,20 +1168,6 @@ theorem validList_nonneg (v : Valuation) (hv : NonnegVal v) :
 
 end
 
-/-- The least instance with every dimension at `b`. -/
-def floorInstance (b : ℝ) : Instance := ⟨Heap.empty, [], [], fun _ => b, 0⟩
-
-/-- On large instances every dimension is at least `b`. -/
-theorem eventually_dims_ge (p : Program) (e : Entry) (b : ℝ) :
-    ∀ᶠ i in Admits p e, ∀ j, b ≤ i.dims j :=
-  ((eventually_ge_atTop (floorInstance b)).filter_mono inf_le_left).mono fun _ h j => h j
-
-/-- Every dimension, read as at least `1`, grows without bound on large instances. -/
-theorem tendsto_dim (p : Program) (e : Entry) (j : ℕ) :
-    Tendsto (fun i : Instance => max 1 (i.dims j)) (Admits p e) atTop :=
-  tendsto_atTop.2 fun b => (eventually_dims_ge p e b).mono fun _ h => le_max_of_le_right (h j)
-
-/-- A comparison of exact values against a nonnegative cost is a comparison of values. -/
 theorem eval_isBigO {l : Filter Instance} {c d : Cost}
     (h : (fun i : Instance => c.raw i.valuation) =O[l] (fun i => d.raw i.valuation))
     (hd : ∀ᶠ i in l, 0 ≤ d.raw i.valuation) :
@@ -1360,54 +1400,105 @@ theorem monoWithin_spec {r r' : Mono} (h : monoWithin r r' = true) :
   simp only [monoWithin, Bool.and_eq_true, Nat.blt_eq, List.all_eq_true] at h
   exact ⟨h.1, fun j hj => h.2 j (List.mem_toFinset.1 hj)⟩
 
-/-- `monoWithin` establishes `O` between monomial values on large instances. -/
-theorem monoWithin_isBigO (p : Program) (e : Entry) {r r' : Mono} (h : monoWithin r r' = true) :
-    (fun i : Instance => monoVal i.valuation r) =O[Admits p e]
-      (fun i => monoVal i.valuation r') := by
+/-- `lg` is monotone. -/
+theorem lg_mono {x y : ℝ} (h : x ≤ y) : lg x ≤ lg y := by
+  unfold lg
+  exact Real.logb_le_logb_of_le (by norm_num) (lt_of_lt_of_le two_pos (le_max_right _ _))
+    (max_le_max h le_rfl)
+
+/-- A monotone nonnegative function on `[1, ∞)` that is `O(g)` at infinity, where `g ≥ 1`, is
+at most a constant times `g` on all of `[1, ∞)`. -/
+theorem uniform_of_isBigO {f g : ℝ → ℝ} (hf : ∀ x y, 1 ≤ x → x ≤ y → f x ≤ f y)
+    (hf0 : ∀ x, 1 ≤ x → 0 ≤ f x) (hg : ∀ x, 1 ≤ x → 1 ≤ g x) (h : f =O[atTop] g) :
+    ∃ K, 0 ≤ K ∧ ∀ x, 1 ≤ x → f x ≤ K * g x := by
+  obtain ⟨c, hc⟩ := h.bound
+  obtain ⟨X, hX⟩ := eventually_atTop.1 hc
+  have hY1 : (1 : ℝ) ≤ max X 1 := le_max_right _ _
+  have hfY := hf0 _ hY1
+  refine ⟨max c 0 + f (max X 1), add_nonneg (le_max_right _ _) hfY, fun x hx => ?_⟩
+  have hgx := hg x hx
+  by_cases hxY : max X 1 ≤ x
+  · have hb := hX x (le_trans (le_max_left _ _) hxY)
+    rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_nonneg (hf0 x hx),
+      abs_of_nonneg (by linarith)] at hb
+    have : f x ≤ max c 0 * g x :=
+      le_trans hb (mul_le_mul_of_nonneg_right (le_max_left _ _) (by linarith))
+    nlinarith
+  · have hfx : f x ≤ f (max X 1) := hf x _ hx (le_of_lt (not_le.1 hxY))
+    nlinarith [le_max_right c 0]
+
+/-- The per-dimension comparison, uniformly on `[1, ∞)`. -/
+theorem lexLe_uniform {p q p' q' : ℕ} (h : lexLe p q p' q' = true) :
+    ∃ K, 0 ≤ K ∧ ∀ x : ℝ, 1 ≤ x → x ^ p * lg x ^ q ≤ K * (x ^ p' * lg x ^ q') := by
+  refine uniform_of_isBigO (fun x y hx hxy => ?_) (fun x hx => ?_) (fun x hx => ?_)
+    (lexLe_isBigO h)
+  · have hx0 : (0 : ℝ) ≤ x := le_trans zero_le_one hx
+    exact mul_le_mul (pow_le_pow_left₀ hx0 hxy p) (pow_le_pow_left₀ (lg_nonneg x) (lg_mono hxy) q)
+      (pow_nonneg (lg_nonneg x) q) (pow_nonneg (le_trans hx0 hxy) p)
+  · exact mul_nonneg (pow_nonneg (le_trans zero_le_one hx) p) (pow_nonneg (lg_nonneg x) q)
+  · exact one_le_mul_of_one_le_of_one_le (one_le_pow₀ hx) (one_le_pow₀ (lg_ge_one x))
+
+/-- `monoWithin` bounds one monomial's value by a constant times the other's, at every
+valuation: every dimension reads as at least `1`, so the comparison holds uniformly. -/
+theorem monoWithin_le {r r' : Mono} (h : monoWithin r r' = true) :
+    ∃ K : ℝ, ∀ v : Valuation, monoVal v r ≤ K * monoVal v r' := by
   obtain ⟨hpos, hlex⟩ := monoWithin_spec h
   set S := (r.2.map (·.1) ++ r'.2.map (·.1)).toFinset
   have hS : ∀ e ∈ r.2, e.1 ∈ S := fun e he => by
     simp only [S, List.mem_toFinset, List.mem_append, List.mem_map]; exact Or.inl ⟨e, he, rfl⟩
   have hS' : ∀ e ∈ r'.2, e.1 ∈ S := fun e he => by
     simp only [S, List.mem_toFinset, List.mem_append, List.mem_map]; exact Or.inr ⟨e, he, rfl⟩
-  have hprod : (fun i : Instance => ∏ j ∈ S,
-      dimVal i.valuation j ^ powSum j r.2 * lg (dimVal i.valuation j) ^ logSum j r.2) =O[Admits p e]
-      (fun i => ∏ j ∈ S,
-        dimVal i.valuation j ^ powSum j r'.2 * lg (dimVal i.valuation j) ^ logSum j r'.2) :=
-    IsBigO.finsetProd fun j hj => (lexLe_isBigO (hlex j hj)).comp_tendsto (tendsto_dim p e j)
-  have e1 : (fun i : Instance => monoVal i.valuation r) = fun i => (r.1 : ℝ) * ∏ j ∈ S,
-      dimVal i.valuation j ^ powSum j r.2 * lg (dimVal i.valuation j) ^ logSum j r.2 :=
-    funext fun i => by rw [monoVal, prod_regroup _ S r.2 hS]
-  have e2 : (fun i : Instance => monoVal i.valuation r') = fun i => (r'.1 : ℝ) * ∏ j ∈ S,
-      dimVal i.valuation j ^ powSum j r'.2 * lg (dimVal i.valuation j) ^ logSum j r'.2 :=
-    funext fun i => by rw [monoVal, prod_regroup _ S r'.2 hS']
-  rw [e1, e2]
-  exact (hprod.const_mul_left _).trans
-    (isBigO_self_const_mul (by exact_mod_cast hpos.ne') _ _)
+  have hK : ∀ j ∈ S, ∃ K : ℝ, 0 ≤ K ∧ ∀ x : ℝ, 1 ≤ x →
+      x ^ powSum j r.2 * lg x ^ logSum j r.2 ≤ K * (x ^ powSum j r'.2 * lg x ^ logSum j r'.2) :=
+    fun j hj => lexLe_uniform (hlex j hj)
+  choose! K hK0 hKle using hK
+  refine ⟨r.1 * ∏ j ∈ S, K j, fun v => ?_⟩
+  have hd : ∀ j, (1 : ℝ) ≤ dimVal v j := fun j => le_max_left _ _
+  have hprod : ∏ j ∈ S, dimVal v j ^ powSum j r.2 * lg (dimVal v j) ^ logSum j r.2 ≤
+      (∏ j ∈ S, K j) * ∏ j ∈ S, dimVal v j ^ powSum j r'.2 * lg (dimVal v j) ^ logSum j r'.2 :=
+    (Finset.prod_le_prod₀ (fun j _ => mul_nonneg (pow_nonneg (le_trans zero_le_one (hd j)) _)
+      (pow_nonneg (lg_nonneg _) _)) fun j hj => hKle j hj _ (hd j)).trans_eq
+      Finset.prod_mul_distrib
+  have hP : 0 ≤ ∏ j ∈ S, dimVal v j ^ powSum j r'.2 * lg (dimVal v j) ^ logSum j r'.2 :=
+    Finset.prod_nonneg fun j _ => mul_nonneg (pow_nonneg (le_trans zero_le_one (hd j)) _)
+      (pow_nonneg (lg_nonneg _) _)
+  have hK0' : 0 ≤ ∏ j ∈ S, K j := Finset.prod_nonneg fun j hj => hK0 j hj
+  have h1 : (1 : ℝ) ≤ r'.1 := by exact_mod_cast hpos
+  rw [monoVal, prod_regroup _ S r.2 hS, monoVal, prod_regroup _ S r'.2 hS']
+  calc (r.1 : ℝ) * ∏ j ∈ S, dimVal v j ^ powSum j r.2 * lg (dimVal v j) ^ logSum j r.2
+      ≤ r.1 * ((∏ j ∈ S, K j) *
+          ∏ j ∈ S, dimVal v j ^ powSum j r'.2 * lg (dimVal v j) ^ logSum j r'.2) :=
+        mul_le_mul_of_nonneg_left hprod (Nat.cast_nonneg _)
+    _ = (r.1 * ∏ j ∈ S, K j) *
+          ∏ j ∈ S, dimVal v j ^ powSum j r'.2 * lg (dimVal v j) ^ logSum j r'.2 := by ring
+    _ ≤ (r.1 * ∏ j ∈ S, K j) *
+          (r'.1 * ∏ j ∈ S, dimVal v j ^ powSum j r'.2 * lg (dimVal v j) ^ logSum j r'.2) :=
+        mul_le_mul_of_nonneg_left (le_mul_of_one_le_left hP h1)
+          (mul_nonneg (Nat.cast_nonneg _) hK0')
 
-/-- `limit-compare`: the decidable comparison `within c d` establishes `c = O(d)` on the large
-admitted instances of any entry. olint's `Within` verdict (cost.rs:863-898) rests on it. -/
-theorem limitCompare_sound (p : Program) (e : Entry) {c d : Cost} (h : within c d = true) :
-    (fun i : Instance => c.eval i.valuation) =O[Admits p e] (fun i => d.eval i.valuation) := by
+/-- `limit-compare`: the decidable comparison `within c d` establishes `c = O(d)` uniformly, so
+on every filter of instances, the admitted instances of any entry included. olint's `Within`
+verdict (cost.rs:863-898) rests on it. -/
+theorem limitCompare_sound (l : Filter Instance) {c d : Cost} (h : within c d = true) :
+    (fun i : Instance => c.eval i.valuation) =O[l] (fun i => d.eval i.valuation) := by
   simp only [within, Bool.or_eq_true] at h
   rcases h with h | h
   · obtain rfl := Cost.eq_of_beq c d h; exact isBigO_refl _ _
   · split at h
     · rename_i r r' hc hd
       refine eval_isBigO ?_ (Eventually.of_forall fun i => ?_)
-      · have e1 : (fun i : Instance => c.raw i.valuation) = fun i => monoVal i.valuation r :=
-          funext fun i => mono_eval _ c r hc
-        have e2 : (fun i : Instance => d.raw i.valuation) = fun i => monoVal i.valuation r' :=
-          funext fun i => mono_eval _ d r' hd
-        rw [e1, e2]
-        exact monoWithin_isBigO p e h
+      · obtain ⟨K, hK⟩ := monoWithin_le h
+        refine IsBigO.of_bound K (Eventually.of_forall fun i => ?_)
+        rw [mono_eval _ c r hc, mono_eval _ d r' hd, Real.norm_eq_abs, Real.norm_eq_abs,
+          abs_of_nonneg (monoVal_nonneg _ _), abs_of_nonneg (monoVal_nonneg _ _)]
+        exact hK _
       · rw [mono_eval _ d r' hd]; exact monoVal_nonneg _ _
     · simp at h
 
 /-- A verdict: a bound within a limit is a bound by the limit. -/
-theorem Bound.of_within {p : Program} {n : Node} {c d : Cost} (h : Bound p n c)
-    (hw : within c d = true) : Bound p n d :=
-  h.mono (limitCompare_sound p n.entry hw)
+theorem Bound.of_within {p : Program} {n : Node} {c d : Cost} (h : Bound W p n c)
+    (hw : within c d = true) : Bound W p n d :=
+  h.mono (limitCompare_sound _ hw)
 
 /-! ## `max-dominance` and `max-normalise` -/
 
@@ -1526,22 +1617,22 @@ theorem sum_isBigO {l : Filter Instance} {g : Instance → ℝ} :
 
 /-- `max-dominance`: dropping from a maximum terms `O` of a remaining term keeps a bound. Both
 sides must be valid, so each is the maximum of its terms. -/
-theorem maxDominance_isBigO (p : Program) (e : Entry) {s t : Cost} (hs : valid s = true)
+theorem maxDominance_isBigO (e : Entry) {s t : Cost} (hs : valid s = true)
     (ht : valid t = true) (hd : dominated (maxView s) (maxView t) = true) :
-    (fun i : Instance => s.eval i.valuation) =O[Admits p e] (fun i => t.eval i.valuation) := by
+    (fun i : Instance => s.eval i.valuation) =O[Admits e] (fun i => t.eval i.valuation) := by
   have hle : ∀ d ∈ maxView t, ∀ i : Instance, d.eval i.valuation ≤ t.eval i.valuation :=
     fun d hdm i => eval_le_of_raw_le (by
       rw [← maxView_eval _ (instance_nonnegVal i) t ht]
       exact le_rawMaximum _ _ d hdm)
-  have hterms : ∀ c ∈ maxView s, (fun i : Instance => c.eval i.valuation) =O[Admits p e]
+  have hterms : ∀ c ∈ maxView s, (fun i : Instance => c.eval i.valuation) =O[Admits e]
       (fun i => t.eval i.valuation) := fun c hc => by
     simp only [dominated, List.all_eq_true, List.any_eq_true] at hd
     obtain ⟨d, hdm, hw⟩ := hd c hc
-    refine (limitCompare_sound p e hw).trans (IsBigO.of_bound 1 (Eventually.of_forall fun i => ?_))
+    refine (limitCompare_sound _ hw).trans (IsBigO.of_bound 1 (Eventually.of_forall fun i => ?_))
     rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_pos (d.eval_pos _),
       abs_of_pos (t.eval_pos _), one_mul]
     exact hle d hdm i
-  have hone : (fun _ : Instance => (1 : ℝ)) =O[Admits p e] (fun i => t.eval i.valuation) :=
+  have hone : (fun _ : Instance => (1 : ℝ)) =O[Admits e] (fun i => t.eval i.valuation) :=
     IsBigO.of_bound 1 (Eventually.of_forall fun i => by
       rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_pos one_pos, abs_of_pos (t.eval_pos _),
         one_mul]
@@ -1574,9 +1665,9 @@ theorem maxCovers_le (v : Valuation) {cs ds : List Cost} (h : maxCovers cs ds = 
 
 /-- `max-normalise`: flattening nested maxima, folding constants and removing duplicates keeps a
 bound; `maxCovers` checks the normalised terms cover the original ones. -/
-theorem maxNormalise_isBigO (p : Program) (e : Entry) {s t : Cost} (hs : valid s = true)
+theorem maxNormalise_isBigO (e : Entry) {s t : Cost} (hs : valid s = true)
     (ht : valid t = true) (hc : maxCovers (flatMax s) (flatMax t) = true) :
-    (fun i : Instance => s.eval i.valuation) =O[Admits p e] (fun i => t.eval i.valuation) :=
+    (fun i : Instance => s.eval i.valuation) =O[Admits e] (fun i => t.eval i.valuation) :=
   isBigO_of_raw_le (Eventually.of_forall fun i => by
     rw [← flatMax_eval_valid _ (instance_nonnegVal i) s hs,
       ← flatMax_eval_valid _ (instance_nonnegVal i) t ht]
@@ -1732,9 +1823,9 @@ theorem prodMatches_eval (v : Valuation) {s t : Cost} (h : prodMatches s t = tru
 
 /-- `product-normalise` keeps a bound: a zero product reads as `1`, the least value, so the
 collapse to `0` is sound. -/
-theorem productNormalise_isBigO (p : Program) (e : Entry) {s t : Cost}
+theorem productNormalise_isBigO (e : Entry) {s t : Cost}
     (h : prodMatches s t = true) :
-    (fun i : Instance => s.eval i.valuation) =O[Admits p e] (fun i => t.eval i.valuation) := by
+    (fun i : Instance => s.eval i.valuation) =O[Admits e] (fun i => t.eval i.valuation) := by
   refine IsBigO.of_bound 1 (Eventually.of_forall fun i => ?_)
   rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_pos (s.eval_pos _), abs_of_pos (t.eval_pos _),
     one_mul]
@@ -1745,20 +1836,20 @@ theorem productNormalise_isBigO (p : Program) (e : Entry) {s t : Cost}
 /-! ## Bound transformers -/
 
 /-- `max-dominance` on bounds. -/
-theorem maxDominance_sound {p : Program} {n : Node} {s t : Cost} (h : Bound p n s)
+theorem maxDominance_sound {p : Program} {n : Node} {s t : Cost} (h : Bound W p n s)
     (hs : valid s = true) (ht : valid t = true) (hd : dominated (maxView s) (maxView t) = true) :
-    Bound p n t :=
-  h.mono (maxDominance_isBigO p n.entry hs ht hd)
+    Bound W p n t :=
+  h.mono (maxDominance_isBigO n.entry hs ht hd)
 
 /-- `max-normalise` on bounds. -/
-theorem maxNormalise_sound {p : Program} {n : Node} {s t : Cost} (h : Bound p n s)
+theorem maxNormalise_sound {p : Program} {n : Node} {s t : Cost} (h : Bound W p n s)
     (hs : valid s = true) (ht : valid t = true) (hc : maxCovers (flatMax s) (flatMax t) = true) :
-    Bound p n t :=
-  h.mono (maxNormalise_isBigO p n.entry hs ht hc)
+    Bound W p n t :=
+  h.mono (maxNormalise_isBigO n.entry hs ht hc)
 
 /-- `product-normalise` on bounds. -/
-theorem productNormalise_sound {p : Program} {n : Node} {s t : Cost} (h : Bound p n s)
-    (hm : prodMatches s t = true) : Bound p n t :=
-  h.mono (productNormalise_isBigO p n.entry hm)
+theorem productNormalise_sound {p : Program} {n : Node} {s t : Cost} (h : Bound W p n s)
+    (hm : prodMatches s t = true) : Bound W p n t :=
+  h.mono (productNormalise_isBigO n.entry hm)
 
 end Olint.Rules

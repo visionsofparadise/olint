@@ -3,8 +3,15 @@ import Olint.Certificate
 /-!
 # End-to-end certificate checks
 
-Concrete certificates checked by kernel `decide`, in the shape the corpus generator writes
-(`check_sound _ _ <derivation> (by decide)`), so `lake build` exercises the pipeline end to end.
+Concrete certificates checked by kernel `decide`, in the shape the corpus generator writes,
+
+```lean
+theorem c_… (W : World) (hW : NoReplacement W xs) : Bound W <program> <node> <bound> :=
+  check_sound W xs _ _ <derivation> hW (by decide)
+```
+
+so `lake build` exercises the pipeline end to end. `scripts/axioms.lean` checks that every
+`c_…` theorem here has exactly that statement.
 -/
 
 namespace Olint.Tests
@@ -28,54 +35,59 @@ def block : Node :=
   ⟨entry, .stmt (.block [.expr (.lit (.num 1)), .decl .«let» "x" .any (some (.lit (.num 2)))])⟩
 
 /-- `seq-max`, unit base: the block is `O(1)`. -/
-theorem c_unit : Bound program block (.constant 1) :=
-  check_sound _ _ .seqUnit (by decide)
+theorem c_unit (W : World) (hW : NoReplacement W []) : Bound W program block (.constant 1) :=
+  check_sound W [] _ _ .seqUnit hW (by decide)
 
 /-- A chain through `product-normalise`, `max-normalise`, `max-dominance` and `expr-validity`:
 `1 = 1·1`, then `O(max(3, 1·1))`, then `O(n₀ · log n₀)`. -/
-theorem c_chain : Bound program block
-    (.product [.dimension 0 .size, .log (.dimension 0 .size)]) :=
-  check_sound _ _
+theorem c_chain (W : World) (hW : NoReplacement W []) :
+    Bound W program block (.product [.dimension 0 .size, .log (.dimension 0 .size)]) :=
+  check_sound W [] _ _
     (.exprValidity
       (.maxDominance
         (.maxNormalise
           (.productNormalise .seqUnit (.product [.constant 1, .constant 1]))
           (.maximum [.constant 3, .product [.constant 1, .constant 1]]))
         (.product [.dimension 0 .size, .log (.dimension 0 .size)])))
-    (by decide)
+    hW (by decide)
 
 /-- `seq-max` composing child certificates: the block from one unit certificate per
 statement. -/
-theorem c_seq : Bound program block (.maximum [.constant 1, .constant 1]) :=
-  check_sound _ _ (.seqMax [.seqUnit, .seqUnit]) (by decide)
+theorem c_seq (W : World) (hW : NoReplacement W []) :
+    Bound W program block (.maximum [.constant 1, .constant 1]) :=
+  check_sound W [] _ _ (.seqMax [.seqUnit, .seqUnit]) hW (by decide)
 
 /-- `branch-join` composing child certificates: the `if` from its literal test and a `seq-max`
 certificate per branch. -/
-theorem c_branch : Bound program
-    ⟨entry, .stmt (.ite (.lit (.bool true)) (.block [.expr (.lit (.num 3))])
-      (some (.block [.decl .«let» "y" .any (some (.lit (.num 4)))])))⟩
-    (.maximum [.constant 1, .maximum [.constant 1], .maximum [.constant 1]]) :=
-  check_sound _ _ (.branchJoin [.seqUnit, .seqMax [.seqUnit], .seqMax [.seqUnit]]) (by decide)
+theorem c_branch (W : World) (hW : NoReplacement W []) :
+    Bound W program
+      ⟨entry, .stmt (.ite (.lit (.bool true)) (.block [.expr (.lit (.num 3))])
+        (some (.block [.decl .«let» "y" .any (some (.lit (.num 4)))])))⟩
+      (.maximum [.constant 1, .maximum [.constant 1], .maximum [.constant 1]]) :=
+  check_sound W [] _ _ (.branchJoin [.seqUnit, .seqMax [.seqUnit], .seqMax [.seqUnit]]) hW
+    (by decide)
 
 /-- The entry itself, composed from its body: `seq-max` over two unit statements and the
 `branch-join` above, then `max-normalise` to `O(1)`. -/
-theorem c_entry : Bound program ⟨entry, .entry⟩ (.constant 1) :=
-  check_sound _ _
+theorem c_entry (W : World) (hW : NoReplacement W []) :
+    Bound W program ⟨entry, .entry⟩ (.constant 1) :=
+  check_sound W [] _ _
     (.maxNormalise
       (.seqMax [.seqUnit, .seqUnit,
         .maxNormalise (.branchJoin [.seqUnit, .seqMax [.seqUnit], .seqMax [.seqUnit]])
           (.constant 1)])
       (.constant 1))
-    (by decide)
+    hW (by decide)
 
 /-- `channel-total` composing bounds on channel sets that cover every channel. -/
-theorem c_channel : Bound program block (.maximum [.constant 1, .maximum [.constant 1, .constant 1]]) :=
-  check_sound _ _
+theorem c_channel (W : World) (hW : NoReplacement W []) :
+    Bound W program block (.maximum [.constant 1, .maximum [.constant 1, .constant 1]]) :=
+  check_sound W [] _ _
     (.channelTotal [([.normal, .brk], .seqUnit), ([.ret, .cont], .seqMax [.seqUnit, .seqUnit])])
-    (by decide)
+    hW (by decide)
 
 /-- The entry's bound bounds its `Work`. -/
-example : ∀ᶠ i in Admits program entry, Halts program i entry :=
-  (Bound.work_isBigO (n := ⟨entry, .entry⟩) rfl c_entry).1
+example (W : World) (hW : NoReplacement W []) : ∀ᶠ i in Admits entry, Halts W program i entry :=
+  (Bound.work_isBigO (n := ⟨entry, .entry⟩) rfl (c_entry W hW)).1
 
 end Olint.Tests

@@ -247,12 +247,19 @@ inductive Value where
 
 /-- Heap objects. -/
 inductive Obj where
-  /-- A variable binding and its declared type (§2.5; `any` when undeclared). -/
+  /-- An initialized variable binding and its declared type (§2.5; `any` when undeclared). -/
   | cell (v : Value) (ty : Ty)
-  /-- An ordinary object with its own properties in creation order, and the class it was
-  constructed from. -/
-  | ordinary (props : List (Name × Value)) (cls : Option Loc)
-  /-- An Array exotic object. -/
+  /-- A `let`, `const` or `class` binding created at its scope's entry and not yet initialized:
+  the temporal dead zone of ECMA-262 §9.1.1.1.1 `CreateMutableBinding`, where reading or
+  writing the binding throws a ReferenceError (§9.1.1.1.6 `GetBindingValue`). -/
+  | uninit (ty : Ty)
+  /-- An ordinary object: its own data properties in creation order, the names of its own
+  accessor properties, and the class it was constructed from, whose prototype is its
+  `[[Prototype]]`. Without a class its `[[Prototype]]` is `%Object.prototype%`, as for every
+  object literal (ECMA-262 §13.2.5.5, `OrdinaryObjectCreate(%Object.prototype%)`). The model
+  runs no accessor: reading or writing one aborts as outside the model. -/
+  | ordinary (props : List (Name × Value)) (accessors : List Name) (cls : Option Loc)
+  /-- An Array exotic object, whose `[[Prototype]]` is `%Array.prototype%`. -/
   | array (elems : List Value)
   /-- A Map, holding its `[[MapData]]` List; `none` is a deleted entry. -/
   | map (data : List (Option (Value × Value)))
@@ -261,8 +268,11 @@ inductive Obj where
   /-- A function closure over its defining environment. A non-arrow call binds `this` in the
   callee's environment under the reserved name `"this"`. -/
   | closure (f : Func) (env : Env)
-  /-- A class over its defining environment. -/
-  | klass (c : Class) (env : Env)
+  /-- A class over its defining environment: its constructor, the closures of its prototype
+  methods, created once when the class is evaluated (ECMA-262 §15.7.14
+  `ClassDefinitionEvaluation`), and the names of its prototype accessors, which the model does
+  not run. The prototype's `[[Prototype]]` is `%Object.prototype%`. -/
+  | klass (ctor : Option Func) (methods : List (Name × Loc)) (accessors : List Name) (env : Env)
   /-- A RegExp object. -/
   | regexp (pattern flags : String)
 

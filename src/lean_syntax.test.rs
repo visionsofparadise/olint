@@ -4,6 +4,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 
 use super::*;
+use crate::syntax::unwrap;
 
 /// The Lean module `lake build` elaborates the encodings of `ENCODED` in.
 const MODULE: &str = concat!(
@@ -269,7 +270,7 @@ fn members_calls_and_new() {
         r#".call (.member (.ident "xs") "push") [.lit (.num 1)]"#
     );
     assert_eq!(expression("new Map()"), r#".new (.ident "Map") []"#);
-    assert_eq!(expression("(x as number[])!"), r#".ident "x""#);
+    assert_eq!(expression("(x satisfies number[])"), r#".ident "x""#);
 }
 
 #[test]
@@ -417,11 +418,11 @@ fn types() {
 #[test]
 fn programs_hold_named_scope_functions_sorted_by_name() {
     let encoding = encode(
-        "function main(xs: number[]) { return b(xs) + a(xs); }\nconst b = (xs: number[]) => xs.length;\nfunction a(xs: number[]) { return 0; }",
+        "function main(xs: number[], ys: string) { return b(xs) + a(xs); }\nconst b = (xs: number[]) => xs.length;\nfunction a(xs: number[]) { return 0; }",
         &[
             Dimension {
                 id: 7,
-                measure: Measure::Var("ys".into()),
+                measure: Measure::Arg(1),
             },
             Dimension {
                 id: 3,
@@ -436,13 +437,97 @@ fn programs_hold_named_scope_functions_sorted_by_name() {
         concat!(
             r#"⟨[("a", .mk [("xs", .array (.number))] [.ret (some (.lit (.num 0)))] false), "#,
             r#"("b", .mk [("xs", .array (.number))] [.ret (some (.member (.ident "xs") "length"))] true), "#,
-            r#"("main", .mk [("xs", .array (.number))] [.ret (some (.binary .add "#,
+            r#"("main", .mk [("xs", .array (.number)), ("ys", .string)] [.ret (some (.binary .add "#,
             r#"(.call (.ident "b") [.ident "xs"]) (.call (.ident "a") [.ident "xs"])))] false)]⟩"#
         )
     );
     assert!(encoding
         .node
-        .ends_with(r#", [], [(3, .arg 0), (7, .var "ys")]⟩, .entry⟩"#));
+        .ends_with(r#", [], [(3, .arg 0), (7, .arg 1)]⟩, .entry⟩"#));
+}
+
+#[test]
+fn free_variable_dimensions_are_refused() {
+    assert!(matches!(
+        encode(
+            "function f(xs: number[]) { return 0; }",
+            &[Dimension {
+                id: 0,
+                measure: Measure::Var("ys".into()),
+            }],
+        ),
+        Err(EncodeError::UnscopedDimension { name }) if name == "ys"
+    ));
+}
+
+#[test]
+fn references_resolve_as_the_model_resolves_them() {
+    // Parameters, locals, nested functions, hoisted declarations and cited functions resolve.
+    assert_eq!(
+        encoded("function f(a: number) { let b = a; function g() { return b + h(); } return g(); }\nfunction h() { return 1; }").node,
+        concat!(
+            r#"⟨⟨.mk [("a", .number)] [.decl .«let» "b" (.any) (some (.ident "a")), "#,
+            r#".funDecl "g" (.mk [] [.ret (some (.binary .add (.ident "b") (.call (.ident "h") [])))] false), "#,
+            r#".ret (some (.call (.ident "g") []))] false, [], []⟩, .entry⟩"#
+        )
+    );
+
+    // A module binding outside the scope, a function expression's own name and an assignment
+    // to an uncited module binding resolve to bindings the encoded program lacks.
+    for source in [
+        "const k = 1;\nfunction f() { return k; }",
+        "function f() { return (function g() { return g; }); }",
+        "let k = 1;\nfunction f() { k = 2; }",
+    ] {
+        assert_eq!(
+            unsupported(source),
+            (AstType::IdentifierReference, Some("binding")),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_scope_function_shadowing_a_global_is_refused() {
+    // The entry's `Map` is the global built-in, but the scope defines a function `Map` from
+    // another file, which the model would resolve it to instead.
+    let allocator = Allocator::default();
+    let semantic = |source: &'static str| {
+        let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
+
+        assert!(parsed.diagnostics.is_empty(), "{source}");
+
+        let program = allocator.alloc(parsed.program);
+
+        SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(program)
+            .semantic
+    };
+    fn function<'s, 'a>(semantic: &'s Semantic<'a>) -> FunctionRef<'s, 'a> {
+        FunctionRef {
+            semantic,
+            node: semantic
+                .nodes()
+                .iter()
+                .find(|node| matches!(node.kind(), AstKind::Function(_)))
+                .unwrap()
+                .id(),
+        }
+    }
+
+    let entry = semantic("function f() { return new Map(); }");
+    let other = semantic("function Map() {}");
+
+    assert!(encode_scope(function(&entry), &[], &[]).is_ok());
+    assert!(matches!(
+        encode_scope(function(&entry), &[function(&other)], &[]),
+        Err(EncodeError::Unsupported {
+            kind: AstType::IdentifierReference,
+            detail: Some("binding"),
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -510,6 +595,37 @@ fn constructs_outside_the_model_name_their_kind() {
             "function f() { (x as number)++; }",
             AstType::TSAsExpression,
             None,
+        ),
+        (
+            "function f() { x as number; }",
+            AstType::TSAsExpression,
+            None,
+        ),
+        ("function f() { x!; }", AstType::TSNonNullExpression, None),
+        (
+            "function f() { <number>x; }",
+            AstType::TSTypeAssertion,
+            None,
+        ),
+        (
+            "function f() { x as const; }",
+            AstType::TSAsExpression,
+            None,
+        ),
+        (
+            "function f() { { function g() {} } }",
+            AstType::Function,
+            Some("block function"),
+        ),
+        (
+            "function f() { ({ __proto__: null }); }",
+            AstType::ObjectProperty,
+            Some("__proto__"),
+        ),
+        (
+            r#"function f() { ({ "__proto__": null }); }"#,
+            AstType::ObjectProperty,
+            Some("__proto__"),
         ),
         (
             "function f() { void 0; }",
@@ -678,6 +794,10 @@ const ENCODED: &[(&str, &[(u64, usize)])] = &[
         "function bisect(xs: number[], t: number) { let lo: number = 0; let hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < t) lo = mid + 1; else hi = mid; } let s = \"\"; for (let i = 0; i < lo; i++) { s += \"x\"; --hi; } xs[0] *= 0.5; xs[1]++; return ~lo | 1e999 & hi >>> 2 ^ s.length << 1; }",
         &[(0, 0)],
     ),
+    (
+        "function hoist(xs: string[]) { var n = 0; for (var i = 0; i < xs.length; i++) { n = n + 1; } return twice(); function twice() { return (n satisfies number) * 2; } }",
+        &[(0, 0)],
+    ),
 ];
 
 fn encoded_module() -> String {
@@ -692,7 +812,7 @@ fn encoded_module() -> String {
         "\n",
         "Generated by the `encoded_lean_module_is_in_sync` unit test in `src/lean_syntax.test.rs`, which\n",
         "fails when this file differs from the encoder's output. Regenerate it with\n",
-        "`OLINT_BLESS=1 cargo test --locked --lib lean_syntax`.\n",
+        "`OLINT_BLESS=1 cargo test --locked -j 4 --lib lean_syntax`.\n",
         "-/\n",
         "\n",
         "namespace Olint.Tests.Encoded\n",
@@ -738,6 +858,6 @@ fn encoded_lean_module_is_in_sync() {
 
     assert!(
         actual == expected,
-        "{MODULE} is stale; regenerate it with `OLINT_BLESS=1 cargo test --locked --lib lean_syntax`"
+        "{MODULE} is stale; regenerate it with `OLINT_BLESS=1 cargo test --locked -j 4 --lib lean_syntax`"
     );
 }

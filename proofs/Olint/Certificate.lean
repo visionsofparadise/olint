@@ -3,36 +3,57 @@ import Olint.Rules.Algebra
 /-!
 # Certificates
 
-A certificate is a derivation in olint's proof rules: one `Cert` constructor per rule of the
-Phase 2 ledger (`corpus/ledger.json`, families A to J), carrying its premises, its
-side-condition facts, and, through the node it is checked at, the syntax it concerns.
+A certificate is a derivation in olint's proof rules: one `Cert` constructor per bound-producing
+rule of the Phase 2 ledger (`corpus/ledger.json`, families A to J), carrying its premises, its
+side-condition facts, and, through the node it is checked at, the syntax it concerns. Families
+K, L and M (knownness, declared types and resolution) provide facts other rules consume, not
+bounds, so they have no constructor: their conclusions enter certificates as `Fact`s, which the
+consuming rule's soundness theorem justifies (`Fact.holds`).
 
-`check p n c` is a structural recursion over `c` using only `Bool`, `ℕ` and structural
+`check p n xs c` is a structural recursion over `c` using only `Bool`, `ℕ` and structural
 recursions over `Cost` and the syntax, so `decide` evaluates it by kernel reduction on a
 concrete certificate. Cost comparisons inside `check` never touch `ℝ`: they are the decidable
 orders of `Olint.Rules.Algebra` (`Cost.beq`, `valid`, `within`, `maxCovers`, `prodMatches`),
-each proven sound there with respect to `Cost.eval` on the large admitted instances. `check`
-rejects a concluded bound that mentions a dimension the entry does not measure, the legacy
-envelope `N`, `log N` or `N log N`, or an unbound name (`measured`).
+each proven sound there with respect to `Cost.eval` on every admitted instance of the entry.
+`check` rejects:
+
+* an entry that is not well formed (`Olint.Model.Entry.wf`): a dimension measuring an argument
+  outside the parameters or of a type without a measured length, a dimension over a variable
+  outside the entry's scope, two dimensions with one id or one measured quantity, a scope
+  naming a variable twice or naming a program definition, or an object type naming a field
+  twice. Every well-formed entry admits an instance at every valuation of its dimensions
+  (`Olint.Model.Admitted.exists`), so no accepted certificate's bound holds vacuously;
+* a concluded bound that mentions a dimension the entry does not measure, the legacy envelope
+  `N`, `log N` or `N log N`, or an unbound name (`measured`);
+* a derivation relying on an intrinsic outside `xs` (`Cert.reliance`).
 
 A composing rule (`seqMax`, `branchJoin`) carries one child certificate per child of its node,
 in syntax order; each child is checked at the child node, whose site `check` computes from the
 parent's syntax, so a child certificate concerns exactly the syntax it bounds.
 
-`check_sound` turns a checked certificate into the bound `costOf c`. A generated certificate
+`check_sound` turns a checked certificate into the bound `costOf c` in every world `W` whose
+analysed program modifies none of the intrinsics `xs` (`NoReplacement W xs`, §2.2). That premise
+is part of every certificate theorem's statement; olint discharges it with its
+intrinsic-replacement scan (family G, `intrinsic-replacement-scan`, certified in Phase 5). The
+theorem quantifies over the world's spec-internal step costs `W.ops` too, so it rests on no G52
+draft; a family whose soundness needs the drafts adds the premise `W.ops = SpecOps.draft`, which
+`scripts/axioms.lean` reports as pending Matt's signature (§2.1, §6.3). A generated certificate
 theorem passes the derivation explicitly, since `costOf` does not determine it:
 
 ```lean
-theorem c_<sha256> : Bound <program> <node> <bound> := check_sound _ _ <derivation> (by decide)
+theorem c_<sha256> (W : World) (hW : NoReplacement W <xs>) : Bound W <program> <node> <bound> :=
+  check_sound W <xs> _ _ <derivation> hW (by decide)
 ```
 
-The family A rules `seq-max` (with its unit base), `branch-join`, `channel-total`,
-`max-dominance`, `max-normalise`, `product-normalise` and `expr-validity` are checked and proven;
-`seq-max`, `branch-join` and `channel-total` compose their child certificates.
-`limit-compare` is a comparison, not a bound producer: `Olint.Rules.limitCompare_sound` and
-`Olint.Rules.Bound.of_within` state it. Every other rule is declared with generic fields
-(premises at their nodes, facts, bound) and `check` rejects it until its family's soundness
-proof lands (action 5.3), so its `check_sound` case is unreachable.
+Family A: `seq-max` (with its unit base), `branch-join`, `channel-total`, `max-dominance`,
+`max-normalise`, `product-normalise` and `expr-validity` are checked and proven; `seq-max`,
+`branch-join` and `channel-total` compose their child certificates. `limit-compare` is a
+comparison, not a bound producer: `Olint.Rules.limitCompare_sound` and
+`Olint.Rules.Bound.of_within` state it. `nest-product`, `partial-bind-known` and
+`preference-rank` are pending their soundness proofs. Every rule without a proof, in family A
+and in families B to J, is declared with generic fields (premises at their nodes, facts, bound)
+and `check` rejects it until its soundness proof lands (action 5.3), so its `check_sound` case
+is unreachable.
 -/
 
 namespace Olint
@@ -55,9 +76,10 @@ inductive Fact where
   /-- A declared-type fact (ledger gap G51): the variable `x`, wherever the node's entry reads
   it, holds a value conforming to `τ`. `Fact.holds` justifies it from the encoded syntax by
   name resolution recomputed in Lean (`bindingTypes`): every binding of `x` the entry's runs
-  can create is declared `τ`, so by §2.5, which admission (`Olint.Model.Admitted`) imposes on
-  every variable cell, its value conforms to `τ`. A rule that consumes the fact proves that
-  consequence with its soundness theorem. -/
+  can create is declared `τ`, so every read of `x` that completes returns a value conforming
+  to `τ`: §2.5 is checked at every variable read (`Olint.Model.readVar`), and a read of a
+  non-conforming value aborts the run. A rule that consumes the fact proves that consequence
+  with its soundness theorem. -/
   | declared (x : Name) (τ : Ty)
 
 /-- A derivation in olint's proof rules, concerning the node it is checked at. -/
@@ -645,10 +667,18 @@ def checkParts (p : Program) (n : Node) : List (List Channel × Cert) → Bool
 
 end
 
-/-- Check a certificate at node `n` of program `p`, and that its bound is `measured` over the
-entry's dimensions. Decidable by kernel reduction. -/
-def check (p : Program) (n : Node) (c : Cert) : Bool :=
-  checkCert p n c && measured (n.entry.dims.map Prod.fst) (costOf c)
+/-- The intrinsics a derivation relies on: those whose modification by the analysed program
+would change the work its rules reason about (§2.2). The family A rules reason about the
+program's syntax and the costs alone and consult no intrinsic; families B to J extend this as
+their rules land. -/
+def Cert.reliance (_ : Cert) : List Intrinsic := []
+
+/-- Check a certificate at node `n` of program `p` under the no-replacement facts `xs`: the
+node's entry is well formed, the derivation checks, its bound is `measured` over the entry's
+dimensions, and every intrinsic it relies on is among `xs`. Decidable by kernel reduction. -/
+def check (p : Program) (n : Node) (xs : List Intrinsic) (c : Cert) : Bool :=
+  n.entry.wf p && checkCert p n c && measured (n.entry.dims.map Prod.fst) (costOf c) &&
+    c.reliance.all xs.contains
 
 theorem partCosts_eq : ∀ parts : List (List Channel × Cert),
     partCosts parts = (parts.map fun x => (x.1, costOf x.2)).map Prod.snd
@@ -658,204 +688,206 @@ theorem partCosts_eq : ∀ parts : List (List Channel × Cert),
 mutual
 
 /-- A checked certificate proves its bound. -/
-theorem checkCert_sound : ∀ (p : Program) (n : Node) (c : Cert), checkCert p n c = true →
-    Bound p n (costOf c)
-  | p, n, .seqUnit, h => by
+theorem checkCert_sound (W : World) : ∀ (p : Program) (n : Node) (c : Cert),
+    n.entry.wf p = true → checkCert p n c = true → Bound W p n (costOf c)
+  | p, n, .seqUnit, hwf, h => by
     simp only [checkCert] at h
     split at h
     · rename_i s hs
-      exact unit_bound hs h
+      exact unit_bound hwf hs h
     · rename_i l hs
-      exact lit_bound hs
+      exact lit_bound hwf hs
     · exact absurd h Bool.false_ne_true
-  | p, n, .seqMax children, h => by
+  | p, n, .seqMax children, hwf, h => by
     simp only [checkCert] at h
     split at h
     · rename_i sites hs
-      obtain ⟨hl, hb⟩ := checkChildren_sound p n.entry sites children h
-      exact seqMax_sound hs hl hb
+      obtain ⟨hl, hb⟩ := checkChildren_sound W p n.entry sites children hwf h
+      exact seqMax_sound hwf hs hl hb
     · exact absurd h Bool.false_ne_true
-  | p, n, .branchJoin children, h => by
+  | p, n, .branchJoin children, hwf, h => by
     simp only [checkCert] at h
     split at h
     · rename_i sites hs
-      obtain ⟨hl, hb⟩ := checkChildren_sound p n.entry sites children h
-      exact branchJoin_sound hs hl hb
+      obtain ⟨hl, hb⟩ := checkChildren_sound W p n.entry sites children hwf h
+      exact branchJoin_sound hwf hs hl hb
     · exact absurd h Bool.false_ne_true
-  | p, n, .channelTotal parts, h => by
+  | p, n, .channelTotal parts, hwf, h => by
     simp only [checkCert, Bool.and_eq_true, List.all_eq_true, List.any_eq_true] at h
     obtain ⟨hp, hcov⟩ := h
-    show Bound p n (.maximum (partCosts parts))
+    show Bound W p n (.maximum (partCosts parts))
     rw [partCosts_eq]
-    refine channelTotal_sound (fun x hx => ?_) (fun k => ?_)
+    refine channelTotal_sound hwf (fun x hx => ?_) (fun k => ?_)
     · obtain ⟨y, hy, rfl⟩ := List.mem_map.1 hx
-      exact (checkParts_sound p n parts hp y hy).restrict fun k _ => mem_allChannels k
+      exact (checkParts_sound W p n parts hwf hp y hy).restrict fun k _ => mem_allChannels k
     · obtain ⟨y, hy, hk⟩ := hcov k (mem_allChannels k)
       exact ⟨(y.1, costOf y.2), List.mem_map.2 ⟨y, hy, rfl⟩, List.contains_iff_mem.1 hk⟩
-  | p, n, .maxDominance premise target, h => by
+  | p, n, .maxDominance premise target, hwf, h => by
     simp only [checkCert, Bool.and_eq_true] at h
     obtain ⟨⟨⟨hc, hs⟩, ht⟩, hd⟩ := h
-    exact maxDominance_sound (checkCert_sound p n premise hc) hs ht hd
-  | p, n, .maxNormalise premise target, h => by
+    exact maxDominance_sound (checkCert_sound W p n premise hwf hc) hs ht hd
+  | p, n, .maxNormalise premise target, hwf, h => by
     simp only [checkCert, Bool.and_eq_true] at h
     obtain ⟨⟨⟨hc, hs⟩, ht⟩, hm⟩ := h
-    exact maxNormalise_sound (checkCert_sound p n premise hc) hs ht hm
-  | p, n, .productNormalise premise target, h => by
+    exact maxNormalise_sound (checkCert_sound W p n premise hwf hc) hs ht hm
+  | p, n, .productNormalise premise target, hwf, h => by
     simp only [checkCert, Bool.and_eq_true] at h
-    exact productNormalise_sound (checkCert_sound p n premise h.1) h.2
-  | p, n, .exprValidity premise, h => by
+    exact productNormalise_sound (checkCert_sound W p n premise hwf h.1) h.2
+  | p, n, .exprValidity premise, hwf, h => by
     simp only [checkCert, Bool.and_eq_true] at h
-    exact checkCert_sound p n premise h.1
-  | _, _, .nestProduct _ _ _, h
-  | _, _, .partialBindKnown _ _ _, h
-  | _, _, .preferenceRank _ _ _, h
-  | _, _, .boundAdditive _ _ _, h
-  | _, _, .boundBestOf _ _ _, h
-  | _, _, .boundBisection _ _ _, h
-  | _, _, .boundConstantCollection _ _ _, h
-  | _, _, .boundConstantDistance _ _ _, h
-  | _, _, .boundDirective _ _ _, h
-  | _, _, .boundExactAdditive _ _ _, h
-  | _, _, .boundFalseCondition _ _ _, h
-  | _, _, .boundForIn _ _ _, h
-  | _, _, .boundForOfNative _ _ _, h
-  | _, _, .boundGeometric _ _ _, h
-  | _, _, .boundIteratorVisits _ _ _, h
-  | _, _, .boundLinearDefault _ _ _, h
-  | _, _, .boundLiveVisits _ _ _, h
-  | _, _, .boundProgression _ _ _, h
-  | _, _, .boundQuantity _ _ _, h
-  | _, _, .boundShare _ _ _, h
-  | _, _, .boundSingleIteration _ _ _, h
-  | _, _, .forOfProducedLength _ _ _, h
-  | _, _, .loopEffectInvalidation _ _ _, h
-  | _, _, .loopNest _ _ _, h
-  | _, _, .loopPhases _ _ _, h
-  | _, _, .loopSuspension _ _ _, h
-  | _, _, .loopUnbounded _ _ _, h
-  | _, _, .loopUnit _ _ _, h
-  | _, _, .budgetCancel _ _ _, h
-  | _, _, .budgetCollect _ _ _, h
-  | _, _, .budgetShare _ _ _, h
-  | _, _, .hoistedJoin _ _ _, h
-  | _, _, .shareSizedOperation _ _ _, h
-  | _, _, .escapeAbsorb _ _ _, h
-  | _, _, .escapeDepthExhausted _ _ _, h
-  | _, _, .escapeLift _ _ _, h
-  | _, _, .flowCompletion _ _ _, h
-  | _, _, .flowGraph _ _ _, h
-  | _, _, .asyncAssimilation _ _ _, h
-  | _, _, .awaitContinuation _ _ _, h
-  | _, _, .callCallbackParameter _ _ _, h
-  | _, _, .callEffectsTransfer _ _ _, h
-  | _, _, .callFallback _ _ _, h
-  | _, _, .callLazyPhase _ _ _, h
-  | _, _, .callOpenRemainder _ _ _, h
-  | _, _, .callReturnedFunction _ _ _, h
-  | _, _, .callSummary _ _ _, h
-  | _, _, .constructionFields _ _ _, h
-  | _, _, .constructorCall _ _ _, h
-  | _, _, .implicitInvocation _ _ _, h
-  | _, _, .iteratorVisits _ _ _, h
-  | _, _, .latentProduction _ _ _, h
-  | _, _, .lazyConsume _ _ _, h
-  | _, _, .returnedFunctionFacts _ _ _, h
-  | _, _, .sizeSubstitution _ _ _, h
-  | _, _, .targetResolution _ _ _, h
-  | _, _, .tscCalleeTargets _ _ _, h
-  | _, _, .recBranchingDecrement _ _ _, h
-  | _, _, .recChainDecrement _ _ _, h
-  | _, _, .recChainDivision _ _ _, h
-  | _, _, .recFactorial _ _ _, h
-  | _, _, .recForgetMultiplicity _ _ _, h
-  | _, _, .recGuard _ _ _, h
-  | _, _, .recMarkers _ _ _, h
-  | _, _, .recMeasure _ _ _, h
-  | _, _, .recReducedMeasureSize _ _ _, h
-  | _, _, .recRelation _ _ _, h
-  | _, _, .recRelationJoin _ _ _, h
-  | _, _, .recUnsolved _ _ _, h
-  | _, _, .arrayMethod _ _ _, h
-  | _, _, .intrinsicReplacementScan _ _ _, h
-  | _, _, .linearConstructor _ _ _, h
-  | _, _, .nativeCallback _ _ _, h
-  | _, _, .nativeChargeLength _ _ _, h
-  | _, _, .nativeModel _ _ _, h
-  | _, _, .nativeVisitBudget _ _ _, h
-  | _, _, .regexCost _ _ _, h
-  | _, _, .regexEveryMatch _ _ _, h
-  | _, _, .regexMatchedOnce _ _ _, h
-  | _, _, .setMapLinear _ _ _, h
-  | _, _, .unmodelledNative _ _ _, h
-  | _, _, .argumentFacts _ _ _, h
-  | _, _, .arrayMethodSize _ _ _, h
-  | _, _, .constantCardinality _ _ _, h
-  | _, _, .countOf _ _ _, h
-  | _, _, .growthSites _ _ _, h
-  | _, _, .holderStability _ _ _, h
-  | _, _, .inputSizeEnvelope _ _ _, h
-  | _, _, .iterableSize _ _ _, h
-  | _, _, .parameterSize _ _ _, h
-  | _, _, .producedSize _ _ _, h
-  | _, _, .restCopy _ _ _, h
-  | _, _, .resultSize _ _ _, h
-  | _, _, .sizeAlgebra _ _ _, h
-  | _, _, .sizeDimension _ _ _, h
-  | _, _, .sizeLabels _ _ _, h
-  | _, _, .spreadCopy _ _ _, h
-  | _, _, .tscTypeKind _ _ _, h
-  | _, _, .valueIdentity _ _ _, h
-  | _, _, .dirBoundedStmt _ _ _, h
-  | _, _, .dirCost _ _ _, h
-  | _, _, .dirFunctionMark _ _ _, h
-  | _, _, .dirHotCold _ _ _, h
-  | _, _, .dirIgnore _ _ _, h
-  | _, _, .dirIgnoreFunction _ _ _, h
-  | _, _, .resourceConfigGraph _ _ _, h
-  | _, _, .resourceEffectSchedulingDepth _ _ _, h
-  | _, _, .resourceExhaustion _ _ _, h
-  | _, _, .resourceFlowLimit _ _ _, h
-  | _, _, .resourceImplementationFiles _ _ _, h
-  | _, _, .resourcePublicSurface _ _ _, h
-  | _, _, .resourceRegexLimits _ _ _, h
-  | _, _, .resourceSchedulerBudget _ _ _, h
-  | _, _, .resourceSpecializationCap _ _ _, h
-  | _, _, .resourceTraceArena _ _ _, h
-  | _, _, .tscCandidateCap _ _ _, h => nomatch h
+    exact checkCert_sound W p n premise hwf h.1
+  | _, _, .nestProduct _ _ _, _, h
+  | _, _, .partialBindKnown _ _ _, _, h
+  | _, _, .preferenceRank _ _ _, _, h
+  | _, _, .boundAdditive _ _ _, _, h
+  | _, _, .boundBestOf _ _ _, _, h
+  | _, _, .boundBisection _ _ _, _, h
+  | _, _, .boundConstantCollection _ _ _, _, h
+  | _, _, .boundConstantDistance _ _ _, _, h
+  | _, _, .boundDirective _ _ _, _, h
+  | _, _, .boundExactAdditive _ _ _, _, h
+  | _, _, .boundFalseCondition _ _ _, _, h
+  | _, _, .boundForIn _ _ _, _, h
+  | _, _, .boundForOfNative _ _ _, _, h
+  | _, _, .boundGeometric _ _ _, _, h
+  | _, _, .boundIteratorVisits _ _ _, _, h
+  | _, _, .boundLinearDefault _ _ _, _, h
+  | _, _, .boundLiveVisits _ _ _, _, h
+  | _, _, .boundProgression _ _ _, _, h
+  | _, _, .boundQuantity _ _ _, _, h
+  | _, _, .boundShare _ _ _, _, h
+  | _, _, .boundSingleIteration _ _ _, _, h
+  | _, _, .forOfProducedLength _ _ _, _, h
+  | _, _, .loopEffectInvalidation _ _ _, _, h
+  | _, _, .loopNest _ _ _, _, h
+  | _, _, .loopPhases _ _ _, _, h
+  | _, _, .loopSuspension _ _ _, _, h
+  | _, _, .loopUnbounded _ _ _, _, h
+  | _, _, .loopUnit _ _ _, _, h
+  | _, _, .budgetCancel _ _ _, _, h
+  | _, _, .budgetCollect _ _ _, _, h
+  | _, _, .budgetShare _ _ _, _, h
+  | _, _, .hoistedJoin _ _ _, _, h
+  | _, _, .shareSizedOperation _ _ _, _, h
+  | _, _, .escapeAbsorb _ _ _, _, h
+  | _, _, .escapeDepthExhausted _ _ _, _, h
+  | _, _, .escapeLift _ _ _, _, h
+  | _, _, .flowCompletion _ _ _, _, h
+  | _, _, .flowGraph _ _ _, _, h
+  | _, _, .asyncAssimilation _ _ _, _, h
+  | _, _, .awaitContinuation _ _ _, _, h
+  | _, _, .callCallbackParameter _ _ _, _, h
+  | _, _, .callEffectsTransfer _ _ _, _, h
+  | _, _, .callFallback _ _ _, _, h
+  | _, _, .callLazyPhase _ _ _, _, h
+  | _, _, .callOpenRemainder _ _ _, _, h
+  | _, _, .callReturnedFunction _ _ _, _, h
+  | _, _, .callSummary _ _ _, _, h
+  | _, _, .constructionFields _ _ _, _, h
+  | _, _, .constructorCall _ _ _, _, h
+  | _, _, .implicitInvocation _ _ _, _, h
+  | _, _, .iteratorVisits _ _ _, _, h
+  | _, _, .latentProduction _ _ _, _, h
+  | _, _, .lazyConsume _ _ _, _, h
+  | _, _, .returnedFunctionFacts _ _ _, _, h
+  | _, _, .sizeSubstitution _ _ _, _, h
+  | _, _, .targetResolution _ _ _, _, h
+  | _, _, .tscCalleeTargets _ _ _, _, h
+  | _, _, .recBranchingDecrement _ _ _, _, h
+  | _, _, .recChainDecrement _ _ _, _, h
+  | _, _, .recChainDivision _ _ _, _, h
+  | _, _, .recFactorial _ _ _, _, h
+  | _, _, .recForgetMultiplicity _ _ _, _, h
+  | _, _, .recGuard _ _ _, _, h
+  | _, _, .recMarkers _ _ _, _, h
+  | _, _, .recMeasure _ _ _, _, h
+  | _, _, .recReducedMeasureSize _ _ _, _, h
+  | _, _, .recRelation _ _ _, _, h
+  | _, _, .recRelationJoin _ _ _, _, h
+  | _, _, .recUnsolved _ _ _, _, h
+  | _, _, .arrayMethod _ _ _, _, h
+  | _, _, .intrinsicReplacementScan _ _ _, _, h
+  | _, _, .linearConstructor _ _ _, _, h
+  | _, _, .nativeCallback _ _ _, _, h
+  | _, _, .nativeChargeLength _ _ _, _, h
+  | _, _, .nativeModel _ _ _, _, h
+  | _, _, .nativeVisitBudget _ _ _, _, h
+  | _, _, .regexCost _ _ _, _, h
+  | _, _, .regexEveryMatch _ _ _, _, h
+  | _, _, .regexMatchedOnce _ _ _, _, h
+  | _, _, .setMapLinear _ _ _, _, h
+  | _, _, .unmodelledNative _ _ _, _, h
+  | _, _, .argumentFacts _ _ _, _, h
+  | _, _, .arrayMethodSize _ _ _, _, h
+  | _, _, .constantCardinality _ _ _, _, h
+  | _, _, .countOf _ _ _, _, h
+  | _, _, .growthSites _ _ _, _, h
+  | _, _, .holderStability _ _ _, _, h
+  | _, _, .inputSizeEnvelope _ _ _, _, h
+  | _, _, .iterableSize _ _ _, _, h
+  | _, _, .parameterSize _ _ _, _, h
+  | _, _, .producedSize _ _ _, _, h
+  | _, _, .restCopy _ _ _, _, h
+  | _, _, .resultSize _ _ _, _, h
+  | _, _, .sizeAlgebra _ _ _, _, h
+  | _, _, .sizeDimension _ _ _, _, h
+  | _, _, .sizeLabels _ _ _, _, h
+  | _, _, .spreadCopy _ _ _, _, h
+  | _, _, .tscTypeKind _ _ _, _, h
+  | _, _, .valueIdentity _ _ _, _, h
+  | _, _, .dirBoundedStmt _ _ _, _, h
+  | _, _, .dirCost _ _ _, _, h
+  | _, _, .dirFunctionMark _ _ _, _, h
+  | _, _, .dirHotCold _ _ _, _, h
+  | _, _, .dirIgnore _ _ _, _, h
+  | _, _, .dirIgnoreFunction _ _ _, _, h
+  | _, _, .resourceConfigGraph _ _ _, _, h
+  | _, _, .resourceEffectSchedulingDepth _ _ _, _, h
+  | _, _, .resourceExhaustion _ _ _, _, h
+  | _, _, .resourceFlowLimit _ _ _, _, h
+  | _, _, .resourceImplementationFiles _ _ _, _, h
+  | _, _, .resourcePublicSurface _ _ _, _, h
+  | _, _, .resourceRegexLimits _ _ _, _, h
+  | _, _, .resourceSchedulerBudget _ _ _, _, h
+  | _, _, .resourceSpecializationCap _ _ _, _, h
+  | _, _, .resourceTraceArena _ _ _, _, h
+  | _, _, .tscCandidateCap _ _ _, _, h => nomatch h
 
 /-- Checked child certificates bound their child nodes. -/
-theorem checkChildren_sound : ∀ (p : Program) (e : Entry) (sites : List Site) (cs : List Cert),
-    checkChildren p e sites cs = true →
-      sites.length = (costsOf cs).length ∧ ∀ x ∈ sites.zip (costsOf cs), Bound p ⟨e, x.1⟩ x.2
-  | _, _, [], [], _ => ⟨rfl, by simp [costsOf]⟩
-  | p, e, s :: ss, c :: cs, h => by
+theorem checkChildren_sound (W : World) : ∀ (p : Program) (e : Entry) (sites : List Site)
+    (cs : List Cert), e.wf p = true → checkChildren p e sites cs = true →
+      sites.length = (costsOf cs).length ∧ ∀ x ∈ sites.zip (costsOf cs), Bound W p ⟨e, x.1⟩ x.2
+  | _, _, [], [], _, _ => ⟨rfl, by simp [costsOf]⟩
+  | p, e, s :: ss, c :: cs, hwf, h => by
     simp only [checkChildren, Bool.and_eq_true] at h
-    obtain ⟨hl, hb⟩ := checkChildren_sound p e ss cs h.2
+    obtain ⟨hl, hb⟩ := checkChildren_sound W p e ss cs hwf h.2
     refine ⟨by simp [costsOf, hl], fun x hx => ?_⟩
     simp only [costsOf, List.zip_cons_cons, List.mem_cons] at hx
     rcases hx with rfl | hx
-    · exact checkCert_sound p ⟨e, s⟩ c h.1
+    · exact checkCert_sound W p ⟨e, s⟩ c hwf h.1
     · exact hb x hx
-  | _, _, [], _ :: _, h => by simp [checkChildren] at h
-  | _, _, _ :: _, [], h => by simp [checkChildren] at h
+  | _, _, [], _ :: _, _, h => by simp [checkChildren] at h
+  | _, _, _ :: _, [], _, h => by simp [checkChildren] at h
 
 /-- Checked parts bound the node. -/
-theorem checkParts_sound : ∀ (p : Program) (n : Node) (parts : List (List Channel × Cert)),
-    checkParts p n parts = true → ∀ x ∈ parts, Bound p n (costOf x.2)
-  | _, _, [], _ => by simp
-  | p, n, (ks, c) :: ps, h => by
+theorem checkParts_sound (W : World) : ∀ (p : Program) (n : Node)
+    (parts : List (List Channel × Cert)), n.entry.wf p = true → checkParts p n parts = true →
+      ∀ x ∈ parts, Bound W p n (costOf x.2)
+  | _, _, [], _, _ => by simp
+  | p, n, (ks, c) :: ps, hwf, h => by
     simp only [checkParts, Bool.and_eq_true] at h
     intro x hx
     rcases List.mem_cons.1 hx with rfl | hx
-    · exact checkCert_sound p n c h.1
-    · exact checkParts_sound p n ps h.2 x hx
+    · exact checkCert_sound W p n c hwf h.1
+    · exact checkParts_sound W p n ps hwf h.2 x hx
 
 end
 
-/-- A checked certificate proves its bound. -/
-theorem check_sound (p : Program) (n : Node) (c : Cert) (h : check p n c = true) :
-    Bound p n (costOf c) := by
+/-- A checked certificate proves its bound in every world whose analysed program modifies none
+of the intrinsics `xs` (§2.2), whatever the world's spec-internal step costs. -/
+theorem check_sound (W : World) (xs : List Intrinsic) (p : Program) (n : Node) (c : Cert)
+    (_hW : NoReplacement W xs) (h : check p n xs c = true) : Bound W p n (costOf c) := by
   simp only [check, Bool.and_eq_true] at h
-  exact checkCert_sound p n c h.1
+  exact checkCert_sound W p n c h.1.1.1 h.1.1.2
 
 end Olint
