@@ -24,9 +24,12 @@ const CONCURRENCY = 8;
 const ATTEMPTS = 4;
 const fetchedPath = path.join(cacheDir, "fetched.json");
 
+// Declaration files are excluded: olint selects a sibling `index.d.ts` over `index.js`, which leaves a package that
+// ships its own typings with no analysed function bodies.
 const tsconfig = {
 	compilerOptions: { allowJs: true, checkJs: false, noEmit: true },
 	include: SOURCE_EXTENSIONS.map((extension) => `**/*${extension}`),
+	exclude: ["**/*.d.ts", "**/*.d.mts", "**/*.d.cts", "node_modules"],
 };
 
 function isFile(file) {
