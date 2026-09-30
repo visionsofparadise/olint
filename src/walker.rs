@@ -22,7 +22,7 @@ use crate::flow::{
     class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, is_suspension,
     loop_phases_of, Completion, Resumption,
 };
-use crate::invocations::is_inlined_spread;
+use crate::invocations::{is_inlined_spread, reads_member};
 use crate::native::{Matching, Native, Pattern};
 use crate::project::{FileId, Site};
 use crate::syntax::{
@@ -695,6 +695,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
 
                 let implicit = self.implicit_reading_of(file, kind);
+                let implicit = match kind {
+                    AstKind::StaticMemberExpression(member) => {
+                        let counted = self.size_getter_reading_of(file, member);
+
+                        implicit.merge(counted, &mut self.unknowns, &mut self.traces)
+                    }
+                    _ => implicit,
+                };
 
                 if let AstKind::YieldExpression(yielded) = kind {
                     if !yielded.delegate && self.is_async_context(file, yielded.node_id(), true) {
@@ -1913,6 +1921,47 @@ impl<'p, 'a> Analysis<'p, 'a> {
             )),
             None => Reading::of_part(self.unknown_part(file, span, UnknownReason::SizeRelation)),
         }
+    }
+
+    /// ECMA-262 §24.1.3.10 and §24.2.4.14: the Map and Set `size` getters count the live records
+    /// of `[[MapData]]` or `[[SetData]]` with a For-each loop, so a read walks the whole entry
+    /// list, deleted records included.
+    fn size_getter_reading_of(
+        &mut self,
+        file: FileId,
+        member: &'a oxc_ast::ast::StaticMemberExpression<'a>,
+    ) -> Reading {
+        if member.property.name != "size"
+            || !reads_member(self.project.file(file).semantic.nodes(), member.node_id())
+        {
+            return Reading::empty();
+        }
+
+        let receiver = &member.object;
+        let kind = self.receiver_kind_of(file, receiver, "size");
+
+        if !matches!(kind, Kind::Map | Kind::Set) || self.builtin_members_replaced(kind, &["size"])
+        {
+            return Reading::empty();
+        }
+
+        let length =
+            match self.is_constant_sized(file, receiver) || self.is_share_sized(file, receiver) {
+                true => Some(Cost::ONE),
+                false => self.tracked_length_of(file, receiver),
+            };
+
+        if length.as_ref().is_some_and(Cost::is_one) {
+            return Reading::empty();
+        }
+
+        let label = format!(
+            "{}.size [size getter]",
+            short(self.text_of(file, receiver.span()))
+        );
+        let site = self.site_of_node(file, member.node_id());
+
+        self.element_steps_of(label, site, (file, member.span), length)
     }
 
     /// `inner` once per element of a collection whose length `input-size-envelope` tracks, else

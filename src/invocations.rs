@@ -125,6 +125,11 @@ fn placement_of(is_static: bool) -> Placement {
     }
 }
 
+/// Whether the member expression at `node` reads its property, as a getter runs for.
+pub(crate) fn reads_member(nodes: &AstNodes<'_>, node: NodeId) -> bool {
+    matches!(member_role_of(nodes, node), Some(Role::Read | Role::Update))
+}
+
 fn member_role_of(nodes: &AstNodes<'_>, node: NodeId) -> Option<Role> {
     let current = outermost_of(nodes, node);
     let span = nodes.kind(current).span();

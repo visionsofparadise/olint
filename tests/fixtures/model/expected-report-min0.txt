@@ -259,6 +259,7 @@ O(rows)        newSetNonConst  src/methods.ts:59 [partial]
     unknown origin: input size relation at src/methods.ts:61 [1635..1637]; multiplicity O(rows)
     unknown origin: input size relation at src/methods.ts:61 [1627..1638]; multiplicity O(rows)
     unknown origin: input size relation at src/methods.ts:61 [1627..1638]; multiplicity unknown
+    unknown origin: input size relation at src/methods.ts:61 [1627..1643]; multiplicity O(rows)
     in loop for-of                                           src/methods.ts:61  x rows
 
 O(items)       structuredCloneCall  src/methods.ts:51 [partial]

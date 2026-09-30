@@ -1153,6 +1153,34 @@ fn string_keys_charge_their_length_per_comparison() {
     ]);
 }
 
+// ECMA-262 §24.1.3.10 and §24.2.4.14: the `size` getters walk the whole entry list.
+#[test]
+fn collection_size_getters_scan_their_entries() {
+    assert_selected(&[
+        ("", "(table: Map<string, number>) { return table.size; }", "O(N)", true),
+        ("", "(values: Set<number>) { return values.size; }", "O(N)", true),
+        (
+            "",
+            "(xs: number[], values: Set<number>) { let t = 0; for (const x of xs) t += values.size + x; return t; }",
+            "O(N^2)",
+            true,
+        ),
+        ("", "() { const values = new Set([1, 2]); return values.size; }", "O(1)", true),
+        (
+            "",
+            "(table: Map<string, number>) { table.clear(); return table.size; }",
+            "O(1)",
+            false,
+        ),
+        (
+            "",
+            "(table: { size: number }) { return table.size; }",
+            "O(1)",
+            true,
+        ),
+    ]);
+}
+
 #[test]
 fn weak_collections_scan_their_entries() {
     assert_selected(&[
