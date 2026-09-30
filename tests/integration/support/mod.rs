@@ -393,8 +393,7 @@ pub fn project_result_in(
 
     let part = summary_of(&mut analysis, file, "selected");
     let reasons = unknown_reasons(&analysis, part.unknowns);
-    let selected = function_of_name(analysis.project, file, "selected");
-    let cost = legacy_class_of(&mut analysis, file, selected, &part.cost);
+    let cost = projected_class_of(&part.cost);
     let mut labels = Vec::new();
     let mut pending: Vec<_> = part.trace.into_iter().collect();
 

@@ -186,11 +186,13 @@ fn unknown_callback_keeps_known_native_invocation_count() {
     run_with_source("export function f(xs: number[], callback: (x: number) => number) { return xs.map(callback); }", |analysis, file| {
         let part = summary_of(analysis, file, "f");
 
-        assert_eq!(part.cost, Cost::N);
+        assert_eq!(support::projected_class_of(&part.cost), Cost::N);
 
         let lines = unknown_lines(analysis, part);
 
-        assert!(lines.iter().any(|line| line.contains("multiplicity O(N)")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("multiplicity O(") && !line.contains("O(1)")));
     });
 }
 

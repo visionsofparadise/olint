@@ -52,7 +52,10 @@ module.exports = require(RECHECK);
 "#;
 
 fn selected_of(body: &str) -> LegacyResult {
-    classified_result_of(&format!("export function selected{body}"), "selected")
+    let (cost, complete, reasons) =
+        classified_result_of(&format!("export function selected{body}"), "selected");
+
+    (support::projected_class_of(&cost), complete, reasons)
 }
 
 fn assert_classified(cases: &[(&str, &str, bool)]) {
@@ -317,7 +320,7 @@ fn repeated_matching_charges_every_match_or_its_proven_modifier() {
         (
             "(s: string) { return [...s.matchAll(/a+/g)]; }",
             "O(N^2)",
-            true,
+            false,
         ),
         (
             "(s: string) { return s.matchAll(\"a*a*$\"); }",
@@ -461,8 +464,8 @@ fn dynamic_patterns_stay_unknown_even_for_constant_subjects() {
         ("(s: string) { return s.includes(\"x\"); }", "O(N)", true),
         (
             "(s: string, pattern: any) { return s.includes(pattern); }",
-            "O(N^2)",
-            true,
+            "O(N)",
+            false,
         ),
     ]);
 }

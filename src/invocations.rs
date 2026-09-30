@@ -55,6 +55,8 @@ pub(crate) struct ImplicitSite {
     operation: &'static str,
     receivers: Vec<ValueId>,
     visits: Option<Option<Cost>>,
+    /// Why an unknown visit count is unknown.
+    reason: UnknownReason,
 }
 
 pub(crate) struct IterationParts {
@@ -401,11 +403,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Reading {
         let receiver = self.storage_value_of(file, value);
         let visited = self.unknown_implicit_part(file, value.span(), &[receiver]);
+        let visits = self.tracked_length_of(file, value);
 
         self.visits_of(
             (file, value.span()),
             Reading::of_part(visited),
-            Some(Cost::N),
+            visits,
+            UnknownReason::SizeRelation,
         )
     }
 
@@ -587,7 +591,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let (acquire, next, _) = self.protocol_parts_of(file, iterable, &iteration, false);
-        let visits = self.visits_of((file, span), next, count);
+        let reason =
+            match count.is_none() && self.is_untracked_iteration(file, iterable, &iteration) {
+                true => UnknownReason::SizeRelation,
+                false => UnknownReason::Bound,
+            };
+        let visits = self.visits_of((file, span), next, count, reason);
         let mut reading = acquire.merge(visits, &mut self.unknowns, &mut self.traces);
 
         if let Some(latent) = latent {
@@ -751,12 +760,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (file, span): (FileId, Span),
         next: Reading,
         count: Option<Cost>,
+        reason: UnknownReason,
     ) -> Reading {
         let site = self.project.site_of(file, span);
         let origin = self.source_span(file, span);
 
         let Some(count) = count else {
-            let bound = self.unknowns.origin(origin, UnknownReason::Bound);
+            let bound = self.unknowns.origin(origin, reason);
 
             for (_, _, part) in &next.completions {
                 self.note_unresolved_multiplicity(part);
@@ -887,18 +897,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             };
         }
 
+        let mut untracked = false;
+
         if let (Some(argument), true) = (&yielded.argument, yielded.delegate) {
             let asynchronous = self.delegation_is_async(file, yielded);
             let iteration = self.iteration_of(file, argument, asynchronous);
             let delegated = self.iteration_count_of(file, argument, &iteration);
 
+            untracked = count.is_some()
+                && delegated.is_none()
+                && self.is_sized_iteration(file, argument, &iteration);
             count = match (count, delegated) {
                 (Some(count), Some(delegated)) => count.multiply(&delegated).ok(),
                 _ => None,
             };
         }
 
-        self.produced = Some(produced.joined(count));
+        self.produced = Some(produced.joined(count, untracked));
     }
 
     fn delegation_is_async(&self, file: FileId, yielded: &YieldExpression<'_>) -> bool {
@@ -1377,7 +1392,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         );
 
         match &planned.visits {
-            Some(count) => self.visits_of((planned.file, planned.span), found, count.clone()),
+            Some(count) => self.visits_of(
+                (planned.file, planned.span),
+                found,
+                count.clone(),
+                planned.reason,
+            ),
             None => found,
         }
     }
@@ -1516,6 +1536,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let mut receivers = Vec::new();
         let mut constant = !sources.open;
         let mut known = Vec::new();
+        let mut lengths = (!sources.open).then(Vec::new);
 
         for (source, value) in sources.values.iter().copied() {
             for (key, getter) in self.literal_getters_of(source, value, 0) {
@@ -1526,8 +1547,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             constant &= self.is_closed(source, value);
 
+            if let Some(found) = &mut lengths {
+                match self.tracked_length_of(source, value) {
+                    Some(length) => found.push(length),
+                    None => lengths = None,
+                }
+            }
+
             receivers.push(self.storage_value_of(source, value));
         }
+
+        let keys = lengths.and_then(|lengths| Cost::maximum(lengths).ok());
 
         if !known.is_empty() {
             plan.push(ImplicitSite {
@@ -1537,6 +1567,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 operation: "getter",
                 receivers: Vec::new(),
                 visits: None,
+                reason: UnknownReason::Bound,
             });
         }
 
@@ -1553,7 +1584,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             },
             operation: "getter",
             receivers,
-            visits: (!constant).then_some(Some(Cost::N)),
+            visits: (!constant).then_some(keys),
+            reason: UnknownReason::SizeRelation,
         });
     }
 
@@ -1722,6 +1754,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             operation: "getter",
             receivers,
             visits: None,
+            reason: UnknownReason::Bound,
         });
 
         child
@@ -1749,6 +1782,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 operation: "iterator",
                 receivers: Vec::new(),
                 visits: None,
+                reason: UnknownReason::Bound,
             });
         }
 
@@ -1774,6 +1808,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     operation: "iterator acquisition",
                     receivers: receivers.clone(),
                     visits: None,
+                    reason: UnknownReason::Bound,
                 });
                 plan.push(ImplicitSite {
                     file: source,
@@ -1782,6 +1817,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     operation: "iterator next",
                     receivers: receivers.clone(),
                     visits: (!closes).then_some(visits.clone()),
+                    reason: UnknownReason::Bound,
                 });
 
                 for (targets, operation, repeated) in [
@@ -1796,6 +1832,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         operation,
                         receivers: receivers.clone(),
                         visits: repeated.then_some(visits.clone()),
+                        reason: UnknownReason::Bound,
                     });
                 }
 
@@ -1807,6 +1844,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         operation: "iterator close getter",
                         receivers: receivers.clone(),
                         visits: None,
+                        reason: UnknownReason::Bound,
                     });
                     plan.push(ImplicitSite {
                         file: source,
@@ -1815,6 +1853,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         operation: "iterator close",
                         receivers,
                         visits: None,
+                        reason: UnknownReason::Bound,
                     });
                 }
             }
@@ -2266,7 +2305,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let mut collected = self.values.allocation(self.source_span(file, span));
 
-        collected.size = constant.then_some(Cost::ONE);
+        collected.size = match constant {
+            true => Some(Cost::ONE),
+            false => self.spread_count_of(
+                file,
+                children.iter().filter_map(|child| match child {
+                    JSXChild::Spread(spread) => Some(&spread.expression),
+                    _ => None,
+                }),
+            ),
+        };
 
         (supplied, Some(defined_facts_of(collected)))
     }
@@ -2775,6 +2823,49 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.iteration_count_at(file, iterable, iteration, 0)
     }
 
+    /// Whether a missing count of `iterable` is missing only for an untracked size
+    /// (`input-size-envelope`): an intact native iteration of an untracked collection, or a
+    /// generator whose yields delegate to one.
+    pub(crate) fn is_untracked_iteration(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+    ) -> bool {
+        if self.is_sized_iteration(file, iterable, iteration) {
+            return true;
+        }
+
+        self.iteration_latent_of(file, iterable, iteration)
+            .and_then(|latent| latent.record)
+            .is_some_and(|record| self.untracked_yields.contains(&record))
+    }
+
+    /// Whether native iteration of `iterable` runs the intact built-in protocol, so that its
+    /// count is the collection's size and fails only where that size is untracked.
+    pub(crate) fn is_sized_iteration(
+        &mut self,
+        file: FileId,
+        iterable: &'a Expression<'a>,
+        iteration: &Iteration,
+    ) -> bool {
+        if !iteration.native || iteration.acquire.open || iteration.next.open {
+            return false;
+        }
+
+        let [acquired, advanced, _] = self.iteration_accessors_of(file, iterable, iteration);
+
+        !(acquired.open
+            || advanced.open
+            || (!acquired.known.is_empty() && iteration.acquire.known.is_empty())
+            || (!advanced.known.is_empty() && iteration.next.known.is_empty()))
+            && iteration.next.known.is_empty()
+            && iteration.acquire.known.is_empty()
+            && self
+                .iteration_latent_of(file, iterable, iteration)
+                .is_none()
+    }
+
     pub(crate) fn iteration_count_at(
         &mut self,
         file: FileId,
@@ -2856,10 +2947,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return Some(Cost::ONE);
             }
 
-            return Some(match size.length.is_one() {
-                true => self.count_of(file, iterable).unwrap_or(Cost::N),
-                false => size.length,
-            });
+            return Some(size.length);
         }
 
         if iteration.next.known.is_empty() {

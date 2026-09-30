@@ -238,15 +238,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let label = self.rest_label_of(file, rest.rest.span);
         let site = self.site_of_node(file, rest.node_id());
-        let part = self.nest_part(
-            label,
-            site,
-            self.source_span(file, rest.rest.span),
-            Cost::N,
-            Part::unmarked(Cost::ONE, None),
-        );
+        let length = match &rest.rest.argument {
+            BindingPattern::BindingIdentifier(identifier) => {
+                identifier.symbol_id.get().and_then(|symbol| {
+                    self.current_substitutions
+                        .get(&Binding::Symbol { file, symbol })
+                        .and_then(|facts| facts.value.size.clone())
+                })
+            }
+            _ => None,
+        };
 
-        Some(Reading::of_part(part))
+        Some(self.element_steps_of(label, site, (file, rest.rest.span), length))
     }
 
     fn collected_arguments_are_constant(
@@ -950,24 +953,6 @@ impl<'p, 'a> Analysis<'p, 'a> {
         absorbed
     }
 
-    fn append_linear_operation(
-        &mut self,
-        reading: Reading,
-        label: String,
-        site: Site,
-        (file, span): (FileId, Span),
-    ) -> Reading {
-        let part = self.nest_part(
-            label,
-            site,
-            self.source_span(file, span),
-            Cost::N,
-            Part::unmarked(Cost::ONE, None),
-        );
-
-        reading.merge(Reading::of_part(part), &mut self.unknowns, &mut self.traces)
-    }
-
     fn append_call(
         &mut self,
         reading: Reading,
@@ -1412,31 +1397,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
             .budget
             .then(|| std::mem::take(&mut self.share_bindings));
         let bound = self.bound_of(file, kind);
-        let mut factor = bound.factor().cloned().unwrap_or(Cost::N);
+        let factor = bound.factor().cloned().unwrap_or(Cost::N);
+        let interfered = invalidation.bound;
 
         invalidation.bound |= bound.is_unresolved();
-
-        if let (AstKind::ForOfStatement(statement), true) = (kind, factor == Cost::N) {
-            if let Some(size) = self.produced_size_of(file, &statement.right) {
-                if size.exceeds {
-                    factor = size.length;
-                }
-
-                if !size.length_resolved {
-                    let unresolved = self.unknown_part(
-                        file,
-                        statement.right.span(),
-                        UnknownReason::SizeRelation,
-                    );
-
-                    sibling = sibling.merge(
-                        Reading::of_part(unresolved),
-                        &mut self.unknowns,
-                        &mut self.traces,
-                    );
-                }
-            }
-        }
 
         let spend = if factor.is_one() {
             None
@@ -1454,9 +1418,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .is_some_and(|budget| self.visits_resolved_since(file, budget.scope));
         let granted = match (&budget, &visits) {
             (Some(budget), Some(visits)) if proven => budget.share.filter(|_| {
-                visits
-                    .multiply(&factor)
-                    .is_ok_and(|charge| charge_covers(&charge, &budget.potential.cost()))
+                visits.multiply(&factor).is_ok_and(|charge| {
+                    budget
+                        .potential
+                        .cost()
+                        .is_some_and(|potential| charge_covers(&charge, &potential))
+                })
             }),
             _ => None,
         };
@@ -1557,7 +1524,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let cancels = budget.as_ref().is_some_and(|budget| {
             budget.cancels()
-                && charge_covers(&factor, &budget.potential.cost())
+                && budget
+                    .potential
+                    .cost()
+                    .is_some_and(|potential| charge_covers(&factor, &potential))
                 && match tests_after_body(kind) {
                     true => visits
                         .as_ref()
@@ -1616,6 +1586,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if invalidation.bound && !assumed_bound {
                 let reason = bound.reason().unwrap_or(UnknownReason::Bound);
                 let mut unknown = Some(self.unknowns.origin(origin, reason));
+
+                if interfered && reason != UnknownReason::Bound {
+                    let interference = self.unknowns.origin(origin, UnknownReason::Bound);
+                    unknown = self.unknowns.join(unknown, Some(interference));
+                }
 
                 if self.fallback_active() {
                     let resource = self
@@ -1872,40 +1847,92 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return inner;
         }
 
-        let produced = match self.latent_of(file, argument) {
-            Some(latent) => Some(self.latent_size_of(&latent)),
-            None => self.produced_size_of(file, argument),
-        };
-        let factor = match &produced {
-            Some(size) if size.exceeds => size.length.clone(),
-            _ => Cost::N,
-        };
-        let inner = match produced.is_some_and(|size| !size.length_resolved) {
-            true => {
-                let unresolved = self.unknown_part(file, span, UnknownReason::SizeRelation);
-
-                inner.merge(
-                    Reading::of_part(unresolved),
-                    &mut self.unknowns,
-                    &mut self.traces,
-                )
+        let nodes = self.project.file(file).semantic.nodes();
+        let keyed = match nodes.kind(node) {
+            AstKind::SpreadElement(_) => {
+                matches!(nodes.parent_kind(node), AstKind::ObjectExpression(_))
             }
-            false => inner,
+            kind => matches!(kind, AstKind::JSXSpreadAttribute(_)),
+        };
+        let size = match self.latent_of(file, argument) {
+            Some(latent) => self.latent_size_of(&latent),
+            None if keyed => self.collection_size_of(file, argument),
+            None => self.iterable_size_at(file, argument, 0),
         };
         let label = format!("spread ...{}", short(self.text_of(file, argument.span())));
         let site = self.site_of_node(file, node);
+        let copied = self.element_steps_of(
+            label,
+            site,
+            (file, span),
+            size.length_resolved.then_some(size.length),
+        );
 
-        inner.merge(
-            Reading::of_part(self.nest_part(
+        inner.merge(copied, &mut self.unknowns, &mut self.traces)
+    }
+
+    /// The tracked length `receiver` holds when `call` starts, which the built-in reads once
+    /// (ECMA-262 §23.1.3 LengthOfArrayLike at each method's first step).
+    fn entry_length_of(
+        &mut self,
+        file: FileId,
+        receiver: &'a Expression<'a>,
+        call: &'a CallExpression<'a>,
+    ) -> Option<Cost> {
+        let size = self.initial_size_of(file, receiver, call.node_id());
+
+        size.length_resolved.then_some(size.length)
+    }
+
+    /// One step per element of a collection whose length `input-size-envelope` tracks, else an
+    /// unknown `SizeRelation` contribution at `span`.
+    fn element_steps_of(
+        &mut self,
+        label: String,
+        site: Site,
+        (file, span): (FileId, Span),
+        length: Option<Cost>,
+    ) -> Reading {
+        match length {
+            Some(length) => Reading::of_part(self.nest_part(
                 label,
                 site,
                 self.source_span(file, span),
-                factor,
+                length,
                 Part::unmarked(Cost::ONE, None),
             )),
-            &mut self.unknowns,
-            &mut self.traces,
-        )
+            None => Reading::of_part(self.unknown_part(file, span, UnknownReason::SizeRelation)),
+        }
+    }
+
+    /// `inner` once per element of a collection whose length `input-size-envelope` tracks, else
+    /// under an unknown multiplicity with a `SizeRelation` unknown at `span`, adding nothing to
+    /// the floor (§1 Floor).
+    fn per_element_reading_of(
+        &mut self,
+        label: String,
+        site: Site,
+        (file, span): (FileId, Span),
+        length: Option<Cost>,
+        inner: Reading,
+    ) -> Reading {
+        let origin = self.source_span(file, span);
+
+        match length {
+            Some(length) => self.nest_reading(label, site, origin, length, inner),
+            None => {
+                let unknown = self.unknowns.origin(origin, UnknownReason::SizeRelation);
+                let scaled = self.unknowns.scale(Some(unknown), None);
+
+                for (_, _, part) in &inner.completions {
+                    self.note_unresolved_multiplicity(part);
+                }
+
+                inner
+                    .map_parts(|part| part.unmultiplied(&mut self.unknowns))
+                    .retaining(scaled, &mut self.unknowns)
+            }
+        }
     }
 
     fn cost_of_binding_rest(&mut self, file: FileId, rest: &'a BindingRestElement<'a>) -> Reading {
@@ -1936,38 +1963,65 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let label = self.rest_label_of(file, span);
         let site = self.site_of_node(file, node);
+        let length = self.rest_length_of(file, node);
+        let copied = self.element_steps_of(label, site, (file, span), length);
 
-        inner.merge(
-            Reading::of_part(self.nest_part(
-                label,
-                site,
-                self.source_span(file, span),
-                Cost::N,
-                Part::unmarked(Cost::ONE, None),
-            )),
-            &mut self.unknowns,
-            &mut self.traces,
-        )
+        inner.merge(copied, &mut self.unknowns, &mut self.traces)
     }
 
-    fn binding_rest_is_constant(&mut self, file: FileId, rest: &'a BindingRestElement<'a>) -> bool {
+    /// The number of entries a rest element at `rest` copies: the tracked key count of the value
+    /// an object pattern destructures, or the tracked length of the value an array pattern iterates.
+    fn rest_length_of(&mut self, file: FileId, rest: NodeId) -> Option<Cost> {
+        let (keys, source) = self.rest_pattern_of(file, rest)?;
+        let source = source?;
+        let size = match keys {
+            true => self.collection_size_of(file, source),
+            false => self.iterable_size_at(file, source, 0),
+        };
+
+        size.length_resolved.then_some(size.length)
+    }
+
+    /// Whether the pattern holding the rest element at `rest` takes keys rather than iterated
+    /// elements, and the value a declarator or assignment destructures through it directly.
+    fn rest_pattern_of(
+        &self,
+        file: FileId,
+        rest: NodeId,
+    ) -> Option<(bool, Option<&'a Expression<'a>>)> {
         let project = self.project;
         let nodes = project.file(file).semantic.nodes();
-        let keys = match nodes.parent_kind(rest.node_id()) {
-            AstKind::ObjectPattern(_) => true,
-            AstKind::ArrayPattern(_) => false,
-            AstKind::FormalParameterRest(_) => return true,
-            _ => return false,
+        let keys = match nodes.parent_kind(rest) {
+            AstKind::ObjectPattern(_) | AstKind::ObjectAssignmentTarget(_) => true,
+            AstKind::ArrayPattern(_) | AstKind::ArrayAssignmentTarget(_) => false,
+            _ => return None,
         };
-        let pattern = nodes.parent_id(rest.node_id());
+        let pattern = nodes.parent_id(rest);
         let span = nodes.kind(pattern).span();
         let source = match nodes.parent_kind(pattern) {
             AstKind::VariableDeclarator(declarator) if declarator.id.span() == span => {
                 declarator.init.as_ref()
             }
+            AstKind::AssignmentExpression(assignment) if assignment.left.span() == span => {
+                Some(&assignment.right)
+            }
             _ => None,
         };
-        let Some(source) = source else {
+
+        Some((keys, source))
+    }
+
+    fn binding_rest_is_constant(&mut self, file: FileId, rest: &'a BindingRestElement<'a>) -> bool {
+        let nodes = self.project.file(file).semantic.nodes();
+
+        if matches!(
+            nodes.parent_kind(rest.node_id()),
+            AstKind::FormalParameterRest(_)
+        ) {
+            return true;
+        }
+
+        let Some((keys, Some(source))) = self.rest_pattern_of(file, rest.node_id()) else {
             return false;
         };
 
@@ -2178,18 +2232,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         short(self.text_of(file, first.span()))
                     );
                     let site = self.site_of_node(file, new.node_id());
+                    let length = first.as_expression().and_then(|argument| {
+                        match self.is_primitive_operand(file, argument) {
+                            true => self.count_of(file, argument),
+                            false => self.tracked_length_of(file, argument),
+                        }
+                    });
+                    let steps = self.element_steps_of(label, site, (file, new.span), length);
 
-                    return reading.merge(
-                        Reading::of_part(self.nest_part(
-                            label,
-                            site,
-                            self.source_span(file, new.span),
-                            Cost::N,
-                            Part::unmarked(Cost::ONE, None),
-                        )),
-                        &mut self.unknowns,
-                        &mut self.traces,
-                    );
+                    return reading.merge(steps, &mut self.unknowns, &mut self.traces);
                 }
             }
         }
@@ -2830,17 +2881,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 if bounded { "bounded" } else { "N" }
             ));
 
-            let produced = match bounded {
-                true => None,
-                false => self.produced_size_of(file, receiver),
+            let factor = match bounded {
+                true => Some(Cost::ONE),
+                false => self.entry_length_of(file, receiver, call),
             };
-            let unresolved = match produced.as_ref().is_some_and(|size| !size.length_resolved) {
-                true => self.unknown_part(file, call.span, UnknownReason::SizeRelation),
-                false => Part::none(),
-            };
-            let factor = produced
-                .filter(|size| size.exceeds)
-                .map_or(Cost::N, |size| size.length);
             let callback = match is_listed(CALLBACK_METHODS, &method) {
                 true => self.callback_part_of(file, first),
                 false => Reading::empty(),
@@ -2854,33 +2898,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
                 false => callback,
             };
-            let length = match bounded {
-                true => Cost::ONE,
-                false => factor.clone(),
-            };
             let part = if bounded {
                 callback
             } else {
-                self.nest_reading(
+                self.per_element_reading_of(
                     label(""),
                     site,
-                    self.source_span(file, call.span),
-                    factor,
-                    callback.executed(),
+                    (file, call.span),
+                    factor.clone(),
+                    Reading::of_part(callback.executed()),
                 )
             };
-            let part = part.merge(unresolved, &mut self.unknowns, &mut self.traces);
-            let written = match joined {
-                true => {
-                    let text = self.joined_text_of(file, receiver, first);
-
-                    self.charged_reading_of(
-                        (file, call.span),
-                        label(" [joined text]"),
-                        &[&length, &text],
-                    )
-                }
-                false => Reading::empty(),
+            let written = match (joined, factor, self.joined_text_of(file, receiver, first)) {
+                (false, _, _) => Reading::empty(),
+                (true, Some(length), Some(text)) => self.charged_reading_of(
+                    (file, call.span),
+                    label(" [joined text]"),
+                    &[&length, &text],
+                ),
+                (true, _, _) => Reading::of_part(self.unknown_part(
+                    file,
+                    call.span,
+                    UnknownReason::SizeRelation,
+                )),
             };
             let coerced = self.coerced_arguments_part_of(
                 file,
@@ -2914,23 +2954,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Reading::empty()
             };
 
-            return reading.merge(
-                Reading::of_part(self.nest_reading(
-                    label(""),
-                    site,
-                    self.source_span(file, call.span),
-                    Cost::N,
-                    callback.executed(),
-                )),
-                &mut self.unknowns,
-                &mut self.traces,
+            // Set and Map forEach visit entries added during the traversal, so only a size that
+            // holds throughout bounds them.
+            let length = match bounded {
+                true => Some(Cost::ONE),
+                false => self.tracked_length_of(file, receiver),
+            };
+            let visited = self.per_element_reading_of(
+                label(""),
+                site,
+                (file, call.span),
+                length,
+                Reading::of_part(callback.executed()),
             );
+
+            return reading.merge(visited, &mut self.unknowns, &mut self.traces);
         }
 
         if kind == Kind::RegExp && is_listed(REGEXP_LINEAR, &method) {
             let subject = match first {
-                Some(argument) if !self.is_constant_sized_argument(file, argument) => Cost::N,
-                _ => Cost::ONE,
+                Some(argument) if !self.is_constant_sized_argument(file, argument) => argument
+                    .as_expression()
+                    .and_then(|argument| self.text_size_of(file, argument)),
+                _ => Some(Cost::ONE),
             };
             let pattern = Pattern {
                 keys: &[],
@@ -2944,15 +2990,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let reading = reading
                 .merge(coerced, &mut self.unknowns, &mut self.traces)
                 .merge(protocol, &mut self.unknowns, &mut self.traces);
-            let matched = self.matching_part_of((file, call.span), receiver, pattern, &subject);
-            let reading = match subject.is_one() {
-                true => reading,
-                false => self.append_linear_operation(
-                    reading,
+            let scanned = match &subject {
+                Some(subject) if subject.is_one() => Reading::empty(),
+                _ => self.element_steps_of(
                     label(" [regexp]"),
                     site,
                     (file, call.span),
+                    subject.clone(),
                 ),
+            };
+            let reading = reading.merge(scanned, &mut self.unknowns, &mut self.traces);
+            let matched = match subject {
+                Some(subject) => {
+                    self.matching_part_of((file, call.span), receiver, pattern, &subject)
+                }
+                None => self
+                    .matching_part_of((file, call.span), receiver, pattern, &Cost::ONE)
+                    .unmultiplied(&mut self.unknowns),
             };
 
             if matched == Part::none() {
@@ -3010,31 +3064,29 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
     /// Array.prototype.join (ECMA-262 §23.1.3.18) builds a string of every element's ToString
     /// joined by the separator: its length is the element count times the longer of an element
-    /// string and the separator.
+    /// string and the separator, whose lengths are tracked only for bounded element text.
     fn joined_text_of(
         &mut self,
         file: FileId,
         receiver: &'a Expression<'a>,
         separator: Option<&'a Argument<'a>>,
-    ) -> Cost {
-        let elements = self.has_bounded_text_elements(file, receiver);
-        let separated = match separator.map(Argument::as_expression) {
-            None => true,
-            Some(Some(separator)) => self.is_constant_text(file, separator),
-            Some(None) => false,
-        };
+    ) -> Option<Cost> {
+        if !self.has_bounded_text_elements(file, receiver) {
+            return None;
+        }
 
-        match elements && separated {
-            true => Cost::ONE,
-            false => Cost::N,
+        match separator.map(Argument::as_expression) {
+            None => Some(Cost::ONE),
+            Some(Some(separator)) => self.text_size_of(file, separator),
+            Some(None) => None,
         }
     }
 
     /// The Set methods of ECMA-262 §24.2.4 read `size`, `has` and `keys` from their argument
     /// through GetSetRecord (§24.2.1.2) and then call `has` or the `keys` iterator once per
     /// element, and each element they keep or test scans [[SetData]] (SetDataHas, §24.2.1.5).
-    /// union and symmetricDifference scan the growing result once per element of the argument;
-    /// the others scan one operand once per element of the other.
+    /// union and symmetricDifference scan the growing result, at most the larger operand, once per
+    /// element of the argument; the others scan the receiver once per element of the argument.
     fn set_operation_reading_of(
         &mut self,
         file: FileId,
@@ -3049,23 +3101,35 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(other) = first.as_expression() else {
             return Reading::of_part(self.unknown_part(file, first.span(), UnknownReason::Target));
         };
-        let receiver_sized =
-            !(self.is_constant_sized(file, receiver) || self.is_share_sized(file, receiver));
-        let other_sized = !self.is_constant_sized(file, other);
-        let factor = match (receiver_sized, other_sized) {
-            (_, true) if receiver_sized || matches!(method, "union" | "symmetricDifference") => {
-                Cost::N.multiply(&Cost::N)
-            }
-            (false, false) => Ok(Cost::ONE),
-            _ => Ok(Cost::N),
+        let receiver_size =
+            match self.is_constant_sized(file, receiver) || self.is_share_sized(file, receiver) {
+                true => Some(Cost::ONE),
+                false => self.tracked_length_of(file, receiver),
+            };
+        let other_size = match self.is_constant_sized(file, other) {
+            true => Some(Cost::ONE),
+            false => self.tracked_length_of(file, other),
         };
-        let mut reading = match factor {
-            Ok(factor) => self.charged_reading_of((file, call.span), label, &[&factor]),
-            Err(_) => Reading::of_part(self.unknown_part(
-                file,
-                call.span,
-                UnknownReason::ResourceExhaustion,
-            )),
+        let mut reading = match (receiver_size, other_size) {
+            (Some(receiver_size), Some(other_size)) => {
+                let scanned = match matches!(method, "union" | "symmetricDifference") {
+                    true if receiver_size.is_one() => Ok(other_size.clone()),
+                    true if !other_size.is_one() => {
+                        Cost::maximum(vec![receiver_size, other_size.clone()])
+                    }
+                    _ => Ok(receiver_size),
+                };
+
+                match scanned.and_then(|scanned| scanned.multiply(&other_size)) {
+                    Ok(factor) => self.charged_reading_of((file, call.span), label, &[&factor]),
+                    Err(_) => Reading::of_part(self.unknown_part(
+                        file,
+                        call.span,
+                        UnknownReason::ResourceExhaustion,
+                    )),
+                }
+            }
+            _ => Reading::of_part(self.unknown_part(file, call.span, UnknownReason::SizeRelation)),
         };
         let builtin = self.receiver_kind_of(file, other, method) == Kind::Set
             && !self.builtin_members_replaced(Kind::Set, &["size", "has", "keys"]);

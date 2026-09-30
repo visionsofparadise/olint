@@ -932,7 +932,23 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
         let mut budget = None;
 
-        if let Some(Visits::Budgeted(found)) = &visits {
+        if let (Some(Visits::Budgeted(_)), false, Some(call)) =
+            (&visits, charge.length_resolved, site.call)
+        {
+            let traversed = match model.arguments.first() == Some(&Role::Iterated) {
+                true => site.expression_at(0),
+                false => site.receiver,
+            };
+
+            if let Some(traversed) = traversed {
+                let initial = self.initial_size_of(file, traversed, call.node_id());
+
+                charge.length = initial.length;
+                charge.length_resolved = initial.length_resolved;
+            }
+        }
+
+        if let (Some(Visits::Budgeted(found)), true) = (&visits, charge.length_resolved) {
             match Cost::maximum(vec![charge.length.clone(), found.cost.clone()]) {
                 Ok(length) => {
                     charge.length = length;
@@ -942,8 +958,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
         }
 
-        let unresolved = visits == Some(Visits::Unresolved)
-            || (model.arguments.first() == Some(&Role::Iterated) && !charge.length_resolved);
+        let unvisited = visits == Some(Visits::Unresolved);
+        let unresolved = unvisited || !charge.length_resolved;
         let bounded = charge.length.is_one() || unresolved;
         let mut inner = Reading::empty();
         let mut beside = match model.receiver {
@@ -1083,6 +1099,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             if let (Role::Pattern(pattern), Some(expression)) = (role, argument.as_expression()) {
                 let matched =
                     self.matching_part_of((file, site.span), expression, pattern, &charge.length);
+                let matched = self.charged_by(&charge, Reading::of_part(matched));
 
                 beside = beside.merge(matched, &mut self.unknowns, &mut self.traces);
             }
@@ -1090,23 +1107,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         if model.identity == Identity::Receiver(Kind::String) {
             let searched = self.string_search_reading_of(site, &charge.length);
+            let searched = self.charged_by(&charge, searched);
 
             beside = beside.merge(searched, &mut self.unknowns, &mut self.traces);
         }
 
         if model.identity == Identity::Namespace("JSON") && site.name == "stringify" {
             let nested = self.serialized_depth_reading_of(site, &charge.length);
+            let nested = self.charged_by(&charge, nested);
 
             beside = beside.merge(nested, &mut self.unknowns, &mut self.traces);
         }
 
         if model.output == Output::Produced {
-            let result = self.result_size_of(file, site.arguments.first(), &charge.element, 0);
-            let copied = Part::unmarked(result.length.clone(), None);
+            let result = self.result_size_of(file, site.arguments.first(), &charge, 0);
 
-            inner = inner.merge(copied, &mut self.unknowns, &mut self.traces);
+            if result.length_resolved {
+                let copied = Part::unmarked(result.length.clone(), None);
 
-            if !result.length_resolved {
+                inner = inner.merge(copied, &mut self.unknowns, &mut self.traces);
+            } else {
                 let unresolved = self.unknown_part(file, site.span, UnknownReason::SizeRelation);
 
                 beside = beside.merge(unresolved, &mut self.unknowns, &mut self.traces);
@@ -1136,7 +1156,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         if unresolved {
-            let unknown = self.unknowns.origin(origin, UnknownReason::Bound);
+            let reason = match unvisited {
+                true => UnknownReason::Bound,
+                false => UnknownReason::SizeRelation,
+            };
+            let unknown = self.unknowns.origin(origin, reason);
             let scaled = self.unknowns.scale(Some(unknown), None);
 
             for (_, _, part) in &inner.completions {
@@ -1249,6 +1273,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
+    /// `reading`, formed over `charge.length`, kept only for its unknowns when that length is an
+    /// untracked placeholder, whose `SizeRelation` unknown the caller adds.
+    fn charged_by(&mut self, charge: &Size, reading: Reading) -> Reading {
+        match charge.length_resolved {
+            true => reading,
+            false => reading.map_parts(|part| part.unmultiplied(&mut self.unknowns)),
+        }
+    }
+
     /// ToString of each element of `receiver` (ECMA-262 §23.1.3.18 step 7.c), which calls the
     /// analysed program's `toString`, `valueOf` or @@toPrimitive for an object element.
     pub(crate) fn element_coercion_reading_of(
@@ -1298,17 +1331,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
             || (self.is_primitive_operand(file, text) && self.is_constant_sized(file, text))
     }
 
-    /// The length of ToString of a string operand: one when constant, else its produced length,
-    /// else the input envelope.
-    fn text_size_of(&mut self, file: FileId, text: &'a Expression<'a>) -> Cost {
+    /// The length of ToString of a string operand: one when constant, else its tracked length
+    /// (`input-size-envelope`) when it is a primitive, else untracked.
+    pub(crate) fn text_size_of(&mut self, file: FileId, text: &'a Expression<'a>) -> Option<Cost> {
         if self.is_constant_text(file, text) {
-            return Cost::ONE;
+            return Some(Cost::ONE);
         }
 
-        match self.produced_size_of(file, text) {
-            Some(size) if size.exceeds && size.length_resolved => size.length,
-            _ => Cost::N,
+        if !self.is_primitive_operand(file, text) {
+            return None;
         }
+
+        self.tracked_length_of(file, text)
     }
 
     fn string_label_of(&self, site: &NativeSite<'a>, suffix: &str) -> String {
@@ -1339,10 +1373,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
             && self.declared_kind_of(site.file, needle) != Kind::RegExp;
 
         if searched && !receiver.is_one() {
-            let length = self.text_size_of(site.file, needle);
-            let label = self.string_label_of(site, "string search");
-            let searched =
-                self.charged_reading_of((site.file, site.span), label, &[receiver, &length]);
+            let searched = match self.text_size_of(site.file, needle) {
+                Some(length) => {
+                    let label = self.string_label_of(site, "string search");
+
+                    self.charged_reading_of((site.file, site.span), label, &[receiver, &length])
+                }
+                None => Reading::of_part(self.unknown_part(
+                    site.file,
+                    site.span,
+                    UnknownReason::SizeRelation,
+                )),
+            };
 
             reading = reading.merge(searched, &mut self.unknowns, &mut self.traces);
         }
@@ -1385,7 +1427,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let file = site.file;
         let mut reading = Reading::empty();
         let per_match = match site.expression_at(1) {
-            None => Cost::ONE,
+            None => Some(Cost::ONE),
             Some(replacer) if !self.is_non_callable_argument(file, replacer) => {
                 let targets = self
                     .resolved_expression_callee_of(file, replacer, replacer.node_id())
@@ -1425,20 +1467,17 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 reading = reading.merge(coerced, &mut self.unknowns, &mut self.traces);
 
-                match bounded {
-                    true => Cost::ONE,
-                    false => Cost::N,
-                }
+                bounded.then_some(Cost::ONE)
             }
             // The template is converted once (§22.1.3.19 step 6), and each of its `$`
             // patterns expands to at most the receiver's length.
             Some(template) => match unwrap(template) {
-                Expression::StringLiteral(literal) if !literal.value.contains('$') => Cost::ONE,
-                _ => {
-                    let length = self.text_size_of(file, template);
-
-                    match receiver.multiply(&length) {
-                        Ok(cost) => cost,
+                Expression::StringLiteral(literal) if !literal.value.contains('$') => {
+                    Some(Cost::ONE)
+                }
+                _ => match self.text_size_of(file, template) {
+                    Some(length) => match receiver.multiply(&length) {
+                        Ok(cost) => Some(cost),
                         Err(_) => {
                             let unknown = self.unknown_part(
                                 file,
@@ -1448,13 +1487,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                             return reading.merge(unknown, &mut self.unknowns, &mut self.traces);
                         }
-                    }
-                }
+                    },
+                    None => None,
+                },
             },
         };
-        let label = self.string_label_of(site, "substitution");
-        let substituted =
-            self.charged_reading_of((site.file, site.span), label, &[matches, &per_match]);
+        let substituted = match per_match {
+            Some(per_match) => {
+                let label = self.string_label_of(site, "substitution");
+
+                self.charged_reading_of((site.file, site.span), label, &[matches, &per_match])
+            }
+            None => {
+                Reading::of_part(self.unknown_part(file, site.span, UnknownReason::SizeRelation))
+            }
+        };
 
         reading.merge(substituted, &mut self.unknowns, &mut self.traces)
     }
@@ -1797,11 +1844,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let file = site.file;
 
         match model.work {
-            Work::Linear(Operand::Each) => match site.receiver {
-                Some(receiver) if !self.is_share_sized(file, receiver) => {
-                    self.collection_size_of(file, receiver)
+            Work::Linear(Operand::Each) => match (site.receiver, site.call) {
+                (Some(receiver), _) if self.is_share_sized(file, receiver) => Size::constant(),
+                (Some(receiver), Some(call)) => {
+                    self.initial_size_of(file, receiver, call.node_id())
                 }
-                _ => Size::constant(),
+                (Some(receiver), None) => self.collection_size_of(file, receiver),
+                (None, _) => Size::constant(),
             },
             Work::Linear(Operand::Every | Operand::Elements | Operand::Nested) => self
                 .output_size_of(site, model, 0)
@@ -1814,21 +1863,133 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     _ => site.expression_at(0),
                 };
 
-                if let Some(latent) = measured.and_then(|measured| self.latent_of(file, measured)) {
-                    return self.latent_size_of(&latent);
-                }
+                let Some(measured) = measured else {
+                    return match (operand, site.arguments.is_empty()) {
+                        (Operand::First, true) => Size::constant(),
+                        _ => Size::unresolved(),
+                    };
+                };
 
-                let produced = measured.and_then(|measured| self.produced_size_of(file, measured));
-
-                match produced {
-                    Some(size) if size.exceeds || !size.length_resolved => size,
-                    _ => Size::sized(Cost::N),
+                match (self.latent_of(file, measured), site.call) {
+                    (Some(latent), _) => self.latent_size_of(&latent),
+                    (None, Some(call)) => self.initial_size_of(file, measured, call.node_id()),
+                    (None, None) => self.collection_size_of(file, measured),
                 }
             }
             work => match self.is_native_bounded(site, work) {
                 true => Size::constant(),
-                false => Size::sized(Cost::N),
+                false => self.operand_size_of(site, work),
             },
+        }
+    }
+
+    /// The tracked size (`input-size-envelope`) of what an unbounded key or graph operand walks:
+    /// the key count of the first argument or the largest of every argument's, and for a graph
+    /// the length of a collection whose elements serialize to constant text.
+    fn operand_size_of(&mut self, site: &NativeSite<'a>, work: Work) -> Size {
+        let file = site.file;
+        let operands: Vec<&'a Argument<'a>> = match work {
+            Work::Linear(Operand::Keys | Operand::Graph) => {
+                site.arguments.first().into_iter().collect()
+            }
+            Work::Linear(Operand::EveryKeys) => site.arguments.iter().collect(),
+            _ => Vec::new(),
+        };
+        let mut size: Option<Size> = None;
+
+        for operand in operands {
+            let Some(expression) = operand.as_expression() else {
+                return Size::unresolved();
+            };
+
+            let found = match work {
+                Work::Linear(Operand::Graph) => match self.graph_size_of(file, expression, 0) {
+                    Some(length) => Size::sized(length),
+                    None => Size::unresolved(),
+                },
+                _ => self.collection_size_of(file, expression),
+            };
+
+            size = Some(match size {
+                Some(size) => size.combined(&found),
+                None => found,
+            });
+        }
+
+        size.unwrap_or_else(Size::unresolved)
+    }
+
+    /// The tracked size (`input-size-envelope`) of the graph SerializeJSONProperty (ECMA-262
+    /// §25.5.2.2) walks from `value`: the text of a primitive, the elements of a literal array and
+    /// the property values of a literal object, and the length of a collection whose elements
+    /// serialize to constant text. A getter, spread, computed key or `toJSON` member, whose
+    /// serialized value the analysis does not follow, leaves the graph untracked.
+    fn graph_size_of(
+        &mut self,
+        file: FileId,
+        value: &'a Expression<'a>,
+        depth: usize,
+    ) -> Option<Cost> {
+        if depth > 16 || !self.charge_work(crate::analysis::work::Event::SizeStep, 1) {
+            return None;
+        }
+
+        if self.is_primitive_operand(file, value) {
+            return self.text_size_of(file, value);
+        }
+
+        let mut parts = vec![Cost::ONE];
+
+        match unwrap(value) {
+            Expression::ArrayExpression(array) => {
+                for element in &array.elements {
+                    match element {
+                        oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => return None,
+                        oxc_ast::ast::ArrayExpressionElement::Elision(_) => {}
+                        element => parts.push(self.graph_size_of(
+                            file,
+                            element.as_expression()?,
+                            depth + 1,
+                        )?),
+                    }
+                }
+            }
+            Expression::ObjectExpression(object) => {
+                for property in &object.properties {
+                    let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property
+                    else {
+                        return None;
+                    };
+
+                    if property.computed
+                        || property.kind != oxc_ast::ast::PropertyKind::Init
+                        || property
+                            .key
+                            .static_name()
+                            .is_none_or(|name| name == "toJSON")
+                    {
+                        return None;
+                    }
+
+                    if property.value.is_function() {
+                        continue;
+                    }
+
+                    parts.push(self.graph_size_of(file, &property.value, depth + 1)?);
+                }
+            }
+            _ if self.has_bounded_text_elements(file, value) => {
+                parts.push(self.tracked_length_of(file, value)?);
+            }
+            _ => return None,
+        }
+
+        parts.retain(|part| !part.is_one());
+
+        match parts.len() {
+            0 => Some(Cost::ONE),
+            1 => parts.pop(),
+            _ => Cost::maximum(parts).ok(),
         }
     }
 
@@ -3836,6 +3997,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 self.array_method_size_of(file, call, member.object(), &method, depth)
             }
+            // ECMA-262 §24.1.3.8, §24.1.3.4, §24.1.3.11 and §24.2.4.10, §24.2.4.8, §24.2.4.17:
+            // a Map or Set iterator visits the entries of the receiver.
+            Native::Receiver(Kind::Map | Kind::Set) => {
+                let member = member?;
+                let method = self.static_member_name_of(file, member)?;
+
+                matches!(method.as_str(), "values" | "keys" | "entries")
+                    .then(|| self.collection_size_at(file, member.object(), depth + 1))
+            }
             _ => None,
         }
     }
@@ -3854,6 +4024,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         match model.output {
+            // ECMA-262 §20.1.2.18, §20.1.2.23, §20.1.2.5: EnumerableOwnProperties lists one entry
+            // per own enumerable key of the argument.
+            Output::Unrelated
+                if model.identity == Identity::Namespace("Object")
+                    && matches!(site.name.as_str(), "keys" | "values" | "entries") =>
+            {
+                let source = self.collection_size_at(file, site.expression_at(0)?, next);
+
+                Some(Size {
+                    element: Cost::ONE,
+                    element_resolved: site.name == "keys",
+                    ..source
+                })
+            }
             Output::Unrelated => None,
             Output::Copied => {
                 let mut source = match self.iterated_size_of(site, model, next) {
@@ -3882,8 +4066,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 match site.arguments.get(1) {
                     Some(callback) => {
-                        let result =
-                            self.result_size_of(file, Some(callback), &source.element, next);
+                        let result = self.result_size_of(file, Some(callback), &source, next);
 
                         Some(source.containing(&result))
                     }
@@ -3929,8 +4112,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 })
             }
             Output::Produced => {
-                let result =
-                    self.result_size_of(file, site.arguments.first(), &receiver.element, next);
+                let result = self.result_size_of(file, site.arguments.first(), &receiver, next);
 
                 Some(receiver.producing(&result))
             }

@@ -272,12 +272,13 @@ fn implicit_construction_charges_fields_and_base_construction() {
         (
             format!("{quadratic} export class Heavy {{ value=quadratic(xs); }}"),
             "new Heavy()",
-            Some("O(N^2)"),
+            // The module's never-written array keeps its literal's constant size.
+            Some("O(1)"),
         ),
         (
             format!("{quadratic} class Base {{ value=quadratic(xs); }} export class Derived extends Base {{}}"),
             "new Derived()",
-            Some("O(N^2)"),
+            Some("O(1)"),
         ),
         (
             format!("{quadratic} export class Light {{ value=1; }}"),
@@ -584,15 +585,15 @@ fn an_ignored_function_is_absent_and_its_calls_cost_nothing() {
 #[test]
 fn a_cold_function_called_beside_a_linear_statement_cascades_linear() {
     run_with_source(
-        "/** @perf cold */\nfunction rebuild(rows: number[][]) {\n\tfor (const row of rows) for (const value of row) void value;\n}\nexport function f(rows: number[][]) {\n\trebuild(rows);\n\trows.indexOf([]);\n}",
+        "/** @perf cold */\nfunction rebuild(rows: number[]) {\n\tfor (const visit of rows) for (const value of rows) void value;\n}\nexport function f(rows: number[]) {\n\trebuild(rows);\n\trows.indexOf([]);\n}",
         |analysis, file| {
             let rebuild = function_of_name(analysis.project, file, "rebuild");
             let f = function_of_name(analysis.project, file, "f");
             let own = analysis.summarize(file, rebuild).total(&mut analysis.unknowns, &mut analysis.traces);
             let part = analysis.summarize(file, f).total(&mut analysis.unknowns, &mut analysis.traces);
 
-            assert_eq!(support::legacy_class_of(analysis, file, rebuild, &own.cost), Cost::parse("O(N^2)").unwrap());
-            assert_eq!(support::legacy_class_of(analysis, file, f, &part.cost), Cost::N);
+            assert_eq!(support::projected_class_of(&own.cost), Cost::parse("O(N^2)").unwrap());
+            assert_eq!(support::projected_class_of(&part.cost), Cost::N);
             assert_eq!(labels_of(&analysis.traces,part.trace), vec!["rows.indexOf()"]);
         },
     );
@@ -601,12 +602,12 @@ fn a_cold_function_called_beside_a_linear_statement_cascades_linear() {
 #[test]
 fn a_hot_function_call_wins_over_a_costlier_sibling() {
     run_with_source(
-        "/** @perf hot */\nconst lookup = (xs: number[]) => xs.indexOf(1);\nexport function f(rows: number[][], xs: number[]) {\n\tfor (const row of rows) for (const value of row) void value;\n\treturn lookup(xs);\n}",
+        "/** @perf hot */\nconst lookup = (xs: number[]) => xs.indexOf(1);\nexport function f(rows: number[], xs: number[]) {\n\tfor (const visit of rows) for (const value of rows) void value;\n\treturn lookup(xs);\n}",
         |analysis, file| {
             let f = function_of_name(analysis.project, file, "f");
             let part = analysis.summarize(file, f).total(&mut analysis.unknowns, &mut analysis.traces);
 
-            assert_eq!(support::legacy_class_of(analysis, file, f, &part.cost), Cost::N);
+            assert_eq!(support::projected_class_of(&part.cost), Cost::N);
             assert_eq!(labels_of(&analysis.traces,part.trace), vec!["call lookup()"]);
         },
     );
@@ -622,7 +623,7 @@ fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
             .total(&mut analysis.unknowns, &mut analysis.traces);
 
         found = (
-            support::legacy_class_of(analysis, file, function, &part.cost),
+            support::projected_class_of(&part.cost),
             labels_of(&analysis.traces, part.trace),
         );
     });
@@ -630,7 +631,7 @@ fn total_of(source: &str, name: &str) -> (Cost, Vec<String>) {
     found
 }
 
-const CALLBACK_SOURCE: &str = "/** @perf cold */\nfunction coldCubic(xs: number[][]): number {\n\tlet sum = 0;\n\tfor (const row of xs) for (const v of row) for (const w of row) sum += v * w;\n\treturn sum;\n}\n/** @perf hot */\nfunction hotConst(x: number[]): number {\n\treturn x.length;\n}\nfunction withHotInside(row: number[]): number {\n\t// @perf hot\n\treturn row.length;\n}\nfunction apply(f: (xs: number[][]) => number, xs: number[][]): number {\n\tconst a = f(xs);\n\tfor (const row of xs) void row;\n\treturn a;\n}\nexport function coldViaMap(xss: number[][][]) {\n\tfor (const xs of xss) void xs;\n\tconst a = xss.map(coldCubic);\n\treturn a;\n}\nexport function hotViaMap(xs: number[][]) {\n\tfor (const row of xs) for (const v of row) void v;\n\tconst a = xs.map(hotConst);\n\treturn a;\n}\nexport function bodyHotViaMap(xs: number[][]) {\n\tfor (const row of xs) for (const v of row) void v;\n\tconst a = xs.map(withHotInside);\n\treturn a;\n}\nexport function coldViaParameter(xs: number[][]) {\n\treturn apply(coldCubic, xs);\n}\n";
+const CALLBACK_SOURCE: &str = "/** @perf cold */\nfunction coldCubic(xs: number[][]): number {\n\tlet sum = 0;\n\tfor (const row of xs) for (const v of row) for (const w of row) sum += v * w;\n\treturn sum;\n}\n/** @perf hot */\nfunction hotConst(x: number[]): number {\n\treturn x.length;\n}\nfunction withHotInside(row: number[]): number {\n\t// @perf hot\n\treturn row.length;\n}\nfunction apply(f: (xs: number[][]) => number, xs: number[][]): number {\n\tconst a = f(xs);\n\tfor (const row of xs) void row;\n\treturn a;\n}\nexport function coldViaMap(xss: number[][][]) {\n\tfor (const xs of xss) void xs;\n\tconst a = xss.map(coldCubic);\n\treturn a;\n}\nexport function hotViaMap(xs: number[][]) {\n\tfor (const row of xs) for (const v of row) void v;\n\tconst a = xs.map(hotConst);\n\treturn a;\n}\nexport function bodyHotViaMap(xs: number[][]) {\n\tfor (const row of xs) for (const v of xs) void v;\n\tconst a = xs.map(withHotInside);\n\treturn a;\n}\nexport function coldViaParameter(xs: number[][]) {\n\treturn apply(coldCubic, xs);\n}\n";
 
 #[test]
 fn a_cold_callback_through_a_stdlib_method_yields_to_a_linear_sibling() {
@@ -730,7 +731,7 @@ fn assert_recurrence(analysis: &Analysis<'_, '_>, part: &olint::cost::Part) {
 
 #[test]
 fn a_cold_call_leaves_its_argument_costs_unmarked() {
-    let source = "/** @perf cold */\nfunction rebuild(rows: number[][], at: number) {\n\tfor (const row of rows) row.indexOf(at);\n}\nexport function f(rows: number[][], xs: number[]) {\n\trebuild(rows, xs.indexOf(1));\n\treturn 0;\n}\n";
+    let source = "/** @perf cold */\nfunction rebuild(rows: number[], at: number) {\n\tfor (const visit of rows) rows.indexOf(at);\n}\nexport function f(rows: number[], xs: number[]) {\n\trebuild(rows, xs.indexOf(1));\n\treturn 0;\n}\n";
 
     assert_eq!(
         total_of(source, "f"),

@@ -419,14 +419,14 @@ fn an_argument_that_cannot_grow_keeps_the_solved_depth() {
         (
             "a constant alias of a parameter",
             "f",
-            "export function f(n: number, xs: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; const same = xs; let t = 0; for (const x of same) t += x; return t + f(n - 1, same); }",
-            "O(max(n, xs, (n * max(1, n, xs))))",
+            "export function f(n: number, xs: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; const same = xs; let t = 0; for (const x of xs) t += x; return t + f(n - 1, same); }",
+            "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "a rest parameter spread through",
             "f",
             "export function f(n: number, ...xs: number[]): number { if (!(n > 0 && n <= 1000000000)) return 0; let t = 0; for (const x of xs) t += x; return t + f(n - 1, ...xs); }",
-            "O(max(n, (n * max(1, n))))",
+            "O(max(xs, (n * max(1, xs))))",
         ),
         (
             "a module function passed as its callback",

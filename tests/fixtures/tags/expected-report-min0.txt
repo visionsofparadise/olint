@@ -1,102 +1,58 @@
 # tsconfig.json  (27 functions in 3 files)
 
-O(xs)               9
-O(max(1, (xs * xs^2)))    8
-O(max(1, xs^2))     4
-O(1) [partial]      3
-O(max(1, xs, (xs * max(xs, fast))))    1
-O(1)                1
-O(max(1, (xs^2 * xs^2)))    1
+O(xs) [partial]    20
+O(1) [partial]      5
+O(xs)               2
 
-O(max(1, (xs^2 * xs^2))) hidden  src/internal/hidden.ts:1
-    in loop for-of                                           src/internal/hidden.ts:3  x xs
-        in loop for-of                                       src/internal/hidden.ts:3  x N
-            in loop for-of                                   src/internal/hidden.ts:3  x N
-                in loop for-of                               src/internal/hidden.ts:3  x N
-
-O(max(1, (xs * xs^2))) uses  src/public.ts:34
-    calls notExported()                                    src/public.ts:34  = O(max(1, (xs * xs^2)))
-    calls cubic()                                          src/public.ts:31  = O(max(1, (xs * xs^2)))
-    in loop for-of                                           src/public.ts:3  x xs
-        in loop for-of                                       src/public.ts:3  x N
-            in loop for-of                                   src/public.ts:3  x N
-
-O(max(1, (xs * xs^2))) notExported  src/public.ts:30
-    calls cubic()                                          src/public.ts:31  = O(max(1, (xs * xs^2)))
-    in loop for-of                                           src/public.ts:3  x xs
-        in loop for-of                                       src/public.ts:3  x N
-            in loop for-of                                   src/public.ts:3  x N
-
-O(max(1, (xs * xs^2))) Engine.helper  src/public.ts:25
-    calls cubic()                                          src/public.ts:26  = O(max(1, (xs * xs^2)))
-    in loop for-of                                           src/public.ts:3  x xs
-        in loop for-of                                       src/public.ts:3  x N
-            in loop for-of                                   src/public.ts:3  x N
-
-O(max(1, (xs * xs^2))) Engine.run  src/public.ts:21
-    calls cubic()                                          src/public.ts:22  = O(max(1, (xs * xs^2)))
-    in loop for-of                                           src/public.ts:3  x xs
-        in loop for-of                                       src/public.ts:3  x N
-            in loop for-of                                   src/public.ts:3  x N
-
-O(max(1, (xs * xs^2))) acceptedCubic  src/public.ts:8
-    in loop for-of                                           src/public.ts:10  x xs
-        in loop for-of                                       src/public.ts:10  x N
-            in loop for-of                                   src/public.ts:10  x N
-
-O(max(1, (xs * xs^2))) cubic  src/public.ts:1
-    in loop for-of                                           src/public.ts:3  x xs
-        in loop for-of                                       src/public.ts:3  x N
-            in loop for-of                                   src/public.ts:3  x N
-
-O(max(1, (xs * xs^2))) costFn [@perf O(N)]  src/tags.ts:129
-    in loop for-of                                           src/tags.ts:131  x xs
-        in loop for-of                                       src/tags.ts:131  x N
-            in loop for-of                                   src/tags.ts:131  x N
-
-O(max(1, (xs * xs^2))) coldFn  src/tags.ts:77
-    in loop for-of                                           src/tags.ts:79  x xs
-        in loop for-of                                       src/tags.ts:79  x N
-            in loop for-of                                   src/tags.ts:79  x N
-
-O(max(1, xs^2)) quadratic  src/public.ts:14
-    in loop for-of                                           src/public.ts:16  x xs
-        in loop for-of                                       src/public.ts:16  x N
-
-O(max(1, xs^2)) coldFirstOfTwo  src/tags.ts:162
-    in loop for-of                                           src/tags.ts:164  x xs
-        in loop for-of                                       src/tags.ts:167  x N
-
-O(max(1, xs^2)) Svc.rebuild  src/tags.ts:91
-    in loop for-of                                           src/tags.ts:93  x xs
-        in loop for-of                                       src/tags.ts:93  x N
-
-O(max(1, xs^2)) plainNested  src/tags.ts:1
-    in loop for-of                                           src/tags.ts:3  x xs
-        in loop for-of                                       src/tags.ts:3  x N
-
-O(max(1, xs, (xs * max(xs, fast)))) untagged  src/tags.ts:104
-    in loop for-of                                           src/tags.ts:107  x xs
-        in loop for-of                                       src/tags.ts:109  x xs
-            in loop for-of                                   src/tags.ts:109  x N
-
-O(xs)          hotTry  src/tags.ts:58
+O(xs)          hotTry  src/tags.ts:58 [partial]
     in loop for-of                                           src/tags.ts:62  x xs
 
-O(xs)          hotCase  src/tags.ts:45
+O(xs)          hotCase  src/tags.ts:45 [partial]
     in loop for-of                                           src/tags.ts:50  x xs
 
-O(xs)          hotStatement  src/tags.ts:37
+O(xs)          hotStatement  src/tags.ts:37 [partial]
     in loop for-of                                           src/tags.ts:41  x xs
 
-O(xs)          hotBranch  src/tags.ts:26
+O(xs)          hotBranch  src/tags.ts:26 [partial]
     in loop for-of                                           src/tags.ts:30  x xs
 
-O(xs)          hotSecondStatement  src/tags.ts:141
+O(xs)          hidden  src/internal/hidden.ts:1 [partial]
+    in loop for-of                                           src/internal/hidden.ts:3  x xs
+
+O(xs)          uses  src/public.ts:34 [partial]
+    calls notExported()                                    src/public.ts:34  = O(xs)
+    calls cubic()                                          src/public.ts:31  = O(xs)
+    in loop for-of                                           src/public.ts:3  x xs
+
+O(xs)          notExported  src/public.ts:30 [partial]
+    calls cubic()                                          src/public.ts:31  = O(xs)
+    in loop for-of                                           src/public.ts:3  x xs
+
+O(xs)          Engine.helper  src/public.ts:25 [partial]
+    calls cubic()                                          src/public.ts:26  = O(xs)
+    in loop for-of                                           src/public.ts:3  x xs
+
+O(xs)          Engine.run  src/public.ts:21 [partial]
+    calls cubic()                                          src/public.ts:22  = O(xs)
+    in loop for-of                                           src/public.ts:3  x xs
+
+O(xs)          quadratic  src/public.ts:14 [partial]
+    in loop for-of                                           src/public.ts:16  x xs
+
+O(xs)          acceptedCubic  src/public.ts:8 [partial]
+    in loop for-of                                           src/public.ts:10  x xs
+
+O(xs)          cubic  src/public.ts:1 [partial]
+    in loop for-of                                           src/public.ts:3  x xs
+
+O(xs)          hotSecondStatement  src/tags.ts:141 [partial]
     in loop for-of                                           src/tags.ts:146  x xs
 
-O(xs)          coldBranch  src/tags.ts:15
+O(xs)          coldBranch  src/tags.ts:15 [partial]
     in loop for-of                                           src/tags.ts:21  x xs
+
+O(xs)          costFn [@perf O(N)]  src/tags.ts:129 [partial]
+    in loop for-of                                           src/tags.ts:131  x xs
 
 O(xs)          costStatement  src/tags.ts:121
     reads as @perf O(N)                                       src/tags.ts:124  = O(xs)
@@ -104,8 +60,20 @@ O(xs)          costStatement  src/tags.ts:121
 O(xs)          boundedLoop  src/tags.ts:114
     in loop for-of                                           src/tags.ts:117  x xs
 
-O(xs)          coldStatement  src/tags.ts:7
+O(xs)          untagged  src/tags.ts:104 [partial]
+    in loop for-of                                           src/tags.ts:107  x xs
+
+O(xs)          Svc.rebuild  src/tags.ts:91 [partial]
+    in loop for-of                                           src/tags.ts:93  x xs
+
+O(xs)          coldFn  src/tags.ts:77 [partial]
+    in loop for-of                                           src/tags.ts:79  x xs
+
+O(xs)          coldStatement  src/tags.ts:7 [partial]
     in loop for-of                                           src/tags.ts:11  x xs
+
+O(xs)          plainNested  src/tags.ts:1 [partial]
+    in loop for-of                                           src/tags.ts:3  x xs
 
 O(1)           callsIgnoredAndCold  src/tags.ts:83 [partial]
 
@@ -113,5 +81,7 @@ O(1)           Svc.run  src/tags.ts:97 [partial]
 
 O(1)           callsCostFn  src/tags.ts:135 [partial]
 
-O(1)           hotSingleStatementBranch  src/tags.ts:153
+O(1)           hotSingleStatementBranch  src/tags.ts:153 [partial]
+
+O(1)           coldFirstOfTwo  src/tags.ts:162 [partial]
 

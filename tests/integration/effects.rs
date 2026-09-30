@@ -350,10 +350,13 @@ fn suspended_live_iteration_accounts_for_outstanding_collection_writes() {
 
             assert_eq!(reasons.contains(&olint::unknowns::UnknownReason::Bound), unresolved, "{source}: {reasons:?}");
 
-            // The producer's own nested additions stay a proven contribution beside the unresolved loop.
+            // The producer's own nested additions stay a proven contribution beside the unresolved loop; each
+            // addition's scan of the collection it grows is an unknown contribution (`input-size-envelope`).
             match unresolved && setup.starts_with(producer) {
-                true => assert_eq!(support::projected_class_of(&cost), Cost::parse("O(N^3)").unwrap(), "{source}"),
-                false => assert_pending_class(&cost, unresolved, if setup.is_empty() || setup.starts_with("const other") { Cost::parse("O(N^3)").unwrap() } else { cost_of_pending(unresolved) }, &source),
+                true => assert_eq!(support::projected_class_of(&cost), Cost::parse("O(N^2)").unwrap(), "{source}"),
+                // A collection grown in place keeps no tracked size, so the loop over it adds nothing to the floor
+                // beyond the growth's own work.
+                false => assert_pending_class(&cost, unresolved, if setup.is_empty() || setup.starts_with("const other") { Cost::parse("O(N^3)").unwrap() } else if setup.starts_with(producer) { Cost::parse("O(N^2)").unwrap() } else { Cost::parse("O(1)").unwrap() }, &source),
             }
         }
     }
@@ -434,7 +437,9 @@ fn pending_writes_follow_captured_and_alternative_generator_storage() {
         for (producer, unresolved) in [("grow(values);", true), ("grow(other);", false), ("", false)] {
             let source=format!("{helpers}export async function selected(xs:number[],flag:boolean){{const values=new Set([0]),other=new Set([0]);{factory}{producer}await consume(iterator,xs);}}");
 
-            assert_pending_cost(&source, unresolved, cost_of_pending(unresolved));
+            // A generator that captures the collection delegates to an untracked size, so the loop adds
+            // nothing to the floor.
+            assert_pending_cost(&source, unresolved, cost("O(1)"));
         }
     }
 }
@@ -456,7 +461,7 @@ fn pending_callee_contexts_remain_distinct_in_both_orders() {
         );
         assert_eq!(
             support::projected_class_of(&known),
-            cost("O(N^4)"),
+            cost("O(N^3)"),
             "{source}: {known:?}"
         );
     }
@@ -489,7 +494,8 @@ fn implicit_native_and_consumed_generator_work_can_schedule_writers() {
         let unresolved=unresolved && shared;
         let source=format!("{helpers}export async function selected(xs:number[],p:Promise<number>){{const values=new Set([0]),other=new Set([0]);{producer}for(const value of values){{await 0;cube(xs);}}}}");
 
-        assert_pending_cost(&source, unresolved, if producer.ends_with("start();") && written == "values" { cost("O(N^4)") } else { cost("O(N^3)") });
+        // A collection a closure grows keeps no tracked size, so the loop over it adds nothing to the floor.
+        assert_pending_cost(&source, unresolved, if producer.ends_with("start();") && written == "values" { cost("O(1)") } else { cost("O(N^3)") });
         }
     }
 }
@@ -764,9 +770,10 @@ fn generator_counter_resumption_has_no_unproved_yield_count() {
     );
 }
 
-/// The resolved cost of a pending-write case: the loop's per-visit Set scan under its proven count.
+/// The resolved cost of a pending-write case: the cube under the loop's proven count, which is the
+/// singleton Set's size a local holder keeps until the call that consumes it.
 fn cost_of_pending(_unresolved: bool) -> Cost {
-    cost("O(N^4)")
+    cost("O(N^3)")
 }
 
 /// A loop whose bound pending writes leave unresolved adds its cubic body to no floor (§1 Floor), so only the proven

@@ -79,7 +79,7 @@ fn iterator_protocols_charge_acquisition_each_visit_and_applicable_close() {
     let cubic = "{ [Symbol.iterator]() { return { next() { return { done: false, value: 1 }; }, return() { for (const x of xs) quadratic(xs); return { done: true, value: 0 }; } }; } }";
     let cases = [
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; for (const value of iterable) {{}} }}")), "O(1)", false),
-        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; return [...iterable]; }}")), "O(N)", false),
+        (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {next}; return [...iterable]; }}")), "O(1)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ class Walk {{ [Symbol.iterator]() {{ return this; }} next() {{ quadratic(xs); return {{ done: true, value: 0 }}; }} }} for (const v of new Walk()) {{}} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {{ *[Symbol.iterator]() {{ yield quadratic(xs); }} }}; for (const v of iterable) {{}} }}")), "O(N^2)", false),
         (index_of(format!("{QUADRATIC}\nexport function selected(xs: number[]) {{ const iterable = {closing}; for (const value of iterable) {{ if (value) break; }} }}")), "O(N^2)", false),
@@ -146,7 +146,7 @@ fn implicit_calls_compose_their_writes_into_effects() {
 #[test]
 fn builtin_accessors_and_replaced_iterators_keep_fresh_arrays_variable() {
     let cases = [
-        (index_of("Object.defineProperty(Array.prototype, 'grow', { get(this: number[]) { this.push(1); return 0; } });\nexport function selected(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += (xs as unknown as { grow: number }).grow; for (const x of xs) total += x; } return total; }".to_string()), "O(N^2)", false),
+        (index_of("Object.defineProperty(Array.prototype, 'grow', { get(this: number[]) { this.push(1); return 0; } });\nexport function selected(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += (xs as unknown as { grow: number }).grow; for (const x of xs) total += x; } return total; }".to_string()), "O(N)", false),
         (index_of("export function selected(n: number) { const ys: number[] = [1, 2, 3]; const it: any = [][Symbol.iterator](); it.__proto__.next = function () { return { done: true, value: 0 }; }; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { for (const y of ys) total += y; } return total; }".to_string()), "O(N)", true),
         (index_of("export function selected(n: number) { const zs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += (zs as unknown as { grow: number }).grow; for (const z of zs) total += z; } return total; }".to_string()), "O(N)", false),
     ];
@@ -176,7 +176,7 @@ fn functions_passed_as_values_receive_their_forwarded_arguments() {
     let slow = "function slow(xs: number[]) { for (const a of xs) for (const b of xs) for (const c of xs) void c; return true; }";
     let cases = [
         (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ t.includes = v; }}\nfunction apply(f: (t: any, v: unknown) => void, xs: number[]) {{ f(Array.prototype, () => slow(xs)); }}\nexport function selected(xs: number[]) {{ set(new Set<number>(), null); apply(set, xs); const zs = [1]; return zs.includes(0); }}")), "O(N^3)", true),
-        (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ t.includes = v; }}\nfunction apply(f: (t: any, v: unknown) => void, xs: number[]) {{ const g = f; g(Array.prototype, () => slow(xs)); }}\nexport function selected(xs: number[]) {{ apply(set, xs); const zs = [1]; return zs.includes(0); }}")), "O(N)", true),
+        (index_of(format!("{slow}\nfunction set(t: any, v: unknown) {{ t.includes = v; }}\nfunction apply(f: (t: any, v: unknown) => void, xs: number[]) {{ const g = f; g(Array.prototype, () => slow(xs)); }}\nexport function selected(xs: number[]) {{ apply(set, xs); const zs = [1]; return zs.includes(0); }}")), "O(1)", true),
     ];
 
     assert_projected_selected(&cases);
@@ -443,18 +443,18 @@ fn classic_jsx_factories_resolve_through_their_scope() {
     );
     let cases = [
         classic("export function selected() { return <div />; }", STORING_FACTORY, "O(1)", false),
-        classic("export function selected(xs: number[]) { return <Cube xs={xs} />; }", CALLING_FACTORY, "O(N^3)", false),
+        classic("export function selected(xs: number[]) { return <Cube xs={xs} />; }", CALLING_FACTORY, "O(1)", true),
         classic("export function selected(xs: number[]) { return <Cube xs={xs} />; }", STORING_FACTORY, "O(1)", false),
         classic("export function selected() { return <div />; }", CALLING_FACTORY, "O(1)", true),
-        classic("export function selected(xs: number[]) { return <>{1}</>; }", &fragment_factory, "O(N^2)", false),
-        classic("export function selected(xs: number[]) { return xs.map(() => <Cube xs={xs} />); }", CALLING_FACTORY, "O(N^4)", false),
-        (jsx_project_of(r#", "jsx": "react""#, &format!("/** @jsx h */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", false),
+        classic("export function selected(xs: number[]) { return <>{1}</>; }", &fragment_factory, "O(1)", true),
+        classic("export function selected(xs: number[]) { return xs.map(() => <Cube xs={xs} />); }", CALLING_FACTORY, "O(N)", true),
+        (jsx_project_of(r#", "jsx": "react""#, &format!("/** @jsx h */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react""#, &format!("{CLASSIC_IMPORTS}/** @jsx h */\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{quadratic(xs)}}</div>; }}\n"), &[]), "O(N^2)", true),
-        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", false),
-        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export const lens = {{ get h() {{ return 1; }} }};\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export const lens = {{ get h() {{ return 1; }} }};\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("{AUTOMATIC_IMPORTS}let h = (type: any, props: any) => type(props);\nexport function swap() {{ h = () => 0; }}\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[]), "O(1)", true),
-        (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("/**\n * @jsxRuntime classic\n * @jsx h\n */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", false),
+        (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("/**\n * @jsxRuntime classic\n * @jsx h\n */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("/** @jsxRuntime classic @jsx h */\n{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
     ];
 
@@ -511,18 +511,18 @@ fn automatic_jsx_runtimes_resolve_through_the_runtime_graph() {
     ];
     let pragma = "/** @jsxImportSource lib */\nimport { Cube } from \"./work\";\nexport function selected(xs: number[]) { return <Cube xs={xs} />; }\n";
     let cases = [
-        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &calling, &[], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &calling, &[], "O(1)", true),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &storing, &[], "O(1)", false),
-        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{1}{2}</Cube>; }", &static_calling, &[], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{1}{2}</Cube>; }", &static_calling, &[], "O(1)", true),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{1}</Cube>; }", &static_calling, &[], "O(1)", false),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>\n  {1}\n</Cube>; }", &static_calling, &[], "O(1)", false),
-        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{...[1]}</Cube>; }", &static_calling, &[], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <Cube xs={xs}>{...[1]}</Cube>; }", &static_calling, &[], "O(1)", true),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[]) { return <>{1}</>; }", &fragment_calling, &[("node_modules/lib/work.js", library_work)], "O(1)", true),
-        automatic(AUTOMATIC_OPTIONS, "function Fragment(props:{xs:number[]}){return quadratic(props.xs);} export function selected(xs:number[]){return <Fragment xs={xs}/>;}", &calling, &[], "O(N^2)", false),
-        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube {...rest} xs={xs} key=\"k\" />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N^3)", false),
+        automatic(AUTOMATIC_OPTIONS, "function Fragment(props:{xs:number[]}){return quadratic(props.xs);} export function selected(xs:number[]){return <Fragment xs={xs}/>;}", &calling, &[], "O(1)", true),
+        automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube {...rest} xs={xs} key=\"k\" />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N)", true),
         automatic(AUTOMATIC_OPTIONS, "export function selected(xs: number[], rest: {}) { return <Cube key=\"k\" {...rest} xs={xs} />; }", &storing, &[("node_modules/lib/index.js", create)], "O(N)", false),
-        automatic(r#", "jsx": "react-jsxdev", "jsxImportSource": "lib""#, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &storing, &[("node_modules/lib/jsx-dev-runtime.js", "export function jsxDEV(type, props) { return type(props); }\n")], "O(N^3)", false),
-        automatic(r#", "jsx": "react""#, "", &calling, &[("src/index.tsx", pragma)], "O(N^3)", false),
+        automatic(r#", "jsx": "react-jsxdev", "jsxImportSource": "lib""#, "export function selected(xs: number[]) { return <Cube xs={xs} />; }", &storing, &[("node_modules/lib/jsx-dev-runtime.js", "export function jsxDEV(type, props) { return type(props); }\n")], "O(1)", true),
+        automatic(r#", "jsx": "react""#, "", &calling, &[("src/index.tsx", pragma)], "O(1)", true),
         automatic(AUTOMATIC_OPTIONS, "import { render } from \"dom\";\nexport function selected(xs: number[]) { render(<Cube xs={xs} />); }", &storing, &render, "O(1)", true),
         (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{quadratic(xs)}}</div>; }}\n"), &[]), "O(N^2)", true),
         (jsx_project_of(r#", "jsx": "react-jsx""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("node_modules/react/package.json", r#"{ "name": "react", "exports": { ".": "./index.js", "./jsx-runtime": "./jsx-runtime.js" } }"#), ("node_modules/react/jsx-runtime.js", "'use strict';\nif (process.env.NODE_ENV === 'production') { module.exports = require('./production.js'); } else { module.exports = require('./development.js'); }\n"), ("node_modules/react/production.js", "exports.jsx = function (type, props) { return type(props); };\n"), ("node_modules/react/development.js", "exports.jsx = function (type, props) { return type(props); };\n")]), "O(1)", true),
@@ -566,7 +566,7 @@ fn untransformed_jsx_keeps_element_creation_unknown() {
     };
     let owners = [
         (owned(r#", "jsx": "preserve""#), "O(1)", true),
-        (owned(AUTOMATIC_OPTIONS), "O(N^3)", false),
+        (owned(AUTOMATIC_OPTIONS), "O(1)", true),
     ];
 
     support::assert_project_cases("src/index.tsx", &owners);
@@ -652,9 +652,14 @@ fn jsx_components_run_once_through_the_factory_and_runtimes_never_execute() {
             .filter(|label| label.contains("[callback parameter]"))
             .count();
 
-        assert_eq!(cost, Cost::parse("O(N^3)").unwrap(), "{types:?}");
-        assert!(reasons.is_empty(), "{types:?}: {reasons:?}");
-        assert_eq!((factories, components), (1, 1), "{types:?}: {labels:?}");
+        // The component reads `props.xs`, a member no rule sizes, so its loops add nothing to the floor
+        // and leave no traced work.
+        assert_eq!(cost, Cost::parse("O(1)").unwrap(), "{types:?}");
+        assert!(
+            reasons.contains(&UnknownReason::SizeRelation),
+            "{types:?}: {reasons:?}"
+        );
+        assert_eq!((factories, components), (0, 0), "{types:?}: {labels:?}");
     }
 
     assert!(!directory
@@ -669,13 +674,13 @@ fn jsx_factory_arguments_follow_the_emitted_call() {
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("{AUTOMATIC_IMPORTS}function h(type: any, props: any) {{ return props.work(); }}\nexport function selected(xs: number[]) {{ return <div work={{() => quadratic(xs)}} />; }}\n"), &[]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ const R = {{ get h() {{ quadratic(xs); return (type: any, props: any) => props; }} }}; return <div />; }}\n"), &[]), "O(N^2)", true),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h", "jsxFragmentFactory": "R.Fragment""#, &format!("{CLASSIC_IMPORTS}export function selected(xs: number[]) {{ const R = {{ get Fragment() {{ quadratic(xs); return () => 1; }} }}; return <>{{1}}</>; }}\n"), &[("src/h.ts", STORING_FACTORY)]), "O(N^2)", false),
-        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}const h = R.h;\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(N^3)", true),
-        (jsx_project_of(r#", "jsx": "react""#, &format!("/**\n * @jsx h\n * @jsx g\n */\nimport {{ h, g }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", &format!("{CALLING_FACTORY}export function g(type: any, props: any) {{ return {{ type, props }}; }}\n"))]), "O(N^3)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}const h = R.h;\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", CALLING_FACTORY)]), "O(1)", true),
+        (jsx_project_of(r#", "jsx": "react""#, &format!("/**\n * @jsx h\n * @jsx g\n */\nimport {{ h, g }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("src/h.ts", &format!("{CALLING_FACTORY}export function g(type: any, props: any) {{ return {{ type, props }}; }}\n"))]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "R.h", "jsxFragmentFactory": "R.Fragment""#, &format!("import * as R from \"./h\";\n{AUTOMATIC_IMPORTS}export const lens = {{ get Fragment() {{ return 1; }} }};\nexport function selected(xs: number[]) {{ return <>{{1}}</>; }}\n"), &[("src/h.ts", STORING_FACTORY)]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "h""#, &format!("{AUTOMATIC_IMPORTS}function h(type: any, props: any) {{ return type(props); }}\nexport function swap() {{ (h as any) = () => 0; }}\nexport function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[]), "O(1)", true),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "k""#, &format!("import {{ k }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{1}}{{() => quadratic(xs)}}</div>; }}\n"), &[("src/h.ts", "export function k(type: any, props: any, first: any, second: any) { return typeof second === \"function\" ? second() : 0; }\n")]), "O(N^2)", false),
         (jsx_project_of(r#", "jsx": "react", "jsxFactory": "nest""#, &format!("import {{ nest }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{...xs}}</div>; }}\n"), &[("src/h.ts", "export function nest(type: any, props: any, ...children: any[]) { let t = 0; for (const c of children) for (const d of children) t += 1; return t; }\n")]), "O(N^2)", false),
-        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "keys""#, &format!("import {{ keys }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(o: Record<string, number>) {{ return <div {{...o}} />; }}\n"), &[("src/h.ts", "export function keys(type: any, props: any, ...children: any[]) { let t = 0; for (const a in props) for (const b in props) t += 1; return t; }\n")]), "O(N^2)", false),
+        (jsx_project_of(r#", "jsx": "react", "jsxFactory": "keys""#, &format!("import {{ keys }} from \"./h\";\n{AUTOMATIC_IMPORTS}export function selected(o: Record<string, number>) {{ return <div {{...o}} />; }}\n"), &[("src/h.ts", "export function keys(type: any, props: any, ...children: any[]) { let t = 0; for (const a in props) for (const b in props) t += 1; return t; }\n")]), "O(N)", true),
         (jsx_project_of(AUTOMATIC_OPTIONS, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}}>{{/* note */}}{{1}}</Cube>; }}\n"), &[("node_modules/lib/package.json", LIBRARY_PACKAGE), ("node_modules/lib/jsx-runtime.js", "export function jsx(type, props) { return { type, props }; }\nexport function jsxs(type, props) { return type(props); }\n")]), "O(1)", false),
         (jsx_project_of(r#", "jsx": "preserve""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <div>{{...xs}}</div>; }}\n"), &[]), "O(N)", true),
         (jsx_project_of(r#", "jsx": "preserve""#, &format!("{AUTOMATIC_IMPORTS}export function selected(xs: number[]) {{ return <Cube xs={{xs}} />; }}\n"), &[("node_modules/react/package.json", r#"{ "name": "react", "type": "module", "exports": { "./jsx-runtime": "./jsx-runtime.js" } }"#), ("node_modules/react/jsx-runtime.js", "export function jsx(type, props) { return type(props); }\nexport const jsxs = jsx;\n")]), "O(1)", true),
@@ -767,8 +772,8 @@ fn jsx_passed_values_escape_into_the_factory() {
                 &format!("{CLASSIC_IMPORTS}{attribute}\n"),
                 &[("src/h.ts", STORING_FACTORY)],
             ),
-            "O(N)",
-            false,
+            "O(1)",
+            true,
         ),
         (
             jsx_project_of(

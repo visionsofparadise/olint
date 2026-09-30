@@ -76,6 +76,10 @@ impl Cost {
     pub fn is_one(&self) -> bool {
         self.0.is_one()
     }
+    /// Whether the cost is a logarithm of one quantity.
+    pub fn is_logarithm(&self) -> bool {
+        matches!(self.0, Expression::Log(_) | Expression::LegacyLog)
+    }
     pub(crate) fn has_polynomial_log_growth(&self, envelope: &Self) -> bool {
         envelope_growth(&self.0, &envelope.0)
             .is_some_and(|(polynomial, logarithmic)| polynomial >= 1 && logarithmic >= 1)

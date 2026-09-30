@@ -34,6 +34,9 @@ fn loop_reasons_of(
                 _ => None,
             })
             .expect("every fixture loop sits in a function");
+
+        analysis.enter_function_inputs(file, function);
+
         let reason = analysis.bound_of(file, kind).label().to_string();
 
         reasons.push((analysis.name_of(file, function), reason));
@@ -797,19 +800,19 @@ fn a_share_collapses_only_where_the_enclosing_multiplicity_covers_the_potential(
         (
             "a bare share endpoint under a halving budget loop",
             halving_window_source("for (let k = 0; k < step; k += 1) total++;"),
-            "O(step * log(N))",
+            "O(step * log(n))",
             true,
         ),
         (
             "a shared slice under a halving budget loop",
             halving_window_source("for (const v of xs.subarray(0, step)) total += v;"),
-            "O(N * log(N))",
+            "O(log(n))",
             false,
         ),
         (
             "a counter the enclosing loop resets",
             reset_halving_window_source("for (let k = offset; k < offset + step; k += 1) total++;"),
-            "O(max(1,step * log(N)) * ys)",
+            "O(step * ys * log(n))",
             true,
         ),
         (
@@ -847,13 +850,13 @@ fn a_subunit_share_consumer_keeps_the_factor_its_enclosing_loop_multiplies() {
         (
             "a quarter step under a halving budget loop",
             halving_share_source("for (let k = offset; k < offset + step; k += 1 / 4) total++;"),
-            "O(step * log(N))",
+            "O(step * log(n))",
             true,
         ),
         (
             "a unit step under a halving budget loop",
             halving_share_source("for (let k = offset; k < offset + step; k++) total++;"),
-            "O(step * log(N))",
+            "O(step * log(n))",
             true,
         ),
     ];
@@ -1158,7 +1161,9 @@ fn getter_readings_need_a_guarded_snapshot_for_a_finite_bound() {
 
     assert!(bound_is_unknown(source, "f"));
 
+    // The snapshot's length is no input dimension (`input-size-envelope`), so its loop stays
+    // unresolved.
     let snapshot = "export function f(){const xs={get length(){return Math.random()<0.5?Infinity:1;}} as unknown as number[];const size=xs.length;for(let i=0;i<size&&size>=0&&size<=1000000000;i++){}}";
 
-    assert!(!bound_is_unknown(snapshot, "f"));
+    assert!(bound_is_unknown(snapshot, "f"));
 }

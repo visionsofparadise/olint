@@ -81,6 +81,8 @@ pub struct Analysis<'p, 'a> {
     pub share_bindings: Vec<Binding>,
     pub(crate) enclosing_factors: Vec<(FileId, NodeId, crate::cost::Cost, bool)>,
     pub(crate) produced: Option<crate::summaries::Produced>,
+    /// Generator summaries whose unknown yield count is unknown only for an untracked size.
+    pub(crate) untracked_yields: HashSet<crate::summaries::SummaryId>,
     pub(crate) deferred_reading: Option<Reading>,
     pub(crate) deferred_storage: Option<crate::effects::Storage>,
     pub(crate) latent_storage: HashMap<crate::summaries::SummaryId, crate::effects::Storage>,
@@ -143,6 +145,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             budget_context: None,
             share_bindings: Vec::new(),
             enclosing_factors: Vec::new(),
+            untracked_yields: HashSet::new(),
             produced: None,
             deferred_reading: None,
             deferred_storage: None,

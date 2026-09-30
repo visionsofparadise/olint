@@ -135,20 +135,24 @@ impl Size {
     pub fn constant() -> Size {
         Size {
             element: Cost::ONE,
+            element_resolved: true,
             ..Size::sized(Cost::ONE)
         }
     }
 
+    /// A collection of `length` elements whose element size no rule tracks.
     pub fn sized(length: Cost) -> Size {
         Size {
             length,
             element: Cost::N,
             exceeds: false,
             length_resolved: true,
-            element_resolved: true,
+            element_resolved: false,
         }
     }
 
+    /// A size no rule tracks. Its `Cost::N` fields are placeholders that the `*_resolved` flags
+    /// mark unproven, so a consumer charges an unknown contribution rather than the placeholder.
     pub fn unresolved() -> Size {
         Size::sized(Cost::N).unresolved_length()
     }
@@ -183,7 +187,7 @@ impl Size {
                 element: Cost::N,
                 exceeds: self.exceeds || product,
                 length_resolved: self.length_resolved && self.element_resolved,
-                element_resolved: true,
+                element_resolved: false,
             },
             Err(_) => Size::unresolved(),
         }
@@ -1021,19 +1025,156 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
     }
 
-    fn input_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Size {
-        let length = match self.is_constant_sized(file, e) {
-            true => Cost::ONE,
-            false => self.parameter_size_of(file, e).unwrap_or(Cost::N),
-        };
-        let element = match self.has_primitive_elements(file, e) {
-            true => Cost::ONE,
-            false => Cost::N,
+    /// Proof rule `input-size-envelope`: the length of `e` is bounded by its size over the entry's
+    /// input dimensions when every step that forms it is one whose produced size the analysis
+    /// tracks (`length_resolved`), from leaves that are constants or unwritten parameters carrying
+    /// their call's size, the entry's own parameters, a plain rest parameter included, carrying
+    /// their input dimension, and no loop or callback of the binding function resizes such a
+    /// parameter in place. The bound is that size itself, so a product or other size that exceeds
+    /// every input dimension is charged as formed. Every other length and element size is
+    /// untracked, and each operation that visits it charges a `SizeRelation` unknown: module or
+    /// class state, a user call's result, a member of a value, a written, destructured or resized
+    /// parameter, a loop binding, and the elements of a collection, which have no dimension of
+    /// their own.
+    pub(crate) fn tracked_length_of(
+        &mut self,
+        file: FileId,
+        e: &'a Expression<'a>,
+    ) -> Option<Cost> {
+        let size = self.collection_size_of(file, e);
+
+        size.length_resolved.then_some(size.length)
+    }
+
+    /// The size `e` holds on the first entry into `region`: its tracked size, else, for a local
+    /// holder that every reference outside `region` leaves unchanged, its initializer's size, and
+    /// for a parameter that only `region` resizes, the size it entered with.
+    pub(crate) fn initial_size_of(
+        &mut self,
+        file: FileId,
+        e: &'a Expression<'a>,
+        region: NodeId,
+    ) -> Size {
+        let size = self.collection_size_of(file, e);
+
+        if size.length_resolved {
+            return size;
+        }
+
+        let Expression::Identifier(reference) = unwrap(e) else {
+            return size;
         };
 
-        Size {
-            element,
-            ..Size::sized(length)
+        if self.has_deleted_entries(file, reference) {
+            return size;
+        }
+
+        let Some(declaration) = self
+            .declarations
+            .of_reference(self.project, file, reference)
+        else {
+            return size;
+        };
+
+        if let Some(binding) = self.parameter_binding_of(declaration) {
+            let crate::declarations::Binding::Symbol {
+                file: owner,
+                symbol,
+            } = binding;
+
+            if !self.is_parameter_unwritten(binding)
+                || owner != file
+                || self.is_resized_outside(owner, symbol, Some(region))
+            {
+                return size;
+            }
+
+            return match self
+                .current_substitutions
+                .get(&binding)
+                .and_then(|facts| facts.value.size.clone())
+            {
+                Some(length) => Size {
+                    element: size.element,
+                    element_resolved: size.element_resolved,
+                    ..Size::sized(length)
+                },
+                None => size,
+            };
+        }
+
+        let (Declaration::Variable { .. }, Some((target, initializer)), Some(symbol)) = (
+            declaration,
+            constant_initializer_of(declaration),
+            reference.reference_id.get().and_then(|id| {
+                self.project
+                    .file(file)
+                    .semantic
+                    .scoping()
+                    .get_reference(id)
+                    .symbol_id()
+            }),
+        ) else {
+            return size;
+        };
+
+        if target != file || !self.is_stable_before(file, symbol, region) {
+            return size;
+        }
+
+        match self.produced_size_of(target, initializer) {
+            Some(initial) if initial.length_resolved => initial,
+            _ => size,
+        }
+    }
+
+    /// The tracked count (`input-size-envelope`) of a list that holds a constant many written
+    /// entries beside the elements of each of `spreads`: the largest spread's tracked size, else
+    /// untracked when any spread's size is.
+    pub(crate) fn spread_count_of(
+        &mut self,
+        file: FileId,
+        spreads: impl Iterator<Item = &'a Expression<'a>>,
+    ) -> Option<Cost> {
+        let mut sizes = Vec::new();
+
+        for spread in spreads {
+            let size = self.iterable_size_at(file, spread, 0);
+
+            if !size.length_resolved {
+                return None;
+            }
+
+            if !size.length.is_one() {
+                sizes.push(size.length);
+            }
+        }
+
+        match sizes.len() {
+            0 => Some(Cost::ONE),
+            1 => sizes.pop(),
+            _ => Cost::maximum(sizes).ok(),
+        }
+    }
+
+    /// The size of a value no produced-size rule derives: a constant length, else its parameter's
+    /// substituted size, else untracked, with constant elements only for declared primitives.
+    fn input_size_of(&mut self, file: FileId, e: &'a Expression<'a>) -> Size {
+        let size = match self.is_constant_sized(file, e) {
+            true => Size::sized(Cost::ONE),
+            false => match self.parameter_size_of(file, e) {
+                Some(length) => Size::sized(length),
+                None => Size::unresolved(),
+            },
+        };
+
+        match self.has_primitive_elements(file, e) {
+            true => Size {
+                element: Cost::ONE,
+                element_resolved: true,
+                ..size
+            },
+            false => size,
         }
     }
 
@@ -1073,18 +1214,132 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     return None;
                 }
 
+                if let Some(size) =
+                    self.array_construction_size_of(file, &new.callee, &new.arguments)
+                {
+                    return Some(size);
+                }
+
                 let model = self.construction_model_of(file, new)?;
                 let site = self.construction_site_of(file, new);
 
                 self.output_size_of(&site, model, depth)
             }
-            Expression::CallExpression(call) => self.call_size_of(file, call, depth),
+            Expression::CallExpression(call) => {
+                match self.intrinsic_replaced_of(file, &call.callee) {
+                    true => None,
+                    false => self.array_construction_size_of(file, &call.callee, &call.arguments),
+                }
+                .or_else(|| self.call_size_of(file, call, depth))
+            }
+            // ECMA-262 §13.15.3 ApplyStringOrNumericBinaryOperator step 1.c and §13.2.8.6: a
+            // concatenation's length is the sum of its operands' string lengths.
+            Expression::BinaryExpression(binary)
+                if binary.operator == oxc_syntax::operator::BinaryOperator::Addition
+                    && self.is_primitive_operand(file, e) =>
+            {
+                let left = self.text_length_at(file, &binary.left, depth);
+                let right = self.text_length_at(file, &binary.right, depth);
+
+                Some(left.combined(&right))
+            }
+            Expression::TemplateLiteral(template) => {
+                let mut size = Size::constant();
+
+                for expression in &template.expressions {
+                    let part = self.text_length_at(file, expression, depth);
+
+                    size = size.combined(&part);
+                }
+
+                Some(size)
+            }
             Expression::Identifier(reference) if self.has_deleted_entries(file, reference) => {
                 Some(Size::unresolved())
             }
             Expression::Identifier(reference) => self.holder_size_of(file, reference, depth),
             _ => None,
         }
+    }
+
+    /// The size of `Array(length)` or `new Array(length)` from the intrinsic constructor: ECMA-262
+    /// §23.1.1.1 step 5 creates an array whose `length` is the one argument, with holes that read
+    /// as undefined, and the array-iteration steps visit every index below that `length`.
+    fn array_construction_size_of(
+        &mut self,
+        file: FileId,
+        callee: &'a Expression<'a>,
+        arguments: &'a [Argument<'a>],
+    ) -> Option<Size> {
+        let Expression::Identifier(reference) = unwrap(callee) else {
+            return None;
+        };
+
+        if reference.name != "Array" || !self.is_intrinsic_reference(file, reference) {
+            return None;
+        }
+
+        let [argument] = arguments else {
+            return None;
+        };
+        let argument = argument.as_expression()?;
+
+        if !self.is_primitive_operand(file, argument) {
+            return None;
+        }
+
+        let size = match self.count_of(file, argument) {
+            Some(length) => Size::sized(length),
+            None => Size::unresolved(),
+        };
+
+        Some(Size {
+            element: Cost::ONE,
+            element_resolved: true,
+            ..size
+        })
+    }
+
+    /// The length of ToString of `e`: constant for bounded text, the tracked length of another
+    /// primitive, and untracked for an object, whose conversion runs its own methods.
+    fn text_length_at(&mut self, file: FileId, e: &'a Expression<'a>, depth: usize) -> Size {
+        if self.is_constant_text(file, e) {
+            return Size::constant();
+        }
+
+        if self.is_primitive_operand(file, e) {
+            return self.collection_size_at(file, e, depth + 1);
+        }
+
+        // Array.prototype.toString joins the elements' strings (ECMA-262 §23.1.3.36, §23.1.3.18),
+        // so a literal array converts to the sum of its elements' lengths.
+        let (Expression::ArrayExpression(array), false) = (
+            unwrap(e),
+            self.builtin_members_replaced(
+                crate::declared_types::Kind::Array,
+                &["toString", "join"],
+            ),
+        ) else {
+            return Size::unresolved();
+        };
+        let mut size = Size::constant();
+
+        for element in &array.elements {
+            let part = match element {
+                ArrayExpressionElement::SpreadElement(_) => return Size::unresolved(),
+                ArrayExpressionElement::Elision(_) => continue,
+                element => match element.as_expression() {
+                    Some(element) if depth < MAXIMUM_PRODUCED_DEPTH => {
+                        self.text_length_at(file, element, depth + 1)
+                    }
+                    _ => return Size::unresolved(),
+                },
+            };
+
+            size = size.combined(&part);
+        }
+
+        size
     }
 
     fn literal_size_of(
@@ -1144,7 +1399,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let primitive = produced.is_some() && self.is_primitive_operand(target, initializer);
 
         match self.holder_growth_of(declaration, primitive) {
-            sizes::Growth::Stable => produced,
+            // A stable alias holds its initializer's value, parameters included.
+            sizes::Growth::Stable => produced.or_else(|| {
+                let size = self.input_size_of(target, initializer);
+
+                size.length_resolved.then_some(size)
+            }),
             sizes::Growth::Unstable => None,
             sizes::Growth::Sites { calls, open } => {
                 let mut size = match produced {
@@ -1257,7 +1517,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         &mut self,
         file: FileId,
         callback: Option<&'a Argument<'a>>,
-        element: &Cost,
+        source: &Size,
         depth: usize,
     ) -> Size {
         let Some(callback) = callback.and_then(Argument::as_expression) else {
@@ -1295,7 +1555,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     function,
                     expression,
                 ) {
-                    Size::sized(element.clone())
+                    Size {
+                        length_resolved: source.element_resolved,
+                        ..Size::sized(source.element.clone())
+                    }
                 } else if self.is_primitive_operand(target.file, expression) {
                     Size::constant()
                 } else {
@@ -1327,6 +1590,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        let crate::declarations::Binding::Symbol { file, symbol } = binding;
+
+        if self.is_resized_in_place(file, symbol) {
+            return None;
+        }
+
         self.current_substitutions.get(&binding)?.value.size.clone()
     }
 
@@ -1342,8 +1611,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match method {
             "map" => {
-                let result =
-                    self.result_size_of(file, call.arguments.first(), &source.element, depth + 1);
+                let result = self.result_size_of(file, call.arguments.first(), &source, depth + 1);
 
                 Some(source.containing(&result))
             }
@@ -1364,6 +1632,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Some(size)
             }
             method if PRESERVING_METHODS.contains(&method) => Some(source),
+            // ECMA-262 §23.1.3.5, §23.1.3.19, §23.1.3.38: CreateArrayIterator visits the indices
+            // below the receiver's length.
+            "values" => Some(source),
+            "keys" | "entries" => Some(Size {
+                element: Cost::ONE,
+                element_resolved: true,
+                ..source
+            }),
             _ => None,
         }
     }

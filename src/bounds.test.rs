@@ -25,9 +25,18 @@ fn short_collapses_whitespace_runs() {
     assert_eq!(short("xs\n\t  .map(f)"), "xs .map(f)");
 }
 
-use super::{constant_bound_of, linear_bound_of, logarithmic_bound_of, unresolved_bound_of, Bound};
-use crate::cost::Cost;
+use super::{
+    constant_bound_of, logarithmic_bound_of, unresolved_bound_of, untracked_bound_of, Bound,
+};
+use crate::cost::{Cost, Domain};
 use crate::unknowns::UnknownReason;
+
+fn linear_bound_of() -> Bound {
+    Bound::Proven {
+        factor: Cost::dimension(0, Domain::Size),
+        proof: None,
+    }
+}
 
 #[test]
 fn a_proven_bound_reports_its_factor_and_an_unresolved_one_reports_its_reason() {
@@ -50,8 +59,12 @@ fn a_label_names_the_proof_the_factor_or_the_unknown() {
         constant_bound_of("single iteration").label(),
         "single iteration"
     );
-    assert_eq!(logarithmic_bound_of("halving").label(), "halving");
+    assert_eq!(
+        logarithmic_bound_of("halving", Cost::dimension(0, Domain::Size)).label(),
+        "halving"
+    );
     assert_eq!(linear_bound_of().label(), "N");
+    assert_eq!(untracked_bound_of().label(), "input size relation");
     assert_eq!(
         Bound::Proven {
             factor: Cost::LOG,
@@ -67,7 +80,7 @@ fn a_label_names_the_proof_the_factor_or_the_unknown() {
 fn a_stronger_bound_wins_a_conjunction_of_comparisons() {
     let ordered = [
         constant_bound_of("constant bound"),
-        logarithmic_bound_of("halving"),
+        logarithmic_bound_of("halving", Cost::dimension(0, Domain::Size)),
         linear_bound_of(),
         unresolved_bound_of(),
     ];

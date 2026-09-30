@@ -193,13 +193,11 @@
     "args": [],
     "kind": "surface",
     "expected_exits": {
-      "lint": 1,
+      "lint": 0,
       "report": 0
     },
     "expected_contains": {
-      "lint": [
-        "selected"
-      ],
+      "lint": [],
       "report": [
         "selected"
       ]
@@ -2802,18 +2800,14 @@
     },
     "expected_contains": {
       "lint": [
-        "2 public functions"
-      ],
-      "report": []
-    },
-    "expected_absent": {
-      "lint": [
-        "partial"
+        "2 public functions",
+        "1 partial results"
       ],
       "report": [
-        "partial"
+        "C.total  index.ts:1 [partial]"
       ]
-    }
+    },
+    "expected_absent": {}
   },
   {
     "name": "surface_object_setter_parameter_store_partial",
@@ -2861,14 +2855,13 @@
     "args": [],
     "kind": "surface",
     "expected_exits": {
-      "lint": 1,
+      "lint": 0,
       "report": 0
     },
     "expected_contains": {
       "lint": [
-        "new HeavyField()",
         "1 public functions",
-        "1 over limit"
+        "0 over limit"
       ],
       "report": [
         "new HeavyField()"
@@ -2898,14 +2891,13 @@
     "args": [],
     "kind": "surface",
     "expected_exits": {
-      "lint": 1,
+      "lint": 0,
       "report": 0
     },
     "expected_contains": {
       "lint": [
-        "HeavyField.constructor",
         "1 public functions",
-        "1 over limit"
+        "1 partial results"
       ],
       "report": [
         "HeavyField.constructor"
@@ -2935,14 +2927,13 @@
     "args": [],
     "kind": "surface",
     "expected_exits": {
-      "lint": 1,
+      "lint": 0,
       "report": 0
     },
     "expected_contains": {
       "lint": [
-        "Base.constructor",
         "1 public functions",
-        "1 over limit"
+        "1 partial results"
       ],
       "report": [
         "Base.constructor"
@@ -2972,14 +2963,13 @@
     "args": [],
     "kind": "surface",
     "expected_exits": {
-      "lint": 1,
+      "lint": 0,
       "report": 0
     },
     "expected_contains": {
       "lint": [
-        "new Derived()",
         "1 public functions",
-        "1 over limit"
+        "1 partial results"
       ],
       "report": [
         "new Derived()"

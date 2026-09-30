@@ -224,13 +224,14 @@ fn growing_const_alias_and_readonly_collections_are_quadratic() {
         "class Holder { readonly values: number[] = []; } export function f(n: number) { const holder = new Holder(); let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { holder.values.push(i); for (const value of holder.values) total += value; } return total; }",
         "export function f(n: number) { const values = [0]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { values[values.length] = i; for (let j = 0; j < values.length; j++) total += j; } return total; }",
     ] {
-        let expected = if source.contains("values[values.length]") {
-            "O(max(1,N*max(1,N)))"
-        } else {
-            "O(N^2)"
+        // Only a push on the holder itself is a growth site the analysis counts; growth through an
+        // alias, a field or a written index leaves the length untracked.
+        let expected = match source.contains("const values: number[] = []; let total") {
+            true => (cost("O(N^2)"), true),
+            false => (cost("O(N)"), false),
         };
 
-        assert_eq!(legacy_cost_of(source, "f"), cost(expected), "{source}");
+        assert_eq!(result_of(source, "f"), expected, "{source}");
     }
 }
 
@@ -277,10 +278,11 @@ fn prototype_enumeration_is_closed_only_without_reachable_prototype_writes() {
     let accessor = "export function f(n: number) { const table = { get a() { for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) (this as any)[i] = i; return 1; } }; let total = table.a; for (const key in table) total += key.length; return total; }";
 
     assert_eq!(result_of(enumeration, "f"), (cost("O(1)"), true));
-    assert_eq!(legacy_cost_of(&written, "f"), cost("O(N)"));
-    assert_eq!(legacy_cost_of(array, "f"), cost("O(N)"));
-    assert_eq!(legacy_cost_of(inherited, "f"), cost("O(N)"));
-    assert_eq!(legacy_cost_of(accessor, "f"), cost("O(N)"));
+    // An open enumeration visits the object's untracked key count.
+    assert_eq!(result_of(&written, "f"), (cost("O(1)"), false));
+    assert_eq!(result_of(array, "f"), (cost("O(1)"), true));
+    assert_eq!(result_of(inherited, "f"), (cost("O(1)"), false));
+    assert_eq!(result_of(accessor, "f"), (cost("O(N)"), false));
 }
 
 #[test]
@@ -323,7 +325,7 @@ fn awaited_values_alias_their_operand() {
         "export async function f(n: number) { const xs: number[] = [1, 2, 3]; const ys: number[] = await xs; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { ys[ys.length] = i; for (const x of xs) total += x; } return total; }",
         "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { ys.push(i); for (const x of xs) total += x; } return total; }",
     ] {
-        assert_eq!(legacy_cost_of(source, "f"), cost("O(N^2)"), "{source}");
+        assert_eq!(result_of(source, "f"), (cost("O(N)"), false), "{source}");
     }
 
     let control = "export async function f(n: number) { const xs = [1, 2, 3]; const ys = await xs; let total: number = ys.length; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { for (const x of xs) total += x; } return total; }";
@@ -339,7 +341,7 @@ fn implicit_coercions_respect_own_methods_and_replaced_intrinsics() {
         "(Array.prototype as { join: unknown }).join = function (this: number[]): string { this.push(1); return ''; }; export function f(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += `${xs}`.length; for (const x of xs) total += x; } return total; }",
         "(Array.prototype as any)[Symbol.iterator] = function* (this: number[]) { this.push(1); yield 1; }; export function f(n: number) { const xs: number[] = [1, 2, 3]; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += [...xs].length; for (let j = 0; j < xs.length; j++) total += j; } return total; }",
     ] {
-        assert_eq!(legacy_cost_of(source, "f"), cost("O(N^2)"), "{source}");
+        assert_eq!(result_of(source, "f"), (cost("O(N)"), false), "{source}");
     }
 
     let inert = "export function f(n: number) { const xs = [1, 2, 3]; const o = { a: 1 }; let total = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) { total += `${xs}${o}`.length + [...xs].length + (xs + '').length; for (const x of xs) total += x; for (const k in o) total += k.length; } return total; }";
@@ -362,7 +364,7 @@ fn argument_facts_carry_computed_sizes() {
     let source = "/** @perf O(items^2) */ function heavy(items: number[]): number { return items.length; } export function literal(): number { return heavy([1, 2, 3]); } export function copied(xs: number[]): number { return heavy([...xs]); } export function passed(xs: number[]): number { const ys = xs; return heavy(ys); }";
 
     assert_eq!(result_of(source, "literal"), (cost("O(1)"), true));
-    assert_eq!(result_of(source, "copied"), (cost("O(N)"), false));
+    assert_eq!(result_of(source, "copied"), (cost("O(N^2)"), true));
     assert_eq!(result_of(source, "passed"), (cost("O(N^2)"), true));
 }
 
@@ -479,8 +481,13 @@ fn produced_sizes_reach_the_operations_that_visit_them() {
         assert_eq!(result_of(source, "f"), (cost("O(N^3)"), true), "{source}");
     }
 
+    // A written length leaves the holder untracked.
+    assert_eq!(
+        result_of("export function f(xs: number[]) { const m = xs.slice(); if (xs.length > 5) m.length = 0; let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }", "f"),
+        (cost("O(N)"), false)
+    );
+
     for source in [
-        "export function f(xs: number[]) { const m = xs.slice(); if (xs.length > 5) m.length = 0; let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
         "export function f(xs: number[]) { const m = xs.map(() => 1); let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
         "export function f(xs: number[]) { const m = xs.filter((x) => x > 0).slice(1); let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
         "export function f(xs: number[]) { const m = [...xs, ...xs]; let t = 0; for (const a of xs) for (const v of m) t += a + v; return t; }",
@@ -522,12 +529,107 @@ fn growth_the_analysis_cannot_count_stays_unresolved() {
         "export function f(n: number, xs: number[]) { const out: number[] = []; out.push(1); xs.forEach((x) => out.push(x)); let c = 0; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) if (out.includes(i)) c++; return c; }",
     ] {
         let (found, complete) = result_of(source, "f");
+        // Growth in a callback leaves every later scan of the holder unknown.
+        let expected = match source.contains("xs.forEach") {
+            true => "O(N)",
+            false => "O(N^2)",
+        };
 
-        assert_eq!(found, cost("O(N^2)"), "{source}");
+        assert_eq!(found, cost(expected), "{source}");
         assert!(!complete, "{source}");
         assert!(
             reasons_of(source, "f").contains(&olint::unknowns::UnknownReason::SizeRelation),
             "{source}"
         );
     }
+}
+
+fn size_result_of(source: &str, name: &str) -> (Cost, bool, bool) {
+    let (cost, complete, reasons) = support::legacy_result_of(source, name);
+
+    (
+        support::projected_class_of(&cost),
+        complete,
+        reasons.contains(&olint::unknowns::UnknownReason::SizeRelation),
+    )
+}
+
+#[test]
+fn untracked_sizes_are_size_relation_unknowns_rather_than_the_input_envelope() {
+    // G5: a module array another entry grows to n^2 elements is no input dimension of `drain`.
+    let module = "const buf: number[] = []; export function fill(a: number[]) { for (const x of a) for (const y of a) buf.push(x * y); } export function drain() { let t = 0; for (const v of buf) t += v; return t; }";
+    // A user function that doubles an array n times returns 2^n elements, not an input's size.
+    let doubled = "function grow(n: number) { const r = [0]; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) r.push(...r); return r; } export function f(n: number) { const a = grow(n); let t = 0; for (const v of a) t += v; return t; }";
+    // One inner array of K elements costs K whatever the outer length, so it borrows no size.
+    let nested = "export function f(a: number[][]) { let t = 0; for (const row of a) for (const x of row) t += x; return t; }";
+    // With no input at all, a module store has no dimension to stand in for.
+    let store = "const store: number[] = []; export function add(x: number) { store.push(x); } export function scan() { let t = 0; for (const v of store) t += v; return t; }";
+
+    assert_eq!(size_result_of(module, "drain"), (cost("O(1)"), false, true));
+    assert_eq!(size_result_of(doubled, "f"), (cost("O(N)"), false, true));
+    assert_eq!(size_result_of(nested, "f"), (cost("O(N)"), false, true));
+    assert_eq!(size_result_of(store, "scan"), (cost("O(1)"), false, true));
+}
+
+#[test]
+fn input_dimensions_keep_their_own_size() {
+    for (source, bound) in [
+        (
+            "export function f(xs: number[]) { let t = 0; for (const x of xs) t += x; return t; }",
+            "O(xs)",
+        ),
+        (
+            "export function f(...xs: number[]) { let t = 0; for (const x of xs) t += x; return t; }",
+            "O(xs)",
+        ),
+        (
+            "export function f(xs: number[], ys: number[]) { let t = 0; for (const x of xs) t += x; for (const y of ys.slice()) t += y; return t; }",
+            "O(max(xs, ys))",
+        ),
+    ] {
+        run_with_source(source, |analysis, file| {
+            let function = support::function_of_name(analysis.project, file, "f");
+            let part = summary_of(analysis, file, "f");
+            let expected = analysis
+                .bind_function_cost(file, function, &cost(bound))
+                .unwrap();
+
+            assert!(part.is_complete(), "{source}");
+            assert_eq!(part.cost, expected, "{source}");
+        });
+    }
+}
+
+#[test]
+fn a_parameter_resized_in_a_loop_leaves_its_input_dimension() {
+    let grown = "export function f(xs: number[], n: number) { for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) xs.push(i); let t = 0; for (const x of xs) for (const y of xs) t += x + y; return t; }";
+    let once = "export function f(xs: number[]) { xs.push(0); let t = 0; for (const x of xs) t += x; return t; }";
+
+    assert_eq!(size_result_of(grown, "f"), (cost("O(N)"), false, true));
+    assert_eq!(size_result_of(once, "f"), (cost("O(N)"), true, false));
+}
+
+#[test]
+fn nested_push_loops_track_the_holder_they_grow() {
+    // The holder grows by one element per inner visit, so the later scan visits n * m elements.
+    let pushed = "export function f(n: number, m: number) { const out: number[] = []; for (let i = 0; i < n && n >= 0 && n <= 1000000000; i++) for (let j = 0; j < m && m >= 0 && m <= 1000000000; j++) out.push(j); let c = 0; for (const v of out) c += v; return c; }";
+    // A push the analysis cannot count leaves the scan an unknown SizeRelation contribution.
+    let escaped = "export function f(xs: number[]) { const out: number[] = []; xs.forEach((x) => { for (const y of xs) out.push(x + y); }); let c = 0; for (const v of out) c += v; return c; }";
+
+    assert_eq!(size_result_of(pushed, "f"), (cost("O(N^2)"), true, false));
+    assert_eq!(size_result_of(escaped, "f"), (cost("O(N)"), false, true));
+}
+
+#[test]
+fn array_iteration_is_charged_by_length() {
+    // G24: ECMA-262 §23.1.1.1 gives `new Array(n)` the length n, and every array-iteration step
+    // visits each index below `length`, holes included.
+    let created = "export function f(n: number) { const a = new Array(n); let t = 0; a.forEach(() => { t++; }); for (let i = 0; i < a.length && a.length >= 0 && a.length <= 4294967295; i++) t++; return t; }";
+    // A written `length` or index can extend the array past any tracked size.
+    let lengthened = "export function f(xs: number[], n: number) { const a = xs.slice(); a.length = n; let t = 0; for (const v of a) t += 1; return t; }";
+    let indexed = "export function f(xs: number[], n: number) { const a = xs.slice(); a[n] = 1; let t = 0; for (const v of a) t += 1; return t; }";
+
+    assert_eq!(size_result_of(created, "f"), (cost("O(N)"), true, false));
+    assert_eq!(size_result_of(lengthened, "f"), (cost("O(N)"), false, true));
+    assert_eq!(size_result_of(indexed, "f"), (cost("O(N)"), false, true));
 }

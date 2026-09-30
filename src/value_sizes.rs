@@ -22,11 +22,13 @@ use super::{SizeId, SizeQuantity};
 
 const MAXIMUM_SIZE_DEPTH: usize = 64;
 const MAXIMUM_ALIAS_DEPTH: usize = 8;
-const READING_METHODS: [&str; 17] = [
+const READING_METHODS: [&str; 19] = [
     "at",
     "concat",
     "entries",
     "flat",
+    "get",
+    "has",
     "includes",
     "indexOf",
     "join",
@@ -78,6 +80,7 @@ const COERCED_MEMBERS: [&str; 5] = [
 const ITERATED_MEMBERS: [&str; 5] = ["values", "next", "return", "@@iterator", "@@asyncIterator"];
 const AWAITED_MEMBERS: [&str; 1] = ["then"];
 const GROWING_METHODS: [&str; 2] = ["push", "unshift"];
+const RESIZING_METHODS: [&str; 5] = ["push", "unshift", "splice", "add", "set"];
 const DELETING_METHODS: [&str; 2] = ["delete", "clear"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -138,6 +141,7 @@ pub(crate) struct SizeMemory {
     holders: HashMap<(FileId, SymbolId, Shape, bool), HolderSummary>,
     growths: HashMap<(FileId, SymbolId, Shape), GrowthSummary>,
     evaluating: HashMap<FileId, bool>,
+    resized: HashMap<(FileId, SymbolId), bool>,
     pub(crate) inherited: HashMap<Kind, bool>,
 }
 
@@ -781,6 +785,159 @@ impl<'p, 'a> Analysis<'p, 'a> {
             true => GrowthSummary::Unstable,
             false => GrowthSummary::Sites { calls, open },
         }
+    }
+
+    /// Whether the local holder `symbol` keeps its initializer's size up to the first entry into
+    /// `region`: every reference outside `region` is a stable use in the holder's own function, and
+    /// `region` lies in that function outside every loop, so it is entered once per call.
+    pub(crate) fn is_stable_before(
+        &mut self,
+        file: FileId,
+        symbol: SymbolId,
+        region: NodeId,
+    ) -> bool {
+        let project = self.project;
+        let source = project.file(file);
+        let scoping = source.semantic.scoping();
+        let nodes = source.semantic.nodes();
+        let function = self.enclosing_function_of(file, scoping.symbol_declaration(symbol));
+
+        if function.is_none()
+            || self.evaluates_directly(file)
+            || self.enclosing_function_of(file, region) != function
+            || nodes
+                .ancestor_ids(region)
+                .take_while(|ancestor| Some(*ancestor) != function)
+                .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)))
+        {
+            return false;
+        }
+
+        let holder = Holder {
+            function,
+            shape: Shape::Array,
+            exact: false,
+        };
+        let mut summary = HolderSummary {
+            stable: true,
+            returned: false,
+            local: true,
+            function,
+        };
+
+        for (node, written) in value_references_of(scoping, symbol) {
+            if !self.charge_work(Event::SizeStep, 1) {
+                return false;
+            }
+
+            if nodes.ancestor_ids(node).any(|ancestor| ancestor == region) {
+                continue;
+            }
+
+            if written
+                || self.enclosing_function_of(file, node) != function
+                || !self.is_stable_use(file, node, holder, &mut summary, 0)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Whether the function that binds `symbol` resizes its value in place where the resizing can
+    /// repeat, inside a loop or a nested function: an intrinsic growing or splicing call on it, or
+    /// a write to one of its members, which can extend an array's `length`. Such a value's size is
+    /// no longer the input dimension it entered with; a site that runs once adds a constant.
+    pub(crate) fn is_resized_in_place(&mut self, file: FileId, symbol: SymbolId) -> bool {
+        if let Some(found) = self.values.sizes.resized.get(&(file, symbol)) {
+            return *found;
+        }
+
+        let found = self.is_resized_outside(file, symbol, None);
+
+        self.values.sizes.resized.insert((file, symbol), found);
+
+        found
+    }
+
+    /// `is_resized_in_place`, ignoring the resizing sites inside `region` when `region` is entered
+    /// once per call, outside every loop of the binding function.
+    pub(crate) fn is_resized_outside(
+        &mut self,
+        file: FileId,
+        symbol: SymbolId,
+        region: Option<NodeId>,
+    ) -> bool {
+        let project = self.project;
+        let semantic = &project.file(file).semantic;
+        let nodes = semantic.nodes();
+        let references = value_references_of(semantic.scoping(), symbol);
+        let function =
+            self.enclosing_function_of(file, semantic.scoping().symbol_declaration(symbol));
+        let mut found = !self.charge_work(Event::SizeStep, references.len() as u64);
+        // A region inside a loop is entered again after its own resizing sites ran.
+        let region = region.filter(|region| {
+            self.enclosing_function_of(file, *region) == function
+                && !nodes
+                    .ancestor_ids(*region)
+                    .take_while(|ancestor| Some(*ancestor) != function)
+                    .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)))
+        });
+
+        for (node, _) in references {
+            if found {
+                break;
+            }
+
+            // A site that runs at most once per call adds a constant to the size.
+            let repeated = self.enclosing_function_of(file, node) != function
+                || nodes
+                    .ancestor_ids(node)
+                    .take_while(|ancestor| Some(*ancestor) != function)
+                    .any(|ancestor| crate::syntax::is_iteration_kind(&nodes.kind(ancestor)));
+
+            if !repeated
+                || region.is_some_and(|region| {
+                    nodes.ancestor_ids(node).any(|ancestor| ancestor == region)
+                })
+            {
+                continue;
+            }
+
+            let current = outermost_of(nodes, node);
+            let span = nodes.kind(current).span();
+            let member = nodes.parent_id(current);
+            let (object, name) = match nodes.kind(member) {
+                AstKind::StaticMemberExpression(access) => {
+                    (access.object.span(), Some(access.property.name.as_str()))
+                }
+                AstKind::ComputedMemberExpression(access) => (access.object.span(), None),
+                _ => continue,
+            };
+
+            if object != span {
+                continue;
+            }
+
+            let accessed = outermost_of(nodes, member);
+            let accessed_span = nodes.kind(accessed).span();
+
+            found = match nodes.parent_kind(accessed) {
+                AstKind::CallExpression(call) if call.callee.span() == accessed_span => {
+                    name.is_some_and(|name| RESIZING_METHODS.contains(&name))
+                        && self.is_intrinsic_member(file, call)
+                }
+                AstKind::AssignmentExpression(assignment) => {
+                    assignment.left.span() == accessed_span
+                }
+                AstKind::UpdateExpression(_) => true,
+                AstKind::UnaryExpression(unary) => unary.operator == UnaryOperator::Delete,
+                _ => false,
+            };
+        }
+
+        found
     }
 
     pub(crate) fn has_deleted_entries(

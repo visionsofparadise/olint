@@ -55,7 +55,7 @@ fn a_counter_raised_toward_an_invariant_bound_is_a_budget() {
             assert_eq!(budget.direction, Direction::Up);
             assert_eq!(budget.text, "i < n");
             assert_eq!(budget.scope, None);
-            assert_eq!(budget.potential, Potential::Enveloped);
+            assert_eq!(budget.potential, Potential::Untracked);
         },
     );
 }
@@ -660,12 +660,27 @@ fn an_unguarded_loop_keeps_the_factor_no_budget_cancels() {
     assert_guarded_costs(&rows);
 }
 
-type VisitRow<'r> = (&'r str, &'r str, &'r str, &'r str, bool);
+type VisitRow<'r> = (&'r str, &'r str, &'r str, &'r str, bool, &'r str);
+
+/// The loop-bound and size-relation reasons among `reasons`, space separated.
+fn visit_reasons_of(
+    reasons: &std::collections::BTreeSet<olint::unknowns::UnknownReason>,
+) -> String {
+    [
+        (olint::unknowns::UnknownReason::Bound, "bound"),
+        (olint::unknowns::UnknownReason::SizeRelation, "size"),
+    ]
+    .iter()
+    .filter(|(reason, _)| reasons.contains(reason))
+    .map(|(_, text)| *text)
+    .collect::<Vec<_>>()
+    .join(" ")
+}
 
 fn assert_live_visits(rows: &[VisitRow<'_>]) {
-    let found: Vec<(&str, String, bool, bool)> = rows
+    let found: Vec<(&str, String, bool, String)> = rows
         .iter()
-        .map(|(label, parameters, body, _, _)| {
+        .map(|(label, parameters, body, _, _, _)| {
             let (cost, complete, reasons) = support::legacy_result_of(
                 &format!(
                     "export function f({parameters}) {{ let total = 0; {body} return total; }}"
@@ -677,20 +692,20 @@ fn assert_live_visits(rows: &[VisitRow<'_>]) {
                 *label,
                 support::projected_class_of(&cost).text(),
                 complete,
-                reasons.contains(&olint::unknowns::UnknownReason::Bound),
+                visit_reasons_of(&reasons),
             )
         })
         .collect();
-    let expected: Vec<(&str, String, bool, bool)> = rows
+    let expected: Vec<(&str, String, bool, String)> = rows
         .iter()
-        .map(|(label, _, _, expected, complete)| {
+        .map(|(label, _, _, expected, complete, reasons)| {
             let cost = olint::cost::Cost::parse(expected).expect("a legacy cost parses");
 
             (
                 *label,
                 support::projected_class_of(&cost).text(),
                 *complete,
-                !*complete,
+                (*reasons).to_string(),
             )
         })
         .collect();
@@ -705,36 +720,41 @@ fn a_size_guarded_addition_budgets_live_collection_visits() {
             "a singleton set grown to xs squared",
             "xs: number[]",
             "const values = new Set([0]); for (const value of values) { if (values.size < xs.length * xs.length) values.add(value + 1); }",
-            "O(N^3)",
-            true,
+            "O(N^2)",
+            false,
+            "size",
         ),
         (
             "a singleton map grown to xs squared",
             "xs: number[]",
             "const table = new Map([[0, 0]]); for (const [key] of table) { if (table.size < xs.length * xs.length) table.set(key + 1, 0); }",
-            "O(N^3)",
-            true,
+            "O(N^2)",
+            false,
+            "size",
         ),
         (
             "a budgeted traversal multiplying its body",
             "xs: number[]",
             "const values = new Set([0]); for (const value of values) { if (values.size < xs.length * xs.length) values.add(value + 1); for (const x of xs) total += x + value; }",
-            "O(N^3)",
-            true,
+            "O((N * max(1, N^2)))",
+            false,
+            "size",
         ),
         (
             "a guard admitting two additions",
             "xs: number[]",
             "const values = new Set([0]); for (const value of values) { if (xs.length > values.size) { values.add(value + 1); values.add(value + 2); } }",
-            "O(N^2)",
-            true,
+            "O(N)",
+            false,
+            "size",
         ),
         (
             "a constant guard keeping the initial size",
             "s: Set<number>",
             "for (const value of s) { if (s.size < 10) s.add(value + 1); total += value; }",
-            "O(N * max(1, N))",
-            true,
+            "O(N)",
+            false,
+            "size",
         ),
     ];
 
@@ -750,13 +770,15 @@ fn deletions_leave_live_collection_visits_unknown_beside_stable_traversals() {
             "for (const value of s) { s.delete(value); total += value; }",
             "O(1)",
             false,
+            "size",
         ),
         (
             "a stable traversal adding to another fresh collection",
             "xs: number[]",
             "const values = new Set(xs); const seen = new Set<number>(); values.forEach(() => {}); for (const value of values) { seen.add(value); total += value; }",
             "O(N^2)",
-            true,
+            false,
+            "size",
         ),
         (
             "a stable traversal",
@@ -764,6 +786,7 @@ fn deletions_leave_live_collection_visits_unknown_beside_stable_traversals() {
             "for (const value of s) { total += value; }",
             "O(N)",
             true,
+            "",
         ),
     ];
 
@@ -779,6 +802,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "for (const value of s) { if (s.size < xs.length) { s.delete(value); s.add(value); } }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "an unguarded addition",
@@ -786,6 +810,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { values.add(value + 1); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "an addition in the alternate branch",
@@ -793,6 +818,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { if (values.size < xs.length) {} else values.add(value + 1); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a loop between the guard and the addition",
@@ -800,6 +826,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { if (values.size < xs.length) for (let i = 0; i < 2; i++) values.add(value + i); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "an endpoint the traversal raises",
@@ -807,6 +834,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); let limit = xs.length; for (const value of values) { if (values.size < limit) { values.add(value + 1); limit++; } }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "an endpoint reading the grown collection",
@@ -814,6 +842,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { if (values.size < values.size + xs.length) values.add(value + 1); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a deletion through a possible alias beside a guarded addition",
@@ -821,6 +850,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "for (const value of s) { if (s.size < xs.length) s.add(value + 1); t.delete(value); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "an endpoint the traversal lengthens",
@@ -828,6 +858,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); const limits = [0]; for (const value of values) { if (values.size < limits.length) { values.add(value + 1); limits.length = values.size + 1; } }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a guarded addition beside an unguarded one",
@@ -835,6 +866,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "for (const value of s) { if (s.size < xs.length) s.add(value + 1); s.add(value + 2); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a guarded addition beside one whose endpoint the traversal lengthens",
@@ -842,6 +874,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const limits = [0]; for (const value of s) { if (s.size < xs.length) s.add(value + 1); if (s.size < limits.length) { s.add(value + 2); limits.length = s.size + 1; } }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a guarded addition beside one whose endpoint reads this",
@@ -849,6 +882,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "for (const value of s) { if (s.size < xs.length) s.add(value + 1); if (s.size < this.items.length) s.add(value + 2); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a guarded addition beside one whose endpoint has no size",
@@ -856,6 +890,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "for (const value of s) { if (s.size < xs.length) s.add(value + 1); if (s.size < o.count) s.add(value + 2); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "an endpoint evaluated through a call",
@@ -863,6 +898,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { if (values.size < xs.concat(xs).length) values.add(value + 1); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a guard bounding the size from below",
@@ -870,6 +906,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { if (values.size > 0) values.add(value + 1); }",
             "O(1)",
             false,
+            "bound size",
         ),
         (
             "a guard on another collection",
@@ -877,6 +914,7 @@ fn growth_no_size_guard_bounds_leaves_live_visits_unknown() {
             "const values = new Set([0]); for (const value of values) { if (t.size < xs.length) values.add(value + 1); }",
             "O(1)",
             false,
+            "bound size",
         ),
     ];
 

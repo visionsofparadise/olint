@@ -619,7 +619,7 @@ fn unavailable_parameter_limits_are_comparison_unknowns() {
         ("olint.config.json", r#"{"entrypoints":["index.ts"]}"#),
         (
             "index.ts",
-            "/** @perf max O(xs.length) */ export function work(...xs:number[]) {}",
+            "/** @perf max O(xs.length) */ export function work([...xs]:number[]) {}",
         ),
     ]);
 

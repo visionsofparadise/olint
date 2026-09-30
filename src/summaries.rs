@@ -99,19 +99,25 @@ pub(crate) enum Deferral {
 pub struct Produced {
     pub count: Option<Cost>,
     pub yielded: bool,
+    /// Whether an unknown count is unknown only because a delegated collection's size is untracked
+    /// (`input-size-envelope`).
+    pub untracked: bool,
 }
 
 impl Produced {
-    pub fn joined(self, count: Option<Cost>) -> Produced {
-        let count = match (self.yielded, self.count, count) {
-            (false, _, count) => count,
-            (true, Some(held), Some(count)) => Cost::maximum(vec![held, count]).ok(),
-            _ => None,
+    pub fn joined(self, count: Option<Cost>, untracked: bool) -> Produced {
+        let (count, untracked) = match (self.yielded, self.count, count) {
+            (false, _, count) => (count, untracked),
+            (true, Some(held), Some(count)) => (Cost::maximum(vec![held, count]).ok(), false),
+            (true, None, Some(_)) => (None, self.untracked),
+            (true, Some(_), None) => (None, untracked),
+            (true, None, None) => (None, self.untracked && untracked),
         };
 
         Produced {
             count,
             yielded: true,
+            untracked,
         }
     }
 }
@@ -415,12 +421,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)),
                     )
                 })
-                .chain(
-                    parameters
-                        .rest
-                        .iter()
-                        .map(|rest| (&rest.rest.argument, false)),
-                );
+                .chain(parameters.rest.iter().map(|rest| {
+                    (
+                        &rest.rest.argument,
+                        matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)),
+                    )
+                }));
 
             for (pattern, plain) in patterns {
                 for identifier in pattern.get_binding_identifiers() {
@@ -458,6 +464,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         substitutions
+    }
+
+    /// Enters `function` as a root summary does: each of its parameters, and those of the
+    /// functions enclosing it, carries its own input dimension.
+    pub fn enter_function_inputs(&mut self, file: FileId, function: FunctionNode<'a>) {
+        self.current_substitutions = self.function_inputs(file, function, Substitutions::new());
     }
 
     pub fn bind_function_cost(
@@ -820,6 +832,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some(produced) = produced {
             result.latent = Some(id);
             result.size = produced.count;
+
+            if produced.untracked && result.size.is_none() {
+                self.untracked_yields.insert(id);
+            }
         }
 
         self.summaries_arena.push(SummaryRecord {
@@ -1494,6 +1510,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     .count
                     .and_then(|count| self.bind_cost_in(&count, &inputs).ok()),
                 yielded: produced.yielded,
+                untracked: produced.untracked,
             });
 
         self.scheduler.tasks[id.0].produced = produced;
@@ -2565,6 +2582,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 self.produced = Some(Produced {
                     count: Some(Cost::ONE),
                     yielded: false,
+                    untracked: false,
                 });
             }
 
@@ -2887,6 +2905,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
         (facts, true)
     }
 
+    /// The tracked size (`input-size-envelope`) a collection argument carries into its callee: its
+    /// produced size, else, for a local holder passed directly to a call, the size it holds when
+    /// that call is reached.
+    fn supplied_size_of(&mut self, file: FileId, expression: &'a Expression<'a>) -> Option<Cost> {
+        if let Some(size) = self.produced_size_of(file, expression) {
+            return size.length_resolved.then_some(size.length);
+        }
+
+        let nodes = self.project.file(file).semantic.nodes();
+        let current = crate::values::outermost_of(nodes, expression.node_id());
+        let call = nodes.parent_id(current);
+
+        if !matches!(
+            nodes.kind(call),
+            AstKind::CallExpression(_) | AstKind::NewExpression(_)
+        ) {
+            return None;
+        }
+
+        let size = self.initial_size_of(file, expression, call);
+
+        size.length_resolved.then_some(size.length)
+    }
+
     pub(crate) fn expression_facts_of(
         &mut self,
         file: FileId,
@@ -2999,6 +3041,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }) {
             if value.size.is_none() {
                 value.size = self.size_of_value(file, expression);
+            }
+
+            if value.size.is_none() && !self.is_primitive_operand(file, expression) {
+                value.size = self.supplied_size_of(file, expression);
             }
         }
 
@@ -4004,7 +4050,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         implicit,
                     );
 
-                    value.size = constant.then_some(Cost::ONE);
+                    value.size = match (constant, implicit) {
+                        (true, _) => Some(Cost::ONE),
+                        (false, true) => None,
+                        // A rest parameter collects at most every argument: a constant many
+                        // written ones and each spread's elements.
+                        (false, false) => self.spread_count_of(
+                            call_file,
+                            arguments.iter().filter_map(|argument| match argument {
+                                Argument::SpreadElement(spread) => Some(&spread.argument),
+                                _ => None,
+                            }),
+                        ),
+                    };
 
                     substitutions.insert(
                         Binding::Symbol { file, symbol },
@@ -4970,9 +5028,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.deferred_reading = Some(self.reading_of_latent(&latent));
         self.deferred_storage = Some(latent.storage.clone());
+        let untracked = latent
+            .record
+            .is_some_and(|record| self.untracked_yields.contains(&record));
+
         self.produced = Some(Produced {
             count: latent.yields,
             yielded: true,
+            untracked,
         });
 
         let mut reading = reading;
@@ -5009,6 +5072,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let Some(held) = held else {
             return latent;
         };
+        let untracked = [&held, &latent].into_iter().all(|joined| {
+            joined.yields.is_some()
+                || joined
+                    .record
+                    .is_some_and(|record| self.untracked_yields.contains(&record))
+        });
         let deferred = self.reading_of_latent(&held).merge(
             self.reading_of_latent(&latent),
             &mut self.unknowns,
@@ -5045,6 +5114,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         result.record = self.store_latent_record(result.clone(), deferred, origin);
+
+        if let (None, true, Some(record)) = (&result.yields, untracked, result.record) {
+            self.untracked_yields.insert(record);
+        }
 
         result
     }
@@ -5584,15 +5657,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
     }
 
     pub(crate) fn latent_size_of(&self, latent: &Latent) -> crate::values::Size {
-        let size = crate::values::Size {
-            exceeds: true,
-            element_resolved: false,
-            ..crate::values::Size::sized(latent.yields.clone().unwrap_or(Cost::N))
-        };
-
-        match latent.yields {
-            Some(_) => size,
-            None => size.unresolved_length(),
+        match &latent.yields {
+            Some(yields) => crate::values::Size {
+                exceeds: true,
+                ..crate::values::Size::sized(yields.clone())
+            },
+            None => crate::values::Size::unresolved(),
         }
     }
 

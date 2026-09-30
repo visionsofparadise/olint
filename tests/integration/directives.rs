@@ -251,7 +251,7 @@ fn an_open_target_marks_a_known_cold_contribution_without_cancelling_it() {
     }
 }
 
-const OPEN_BASE: &str = "declare const OpenBase: new () => object;\ndeclare function opaque(): number;\nfunction quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nfunction coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nclass Empty {}\nclass ClosedChild extends Empty {}\nclass OpenChild extends OpenBase {}\nclass ExplicitChild extends OpenBase {\n\tconstructor() {\n\t\tsuper();\n\t}\n}\nclass MixedOpenChild extends OpenBase {\n\tv = opaque();\n}\nclass MixedClosedChild extends Empty {\n\tv = opaque();\n}\ndeclare const data: number[];\nfunction knownLinear() {\n\tlet total = 0;\n\tfor (const item of data) total += item;\n\treturn total;\n}\nclass KnownClosedChild extends Empty {\n\tv = knownLinear();\n}\n";
+const OPEN_BASE: &str = "declare const OpenBase: new () => object;\ndeclare function opaque(): number;\nfunction quadratic(xs: number[]) {\n\tlet total = 0;\n\tfor (const x of xs) for (const y of xs) total += x + y;\n\treturn total;\n}\n// @perf cold\nfunction coldQuadratic(xs: number[]) {\n\treturn quadratic(xs);\n}\nclass Empty {}\nclass ClosedChild extends Empty {}\nclass OpenChild extends OpenBase {}\nclass ExplicitChild extends OpenBase {\n\tconstructor() {\n\t\tsuper();\n\t}\n}\nclass MixedOpenChild extends OpenBase {\n\tv = opaque();\n}\nclass MixedClosedChild extends Empty {\n\tv = opaque();\n}\nfunction knownLinear(data: number[]) {\n\tlet total = 0;\n\tfor (const item of data) total += item;\n\treturn total;\n}\nclass KnownClosedChild extends Empty {\n\tv: number;\n\tconstructor(xs: number[]) {\n\t\tsuper();\n\t\tthis.v = knownLinear(xs);\n\t}\n}\n";
 
 #[test]
 fn an_unresolved_construction_never_manufactures_a_competing_statement() {
@@ -284,7 +284,7 @@ fn an_unresolved_construction_never_manufactures_a_competing_statement() {
             true,
         ),
         (
-            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new KnownClosedChild()];\n}",
+            "(xs: number[]) {\n\treturn [coldQuadratic(xs), new KnownClosedChild(xs)];\n}",
             "O(N)",
             false,
         ),

@@ -385,7 +385,7 @@ fn captured_callback_facts_separate_impure_work_and_reuse_pure_work() {
 
 #[test]
 fn recurrence_members_keep_local_work_and_cached_member_results() {
-    let source = "declare const xs:number[];\nfunction a(){\nfor(const item of xs)void item;\nb();\n}\nfunction b(){\nfor(const outer of xs)for(const inner of xs)void inner;\na();\n}";
+    let source = "export function holder(xs:number[]){\nfunction a(){\nfor(const item of xs)void item;\nb();\n}\nfunction b(){\nfor(const outer of xs)for(const inner of xs)void inner;\na();\n}\n}";
     let mut first_order = None;
 
     for order in [["a", "b"], ["b", "a"]] {
@@ -612,7 +612,7 @@ fn cyclic_discovery_and_retry_limits_always_reach_terminal_states() {
 
 #[test]
 fn three_member_recurrence_preserves_distant_known_work() {
-    let source="declare const xs:number[]; function a(){b()} function b(){c()} function c(){for(const first of xs)for(const second of xs)for(const third of xs)void third;a()}";
+    let source="function a(xs:number[]){b(xs)} function b(xs:number[]){c(xs)} function c(xs:number[]){for(const first of xs)for(const second of xs)for(const third of xs)void third;a(xs)}";
 
     for order in [["a", "b", "c"], ["c", "b", "a"]] {
         run_with_source(source, |analysis, file| {
@@ -632,22 +632,22 @@ fn three_member_recurrence_preserves_distant_known_work() {
 #[test]
 fn recurrence_contexts_preserve_selection_and_independent_loop_assumptions() {
     for (body, expected, partial, bound) in [
-        ("b();", "O(N^3)", true, false),
+        ("b(xs);", "O(N^3)", true, false),
         (
-            "/** @perf hot @perf O(1) */\nvoid 0; b();",
+            "/** @perf hot @perf O(1) */\nvoid 0; b(xs);",
             "O(1)",
             true,
             false,
         ),
-        ("for(const item of xs)b();", "O(1)", true, true),
+        ("for(const item of xs)b(xs);", "O(1)", true, true),
         (
-            "/** @perf bounded */\nfor(const item of xs)b();",
+            "/** @perf bounded */\nfor(const item of xs)b(xs);",
             "O(N^3)",
             true,
             false,
         ),
     ] {
-        let source=format!("declare const xs:number[]; function a(){{\n{body}\n}} function b(){{c()}} function c(){{for(const x of xs)for(const y of xs)for(const z of xs)void z;a()}} export function root(){{a()}}");
+        let source=format!("function a(xs:number[]){{\n{body}\n}} function b(xs:number[]){{c(xs)}} function c(xs:number[]){{for(const x of xs)for(const y of xs)for(const z of xs)void z;a(xs)}} export function root(xs:number[]){{a(xs)}}");
 
         run_with_source(&source, |analysis, file| {
             let (part, function) = root_summary(analysis, file);
@@ -909,7 +909,7 @@ fn root_summary<'a>(
 
 #[test]
 fn context_exhaustion_keeps_an_independent_local_loop_prefix() {
-    run_with_source("declare const xs:number[]; function a(){for(const x of xs)for(const y of xs)for(const z of xs)void z;b()} function b(){a()}",|analysis,file| {
+    run_with_source("function a(xs:number[]){for(const x of xs)for(const y of xs)for(const z of xs)void z;b(xs)} function b(xs:number[]){a(xs)}",|analysis,file| {
         limit_work(analysis,Event::RecurrenceContext,0);
 
         let part=summary_of(analysis,file,"a");
@@ -2075,7 +2075,7 @@ fn branch_scan_source(sites: usize, escaping: bool) -> String {
 
     format!(
         "function scan(xs: number[]) {{ let found = 0; for (const x of xs) found += x; return found; }}
-export function selected(rows: number[][]) {{ let total = 0; for (const row of rows) {{ for (const value of row) {{ {branches}}} }} return total; }}"
+export function selected(rows: number[], row: number[]) {{ let total = 0; for (const visit of rows) {{ for (const value of row) {{ {branches}}} }} return total; }}"
     )
 }
 
@@ -2114,7 +2114,7 @@ fn escaping_branches_scan_their_own_subtree_once() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             branch_scan_edges_of(sites as usize, true),
-            298 * sites + 203,
+            241 * sites + 269,
             "{sites}"
         );
     }
@@ -2125,7 +2125,7 @@ fn branches_that_cannot_leave_their_loop_stop_scanning_early() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             branch_scan_edges_of(sites as usize, false),
-            337 * sites + 203,
+            280 * sites + 269,
             "{sites}"
         );
     }
@@ -2146,7 +2146,7 @@ fn finalizer_scan_source(sites: usize, overriding: bool) -> String {
 
     format!(
         "function scan(xs: number[]) {{ let found = 0; for (const a of xs) for (const b of xs) found += a + b; return found; }}
-export function selected(rows: number[][]) {{ let total = 0; for (const row of rows) {{ {statements}}} return total; }}"
+export function selected(rows: number[], row: number[]) {{ let total = 0; for (const visit of rows) {{ {statements}}} return total; }}"
     )
 }
 
@@ -2163,7 +2163,7 @@ fn finalizers_scan_their_own_subtree_once_per_resolved_completion() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             finalizer_scan_edges_of(sites as usize, false),
-            291 * sites + 133,
+            186 * sites + 246,
             "{sites}"
         );
     }
@@ -2174,7 +2174,7 @@ fn overriding_finalizers_stop_their_branch_from_leaving_the_loop() {
     for sites in [8_u64, 16, 24, 32] {
         assert_eq!(
             finalizer_scan_edges_of(sites as usize, true),
-            253 * sites + 133,
+            148 * sites + 246,
             "{sites}"
         );
     }
@@ -2209,7 +2209,7 @@ fn nested_finalizers_resolve_each_completion_once_per_exit_site() {
     for depth in [4_u64, 8, 12, 16] {
         assert_eq!(
             nested_finalizer_edges_of(depth as usize, 1),
-            65 * depth + 265,
+            65 * depth + 269,
             "{depth}"
         );
     }
@@ -2248,7 +2248,7 @@ fn escape_resolution_past_its_depth_cap_stays_linear_and_partial() {
     for depth in [36_u64, 40, 44, 48] {
         assert_eq!(
             capped_finalizer_edges_of(depth as usize),
-            60 * depth + 425,
+            60 * depth + 429,
             "{depth}"
         );
     }
@@ -2259,7 +2259,7 @@ fn transfer_bearing_nested_finalizers_stay_linear_in_their_depth() {
     for depth in [4_u64, 8, 12, 16] {
         assert_eq!(
             nested_finalizer_edges_of(depth as usize, 4),
-            197 * depth + 265,
+            197 * depth + 269,
             "{depth}"
         );
     }

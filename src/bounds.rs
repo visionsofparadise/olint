@@ -99,7 +99,7 @@ impl Bound {
             Bound::Proven {
                 proof: Some(proof), ..
             } => proof,
-            Bound::Proven { factor, .. } if *factor == Cost::LOG => "log",
+            Bound::Proven { factor, .. } if factor.is_logarithm() => "log",
             Bound::Proven { .. } => "N",
         }
     }
@@ -107,7 +107,7 @@ impl Bound {
     fn strength(&self) -> u8 {
         match self {
             Bound::Proven { factor, .. } if factor.is_one() => 0,
-            Bound::Proven { factor, .. } if *factor == Cost::LOG => 1,
+            Bound::Proven { factor, .. } if factor.is_logarithm() => 1,
             Bound::Proven { .. } => 2,
             Bound::Unresolved { .. } => 3,
         }
@@ -275,7 +275,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         let Some(body) = loop_body_of(loop_kind) else {
-            return linear_bound_of();
+            return unresolved_bound_of();
         };
 
         if self.runs_at_most_once(file, loop_kind.node_id(), body) {
@@ -285,21 +285,39 @@ impl<'p, 'a> Analysis<'p, 'a> {
         match loop_kind {
             AstKind::ForOfStatement(statement) => {
                 let iteration = self.iteration_of(file, &statement.right, statement.r#await);
-                let Some(count) = self.iteration_count_of(file, &statement.right, &iteration)
-                else {
+                let count = self.iteration_count_of(file, &statement.right, &iteration);
+                let sized = self.is_sized_iteration(file, &statement.right, &iteration);
+
+                if count.is_none()
+                    && !sized
+                    && !self.is_untracked_iteration(file, &statement.right, &iteration)
+                {
                     return unresolved_bound_of();
-                };
+                }
 
                 if !iteration.native {
-                    return Bound::Proven {
-                        factor: count,
-                        proof: Some("iterator visits"),
+                    return match count {
+                        Some(count) => Bound::Proven {
+                            factor: count,
+                            proof: Some("iterator visits"),
+                        },
+                        None if self.is_untracked_iteration(file, &statement.right, &iteration) => {
+                            untracked_bound_of()
+                        }
+                        None => unresolved_bound_of(),
                     };
                 }
 
                 match self.live_iteration_of(file, statement) {
                     Some(Visits::Budgeted(budget)) => {
-                        return match Cost::maximum(vec![Cost::N, budget.cost]) {
+                        let initial =
+                            self.initial_size_of(file, &statement.right, statement.node_id());
+
+                        if !initial.length_resolved {
+                            return untracked_bound_of();
+                        }
+
+                        return match Cost::maximum(vec![initial.length, budget.cost]) {
                             Ok(factor) => Bound::Proven {
                                 factor,
                                 proof: Some("visit budget"),
@@ -316,9 +334,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 } else if self.is_share_sized(file, &statement.right) {
                     constant_bound_of("share of budget")
                 } else {
-                    Bound::Proven {
-                        factor: count,
-                        proof: None,
+                    match count {
+                        Some(count) => Bound::Proven {
+                            factor: count,
+                            proof: None,
+                        },
+                        None => untracked_bound_of(),
                     }
                 }
             }
@@ -328,7 +349,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 {
                     constant_bound_of("closed object type")
                 } else {
-                    linear_bound_of()
+                    match self.tracked_length_of(file, &statement.right) {
+                        Some(factor) => Bound::Proven {
+                            factor,
+                            proof: None,
+                        },
+                        None => untracked_bound_of(),
+                    }
                 }
             }
             AstKind::ForStatement(statement) => self.bound_of_for(file, statement, body),
@@ -338,7 +365,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             AstKind::DoWhileStatement(statement) => {
                 self.bound_of_while(file, loop_kind.node_id(), &statement.test, body)
             }
-            _ => linear_bound_of(),
+            _ => unresolved_bound_of(),
         }
     }
 
@@ -909,8 +936,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 let initial = self.initial_expression_of(file, comparison.counter, repetition)?;
 
-                (self.numeric_value_of(file, initial)? >= 1.0)
-                    .then(|| logarithmic_bound_of(repetition.geometric_proof))
+                if self.numeric_value_of(file, initial)? < 1.0 {
+                    return None;
+                }
+
+                Some(
+                    match self.bounded_quantity_of(file, comparison.endpoint, repetition, 0) {
+                        Some((endpoint, _)) => {
+                            logarithmic_bound_of(repetition.geometric_proof, endpoint)
+                        }
+                        None => untracked_bound_of(),
+                    },
+                )
             }
             Direction::Down => {
                 if !ratios
@@ -926,7 +963,26 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     Strictness::Inclusive => endpoint > 0.0,
                 };
 
-                clears_the_endpoint.then(|| logarithmic_bound_of(repetition.geometric_proof))
+                if !clears_the_endpoint {
+                    return None;
+                }
+
+                let initial = self
+                    .initial_expression_of(file, comparison.counter, repetition)
+                    .unwrap_or(comparison.expression);
+
+                Some(
+                    match self
+                        .bounded_quantity_of(file, initial, repetition, 0)
+                        .or_else(|| {
+                            self.bounded_quantity_of(file, comparison.expression, repetition, 0)
+                        }) {
+                        Some((initial, _)) => {
+                            logarithmic_bound_of(repetition.geometric_proof, initial)
+                        }
+                        None => untracked_bound_of(),
+                    },
+                )
             }
         }
     }
@@ -1703,6 +1759,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             return None;
         }
 
+        let mut range = Cost::ONE;
+
         for binding in [lower, upper] {
             let (_, initial) = repetition
                 .initial
@@ -1716,11 +1774,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 return None;
             }
 
-            let (_, magnitude) = self.bounded_quantity_of(file, initial, repetition, 0)?;
+            let (quantity, magnitude) = self.bounded_quantity_of(file, initial, repetition, 0)?;
 
             if magnitude > 1_073_741_823.0 {
                 return None;
             }
+
+            range = quantity_maximum(range, quantity)?;
         }
 
         let mut sites = Vec::new();
@@ -1753,7 +1813,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.covers_every_path(file, repetition, &sites)
-            .then(|| logarithmic_bound_of("halving"))
+            .then(|| logarithmic_bound_of("halving", range))
     }
 
     fn is_bisecting_write(
@@ -2268,17 +2328,26 @@ fn constant_bound_of(proof: &'static str) -> Bound {
     }
 }
 
-fn logarithmic_bound_of(proof: &'static str) -> Bound {
-    Bound::Proven {
-        factor: Cost::LOG,
-        proof: Some(proof),
+/// A counter scaled geometrically across `quantity`: logarithmic in that quantity, which is
+/// constant for a constant range.
+fn logarithmic_bound_of(proof: &'static str, quantity: Cost) -> Bound {
+    if quantity.is_one() {
+        return constant_bound_of(proof);
+    }
+
+    match Cost::logarithm(quantity) {
+        Ok(factor) => Bound::Proven {
+            factor,
+            proof: Some(proof),
+        },
+        Err(_) => unresolved_bound_of(),
     }
 }
 
-fn linear_bound_of() -> Bound {
-    Bound::Proven {
-        factor: Cost::N,
-        proof: None,
+/// A loop over a collection whose size no rule tracks (`input-size-envelope`).
+fn untracked_bound_of() -> Bound {
+    Bound::Unresolved {
+        reason: UnknownReason::SizeRelation,
     }
 }
 

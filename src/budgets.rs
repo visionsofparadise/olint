@@ -53,16 +53,17 @@ pub enum Strictness {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Potential {
     Constant(f64),
-    Enveloped,
+    /// An endpoint whose size no rule tracks (`input-size-envelope`), so no charge covers it.
+    Untracked,
     Symbolic(Cost),
 }
 
 impl Potential {
-    pub fn cost(&self) -> Cost {
+    pub fn cost(&self) -> Option<Cost> {
         match self {
-            Potential::Constant(_) => Cost::ONE,
-            Potential::Enveloped => Cost::N,
-            Potential::Symbolic(cost) => cost.clone(),
+            Potential::Constant(_) => Some(Cost::ONE),
+            Potential::Untracked => None,
+            Potential::Symbolic(cost) => Some(cost.clone()),
         }
     }
 }
@@ -427,12 +428,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                                 Expression::StaticMemberExpression(member)
                                     if member.property.name == "length" =>
                                 {
-                                    Some(self.collection_size_of(file, &member.object).length)
+                                    self.tracked_length_of(file, &member.object)
                                 }
                                 _ => None,
                             });
 
-                        size.map_or(Potential::Enveloped, Potential::Symbolic)
+                        size.map_or(Potential::Untracked, Potential::Symbolic)
                     }
                 };
 
