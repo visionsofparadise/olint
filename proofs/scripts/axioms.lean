@@ -6,12 +6,15 @@ import Lean
 Run from `proofs/` with `lake env lean scripts/axioms.lean` after `lake build` (and after the
 corpus generator has written `Olint/Corpus/`, when it has).
 
-It imports every module under `Olint/` and prints the axioms of every theorem those modules
-declare, as `#print axioms` does, skipping only the equation lemmas Lean generates for
-definitions (`f.eq_1`, `f.eq_def`, `f.eq_unfold`). It fails, so `lean` exits non-zero, when:
+It imports every module under `Olint/` and prints the axioms, as `#print axioms` does, of every
+declaration those modules make that can carry a proof: every theorem, equation lemmas included,
+every definition or opaque constant whose type is a proposition, every instance, and every
+axiom. An equation lemma is audited like any theorem. The count of equation lemmas it prints
+reads each one's status from its statement, an equation whose left side is the definition its
+name extends, never from the name alone. It fails, so `lean` exits non-zero, when:
 
-* any audited theorem depends on an axiom outside `propext`, `Classical.choice` and
-  `Quot.sound`;
+* any audited declaration depends on an axiom outside `propext`, `Classical.choice` and
+  `Quot.sound`, an audited axiom depending on itself;
 * any source file (`Olint.lean`, `Olint/**`, `lakefile.toml`) mentions the kernel-check bypass
   option `debug.skipKernelTC`;
 * a generated certificate theorem (`Olint.Corpus.*`, and the `c_…` theorems of
@@ -86,13 +89,30 @@ partial def axiomsOf (env : Environment) (c : Name) : StateM (NameMap (Array Nam
   modify (·.insert c r)
   return r
 
-/-- An equation lemma Lean generates for a definition: `eq_<n>`, `eq_def` or `eq_unfold`. -/
-def isEquationLemma (n : Name) : Bool :=
-  match n with
-  | .str _ s =>
-    s == "eq_def" || s == "eq_unfold" ||
-      (s.startsWith "eq_" && !(s.drop 3).isEmpty && (s.drop 3).all Char.isDigit)
-  | _ => false
+/-- A theorem is an equation lemma of a definition: its name extends a definition `f` with an
+equation suffix (`eq_<n>`, `eq_def`, `eq_unfold`), and its statement, under its binders, is an
+equation whose left side is `f` or an application of `f`. A lemma Lean realizes in another
+module than `f`'s carries that module's private prefix, so `f` is also read from the lemma's
+user name. Only counted, never skipped. -/
+def isEquationLemma (env : Environment) (n : Name) (type : Expr) : Bool :=
+  let defines (f : Name) : Bool :=
+    (match env.find? f with
+      | some (.defnInfo _) => true
+      | _ => false) &&
+      (match type.getForallBody.eq? with
+        | some (_, lhs, _) => lhs.getAppFn.isConstOf f
+        | none => false)
+  let equation (m : Name) : Bool :=
+    match m with
+    | .str f s => Meta.isEqnLikeSuffix s && defines f
+    | _ => false
+  equation n || (privateToUserName? n).any equation
+
+/-- Whether `type` is a proposition, by `Meta.isProp` in the imported environment. -/
+def isPropType (env : Environment) (type : Expr) : IO Bool := do
+  let ctx : Core.Context := { fileName := "<axioms>", fileMap := default }
+  let (prop, _) ← (Meta.MetaM.run' (Meta.isProp type)).toIO ctx { env }
+  return prop
 
 /-- `e` is `∀ W : World, NoReplacement W xs → [W.ops = SpecOps.draft →] Bound W p n c` with closed
 `xs`, `p`, `n` and `c`. -/
@@ -124,8 +144,9 @@ def isCertificate (m n : Name) : Bool :=
 def sources : IO (Array FilePath) := do
   return (#["Olint.lean", "lakefile.toml"] : Array FilePath) ++ (← leanFiles "Olint")
 
-/-- The audit. -/
-def audit : IO Unit := do
+/-- The audit. It loads the imported environment extensions, which the instance attribute lives
+in, so it runs the imported modules' initializers first, which `unsafe` permits. -/
+unsafe def audit : IO Unit := do
   let needle := "skipKernel" ++ "TC"
   let mut bypass : Array FilePath := #[]
   for f in ← sources do
@@ -134,13 +155,31 @@ def audit : IO Unit := do
   initSearchPath (← findSysroot)
   let mods := (← leanFiles "Olint").map moduleOf
   let imports := mods.map fun m => ({ module := m } : Import)
-  let env ← importModules imports {} (loadExts := false)
+  enableInitializersExecution
+  let env ← importModules imports {} (loadExts := true)
   let mut targets : Array (Name × Name) := #[]
+  let mut equations := 0
+  let mut props := 0
+  let mut instances := 0
+  let mut axioms := 0
   for m in mods do
     let some idx := env.getModuleIdx? m | throw <| IO.userError s!"module {m} not imported"
     for n in env.header.moduleData[idx.toNat]!.constNames do
-      if let some (.thmInfo _) := env.find? n then
-        if !isEquationLemma n then targets := targets.push (n, m)
+      match env.find? n with
+      | some (.thmInfo info) =>
+        targets := targets.push (n, m)
+        if isEquationLemma env n info.type then equations := equations + 1
+      | some (.axiomInfo _) =>
+        targets := targets.push (n, m)
+        axioms := axioms + 1
+      | some (.defnInfo info) | some (.opaqueInfo ⟨info, _, _, _⟩) =>
+        if Meta.isInstanceCore env n then
+          targets := targets.push (n, m)
+          instances := instances + 1
+        else if ← isPropType env info.type then
+          targets := targets.push (n, m)
+          props := props + 1
+      | _ => pure ()
   let sorted := targets.qsort (fun a b => Name.lt a.1 b.1)
   let mut memo : NameMap (Array Name) := {}
   let mut bad : Array (Name × Array Name) := #[]
@@ -160,11 +199,11 @@ def audit : IO Unit := do
       certificates := certificates + 1
       if let some (.thmInfo info) := env.find? n then
         if !isCertificateStatement info.type then shapes := shapes.push n
-  IO.println s!"audited {sorted.size} theorems in {mods.size} modules"
+  IO.println s!"audited {sorted.size} declarations in {mods.size} modules: {sorted.size - props - instances - axioms} theorems ({equations} equation lemmas of definitions), {props} Prop-typed definitions, {instances} instances, {axioms} axioms"
   IO.println s!"checked the statement of {certificates} certificate theorems"
   for (n, drafts) in pending do
     IO.println s!"pending signature (rests on the G52 drafts {drafts.toList}): '{n}'"
-  IO.println s!"{pending.size} theorems pending signature"
+  IO.println s!"{pending.size} declarations pending signature"
   let mut errors : Array String := #[]
   if !bypass.isEmpty then
     errors := errors.push s!"kernel-check bypass `debug.{needle}` in {bypass.toList}"

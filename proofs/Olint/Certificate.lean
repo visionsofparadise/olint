@@ -668,6 +668,241 @@ def checkParts (p : Program) (n : Node) : List (List Channel × Cert) → Bool
 
 end
 
+/-! ## The node lies in its entry -/
+
+mutual
+
+/-- Structural equality of expressions, decidable by kernel reduction. -/
+def Expr.beq : Expr → Expr → Bool
+  | .lit a, .lit b => a == b
+  | .ident x, .ident y => x == y
+  | .this, .this => true
+  | .unary o a, .unary q b => o == q && Expr.beq a b
+  | .binary o a b, .binary q c d => o == q && Expr.beq a c && Expr.beq b d
+  | .cond a b c, .cond d e f => Expr.beq a d && Expr.beq b e && Expr.beq c f
+  | .assign x a, .assign y b => x == y && Expr.beq a b
+  | .assignIndex a b c, .assignIndex d e f => Expr.beq a d && Expr.beq b e && Expr.beq c f
+  | .assignOp o x a, .assignOp q y b => o == q && x == y && Expr.beq a b
+  | .assignOpIndex o a b c, .assignOpIndex q d e f =>
+    o == q && Expr.beq a d && Expr.beq b e && Expr.beq c f
+  | .update i p x, .update j q y => i == j && p == q && x == y
+  | .updateIndex i p a b, .updateIndex j q c d =>
+    i == j && p == q && Expr.beq a c && Expr.beq b d
+  | .member a x, .member b y => Expr.beq a b && x == y
+  | .index a b, .index c d => Expr.beq a c && Expr.beq b d
+  | .call f as, .call g bs => Expr.beq f g && Expr.beqList as bs
+  | .new f as, .new g bs => Expr.beq f g && Expr.beqList as bs
+  | .func f, .func g => Func.beq f g
+  | .klass c, .klass d => Class.beq c d
+  | .array as, .array bs => Expr.beqList as bs
+  | .object ps, .object qs => Expr.beqProps ps qs
+  | .regex a b, .regex c d => a == c && b == d
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of expression lists. -/
+def Expr.beqList : List Expr → List Expr → Bool
+  | [], [] => true
+  | a :: as, b :: bs => Expr.beq a b && Expr.beqList as bs
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of object literal properties. -/
+def Expr.beqProps : List (Name × Expr) → List (Name × Expr) → Bool
+  | [], [] => true
+  | (x, a) :: ps, (y, b) :: qs => x == y && Expr.beq a b && Expr.beqProps ps qs
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of optional expressions. -/
+def Expr.beqOpt : Option Expr → Option Expr → Bool
+  | none, none => true
+  | some a, some b => Expr.beq a b
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of statements. -/
+def Stmt.beq : Stmt → Stmt → Bool
+  | .expr a, .expr b => Expr.beq a b
+  | .decl k x τ a, .decl l y σ b => k == l && x == y && Ty.beq τ σ && Expr.beqOpt a b
+  | .block as, .block bs => Stmt.beqList as bs
+  | .ite c t e, .ite d u f => Expr.beq c d && Stmt.beq t u && Stmt.beqOpt e f
+  | .forLoop i t u b, .forLoop j s v c =>
+    Stmt.beqOpt i j && Expr.beqOpt t s && Expr.beqOpt u v && Stmt.beq b c
+  | .forOf x e b, .forOf y f c => x == y && Expr.beq e f && Stmt.beq b c
+  | .forIn x e b, .forIn y f c => x == y && Expr.beq e f && Stmt.beq b c
+  | .while c b, .while d e => Expr.beq c d && Stmt.beq b e
+  | .doWhile b c, .doWhile e d => Stmt.beq b e && Expr.beq c d
+  | .ret a, .ret b => Expr.beqOpt a b
+  | .brk, .brk | .cont, .cont => true
+  | .funDecl x f, .funDecl y g => x == y && Func.beq f g
+  | .classDecl x c, .classDecl y d => x == y && Class.beq c d
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of statement lists. -/
+def Stmt.beqList : List Stmt → List Stmt → Bool
+  | [], [] => true
+  | a :: as, b :: bs => Stmt.beq a b && Stmt.beqList as bs
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of optional statements. -/
+def Stmt.beqOpt : Option Stmt → Option Stmt → Bool
+  | none, none => true
+  | some a, some b => Stmt.beq a b
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of functions. -/
+def Func.beq : Func → Func → Bool
+  | .mk ps b a, .mk qs c d => Ty.beqFields ps qs && Stmt.beqList b c && a == d
+termination_by structural a _ => a
+
+/-- Structural equality of optional functions. -/
+def Func.beqOpt : Option Func → Option Func → Bool
+  | none, none => true
+  | some f, some g => Func.beq f g
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of class methods. -/
+def Func.beqMethods : List (Name × Func) → List (Name × Func) → Bool
+  | [], [] => true
+  | (x, f) :: ms, (y, g) :: ns => x == y && Func.beq f g && Func.beqMethods ms ns
+  | _, _ => false
+termination_by structural a _ => a
+
+/-- Structural equality of classes. -/
+def Class.beq : Class → Class → Bool
+  | .mk c ms, .mk d ns => Func.beqOpt c d && Func.beqMethods ms ns
+termination_by structural a _ => a
+
+end
+
+/-- The site is the expression `e`. -/
+def Site.isExpr (t : Site) (e : Expr) : Bool :=
+  match t with
+  | .expr x => Expr.beq x e
+  | _ => false
+
+/-- The site is the statement `s`. -/
+def Site.isStmt (t : Site) (s : Stmt) : Bool :=
+  match t with
+  | .stmt x => Stmt.beq x s
+  | _ => false
+
+mutual
+
+/-- The site is the expression or one of its subexpressions or substatements. -/
+def Expr.has (t : Site) : Expr → Bool
+  | .lit l => Site.isExpr t (.lit l)
+  | .ident x => Site.isExpr t (.ident x)
+  | .this => Site.isExpr t .this
+  | .unary o a => Site.isExpr t (.unary o a) || Expr.has t a
+  | .binary o a b => Site.isExpr t (.binary o a b) || Expr.has t a || Expr.has t b
+  | .cond a b c => Site.isExpr t (.cond a b c) || Expr.has t a || Expr.has t b || Expr.has t c
+  | .assign x a => Site.isExpr t (.assign x a) || Expr.has t a
+  | .assignIndex a b c =>
+    Site.isExpr t (.assignIndex a b c) || Expr.has t a || Expr.has t b || Expr.has t c
+  | .assignOp o x a => Site.isExpr t (.assignOp o x a) || Expr.has t a
+  | .assignOpIndex o a b c =>
+    Site.isExpr t (.assignOpIndex o a b c) || Expr.has t a || Expr.has t b || Expr.has t c
+  | .update i p x => Site.isExpr t (.update i p x)
+  | .updateIndex i p a b => Site.isExpr t (.updateIndex i p a b) || Expr.has t a || Expr.has t b
+  | .member a x => Site.isExpr t (.member a x) || Expr.has t a
+  | .index a b => Site.isExpr t (.index a b) || Expr.has t a || Expr.has t b
+  | .call f as => Site.isExpr t (.call f as) || Expr.has t f || Expr.hasList t as
+  | .new f as => Site.isExpr t (.new f as) || Expr.has t f || Expr.hasList t as
+  | .func f => Site.isExpr t (.func f) || Func.has t f
+  | .klass c => Site.isExpr t (.klass c) || Class.has t c
+  | .array as => Site.isExpr t (.array as) || Expr.hasList t as
+  | .object ps => Site.isExpr t (.object ps) || Expr.hasProps t ps
+  | .regex a b => Site.isExpr t (.regex a b)
+termination_by structural a => a
+
+/-- The site occurs in one of the expressions. -/
+def Expr.hasList (t : Site) : List Expr → Bool
+  | [] => false
+  | a :: as => Expr.has t a || Expr.hasList t as
+termination_by structural a => a
+
+/-- The site occurs in one of the properties' values. -/
+def Expr.hasProps (t : Site) : List (Name × Expr) → Bool
+  | [] => false
+  | (_, a) :: ps => Expr.has t a || Expr.hasProps t ps
+termination_by structural a => a
+
+/-- The site occurs in the optional expression. -/
+def Expr.hasOpt (t : Site) : Option Expr → Bool
+  | none => false
+  | some a => Expr.has t a
+termination_by structural a => a
+
+/-- The site is the statement or one of its subexpressions or substatements. -/
+def Stmt.has (t : Site) : Stmt → Bool
+  | .expr a => Site.isStmt t (.expr a) || Expr.has t a
+  | .decl k x τ a => Site.isStmt t (.decl k x τ a) || Expr.hasOpt t a
+  | .block as => Site.isStmt t (.block as) || Stmt.hasList t as
+  | .ite c u e => Site.isStmt t (.ite c u e) || Expr.has t c || Stmt.has t u || Stmt.hasOpt t e
+  | .forLoop i c u b =>
+    Site.isStmt t (.forLoop i c u b) || Stmt.hasOpt t i || Expr.hasOpt t c || Expr.hasOpt t u ||
+      Stmt.has t b
+  | .forOf x e b => Site.isStmt t (.forOf x e b) || Expr.has t e || Stmt.has t b
+  | .forIn x e b => Site.isStmt t (.forIn x e b) || Expr.has t e || Stmt.has t b
+  | .while c b => Site.isStmt t (.while c b) || Expr.has t c || Stmt.has t b
+  | .doWhile b c => Site.isStmt t (.doWhile b c) || Stmt.has t b || Expr.has t c
+  | .ret a => Site.isStmt t (.ret a) || Expr.hasOpt t a
+  | .brk => Site.isStmt t .brk
+  | .cont => Site.isStmt t .cont
+  | .funDecl x f => Site.isStmt t (.funDecl x f) || Func.has t f
+  | .classDecl x c => Site.isStmt t (.classDecl x c) || Class.has t c
+termination_by structural a => a
+
+/-- The site occurs in one of the statements. -/
+def Stmt.hasList (t : Site) : List Stmt → Bool
+  | [] => false
+  | s :: ss => Stmt.has t s || Stmt.hasList t ss
+termination_by structural a => a
+
+/-- The site occurs in the optional statement. -/
+def Stmt.hasOpt (t : Site) : Option Stmt → Bool
+  | none => false
+  | some s => Stmt.has t s
+termination_by structural a => a
+
+/-- The site occurs in the function's body. -/
+def Func.has (t : Site) : Func → Bool
+  | .mk _ body _ => Stmt.hasList t body
+termination_by structural a => a
+
+/-- The site occurs in the optional function's body. -/
+def Func.hasOpt (t : Site) : Option Func → Bool
+  | none => false
+  | some f => Func.has t f
+termination_by structural a => a
+
+/-- The site occurs in one of the methods' bodies. -/
+def Func.hasMethods (t : Site) : List (Name × Func) → Bool
+  | [] => false
+  | (_, f) :: ms => Func.has t f || Func.hasMethods t ms
+termination_by structural a => a
+
+/-- The site occurs in the class's constructor or methods. -/
+def Class.has (t : Site) : Class → Bool
+  | .mk c ms => Func.hasOpt t c || Func.hasMethods t ms
+termination_by structural a => a
+
+end
+
+/-- The node lies in its entry: the entry itself, or an expression or statement that occurs in
+the entry function's body. A site elsewhere is evaluated by no run of the entry, so a bound
+at it would hold vacuously. -/
+def Node.inEntry (n : Node) : Bool :=
+  match n.site, n.entry.fn with
+  | .entry, _ => true
+  | t, .mk _ body _ => Stmt.hasList t body
+
 /-- The intrinsics a derivation relies on: those whose modification by the analysed program
 would change the work its rules reason about (§2.2). The family A rules reason about the
 program's syntax and the costs alone and consult no intrinsic; families B to J extend this as
@@ -675,10 +910,11 @@ their rules land. -/
 def Cert.reliance (_ : Cert) : List Intrinsic := []
 
 /-- Check a certificate at node `n` of program `p` under the no-replacement facts `xs`: the
-node's entry is well formed, the derivation checks, its bound is `measured` over the entry's
-dimensions, and every intrinsic it relies on is among `xs`. Decidable by kernel reduction. -/
+node's entry is well formed, the node lies in the entry (`Node.inEntry`), the derivation checks,
+its bound is `measured` over the entry's dimensions, and every intrinsic it relies on is among
+`xs`. Decidable by kernel reduction. -/
 def check (p : Program) (n : Node) (xs : List Intrinsic) (c : Cert) : Bool :=
-  n.entry.wf p && checkCert p n c && measured (n.entry.dims.map Prod.fst) (costOf c) &&
+  n.entry.wf p && Node.inEntry n && checkCert p n c && measured (n.entry.dims.map Prod.fst) (costOf c) &&
     c.reliance.all xs.contains
 
 theorem partCosts_eq : ∀ parts : List (List Channel × Cert),
@@ -889,6 +1125,6 @@ of the intrinsics `xs` (§2.2), whatever the world's spec-internal step costs. -
 theorem check_sound (W : World) (xs : List Intrinsic) (p : Program) (n : Node) (c : Cert)
     (_hW : NoReplacement W xs) (h : check p n xs c = true) : Bound W p n (costOf c) := by
   simp only [check, Bool.and_eq_true] at h
-  exact checkCert_sound W p n c h.1.1.1 h.1.1.2
+  exact checkCert_sound W p n c h.1.1.1.1 h.1.1.2
 
 end Olint

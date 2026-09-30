@@ -21,16 +21,16 @@ open Olint Olint.Model
 /-- A program with no definitions. -/
 def program : Program := ⟨[]⟩
 
-/-- `function f(xs: number[]) { 1; let x = 2; if (true) { 3; } else { let y = 4; } }`, costed
-over the length of `xs`. -/
+/-- `function f(xs: number[]) { { 1; let x = 2; } if (true) { 3; } else { let y = 4; } }`,
+costed over the length of `xs`. -/
 def entry : Entry :=
   ⟨.mk [("xs", .array .number)]
-    [.expr (.lit (.num 1)), .decl .«let» "x" .any (some (.lit (.num 2))),
+    [.block [.expr (.lit (.num 1)), .decl .«let» "x" .any (some (.lit (.num 2)))],
       .ite (.lit (.bool true)) (.block [.expr (.lit (.num 3))])
         (some (.block [.decl .«let» "y" .any (some (.lit (.num 4)))]))] false,
     [], [(0, .arg 0)]⟩
 
-/-- `{ 1; let x = 2; }`: a sequence of two constant statements. -/
+/-- `{ 1; let x = 2; }`, the entry's first statement: a sequence of two constant statements. -/
 def block : Node :=
   ⟨entry, .stmt (.block [.expr (.lit (.num 1)), .decl .«let» "x" .any (some (.lit (.num 2)))])⟩
 
@@ -67,13 +67,13 @@ theorem c_branch (W : World) (hW : NoReplacement W []) :
   check_sound W [] _ _ (.branchJoin [.seqUnit, .seqMax [.seqUnit], .seqMax [.seqUnit]]) hW
     (by decide)
 
-/-- The entry itself, composed from its body: `seq-max` over two unit statements and the
+/-- The entry itself, composed from its body: `seq-max` over the block's `seq-max` and the
 `branch-join` above, then `max-normalise` to `O(1)`. -/
 theorem c_entry (W : World) (hW : NoReplacement W []) :
     Bound W program ⟨entry, .entry⟩ (.constant 1) :=
   check_sound W [] _ _
     (.maxNormalise
-      (.seqMax [.seqUnit, .seqUnit,
+      (.seqMax [.maxNormalise (.seqMax [.seqUnit, .seqUnit]) (.constant 1),
         .maxNormalise (.branchJoin [.seqUnit, .seqMax [.seqUnit], .seqMax [.seqUnit]])
           (.constant 1)])
       (.constant 1))
@@ -85,6 +85,13 @@ theorem c_channel (W : World) (hW : NoReplacement W []) :
   check_sound W [] _ _
     (.channelTotal [([.normal, .brk], .seqUnit), ([.ret, .cont], .seqMax [.seqUnit, .seqUnit])])
     hW (by decide)
+
+/-- A statement that does not occur in the entry is rejected (`Node.inEntry`): no run of the
+entry evaluates it, so a bound at it would hold vacuously. -/
+example : check program ⟨entry, .stmt (.expr (.lit (.num 9)))⟩ [] .seqUnit = false := by decide
+
+/-- … while the same statement inside the entry's first block is accepted. -/
+example : check program ⟨entry, .stmt (.expr (.lit (.num 1)))⟩ [] .seqUnit = true := by decide
 
 /-- The entry's bound bounds its `Work`. -/
 example (W : World) (hW : NoReplacement W []) : ∀ᶠ i in Admits entry, Halts W program i entry :=
