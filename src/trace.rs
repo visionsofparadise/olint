@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Write};
 
 use crate::cost::Cost;
+use crate::derivation::DerivationArena;
 use crate::project::Site;
 use crate::unknowns::SourceSpan;
 
@@ -74,6 +75,9 @@ pub enum TraceError {
 }
 
 pub struct TraceArena {
+    /// The derivations behind the traced bounds. They live beside the traces because every function that composes a
+    /// `Part` already threads this arena.
+    pub derivations: DerivationArena,
     records: Vec<TraceKey>,
     interned: HashMap<TraceKey, TraceId>,
     limits: ArenaLimits,
@@ -166,6 +170,7 @@ impl TraceArena {
     }
     pub fn new(limits: ArenaLimits) -> Self {
         Self {
+            derivations: DerivationArena::default(),
             records: Vec::new(),
             interned: HashMap::new(),
             limits,

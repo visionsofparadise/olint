@@ -6,6 +6,7 @@ pub mod constants;
 pub mod cost;
 pub mod declarations;
 pub mod declared_types;
+pub mod derivation;
 pub mod directives;
 pub mod effects;
 pub mod flow;

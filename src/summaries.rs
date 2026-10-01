@@ -975,7 +975,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
     pub fn scheduler_stats(&self) -> SchedulerStats {
         SchedulerStats {
             generation: self.scheduler.generation,
-            work: self.scheduler.work.snapshot(),
+            work: self.scheduler.work.snapshot().including(
+                Event::Derivation,
+                self.traces.derivations.charged(),
+                self.traces.derivations.exhausted(),
+            ),
             tasks: self.scheduler.tasks.len(),
             ready: self
                 .scheduler
@@ -1002,6 +1006,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.scheduler = Scheduler::new(limits, self.scheduler.generation);
 
+        self.traces.derivations.begin_generation();
         self.counter_writes.clear();
 
         Ok(())
@@ -4943,6 +4948,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         self.scheduler.callback_values = callback_values;
         self.scheduler.body_sizes = body_sizes;
 
+        self.traces.derivations.begin_generation();
         self.bound_seen.clear();
         self.counter_writes.clear();
         self.node_records.clear();

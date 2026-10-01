@@ -29,9 +29,10 @@ pub enum Event {
     SizeStep,
     RecurrenceStep,
     LatentStep,
+    Derivation,
 }
 
-pub const EVENTS: [Event; 26] = [
+pub const EVENTS: [Event; 27] = [
     Event::TaskKey,
     Event::Publication,
     Event::BodyPass,
@@ -58,6 +59,7 @@ pub const EVENTS: [Event; 26] = [
     Event::SizeStep,
     Event::RecurrenceStep,
     Event::LatentStep,
+    Event::Derivation,
 ];
 const COUNT: usize = EVENTS.len();
 
@@ -145,6 +147,15 @@ impl Snapshot {
     }
     pub fn exhausted(&self, event: Event) -> bool {
         self.exhaustion[event as usize]
+    }
+    /// This snapshot with `consumed` ordinary work of `event` charged outside the budget, such as the derivation
+    /// arena's, flagged exhausted when that charger refused work.
+    pub fn including(mut self, event: Event, consumed: u64, exhausted: bool) -> Self {
+        let count = &mut self.ordinary.0[event as usize];
+        *count = count.saturating_add(consumed);
+        self.exhaustion[event as usize] |= exhausted;
+
+        self
     }
 }
 
