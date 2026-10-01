@@ -144,9 +144,13 @@ def isCertificate (m n : Name) : Bool :=
 def sources : IO (Array FilePath) := do
   return (#["Olint.lean", "lakefile.toml"] : Array FilePath) ++ (← leanFiles "Olint")
 
-/-- The audit. It loads the imported environment extensions, which the instance attribute lives
-in, so it runs the imported modules' initializers first, which `unsafe` permits. -/
-unsafe def audit : IO Unit := do
+/-- The audit. It imports the modules without loading their environment extensions, so it runs
+none of the imported modules' initializers: run inside this file's elaboration, initializers
+would register imported extensions in the process after this file's own environment was built,
+and the frontend would then read them from that environment, which lacks them (the panic
+"invalid environment extension has been accessed"). The instance attribute's entries are read from each module's
+imported data instead of the attribute's loaded state. -/
+def audit : IO Unit := do
   let needle := "skipKernel" ++ "TC"
   let mut bypass : Array FilePath := #[]
   for f in ← sources do
@@ -155,8 +159,15 @@ unsafe def audit : IO Unit := do
   initSearchPath (← findSysroot)
   let mods := (← leanFiles "Olint").map moduleOf
   let imports := mods.map fun m => ({ module := m } : Import)
-  enableInitializersExecution
-  let env ← importModules imports {} (loadExts := true)
+  let env ← importModules imports {}
+  let instanceNames : NameSet := Id.run do
+    let mut names : NameSet := {}
+    for i in [:env.header.moduleData.size] do
+      for entry in Meta.instanceExtension.ext.getModuleEntries env i do
+        match entry with
+        | .global e | .scoped _ e =>
+          if let some n := e.globalName? then names := names.insert n
+    return names
   let mut targets : Array (Name × Name) := #[]
   let mut equations := 0
   let mut props := 0
@@ -173,7 +184,7 @@ unsafe def audit : IO Unit := do
         targets := targets.push (n, m)
         axioms := axioms + 1
       | some (.defnInfo info) | some (.opaqueInfo ⟨info, _, _, _⟩) =>
-        if Meta.isInstanceCore env n then
+        if instanceNames.contains n then
           targets := targets.push (n, m)
           instances := instances + 1
         else if ← isPropType env info.type then

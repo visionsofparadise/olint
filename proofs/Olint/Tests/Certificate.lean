@@ -86,6 +86,14 @@ theorem c_channel (W : World) (hW : NoReplacement W []) :
     (.channelTotal [([.normal, .brk], .seqUnit), ([.ret, .cont], .seqMax [.seqUnit, .seqUnit])])
     hW (by decide)
 
+/-- `preference-rank` keeping a part whose cost dominates the dropped one. -/
+theorem c_rank (W : World) (hW : NoReplacement W []) : Bound W program block (.constant 1) :=
+  check_sound W [] _ _ (.preferenceRank (.seqMax [.seqUnit, .seqUnit]) (.constant 1)) hW (by decide)
+
+/-- … while dropping a costlier part, `O(n₀)` for `O(1)` (ledger gap G1), is rejected. -/
+example : check program block [] (.preferenceRank (.maxDominance .seqUnit (.dimension 0 .size))
+    (.constant 1)) = false := by decide
+
 /-- A statement that does not occur in the entry is rejected (`Node.inEntry`): no run of the
 entry evaluates it, so a bound at it would hold vacuously. -/
 example : check program ⟨entry, .stmt (.expr (.lit (.num 9)))⟩ [] .seqUnit = false := by decide

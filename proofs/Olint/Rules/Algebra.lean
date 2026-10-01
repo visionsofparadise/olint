@@ -31,13 +31,17 @@ use the `Sub` edges from the parent to each child.
 | `channel-total` | cost.rs:2101 | parts checked, channels covered | `channelTotal_sound` |
 | `max-dominance` | cost.rs:1826-1850, cost.rs:1009-1038 | `within` per dropped term | `maxDominance_sound` |
 | `max-normalise` | cost.rs:288-380 (kind 2) | `maxCovers` over the flattened terms | `maxNormalise_sound` |
+| `preference-rank` | cost.rs:1985-2068 | `within` per dropped term, as `max-dominance` | `maxDominance_sound` |
 | `product-normalise` | cost.rs:288-380 (kind 1) | `prodMatches` over the expanded factors | `productNormalise_sound` |
 | `expr-validity` | cost.rs:383-475 | `valid` | `valid_nonneg` |
 | `limit-compare` | cost.rs:863-898, main.rs:290-316 | `within` | `limitCompare_sound` |
 
-The family A rules `nest-product` (cost.rs:2150-2191), `partial-bind-known` (cost.rs:124-156)
-and `preference-rank` (cost.rs:1788-1798) are pending their soundness proofs; `Olint.check`
-rejects them until they land.
+`preference-rank` keeps the part of higher preference rank and drops the other's cost whatever
+its magnitude; its certificate is checked as `max-dominance`, so it is accepted exactly where
+the dropped cost is `O` of the kept one, and the drop of a costlier part (ledger gap G1) is
+rejected. The family A rules `nest-product` (cost.rs:2150-2191) and `partial-bind-known`
+(cost.rs:124-156) are pending their soundness proofs; `Olint.check` rejects them until they
+land.
 -/
 
 namespace Olint.Rules

@@ -8,12 +8,13 @@
 //! carry the recorded premises at their nodes, the facts and the bound; `check` rejects them until action 5.3 lands
 //! their proofs.
 //!
-//! olint joins parts pairwise (`Part::max`), recording each join as `max-dominance` or `max-normalise` at its first
-//! part's syntax, and a reading's channels by `channel-total`. A join of parts at different nodes is no rule
+//! olint joins parts pairwise (`Part::max`), recording each join as `max-dominance`, `max-normalise` or
+//! `preference-rank` at its first part's syntax, and a reading's channels by `channel-total`. A join of parts at different nodes is no rule
 //! application at a node of its own, so a certificate holds the parts it joins in its place ([`leaves`]): a
 //! `seq-max` or `branch-join` at a node is `seqMax` or `branchJoin` over one certificate per child site
 //! (`Olint.Rules.seqSites`, `Olint.Rules.branchSites`), each joined part at its child's site and `seqUnit` at every
-//! child without one, concluded at the node's cost by `maxNormalise` or `maxDominance`; a generic constructor's
+//! child without one, concluded at the node's cost by `preferenceRank` where a join dropped a part by preference,
+//! else by `maxNormalise` or `maxDominance`; a generic constructor's
 //! premises are the joined parts at their own nodes. Every term concludes its derivation's cost.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -99,11 +100,12 @@ pub const UNCONSTRUCTED: &[&str] = &[
 
 /// The family A rules whose constructors fix their premises' shape: one child certificate per child site
 /// (`seqMax`, `branchJoin`), parts checked at the node itself (`channelTotal`), or a single premise at the node
-/// (`maxDominance`, `maxNormalise`, `productNormalise`, `exprValidity`). `seq-max` without premises is `seqUnit`, or
+/// (`maxDominance`, `maxNormalise`, `preferenceRank`, `productNormalise`, `exprValidity`). `seq-max` without premises is `seqUnit`, or
 /// one `seqUnit` per child at the entry or a branch; `seq-max` and `branch-join` over premises are `seqMax` and
 /// `branchJoin` over the parts their joins combine, where those parts lie at the node's children; `channel-total`
-/// over parts at its own node is `channelTotal`; `max-dominance`, `max-normalise` and `channel-total` over parts at
-/// other nodes are joins a certificate holds the parts of. Every other application of these rules is
+/// over parts at its own node is `channelTotal`; `max-dominance`, `max-normalise`, `preference-rank` and
+/// `channel-total` over parts at other nodes are joins a certificate holds the parts of, and a composition over a
+/// `preference-rank` join concludes by `preferenceRank`. Every other application of these rules is
 /// [`Absence::Unshaped`].
 pub const SHAPED: &[&str] = &[
     "seq-max",
@@ -111,6 +113,7 @@ pub const SHAPED: &[&str] = &[
     "channel-total",
     "max-dominance",
     "max-normalise",
+    "preference-rank",
     "product-normalise",
     "expr-validity",
 ];
@@ -296,7 +299,11 @@ enum Shape {
     Unit,
     /// `seqMax` or `branchJoin`: one certificate per child site, the premises' join leaves at their children's sites
     /// and `seqUnit` at every other child, concluded at the derivation's cost.
-    Composed { branch: bool, sites: Vec<String> },
+    Composed {
+        branch: bool,
+        sites: Vec<String>,
+        ranked: bool,
+    },
     /// The term of the one premise, a bound at the node by the derivation's cost: `seq-max` or `branch-join` passing a
     /// part derived at the node itself through unchanged.
     Same,
@@ -417,6 +424,7 @@ impl Terms<'_, '_, '_> {
                         Shape::Composed {
                             branch: children.branch,
                             sites: children.sites,
+                            ranked: false,
                         },
                         Vec::new(),
                     ),
@@ -451,12 +459,13 @@ impl Terms<'_, '_, '_> {
                     start: body.start,
                     end: body.end,
                 });
-                let leaves = leaves(self.arena, &premises, body)?;
+                let (leaves, ranked) = leaves(self.arena, &premises, body)?;
 
                 Ok((
                     Shape::Composed {
                         branch: children.branch,
                         sites: children.sites,
+                        ranked,
                     },
                     leaves,
                 ))
@@ -468,7 +477,7 @@ impl Terms<'_, '_, '_> {
             rule if SHAPED.contains(&rule) => Err(Absence::Unshaped(rule)),
             _ => Ok((
                 Shape::Generic,
-                leaves(self.arena, &derivation.premises, None)?,
+                leaves(self.arena, &derivation.premises, None)?.0,
             )),
         }
     }
@@ -483,7 +492,11 @@ impl Terms<'_, '_, '_> {
         match shape {
             Shape::Unit => Ok(".seqUnit".to_string()),
             Shape::Same => Ok(self.held(held[0])?.to_string()),
-            Shape::Composed { branch, sites } => {
+            Shape::Composed {
+                branch,
+                sites,
+                ranked,
+            } => {
                 // Each leaf fills the first unfilled child of its site: children with equal sites are one structural
                 // site, which the leaf bounds whichever of them it concerns.
                 let mut filled: Vec<Option<DerivationId>> = vec![None; sites.len()];
@@ -525,7 +538,7 @@ impl Terms<'_, '_, '_> {
                 };
                 let term = format!("(.{constructor} [{}])", children.join(", "));
 
-                Ok(self.concluded(term, &costs, &derivation.cost))
+                Ok(self.concluded(term, &costs, &derivation.cost, ranked))
             }
             Shape::Total => {
                 let mut parts = Vec::with_capacity(held.len());
@@ -541,7 +554,7 @@ impl Terms<'_, '_, '_> {
 
                 let term = format!("(.channelTotal [{}])", parts.join(", "));
 
-                Ok(self.concluded(term, &costs, &derivation.cost))
+                Ok(self.concluded(term, &costs, &derivation.cost, false))
             }
             Shape::Generic => {
                 let mut premises = Vec::with_capacity(held.len());
@@ -585,10 +598,11 @@ impl Terms<'_, '_, '_> {
             .ok_or(Absence::Missing)
     }
 
-    /// `term`, which concludes the maximum of `costs`, concluding `target` instead: by `max-normalise` when every
-    /// flattened term of that maximum is `0` or at most a flattened term of `target` (`Olint.Rules.maxCovers`), else by
-    /// `max-dominance`, which drops the terms `O` of a kept one (`Olint.Rules.dominated`).
-    fn concluded(&self, term: String, costs: &[Cost], target: &Cost) -> String {
+    /// `term`, which concludes the maximum of `costs`, concluding `target` instead: by `preference-rank` when a join
+    /// ranked its parts by preference (`ranked`), else by `max-normalise` when every flattened term of that maximum is
+    /// `0` or at most a flattened term of `target` (`Olint.Rules.maxCovers`), else by `max-dominance`. `preference-rank`
+    /// and `max-dominance` drop the terms `O` of a kept one (`Olint.Rules.dominated`).
+    fn concluded(&self, term: String, costs: &[Cost], target: &Cost, ranked: bool) -> String {
         let maximum = format!(
             ".maximum [{}]",
             costs
@@ -616,22 +630,23 @@ impl Terms<'_, '_, '_> {
                     || matches!((constant, bound), (Some(value), Some(bound)) if value <= *bound)
             })
         });
-        let rule = match covers {
-            true => "maxNormalise",
-            false => "maxDominance",
+        let rule = match (ranked, covers) {
+            (true, _) => "preferenceRank",
+            (false, true) => "maxNormalise",
+            (false, false) => "maxDominance",
         };
 
         format!("(.{rule} {term} ({target_text}))")
     }
 }
 
-/// Whether a derivation is a join of parts at other nodes rather than a rule application at its own: `max-dominance`
-/// and `max-normalise` (`Part::max`), which record their first part's syntax, and `channel-total` over parts at
-/// different nodes.
+/// Whether a derivation is a join of parts at other nodes rather than a rule application at its own: `max-dominance`,
+/// `max-normalise` and `preference-rank` (`Part::max`), which record their first part's syntax, and `channel-total`
+/// over parts at different nodes.
 fn is_join(arena: &DerivationArena, derivation: &Derivation) -> bool {
     derivation.facts.is_empty()
         && match derivation.rule {
-            "max-dominance" | "max-normalise" => true,
+            "max-dominance" | "max-normalise" | "preference-rank" => true,
             "channel-total" => !derivation.premises.iter().all(|premise| {
                 arena
                     .get(*premise)
@@ -642,13 +657,15 @@ fn is_join(arena: &DerivationArena, derivation: &Derivation) -> bool {
 }
 
 /// The parts the joins under `premises` combine, each once, in order: a premise that is a join (`is_join`) stands for
-/// its own premises' parts, as does `seq-max` at `body`, the entry's function body.
+/// its own premises' parts, as does `seq-max` at `body`, the entry's function body. With them, whether a join ranked
+/// its parts by preference (`preference-rank`), dropping one part's cost.
 fn leaves(
     arena: &DerivationArena,
     premises: &[DerivationId],
     body: Option<SourceSpan>,
-) -> Result<Vec<DerivationId>, Absence> {
+) -> Result<(Vec<DerivationId>, bool), Absence> {
     let mut leaves = Vec::new();
+    let mut ranked = false;
     let mut seen = HashSet::new();
     let mut pending: Vec<DerivationId> = premises.iter().rev().copied().collect();
 
@@ -663,13 +680,15 @@ fn leaves(
                 && derivation.facts.is_empty()
                 && Some(derivation.syntax) == body);
 
+        ranked |= transparent && derivation.rule == "preference-rank";
+
         match transparent {
             true => pending.extend(derivation.premises.iter().rev()),
             false => leaves.push(id),
         }
     }
 
-    Ok(leaves)
+    Ok((leaves, ranked))
 }
 
 #[cfg(test)]

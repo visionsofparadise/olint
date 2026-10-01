@@ -47,11 +47,12 @@ theorem c_<sha256> (W : World) (hW : NoReplacement W <xs>) : Bound W <program> <
 ```
 
 Family A: `seq-max` (with its unit base), `branch-join`, `channel-total`, `max-dominance`,
-`max-normalise`, `product-normalise` and `expr-validity` are checked and proven; `seq-max`,
+`max-normalise`, `preference-rank`, `product-normalise` and `expr-validity` are checked and
+proven; `seq-max`,
 `branch-join` and `channel-total` compose their child certificates. `limit-compare` is a
 comparison, not a bound producer: `Olint.Rules.limitCompare_sound` and
-`Olint.Rules.Bound.of_within` state it. `nest-product`, `partial-bind-known` and
-`preference-rank` are pending their soundness proofs. Every rule without a proof, in family A
+`Olint.Rules.Bound.of_within` state it. `nest-product` and
+`partial-bind-known` are pending their soundness proofs. Every rule without a proof, in family A
 and in families B to J, is declared with generic fields (premises at their nodes, facts, bound)
 and `check` rejects it until its soundness proof lands (action 5.3), so its `check_sound` case
 is unreachable.
@@ -114,8 +115,10 @@ inductive Cert where
   | nestProduct (premises : List (Node × Cert)) (facts : List Fact) (bound : Cost)
   /-- `partial-bind-known` (family A, src/cost.rs:124-156); pending its soundness proof. -/
   | partialBindKnown (premises : List (Node × Cert)) (facts : List Fact) (bound : Cost)
-  /-- `preference-rank` (family A, src/cost.rs:1788-1798); pending its soundness proof. -/
-  | preferenceRank (premises : List (Node × Cert)) (facts : List Fact) (bound : Cost)
+  /-- `preference-rank` (cost.rs:1985-2068): a join keeping the part of higher preference rank and
+  dropping the other's cost, checked as `max-dominance`: the kept cost must dominate every
+  dropped term, so a drop of a costlier part (ledger gap G1) is rejected. -/
+  | preferenceRank (premise : Cert) (target : Cost)
   /-- `bound-additive` (family B, src/bounds.rs:934-1007); pending its soundness proof. -/
   | boundAdditive (premises : List (Node × Cert)) (facts : List Fact) (bound : Cost)
   /-- `bound-best-of` (family B, src/bounds.rs:390-417); pending its soundness proof. -/
@@ -357,7 +360,7 @@ def costOf : Cert → Cost
   | .exprValidity premise => costOf premise
   | .nestProduct _ _ b => b
   | .partialBindKnown _ _ b => b
-  | .preferenceRank _ _ b => b
+  | .preferenceRank _ target => target
   | .boundAdditive _ _ b => b
   | .boundBestOf _ _ b => b
   | .boundBisection _ _ b => b
@@ -653,6 +656,9 @@ def checkCert (p : Program) (n : Node) : Cert → Bool
   | .productNormalise premise target =>
     checkCert p n premise && prodMatches (costOf premise) target
   | .exprValidity premise => checkCert p n premise && valid (costOf premise)
+  | .preferenceRank premise target =>
+    checkCert p n premise && valid (costOf premise) && valid target &&
+      dominated (maxView (costOf premise)) (maxView target)
   | _ => false
 
 /-- Check one certificate per child site, in order, each at its child node. -/
@@ -973,9 +979,12 @@ theorem checkCert_sound (W : World) : ∀ (p : Program) (n : Node) (c : Cert),
   | p, n, .exprValidity premise, hwf, h => by
     simp only [checkCert, Bool.and_eq_true] at h
     exact checkCert_sound W p n premise hwf h.1
+  | p, n, .preferenceRank premise target, hwf, h => by
+    simp only [checkCert, Bool.and_eq_true] at h
+    obtain ⟨⟨⟨hc, hs⟩, ht⟩, hd⟩ := h
+    exact maxDominance_sound (checkCert_sound W p n premise hwf hc) hs ht hd
   | _, _, .nestProduct _ _ _, _, h
   | _, _, .partialBindKnown _ _ _, _, h
-  | _, _, .preferenceRank _ _ _, _, h
   | _, _, .boundAdditive _ _ _, _, h
   | _, _, .boundBestOf _ _ _, _, h
   | _, _, .boundBisection _ _ _, _, h
