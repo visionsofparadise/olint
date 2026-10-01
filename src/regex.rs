@@ -887,6 +887,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 let label = format!("{}{suffix}", short(self.text_of(file, expression.span())));
                 let site = self.project.site_of(file, span);
                 let origin = self.source_span(file, span);
+                let rule = match counted {
+                    true => "regex-every-match",
+                    false => "regex-cost",
+                };
+                let cost = self.witnessed(rule, origin, cost);
 
                 crate::cost::nest(
                     label,

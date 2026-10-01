@@ -282,6 +282,66 @@ impl DerivationArena {
         Some(DerivationId(index as u32))
     }
 
+    /// Records a rule application with no premises.
+    pub fn leaf(
+        &mut self,
+        rule: &'static str,
+        syntax: SourceSpan,
+        facts: Vec<Fact>,
+        cost: Cost,
+    ) -> Option<DerivationId> {
+        self.record(Derivation {
+            rule,
+            syntax,
+            premises: Vec::new(),
+            facts,
+            cost,
+        })
+    }
+
+    /// Records `rule` concluding `cost` from `premises`, concerning `syntax` or, without it, the syntax of the first
+    /// premise. `None` when there is neither.
+    pub fn derive(
+        &mut self,
+        rule: &'static str,
+        syntax: Option<SourceSpan>,
+        premises: &[DerivationId],
+        facts: Vec<Fact>,
+        cost: Cost,
+    ) -> Option<DerivationId> {
+        let syntax = syntax.or_else(|| {
+            premises
+                .first()
+                .and_then(|premise| self.get(*premise))
+                .map(|premise| premise.syntax)
+        })?;
+
+        self.record(Derivation {
+            rule,
+            syntax,
+            premises: premises.to_vec(),
+            facts,
+            cost,
+        })
+    }
+
+    /// Records `rule` concluding `cost` at `syntax` from a part's derivation and cost: a unit cost without derivation
+    /// needs no premise, and any other cost without derivation leaves the conclusion underived.
+    pub fn over(
+        &mut self,
+        rule: &'static str,
+        syntax: Option<SourceSpan>,
+        (premise, premise_cost): (Option<DerivationId>, &Cost),
+        facts: Vec<Fact>,
+        cost: Cost,
+    ) -> Option<DerivationId> {
+        match premise {
+            Some(premise) => self.derive(rule, syntax, &[premise], facts, cost),
+            None if premise_cost.is_one() => self.leaf(rule, syntax?, facts, cost),
+            None => None,
+        }
+    }
+
     pub fn get(&self, id: DerivationId) -> Option<&Derivation> {
         self.records.get_index(id.0 as usize)
     }

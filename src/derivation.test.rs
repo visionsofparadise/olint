@@ -1,6 +1,10 @@
 use super::*;
 use crate::analysis::work::{Event, Limits, WorkBudget};
-use crate::project::FileId;
+use crate::cost::{nest, Domain, ExecutionPhase, Part, Preference, Reading};
+use crate::flow::Completion;
+use crate::project::{FileId, Site};
+use crate::trace::TraceArena;
+use crate::unknowns::Unknowns;
 
 fn span(start: u32) -> SourceSpan {
     SourceSpan {
@@ -115,4 +119,153 @@ fn the_work_snapshot_includes_the_arena_charges_under_the_derivation_event() {
 
     assert_eq!(snapshot.consumed(Event::Derivation), 1);
     assert!(!snapshot.exhausted(Event::Derivation));
+}
+
+fn derived_part(traces: &mut TraceArena, cost: Cost, start: u32) -> Part {
+    let derivation = traces
+        .derivations
+        .leaf("seq-max", span(start), Vec::new(), cost.clone());
+
+    Part::unmarked(cost, None).derived(derivation)
+}
+
+fn premises_of(traces: &TraceArena, part: &Part) -> (&'static str, Vec<DerivationId>) {
+    let derivation = traces.derivations.get(part.derivation.unwrap()).unwrap();
+
+    (derivation.rule, derivation.premises.clone())
+}
+
+#[test]
+fn a_join_keeps_both_sides_whichever_it_selects() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let x = Cost::dimension(1, Domain::Size);
+    let y = Cost::dimension(2, Domain::Size);
+    let unit = derived_part(&mut traces, Cost::ONE, 0);
+    let linear = derived_part(&mut traces, x.clone(), 1);
+    let other = derived_part(&mut traces, y, 2);
+    let (unit_id, linear_id, other_id) = (
+        unit.derivation.unwrap(),
+        linear.derivation.unwrap(),
+        other.derivation.unwrap(),
+    );
+
+    let dominated = unit.clone().max(linear.clone(), &mut unknowns, &mut traces);
+
+    assert_eq!(dominated.cost, x);
+    assert_eq!(
+        premises_of(&traces, &dominated),
+        ("max-dominance", vec![unit_id, linear_id])
+    );
+
+    let both = linear
+        .clone()
+        .max(other.clone(), &mut unknowns, &mut traces);
+
+    assert_eq!(
+        premises_of(&traces, &both),
+        ("max-normalise", vec![linear_id, other_id])
+    );
+
+    let ranked = linear
+        .preferred(Preference::Cold)
+        .max(unit, &mut unknowns, &mut traces);
+
+    assert_eq!(ranked.cost, Cost::ONE);
+    assert_eq!(
+        premises_of(&traces, &ranked),
+        ("preference-rank", vec![linear_id, unit_id])
+    );
+}
+
+#[test]
+fn a_join_over_an_underived_cost_is_underived_and_a_unit_needs_no_derivation() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let x = Cost::dimension(1, Domain::Size);
+    let linear = derived_part(&mut traces, x.clone(), 1);
+    let underived = Part::unmarked(x.clone(), None);
+
+    let lost = linear.clone().max(underived, &mut unknowns, &mut traces);
+    let kept = linear
+        .clone()
+        .max(Part::unmarked(Cost::ONE, None), &mut unknowns, &mut traces);
+
+    assert_eq!(lost.derivation, None);
+    assert_eq!(kept.derivation, linear.derivation);
+}
+
+#[test]
+fn parts_compare_without_their_derivations() {
+    let mut traces = TraceArena::default();
+    let part = derived_part(&mut traces, Cost::ONE, 0).preferred(Preference::Absent);
+
+    assert_eq!(part, Part::none());
+}
+
+#[test]
+fn a_total_is_derived_from_every_channel_by_channel_total() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let main = derived_part(&mut traces, Cost::dimension(1, Domain::Size), 0);
+    let returned = derived_part(&mut traces, Cost::dimension(2, Domain::Size), 1);
+    let mut reading = Reading::of_part(main.clone());
+
+    reading.set(
+        ExecutionPhase::Immediate,
+        Completion::Return,
+        returned.clone(),
+    );
+
+    let total = reading.total(&mut unknowns, &mut traces);
+
+    assert_eq!(
+        premises_of(&traces, &total),
+        (
+            "channel-total",
+            vec![main.derivation.unwrap(), returned.derivation.unwrap()]
+        )
+    );
+}
+
+#[test]
+fn a_repetition_is_derived_from_its_witness_and_its_body() {
+    let mut traces = TraceArena::default();
+    let mut unknowns = Unknowns::default();
+    let x = Cost::dimension(1, Domain::Size);
+    let body = derived_part(&mut traces, x.clone(), 0);
+    let witness = traces
+        .derivations
+        .leaf("loop-nest", span(1), Vec::new(), x.clone());
+    let site = Site {
+        file: FileId(0),
+        line: 1,
+    };
+    let looped = nest(
+        "loop".to_string(),
+        site,
+        span(1),
+        (x.clone(), witness),
+        body.clone(),
+        &mut unknowns,
+        &mut traces,
+    );
+    let unwitnessed = nest(
+        "loop".to_string(),
+        site,
+        span(1),
+        (x.clone(), None),
+        body.clone(),
+        &mut unknowns,
+        &mut traces,
+    );
+
+    assert_eq!(
+        premises_of(&traces, &looped),
+        (
+            "nest-product",
+            vec![witness.unwrap(), body.derivation.unwrap()]
+        )
+    );
+    assert_eq!(unwitnessed.derivation, None);
 }

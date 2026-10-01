@@ -17,6 +17,7 @@ use crate::declarations::{
     TargetSet,
 };
 use crate::declared_types::Kind;
+use crate::derivation::DerivationId;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::flow::{
     class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, is_suspension,
@@ -384,9 +385,41 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let diagnostics = (self.warnings.len(), self.errors.len());
         let scoped = self.pending_scoped.is_empty() && self.share_bindings.is_empty();
         let reading = self.cost_of_node_inner(file, kind);
+        let reading = self.derived_at_node(file, kind, reading);
 
         if iteration && scoped {
             self.retain_stable_loop(file, kind.node_id(), serial, diagnostics, &reading);
+        }
+
+        reading
+    }
+
+    /// Derives each channel of a node's reading by the rule composing the node from its children (`node_rule_of`),
+    /// concerning the node's syntax. Channels are rederived in place, so the reading's channels stay as they are.
+    fn derived_at_node(
+        &mut self,
+        file: FileId,
+        kind: AstKind<'a>,
+        mut reading: Reading,
+    ) -> Reading {
+        if reading.completions.is_empty() {
+            return reading;
+        }
+
+        let rule = node_rule_of(&kind);
+        let syntax = self.source_span(file, kind.span());
+
+        for (_, _, part) in &mut reading.completions {
+            part.derivation = match part.cost_error {
+                Some(_) => None,
+                None => self.traces.derivations.over(
+                    rule,
+                    Some(syntax),
+                    (part.derivation, &part.cost),
+                    Vec::new(),
+                    part.cost.clone(),
+                ),
+            };
         }
 
         reading
@@ -910,12 +943,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading.sibling()
     }
 
+    /// `factor` with its derivation by `rule` at `origin`, the witness `nest` derives a repetition from.
+    pub(crate) fn witnessed(
+        &mut self,
+        rule: &'static str,
+        origin: crate::unknowns::SourceSpan,
+        factor: Cost,
+    ) -> (Cost, Option<DerivationId>) {
+        let witness = self
+            .traces
+            .derivations
+            .leaf(rule, origin, Vec::new(), factor.clone());
+
+        (factor, witness)
+    }
+
     fn nest_part(
         &mut self,
         label: String,
         site: Site,
         origin: crate::unknowns::SourceSpan,
-        factor: Cost,
+        factor: (Cost, Option<DerivationId>),
         inner: Part,
     ) -> Part {
         crate::cost::nest(
@@ -934,7 +982,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         label: String,
         site: Site,
         origin: crate::unknowns::SourceSpan,
-        factor: Cost,
+        factor: (Cost, Option<DerivationId>),
         reading: Reading,
     ) -> Reading {
         reading.map_parts(|part| self.nest_part(label.clone(), site, origin, factor.clone(), part))
@@ -1652,6 +1700,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             let charged = overshoot.clone().unwrap_or_else(|| factor.clone());
+            let charged = self.witnessed("loop-nest", origin, charged);
             let looped = self.nest_part(label.clone(), site, origin, charged, body_main);
             let looped = match escaped {
                 true => looped,
@@ -1912,13 +1961,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         length: Option<Cost>,
     ) -> Reading {
         match length {
-            Some(length) => Reading::of_part(self.nest_part(
-                label,
-                site,
-                self.source_span(file, span),
-                length,
-                Part::unmarked(Cost::ONE, None),
-            )),
+            Some(length) => {
+                let origin = self.source_span(file, span);
+                let length = self.witnessed("input-size-envelope", origin, length);
+
+                Reading::of_part(self.nest_part(
+                    label,
+                    site,
+                    origin,
+                    length,
+                    Part::unmarked(Cost::ONE, None),
+                ))
+            }
             None => Reading::of_part(self.unknown_part(file, span, UnknownReason::SizeRelation)),
         }
     }
@@ -1978,7 +2032,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let origin = self.source_span(file, span);
 
         match length {
-            Some(length) => self.nest_reading(label, site, origin, length, inner),
+            Some(length) => {
+                let length = self.witnessed("input-size-envelope", origin, length);
+
+                self.nest_reading(label, site, origin, length, inner)
+            }
             None => {
                 let unknown = self.unknowns.origin(origin, UnknownReason::SizeRelation);
                 let scaled = self.unknowns.scale(Some(unknown), None);
@@ -2975,6 +3033,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             ) {
                 (false, _, _) => Reading::empty(),
                 (true, Some(length), Some(text)) => self.charged_reading_of(
+                    "native-charge-length",
                     (file, call.span),
                     label(" [joined text]"),
                     &[length, &text],
@@ -3213,11 +3272,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 match scanned.and_then(|scanned| scanned.multiply(&other_size)) {
                     Ok(factor) => match key {
-                        Some(key) => {
-                            self.charged_reading_of((file, call.span), label, &[&factor, &key])
-                        }
+                        Some(key) => self.charged_reading_of(
+                            "set-map-linear",
+                            (file, call.span),
+                            label,
+                            &[&factor, &key],
+                        ),
                         None => self
-                            .charged_reading_of((file, call.span), label, &[&factor])
+                            .charged_reading_of(
+                                "set-map-linear",
+                                (file, call.span),
+                                label,
+                                &[&factor],
+                            )
                             .merge(
                                 Reading::of_part(self.unknown_part(
                                     file,
@@ -3268,6 +3335,24 @@ fn is_modelled(native: Native, method: &str) -> bool {
     }
 }
 
+/// The ledger rule composing a node's reading from its children's: `branch-join` for a branching statement or
+/// expression, `loop-phases` for a loop, `spread-copy` and `rest-copy` for a copying spread or rest, and `seq-max`
+/// for every other node, which runs its children in sequence.
+pub(crate) fn node_rule_of(kind: &AstKind<'_>) -> &'static str {
+    match kind {
+        AstKind::IfStatement(_)
+        | AstKind::ConditionalExpression(_)
+        | AstKind::SwitchStatement(_)
+        | AstKind::TryStatement(_) => "branch-join",
+        _ if is_iteration_kind(kind) => "loop-phases",
+        AstKind::SpreadElement(_) | AstKind::JSXSpreadAttribute(_) | AstKind::JSXSpreadChild(_) => {
+            "spread-copy"
+        }
+        AstKind::BindingRestElement(_) | AstKind::AssignmentTargetRest(_) => "rest-copy",
+        _ => "seq-max",
+    }
+}
+
 fn constructed_part_of(part: Part) -> Part {
     match part.holds_no_work() {
         true => part.preferred(Preference::Absent),
@@ -3296,7 +3381,10 @@ pub(crate) fn tagged_reading_of(
     traces: &mut crate::trace::TraceArena,
     unknowns: &mut crate::unknowns::Unknowns,
 ) -> Reading {
-    let part = Part::unmarked(cost.clone(), None);
+    let derivation = traces
+        .derivations
+        .leaf("dir-cost", origin, Vec::new(), cost.clone());
+    let part = Part::unmarked(cost.clone(), None).derived(derivation);
 
     Reading::of_part(if cost.is_one() {
         part

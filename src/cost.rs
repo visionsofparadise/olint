@@ -1,3 +1,4 @@
+use crate::derivation::{DerivationArena, DerivationId};
 use crate::flow::Completion;
 use crate::project::Site;
 use crate::trace::{TraceArena, TraceId};
@@ -1669,7 +1670,7 @@ pub fn state_of(unknowns: Option<UnknownId>, absent: bool) -> State {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct Part {
     pub origin: Option<SourceSpan>,
     pub cost_error: Option<CostError>,
@@ -1678,6 +1679,56 @@ pub struct Part {
     pub preference: Preference,
     pub unknowns: Option<UnknownId>,
     pub retained: Option<UnknownId>,
+    /// The derivation of `cost`: `None` for a unit cost no rule needs to derive, or for a cost some rule application
+    /// behind it left underived.
+    pub derivation: Option<DerivationId>,
+}
+
+/// Parts compare without their derivations: a derivation records how olint proved a part's cost and never changes
+/// what the analysis does with the part.
+impl PartialEq for Part {
+    fn eq(&self, other: &Self) -> bool {
+        self.origin == other.origin
+            && self.cost_error == other.cost_error
+            && self.cost == other.cost
+            && self.trace == other.trace
+            && self.preference == other.preference
+            && self.unknowns == other.unknowns
+            && self.retained == other.retained
+    }
+}
+
+impl Eq for Part {}
+
+/// The derivation joining parts by `rule` into a part costing `cost`, from each part's derivation and whether its cost
+/// is a unit. A unit part without derivation needs none and is left out. Any other part without derivation leaves the
+/// join underived. A join resting on one derivation of the joined cost is that derivation.
+fn joined(
+    arena: &mut DerivationArena,
+    rule: &'static str,
+    sides: &[(Option<DerivationId>, bool)],
+    cost: &Cost,
+) -> Option<DerivationId> {
+    let mut premises: Vec<DerivationId> = Vec::with_capacity(sides.len());
+
+    for (derivation, unit) in sides {
+        match derivation {
+            Some(derivation) if !premises.contains(derivation) => premises.push(*derivation),
+            Some(_) => {}
+            None if *unit => {}
+            None => return None,
+        }
+    }
+
+    match premises.as_slice() {
+        [] => None,
+        [only] if arena.get(*only).is_some_and(|held| held.cost == *cost) => Some(*only),
+        _ => arena.derive(rule, None, &premises, Vec::new(), cost.clone()),
+    }
+}
+
+fn side_of(part: &Part) -> (Option<DerivationId>, bool) {
+    (part.derivation, part.cost.is_one())
 }
 
 impl Part {
@@ -1709,6 +1760,7 @@ impl Part {
         Part {
             cost: Cost::ONE,
             trace: None,
+            derivation: None,
             ..self.scaled(None, unknowns)
         }
     }
@@ -1770,7 +1822,13 @@ impl Part {
             preference: Preference::Unmarked,
             unknowns: None,
             retained: None,
+            derivation: None,
         }
+    }
+
+    /// This part with its cost derived by `derivation`.
+    pub fn derived(self, derivation: Option<DerivationId>) -> Part {
+        Part { derivation, ..self }
     }
 
     pub fn is_absent(&self) -> bool {
@@ -1804,7 +1862,26 @@ impl Part {
         }
     }
 
+    /// The larger of two parts. Its derivation keeps both sides as premises, whichever side the join selects: by
+    /// `preference-rank` when their preferences differ, `max-dominance` when one cost covers the other, and
+    /// `max-normalise` when the join keeps the maximum of both costs.
     pub fn max(self, other: Part, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
+        let sides = [side_of(&self), side_of(&other)];
+        let (selected, rule) = self.select(other, unknowns, traces);
+        let derivation = match selected.cost_error {
+            Some(_) => None,
+            None => joined(&mut traces.derivations, rule, &sides, &selected.cost),
+        };
+
+        selected.derived(derivation)
+    }
+
+    fn select(
+        self,
+        other: Part,
+        unknowns: &mut Unknowns,
+        traces: &mut TraceArena,
+    ) -> (Part, &'static str) {
         let (mine, theirs) = (self.rank(), other.rank());
         let selected_error = if mine == theirs {
             self.cost_error.clone().or(other.cost_error.clone())
@@ -1829,13 +1906,17 @@ impl Part {
         let selected_unknowns = unknowns.join(selected_unknowns, retained);
 
         let comparison = other.cost.compare_legacy(&self.cost);
+        let both =
+            theirs == mine && comparison == CostComparison::Inconclusive && self.cost != other.cost;
+        let rule = match (mine == theirs, both) {
+            (false, _) => "preference-rank",
+            (true, true) => "max-normalise",
+            (true, false) => "max-dominance",
+        };
         let mut selected =
             if theirs > mine || (theirs == mine && comparison == CostComparison::Exceeds) {
                 other
-            } else if theirs == mine
-                && comparison == CostComparison::Inconclusive
-                && self.cost != other.cost
-            {
+            } else if both {
                 let mut combined = self;
 
                 match Cost::maximum(vec![combined.cost.clone(), other.cost.clone()]) {
@@ -1866,7 +1947,7 @@ impl Part {
             }
         }
 
-        selected
+        (selected, rule)
     }
 
     pub fn preferred(self, preference: Preference) -> Part {
@@ -2105,31 +2186,26 @@ impl Reading {
         self.with_main(main)
     }
 
+    /// The maximum over every channel outside the lazy phase, derived by `channel-total` from every channel's part.
     pub fn total(&self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
-        let mut total = self.main();
-
-        for channel in self
+        let main = self.main();
+        let channels = self
             .beside_main()
             .filter(|channel| channel.0 != ExecutionPhase::Lazy)
-        {
-            total = total.max(channel.2.clone(), unknowns, traces);
-        }
+            .map(|channel| &channel.2);
 
-        total
+        channel_total(main, channels, unknowns, traces)
     }
 
+    /// The maximum over the lazy phase's channels, derived by `channel-total`.
     pub fn latent(&self, unknowns: &mut Unknowns, traces: &mut TraceArena) -> Part {
-        let mut latent = Part::none();
-
-        for channel in self
+        let channels = self
             .completions
             .iter()
             .filter(|channel| channel.0 == ExecutionPhase::Lazy)
-        {
-            latent = latent.max(channel.2.clone(), unknowns, traces);
-        }
+            .map(|channel| &channel.2);
 
-        latent
+        channel_total(Part::none(), channels, unknowns, traces)
     }
 
     pub fn in_phase(
@@ -2154,11 +2230,41 @@ impl Reading {
     }
 }
 
+fn channel_total<'r>(
+    first: Part,
+    channels: impl Iterator<Item = &'r Part>,
+    unknowns: &mut Unknowns,
+    traces: &mut TraceArena,
+) -> Part {
+    let mut sides = vec![side_of(&first)];
+    let mut total = first;
+
+    for part in channels {
+        sides.push(side_of(part));
+
+        total = total.select(part.clone(), unknowns, traces).0;
+    }
+
+    let derivation = match total.cost_error {
+        Some(_) => None,
+        None => joined(
+            &mut traces.derivations,
+            "channel-total",
+            &sides,
+            &total.cost,
+        ),
+    };
+
+    total.derived(derivation)
+}
+
+/// `inner` repeated `factor` times, derived by `nest-product` from `witness`, the derivation of the bound `factor`,
+/// and `inner`'s derivation.
 pub fn nest(
     label: String,
     site: Site,
     origin: SourceSpan,
-    factor: Cost,
+    (factor, witness): (Cost, Option<DerivationId>),
     inner: Part,
     unknowns: &mut Unknowns,
     traces: &mut TraceArena,
@@ -2175,15 +2281,31 @@ pub fn nest(
     }
 
     // A product past the cost representation is an unknown contribution, so it adds nothing to the floor (§1 Floor).
-    let (cost, trace) = match factor.multiply(&inner.cost) {
-        Ok(cost) => (cost, trace.ok()),
+    let (cost, trace, derived) = match factor.multiply(&inner.cost) {
+        Ok(cost) => (cost, trace.ok(), true),
         Err(_) => {
             let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
             selected_unknowns = unknowns.join(selected_unknowns, Some(failure));
 
-            (Cost::ONE, None)
+            (Cost::ONE, None, false)
         }
     };
+    let premises = match (inner.derivation, witness) {
+        (Some(premise), Some(witness)) => Some(vec![witness, premise]),
+        (None, Some(witness)) if inner.cost.is_one() => Some(vec![witness]),
+        _ => None,
+    };
+    let derivation = premises
+        .filter(|_| derived && !trace_error && inner.cost_error.is_none())
+        .and_then(|premises| {
+            traces.derivations.derive(
+                "nest-product",
+                Some(origin),
+                &premises,
+                Vec::new(),
+                cost.clone(),
+            )
+        });
 
     Part {
         origin: Some(origin),
@@ -2195,6 +2317,7 @@ pub fn nest(
         cost,
         trace,
         preference: inner.preference,
+        derivation,
     }
 }
 

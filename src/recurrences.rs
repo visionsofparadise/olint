@@ -62,6 +62,18 @@ pub struct RecurrenceEquation {
     pub edges: Vec<RecurrenceEdge>,
 }
 
+/// The ledger rule a solved recurrence's proof applies: the decrementing and dividing chains, the factorial of a
+/// measure multiplicity, and the branching decrement.
+pub fn rule_of_proof(proof: &str) -> &'static str {
+    match proof {
+        "guarded decrement depth" => "rec-chain-decrement",
+        "guarded geometric reduction depth" => "rec-chain-division",
+        "guarded decrement with measure multiplicity" => "rec-factorial",
+        "guarded decrement with branching" => "rec-branching-decrement",
+        _ => "rec-relation",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecurrenceSolution {
     Solved {

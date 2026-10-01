@@ -1079,7 +1079,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             match scanned {
                 Ok(scanned) if scanned.is_one() => {}
                 Ok(scanned) => {
-                    let scanned = Part::unmarked(scanned, None);
+                    let derivation = self.traces.derivations.leaf(
+                        "native-charge-length",
+                        origin,
+                        Vec::new(),
+                        scanned.clone(),
+                    );
+                    let scanned = Part::unmarked(scanned, None).derived(derivation);
 
                     inner = inner.merge(scanned, &mut self.unknowns, &mut self.traces);
                 }
@@ -1185,7 +1191,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             let result = self.result_size_of(file, site.arguments.first(), &charge, 0);
 
             if result.length_resolved {
-                let copied = Part::unmarked(result.length.clone(), None);
+                let derivation = self.traces.derivations.leaf(
+                    "result-size",
+                    origin,
+                    Vec::new(),
+                    result.length.clone(),
+                );
+                let copied = Part::unmarked(result.length.clone(), None).derived(derivation);
 
                 inner = inner.merge(copied, &mut self.unknowns, &mut self.traces);
             } else {
@@ -1276,13 +1288,14 @@ impl<'p, 'a> Analysis<'p, 'a> {
         let part = match (bounded, label) {
             (false, Some(label)) => {
                 let site_of = self.project.site_of(file, site.span);
+                let length = self.witnessed("native-charge-length", origin, charge.length.clone());
 
                 inner.executed().map_parts(|part| {
                     crate::cost::nest(
                         label.clone(),
                         site_of,
                         origin,
-                        charge.length.clone(),
+                        length.clone(),
                         part,
                         &mut self.unknowns,
                         &mut self.traces,
@@ -1312,6 +1325,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
     /// A step that does `factors` work once, traced under `label`.
     pub(crate) fn charged_reading_of(
         &mut self,
+        rule: &'static str,
         (file, span): (FileId, Span),
         label: String,
         factors: &[&Cost],
@@ -1320,15 +1334,20 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         match cost {
             Ok(cost) if cost.is_one() => Reading::empty(),
-            Ok(cost) => Reading::of_part(crate::cost::nest(
-                label,
-                self.project.site_of(file, span),
-                self.source_span(file, span),
-                cost,
-                Part::unmarked(Cost::ONE, None),
-                &mut self.unknowns,
-                &mut self.traces,
-            )),
+            Ok(cost) => {
+                let origin = self.source_span(file, span);
+                let cost = self.witnessed(rule, origin, cost);
+
+                Reading::of_part(crate::cost::nest(
+                    label,
+                    self.project.site_of(file, span),
+                    origin,
+                    cost,
+                    Part::unmarked(Cost::ONE, None),
+                    &mut self.unknowns,
+                    &mut self.traces,
+                ))
+            }
             Err(_) => {
                 Reading::of_part(self.unknown_part(file, span, UnknownReason::ResourceExhaustion))
             }
@@ -1439,7 +1458,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 Some(length) => {
                     let label = self.string_label_of(site, "string search");
 
-                    self.charged_reading_of((site.file, site.span), label, &[receiver, &length])
+                    self.charged_reading_of(
+                        "native-charge-length",
+                        (site.file, site.span),
+                        label,
+                        &[receiver, &length],
+                    )
                 }
                 None => Reading::of_part(self.unknown_part(
                     site.file,
@@ -1533,7 +1557,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
     ) -> Reading {
         match key {
             Some(key) if key.is_one() => Reading::empty(),
-            Some(key) => self.charged_reading_of((file, span), label, &[entries, &key]),
+            Some(key) => {
+                self.charged_reading_of("set-map-linear", (file, span), label, &[entries, &key])
+            }
             None => Reading::of_part(self.unknown_part(file, span, UnknownReason::SizeRelation)),
         }
     }
@@ -1670,6 +1696,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         let label = self.string_label_of(site, "replacement result");
                         let site_of = self.project.site_of(file, site.span);
                         let origin = self.source_span(file, site.span);
+                        let matches = self.witnessed("regex-every-match", origin, matches.clone());
 
                         coerced.executed().map_parts(|part| {
                             crate::cost::nest(
@@ -1716,7 +1743,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             Some(per_match) => {
                 let label = self.string_label_of(site, "substitution");
 
-                self.charged_reading_of((site.file, site.span), label, &[matches, &per_match])
+                self.charged_reading_of(
+                    "regex-every-match",
+                    (site.file, site.span),
+                    label,
+                    &[matches, &per_match],
+                )
             }
             None => {
                 Reading::of_part(self.unknown_part(file, site.span, UnknownReason::SizeRelation))
@@ -1747,7 +1779,12 @@ impl<'p, 'a> Analysis<'p, 'a> {
             short(self.text_of(site.file, value.span()))
         );
 
-        self.charged_reading_of((site.file, site.span), label, &[graph, graph])
+        self.charged_reading_of(
+            "native-model",
+            (site.file, site.span),
+            label,
+            &[graph, graph],
+        )
     }
 
     fn is_shallow_serialized(
@@ -3634,6 +3671,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .map_parts(|part| part.unmultiplied(&mut self.unknowns))
                 .retaining(Some(unknown), &mut self.unknowns);
         };
+
+        let count = self.witnessed("native-model", origin, count);
 
         reading.map_parts(|part| {
             crate::cost::nest(

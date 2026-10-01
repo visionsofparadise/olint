@@ -782,6 +782,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 .retaining(Some(bound), &mut self.unknowns);
         };
 
+        let count = self.witnessed("iterator-visits", origin, count);
+
         next.executed().map_parts(|part| {
             crate::cost::nest(
                 "iterator visits".to_string(),

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::Analysis;
 use crate::cost::{state_of, Cost, Part, Reading, State};
 use crate::declarations::FunctionId;
+use crate::directives::PerfTag;
 use crate::flow::loop_phases_of;
 use crate::project::FileId;
 use crate::report::report_rows_of;
@@ -106,8 +107,30 @@ impl<'p, 'a> Analysis<'p, 'a> {
         reading: &Reading,
         asserted: bool,
     ) {
-        let part = reading.total(&mut self.unknowns, &mut self.traces);
+        let mut part = reading.total(&mut self.unknowns, &mut self.traces);
         let origin = self.source_span(file, kind.span());
+
+        // A node whose reading holds no work derives its unit cost by the rule that leaves it without work: an ignored
+        // or a bounded statement's directive, else `seq-max`'s unit base. The directives are read from the cache the
+        // walker filled, so recording raises no directive diagnostic the walk did not.
+        if part.derivation.is_none() && part.cost.is_one() && part.cost_error.is_none() {
+            let tags = self
+                .tag_cache
+                .get(&(file, kind.node_id()))
+                .map_or(&[][..], Vec::as_slice);
+            let rule = if tags.contains(&PerfTag::Ignore) {
+                "dir-ignore"
+            } else if tags.contains(&PerfTag::Bounded) {
+                "dir-bounded-stmt"
+            } else {
+                "seq-max"
+            };
+
+            part.derivation = self
+                .traces
+                .derivations
+                .leaf(rule, origin, Vec::new(), Cost::ONE);
+        }
 
         self.node_records.insert(
             (origin, kind.ty()),

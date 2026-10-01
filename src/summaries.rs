@@ -602,6 +602,19 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
             let reason = match self.bind_cost_in(&part.cost, inputs) {
                 Ok(cost) => {
+                    if cost != part.cost {
+                        part.derivation = match part.cost_error {
+                            Some(_) => None,
+                            None => self.traces.derivations.over(
+                                "size-substitution",
+                                Some(origin),
+                                (part.derivation, &part.cost),
+                                Vec::new(),
+                                cost.clone(),
+                            ),
+                        };
+                    }
+
                     part.cost = cost;
 
                     part.cost_error
@@ -623,6 +636,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                     part.cost = Cost::ONE;
                     part.trace = None;
+                    part.derivation = None;
                     part.cost_error = Some(error);
 
                     Some(reason)
@@ -1979,7 +1993,21 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         self.current_effects.join(&effects);
 
-        Some(Part::unmarked(cost, None).retaining(provenance, &mut self.unknowns))
+        let origin = self.scheduler.tasks[id.0].key.function;
+        let origin = self.source_span(
+            origin.file,
+            self.kind_of_node(origin.file, origin.node).span(),
+        );
+        let derivation =
+            self.traces
+                .derivations
+                .leaf("rec-markers", origin, Vec::new(), cost.clone());
+
+        Some(
+            Part::unmarked(cost, None)
+                .derived(derivation)
+                .retaining(provenance, &mut self.unknowns),
+        )
     }
 
     fn cyclic_effects_of(&mut self, key: &SummaryKey) -> Effects {
@@ -2208,7 +2236,16 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     false => channel,
                 };
 
-                part.cost = factors[index].multiply(&channel).ok()?;
+                let cost = factors[index].multiply(&channel).ok()?;
+
+                part.derivation = self.traces.derivations.over(
+                    crate::recurrences::rule_of_proof(proof),
+                    None,
+                    (part.derivation, &part.cost),
+                    vec![crate::derivation::Fact::Cost(factors[index].clone())],
+                    cost.clone(),
+                );
+                part.cost = cost;
             }
 
             solved.push((*id, reading));
@@ -3621,11 +3658,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.function_preference_of(file, function)
         };
 
-        match mark {
+        let part = match mark {
             Some(mark) => part.preferred(mark),
             None if part.holds_no_work() => part.preferred(Preference::Absent),
             None => part.preferred(Preference::Unmarked),
-        }
+        };
+        let syntax = self.source_span(file, self.kind_of_node(file, function.node_id()).span());
+        let derivation = match part.cost_error {
+            Some(_) => None,
+            None => self.traces.derivations.over(
+                "call-summary",
+                Some(syntax),
+                (part.derivation, &part.cost),
+                Vec::new(),
+                part.cost.clone(),
+            ),
+        };
+
+        part.derived(derivation)
     }
 
     pub(crate) fn called_reading_of(
