@@ -11,13 +11,12 @@ use crate::analysis::work::Event;
 use crate::analysis::Analysis;
 use crate::bounds::{loop_label, short};
 use crate::budgets::{charge_covers, tests_after_body};
-use crate::cost::{Cost, ExecutionPhase, Part, Preference, Reading};
+use crate::cost::{Cost, ExecutionPhase, Multiplicity, Part, Preference, Reading};
 use crate::declarations::{
     function_of_initializer, parameters_of, Binding, Declaration, FunctionNode, ParameterNode,
     TargetSet,
 };
 use crate::declared_types::Kind;
-use crate::derivation::DerivationId;
 use crate::directives::{cost_tag_of, preference_of, PerfTag};
 use crate::flow::{
     class_phases_of, completion_of, enclosing_iteration_of, interceptions_of, is_suspension,
@@ -949,13 +948,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         rule: &'static str,
         origin: crate::unknowns::SourceSpan,
         factor: Cost,
-    ) -> (Cost, Option<DerivationId>) {
+    ) -> Multiplicity {
         let witness = self
             .traces
             .derivations
             .leaf(rule, origin, Vec::new(), factor.clone());
 
-        (factor, witness)
+        Multiplicity::nested(factor, witness)
     }
 
     fn nest_part(
@@ -963,7 +962,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         label: String,
         site: Site,
         origin: crate::unknowns::SourceSpan,
-        factor: (Cost, Option<DerivationId>),
+        factor: Multiplicity,
         inner: Part,
     ) -> Part {
         crate::cost::nest(
@@ -982,7 +981,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         label: String,
         site: Site,
         origin: crate::unknowns::SourceSpan,
-        factor: (Cost, Option<DerivationId>),
+        factor: Multiplicity,
         reading: Reading,
     ) -> Reading {
         reading.map_parts(|part| self.nest_part(label.clone(), site, origin, factor.clone(), part))
@@ -1699,9 +1698,9 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             }
 
-            // The bound's derivation witnesses the factor; a granted share overshooting it is witnessed by
-            // `budget-share` over the bound.
-            let charged = match &overshoot {
+            // `loop-nest` derives the repetition from the bound's derivation; a granted share overshooting the bound is
+            // witnessed by `budget-share` over the bound.
+            let (charged, witness) = match &overshoot {
                 Some(overshoot) => {
                     let witness = bound.derivation().and_then(|bound| {
                         self.traces.derivations.derive(
@@ -1717,6 +1716,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
                 None => (factor.clone(), bound.derivation()),
             };
+            let charged = Multiplicity::looped(charged, witness);
             let looped = self.nest_part(label.clone(), site, origin, charged, body_main);
             let looped = match escaped {
                 true => looped,

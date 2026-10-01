@@ -2258,17 +2258,51 @@ fn channel_total<'r>(
     total.derived(derivation)
 }
 
-/// `inner` repeated `factor` times, derived by `nest-product` from `witness`, the derivation of the bound `factor`,
-/// and `inner`'s derivation.
+/// The number of times `nest` repeats a part: the bound `factor`, its derivation `witness`, and the rule deriving the
+/// repetition from the witness and the repeated part.
+#[derive(Clone, Debug)]
+pub struct Multiplicity {
+    pub factor: Cost,
+    pub witness: Option<DerivationId>,
+    pub rule: &'static str,
+}
+
+impl Multiplicity {
+    /// A repetition `nest-product` derives: work done once per unit of a bound some rule established.
+    pub fn nested(factor: Cost, witness: Option<DerivationId>) -> Self {
+        Self {
+            factor,
+            witness,
+            rule: "nest-product",
+        }
+    }
+
+    /// A loop's body repeated once per iteration, which `loop-nest` derives from the loop's bound.
+    pub fn looped(factor: Cost, witness: Option<DerivationId>) -> Self {
+        Self {
+            factor,
+            witness,
+            rule: "loop-nest",
+        }
+    }
+}
+
+/// `inner` repeated `multiplicity.factor` times, derived by the multiplicity's rule from its witness and `inner`'s
+/// derivation.
 pub fn nest(
     label: String,
     site: Site,
     origin: SourceSpan,
-    (factor, witness): (Cost, Option<DerivationId>),
+    multiplicity: Multiplicity,
     inner: Part,
     unknowns: &mut Unknowns,
     traces: &mut TraceArena,
 ) -> Part {
+    let Multiplicity {
+        factor,
+        witness,
+        rule,
+    } = multiplicity;
     let trace = traces.factor(label, site, origin, factor.clone(), None, inner.trace);
     let trace_error = trace.is_err();
 
@@ -2298,13 +2332,9 @@ pub fn nest(
     let derivation = premises
         .filter(|_| derived && !trace_error && inner.cost_error.is_none())
         .and_then(|premises| {
-            traces.derivations.derive(
-                "nest-product",
-                Some(origin),
-                &premises,
-                Vec::new(),
-                cost.clone(),
-            )
+            traces
+                .derivations
+                .derive(rule, Some(origin), &premises, Vec::new(), cost.clone())
         });
 
     Part {

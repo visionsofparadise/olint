@@ -1,6 +1,6 @@
 use super::*;
 use crate::analysis::work::{Event, Limits, WorkBudget};
-use crate::cost::{nest, Domain, ExecutionPhase, Part, Preference, Reading};
+use crate::cost::{nest, Domain, ExecutionPhase, Multiplicity, Part, Preference, Reading};
 use crate::flow::Completion;
 use crate::project::{FileId, Site};
 use crate::trace::TraceArena;
@@ -245,7 +245,7 @@ fn a_repetition_is_derived_from_its_witness_and_its_body() {
         "loop".to_string(),
         site,
         span(1),
-        (x.clone(), witness),
+        Multiplicity::looped(x.clone(), witness),
         body.clone(),
         &mut unknowns,
         &mut traces,
@@ -254,7 +254,7 @@ fn a_repetition_is_derived_from_its_witness_and_its_body() {
         "loop".to_string(),
         site,
         span(1),
-        (x.clone(), None),
+        Multiplicity::nested(x.clone(), None),
         body.clone(),
         &mut unknowns,
         &mut traces,
@@ -263,9 +263,21 @@ fn a_repetition_is_derived_from_its_witness_and_its_body() {
     assert_eq!(
         premises_of(&traces, &looped),
         (
-            "nest-product",
+            "loop-nest",
             vec![witness.unwrap(), body.derivation.unwrap()]
         )
     );
     assert_eq!(unwitnessed.derivation, None);
+
+    let nested = nest(
+        "per element".to_string(),
+        site,
+        span(1),
+        Multiplicity::nested(x, witness),
+        body.clone(),
+        &mut unknowns,
+        &mut traces,
+    );
+
+    assert_eq!(premises_of(&traces, &nested).0, "nest-product");
 }
