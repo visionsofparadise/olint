@@ -5,6 +5,7 @@ import Olint.Model.Cost
 import Olint.Model.Admission
 import Olint.Bound
 import Olint.Rules.Algebra
+import Olint.Rules.Types
 import Olint.Certificate
 import Olint.Tests.Certificate
 import Olint.Tests.Encoded
