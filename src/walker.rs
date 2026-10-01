@@ -1618,7 +1618,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
         let mut label = loop_label(kind).to_string();
 
-        if let Some(proof) = bound.proof() {
+        if let Some(proof) = bound.proof(&self.traces.derivations) {
             label.push_str(&format!(" [{proof}]"));
         }
 
@@ -1699,8 +1699,24 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 continue;
             }
 
-            let charged = overshoot.clone().unwrap_or_else(|| factor.clone());
-            let charged = self.witnessed("loop-nest", origin, charged);
+            // The bound's derivation witnesses the factor; a granted share overshooting it is witnessed by
+            // `budget-share` over the bound.
+            let charged = match &overshoot {
+                Some(overshoot) => {
+                    let witness = bound.derivation().and_then(|bound| {
+                        self.traces.derivations.derive(
+                            "budget-share",
+                            Some(origin),
+                            &[bound],
+                            Vec::new(),
+                            overshoot.clone(),
+                        )
+                    });
+
+                    (overshoot.clone(), witness)
+                }
+                None => (factor.clone(), bound.derivation()),
+            };
             let looped = self.nest_part(label.clone(), site, origin, charged, body_main);
             let looped = match escaped {
                 true => looped,

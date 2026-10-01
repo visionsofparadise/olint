@@ -16,6 +16,7 @@ use crate::budgets::{
 };
 use crate::cost::{Cost, CostComparison};
 use crate::declarations::{Binding, Declaration, ParameterNode};
+use crate::derivation::{DerivationArena, DerivationId, Fact};
 use crate::directives::PerfTag;
 use crate::flow::{completion_of, control_target_of, Completion};
 use crate::project::FileId;
@@ -56,11 +57,13 @@ struct QuantityProof {
     settled: HashMap<QuantityKey, Option<(Cost, f64)>>,
 }
 
+/// A loop's iteration bound. A proven bound carries the derivation that proved its factor: the ledger rule, the loop
+/// it concerns and the side condition the rule established, named in the loop's explanation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Bound {
     Proven {
         factor: Cost,
-        proof: Option<&'static str>,
+        derivation: Option<DerivationId>,
     },
     Unresolved {
         reason: UnknownReason,
@@ -75,11 +78,21 @@ impl Bound {
         }
     }
 
-    pub fn proof(&self) -> Option<&'static str> {
+    pub fn derivation(&self) -> Option<DerivationId> {
         match self {
-            Bound::Proven { proof, .. } => *proof,
+            Bound::Proven { derivation, .. } => *derivation,
             Bound::Unresolved { .. } => None,
         }
+    }
+
+    /// The side condition the bound's derivation names, which the loop's explanation shows.
+    pub fn proof<'d>(&self, derivations: &'d DerivationArena) -> Option<&'d str> {
+        let derivation = derivations.get(self.derivation()?)?;
+
+        derivation.facts.iter().find_map(|fact| match fact {
+            Fact::Name(name) => Some(name.as_str()),
+            _ => None,
+        })
     }
 
     pub fn reason(&self) -> Option<UnknownReason> {
@@ -93,23 +106,54 @@ impl Bound {
         matches!(self, Bound::Unresolved { .. })
     }
 
-    pub fn label(&self) -> &'static str {
+    pub fn label<'d>(&self, derivations: &'d DerivationArena) -> &'d str {
+        match (self, self.proof(derivations)) {
+            (_, Some(proof)) => proof,
+            (Bound::Unresolved { reason }, None) => reason.text(),
+            (Bound::Proven { factor, .. }, None) => factor_label_of(factor),
+        }
+    }
+}
+
+fn factor_label_of(factor: &Cost) -> &'static str {
+    match factor.is_logarithm() {
+        true => "log",
+        false => "N",
+    }
+}
+
+/// A bound as the bound rules find it, before its derivation is recorded: a proven factor with the ledger rule that
+/// proved it and the side condition the rule established, if the explanation names one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Verdict {
+    Proven {
+        factor: Cost,
+        rule: &'static str,
+        condition: Option<&'static str>,
+    },
+    Unresolved {
+        reason: UnknownReason,
+    },
+}
+
+impl Verdict {
+    fn label(&self) -> &'static str {
         match self {
-            Bound::Unresolved { reason } => reason.text(),
-            Bound::Proven {
-                proof: Some(proof), ..
-            } => proof,
-            Bound::Proven { factor, .. } if factor.is_logarithm() => "log",
-            Bound::Proven { .. } => "N",
+            Verdict::Unresolved { reason } => reason.text(),
+            Verdict::Proven {
+                condition: Some(condition),
+                ..
+            } => condition,
+            Verdict::Proven { factor, .. } => factor_label_of(factor),
         }
     }
 
     fn strength(&self) -> u8 {
         match self {
-            Bound::Proven { factor, .. } if factor.is_one() => 0,
-            Bound::Proven { factor, .. } if factor.is_logarithm() => 1,
-            Bound::Proven { .. } => 2,
-            Bound::Unresolved { .. } => 3,
+            Verdict::Proven { factor, .. } if factor.is_one() => 0,
+            Verdict::Proven { factor, .. } if factor.is_logarithm() => 1,
+            Verdict::Proven { .. } => 2,
+            Verdict::Unresolved { .. } => 3,
         }
     }
 }
@@ -245,14 +289,18 @@ impl<'p, 'a> Analysis<'p, 'a> {
         false
     }
 
+    /// The loop's iteration bound, a proven one with its derivation: a leaf of the bound rule that proved it,
+    /// concerning the loop and naming the side condition the rule established.
     pub fn bound_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Bound {
         let key = (file, loop_kind.node_id());
 
         if !self.active_bounds.insert(key) {
-            return unresolved_bound_of();
+            return Bound::Unresolved {
+                reason: UnknownReason::Bound,
+            };
         }
 
-        let bound = self.inner_bound_of(file, loop_kind);
+        let verdict = self.inner_bound_of(file, loop_kind);
 
         self.active_bounds.remove(&key);
 
@@ -260,18 +308,36 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.stats.count(&format!(
                 "loop {}: {}",
                 loop_label(loop_kind),
-                bound.label()
+                verdict.label()
             ));
         }
 
-        bound
+        match verdict {
+            Verdict::Proven {
+                factor,
+                rule,
+                condition,
+            } => {
+                let syntax = self.source_span(file, loop_kind.span());
+                let facts = condition
+                    .map(|condition| vec![Fact::Name(condition.to_string())])
+                    .unwrap_or_default();
+                let derivation = self
+                    .traces
+                    .derivations
+                    .leaf(rule, syntax, facts, factor.clone());
+
+                Bound::Proven { factor, derivation }
+            }
+            Verdict::Unresolved { reason } => Bound::Unresolved { reason },
+        }
     }
 
-    fn inner_bound_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Bound {
+    fn inner_bound_of(&mut self, file: FileId, loop_kind: AstKind<'a>) -> Verdict {
         if self.perf_tags(file, loop_kind).contains(&PerfTag::Bounded) {
             self.assertions += 1;
 
-            return constant_bound_of("@perf bounded");
+            return constant_bound_of("bound-directive", "@perf bounded");
         }
 
         let Some(body) = loop_body_of(loop_kind) else {
@@ -279,7 +345,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         };
 
         if self.runs_at_most_once(file, loop_kind.node_id(), body) {
-            return constant_bound_of("single iteration");
+            return constant_bound_of("bound-single-iteration", "single iteration");
         }
 
         match loop_kind {
@@ -297,9 +363,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 if !iteration.native {
                     return match count {
-                        Some(count) => Bound::Proven {
+                        Some(count) => Verdict::Proven {
                             factor: count,
-                            proof: Some("iterator visits"),
+                            rule: "bound-iterator-visits",
+                            condition: Some("iterator visits"),
                         },
                         None if self.is_untracked_iteration(file, &statement.right, &iteration) => {
                             untracked_bound_of()
@@ -318,9 +385,10 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         }
 
                         return match Cost::maximum(vec![initial.length, budget.cost]) {
-                            Ok(factor) => Bound::Proven {
+                            Ok(factor) => Verdict::Proven {
                                 factor,
-                                proof: Some("visit budget"),
+                                rule: "bound-live-visits",
+                                condition: Some("visit budget"),
                             },
                             Err(_) => unresolved_bound_of(),
                         };
@@ -330,14 +398,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 }
 
                 if self.is_constant_sized(file, &statement.right) {
-                    constant_bound_of("constant collection")
+                    constant_bound_of("bound-constant-collection", "constant collection")
                 } else if self.is_share_sized(file, &statement.right) {
-                    constant_bound_of("share of budget")
+                    constant_bound_of("bound-share", "share of budget")
                 } else {
                     match count {
-                        Some(count) => Bound::Proven {
+                        Some(count) => Verdict::Proven {
                             factor: count,
-                            proof: None,
+                            rule: "bound-for-of-native",
+                            condition: None,
                         },
                         None => untracked_bound_of(),
                     }
@@ -347,12 +416,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 if self.is_constant_sized(file, &statement.right)
                     || self.is_closed(file, &statement.right)
                 {
-                    constant_bound_of("closed object type")
+                    constant_bound_of("bound-for-in", "closed object type")
                 } else {
                     match self.tracked_length_of(file, &statement.right) {
-                        Some(factor) => Bound::Proven {
+                        Some(factor) => Verdict::Proven {
                             factor,
-                            proof: None,
+                            rule: "bound-for-in",
+                            condition: None,
                         },
                         None => untracked_bound_of(),
                     }
@@ -374,7 +444,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         statement: &'a ForStatement<'a>,
         body: &'a Statement<'a>,
-    ) -> Bound {
+    ) -> Verdict {
         let Some(test) = statement.test.as_ref() else {
             return unresolved_bound_of();
         };
@@ -401,7 +471,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         node: NodeId,
         test: &'a Expression<'a>,
         body: &'a Statement<'a>,
-    ) -> Bound {
+    ) -> Verdict {
         let repetition = Repetition {
             node,
             body,
@@ -419,13 +489,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         test: &'a Expression<'a>,
         repetition: &Repetition<'a>,
-    ) -> Bound {
+    ) -> Verdict {
         if matches!(unwrap(test), Expression::BooleanLiteral(literal) if !literal.value) {
-            return constant_bound_of("false condition");
+            return constant_bound_of("bound-false-condition", "false condition");
         }
 
         let comparisons = self.comparisons_of(file, test);
-        let mut best: Option<Bound> = None;
+        let mut best: Option<Verdict> = None;
 
         for comparison in comparisons {
             let Some(bound) = self.verdict_of(file, &comparison, repetition) else {
@@ -478,7 +548,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         comparison: &Comparison<'a>,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         let progression = self.progression_of(file, comparison.counter, repetition)?;
 
         if let Some(bound) = self.bisection_bound_of(file, comparison, repetition) {
@@ -881,7 +951,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         comparison: &Comparison<'a>,
         progression: &Progression,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         if progression.writes.is_empty() {
             return None;
         }
@@ -942,9 +1012,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                 Some(
                     match self.bounded_quantity_of(file, comparison.endpoint, repetition, 0) {
-                        Some((endpoint, _)) => {
-                            logarithmic_bound_of(repetition.geometric_proof, endpoint)
-                        }
+                        Some((endpoint, _)) => logarithmic_bound_of(
+                            "bound-geometric",
+                            repetition.geometric_proof,
+                            endpoint,
+                        ),
                         None => untracked_bound_of(),
                     },
                 )
@@ -977,9 +1049,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         .or_else(|| {
                             self.bounded_quantity_of(file, comparison.expression, repetition, 0)
                         }) {
-                        Some((initial, _)) => {
-                            logarithmic_bound_of(repetition.geometric_proof, initial)
-                        }
+                        Some((initial, _)) => logarithmic_bound_of(
+                            "bound-geometric",
+                            repetition.geometric_proof,
+                            initial,
+                        ),
                         None => untracked_bound_of(),
                     },
                 )
@@ -993,7 +1067,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         comparison: &Comparison<'a>,
         progression: &Progression,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         if progression.writes.is_empty() {
             return None;
         }
@@ -1053,12 +1127,15 @@ impl<'p, 'a> Analysis<'p, 'a> {
         if let Some((distance, proof)) = self.distance_of(file, comparison, repetition) {
             let repetitions = (distance / guaranteed).floor() + 1.0;
 
-            return repetitions.is_finite().then(|| constant_bound_of(proof));
+            return repetitions
+                .is_finite()
+                .then(|| constant_bound_of("bound-constant-distance", proof));
         }
 
-        quantity_maximum(initial_cost, endpoint_cost).map(|factor| Bound::Proven {
+        quantity_maximum(initial_cost, endpoint_cost).map(|factor| Verdict::Proven {
             factor,
-            proof: None,
+            rule: "bound-additive",
+            condition: None,
         })
     }
 
@@ -1068,7 +1145,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         comparison: &Comparison<'a>,
         progression: &Progression,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         if progression.unconditional.len() != progression.writes.len()
             || progression.writes.iter().any(|write| write.deferred)
             || !self.is_stable_endpoint(file, comparison.endpoint, repetition)
@@ -1110,7 +1187,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             magnitude += delta.abs();
         }
 
-        (magnitude <= 281_474_976_710_656.0).then(|| constant_bound_of("constant bound"))
+        (magnitude <= 281_474_976_710_656.0)
+            .then(|| constant_bound_of("bound-exact-additive", "constant bound"))
     }
 
     fn bounded_quantity_of(
@@ -1746,7 +1824,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         comparison: &Comparison<'a>,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         if comparison.direction != Direction::Up {
             return None;
         }
@@ -1813,7 +1891,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         }
 
         self.covers_every_path(file, repetition, &sites)
-            .then(|| logarithmic_bound_of("halving", range))
+            .then(|| logarithmic_bound_of("bound-bisection", "halving", range))
     }
 
     fn is_bisecting_write(
@@ -2013,7 +2091,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         test: &'a Expression<'a>,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         for conjunct in conjuncts_of(test) {
             if let Some(bound) = self.share_conjunct_bound_of(file, conjunct, repetition) {
                 return Some(bound);
@@ -2028,7 +2106,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
         file: FileId,
         test: &'a Expression<'a>,
         repetition: &Repetition<'a>,
-    ) -> Option<Bound> {
+    ) -> Option<Verdict> {
         let Expression::BinaryExpression(binary) = unwrap(test) else {
             return None;
         };
@@ -2055,7 +2133,7 @@ impl<'p, 'a> Analysis<'p, 'a> {
             self.is_share_sized(file, endpoint) || self.is_share_offset_of(file, initial, endpoint);
 
         (shared && self.consumes_a_unit(file, counter, repetition))
-            .then(|| constant_bound_of("share of budget"))
+            .then(|| constant_bound_of("bound-share", "share of budget"))
     }
 
     fn is_share_offset_of(
@@ -2321,38 +2399,40 @@ fn is_within(nodes: &AstNodes<'_>, node: NodeId, ancestor: NodeId) -> bool {
     node == ancestor || nodes.ancestor_ids(node).any(|found| found == ancestor)
 }
 
-fn constant_bound_of(proof: &'static str) -> Bound {
-    Bound::Proven {
+fn constant_bound_of(rule: &'static str, condition: &'static str) -> Verdict {
+    Verdict::Proven {
         factor: Cost::ONE,
-        proof: Some(proof),
+        rule,
+        condition: Some(condition),
     }
 }
 
 /// A counter scaled geometrically across `quantity`: logarithmic in that quantity, which is
 /// constant for a constant range.
-fn logarithmic_bound_of(proof: &'static str, quantity: Cost) -> Bound {
+fn logarithmic_bound_of(rule: &'static str, condition: &'static str, quantity: Cost) -> Verdict {
     if quantity.is_one() {
-        return constant_bound_of(proof);
+        return constant_bound_of(rule, condition);
     }
 
     match Cost::logarithm(quantity) {
-        Ok(factor) => Bound::Proven {
+        Ok(factor) => Verdict::Proven {
             factor,
-            proof: Some(proof),
+            rule,
+            condition: Some(condition),
         },
         Err(_) => unresolved_bound_of(),
     }
 }
 
 /// A loop over a collection whose size no rule tracks (`input-size-envelope`).
-fn untracked_bound_of() -> Bound {
-    Bound::Unresolved {
+fn untracked_bound_of() -> Verdict {
+    Verdict::Unresolved {
         reason: UnknownReason::SizeRelation,
     }
 }
 
-fn unresolved_bound_of() -> Bound {
-    Bound::Unresolved {
+fn unresolved_bound_of() -> Verdict {
+    Verdict::Unresolved {
         reason: UnknownReason::Bound,
     }
 }

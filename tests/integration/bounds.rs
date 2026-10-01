@@ -37,7 +37,8 @@ fn loop_reasons_of(
 
         analysis.enter_function_inputs(file, function);
 
-        let reason = analysis.bound_of(file, kind).label().to_string();
+        let bound = analysis.bound_of(file, kind);
+        let reason = bound.label(&analysis.traces.derivations).to_string();
 
         reasons.push((analysis.name_of(file, function), reason));
     }
@@ -750,7 +751,9 @@ fn shared_inner_reason_of(source: &str) -> String {
             matches!(kind, AstKind::ForStatement(_) | AstKind::ForOfStatement(_)).then_some(kind)
         });
 
-        found = analysis.bound_of(file, inner).label().to_string();
+        let bound = analysis.bound_of(file, inner);
+
+        found = bound.label(&analysis.traces.derivations).to_string();
     });
 
     found
