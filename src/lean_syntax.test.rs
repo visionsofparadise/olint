@@ -575,6 +575,68 @@ fn anonymous_entries_define_nothing_and_scope_errors_are_typed() {
 }
 
 #[test]
+fn composing_nodes_name_their_children_by_their_sites() {
+    let source = "function f(c) { let a = 1; if (c) { a; } else a = 2; return (c ? 1 : 2); }";
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program)
+        .semantic;
+    let entry = FunctionRef {
+        semantic: &semantic,
+        node: top_level(&parsed.program)[0],
+    };
+    let scope = Scope::of(entry, &[]).unwrap();
+    let function_body = Span::new(source.find("{ let").unwrap() as u32, source.len() as u32);
+    let span = |text: &str, after: &str| {
+        let from = source.find(after).unwrap();
+        let start = (from + source[from..].find(text).unwrap()) as u32;
+
+        Span::new(start, start + text.len() as u32)
+    };
+    let site = |text: &str, after: &str| scope.site(span(text, after)).unwrap().unwrap();
+    let children = |text: &str, after: &str| scope.children(span(text, after)).unwrap();
+
+    let body = children(source, "").unwrap();
+
+    assert!(!body.branch);
+    assert_eq!(
+        body.sites,
+        [
+            site("let a = 1;", ""),
+            site("if (c) { a; } else a = 2;", ""),
+            site("return (c ? 1 : 2);", "")
+        ]
+    );
+    assert_eq!(body.body, Some(function_body));
+    assert_eq!(children("let a = 1;", "").unwrap().sites, [site("1", "")]);
+
+    let branch = children("if (c) { a; } else a = 2;", "").unwrap();
+
+    assert!(branch.branch);
+    assert_eq!(
+        branch.sites,
+        [site("c", "if ("), site("{ a; }", ""), site("a = 2;", "")]
+    );
+    assert_eq!(children("{ a; }", "").unwrap().sites, [site("a;", "{ a")]);
+    assert_eq!(
+        children("return (c ? 1 : 2);", "").unwrap().sites,
+        [site("(c ? 1 : 2)", "")]
+    );
+
+    let conditional = children("(c ? 1 : 2)", "").unwrap();
+
+    assert!(conditional.branch);
+    assert_eq!(
+        conditional.sites,
+        [site("c", "(c ?"), site("1", "? "), site("2", ": ")]
+    );
+    assert_eq!(children("a = 2", ""), None);
+    assert_eq!(scope.children(function_body).unwrap(), None);
+}
+
+#[test]
 fn constructs_outside_the_model_name_their_kind() {
     for (source, kind, detail) in [
         (

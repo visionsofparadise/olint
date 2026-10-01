@@ -7,8 +7,16 @@
 //! term the rule's constructor does not mean. The generic constructors of the rules pending their soundness proofs
 //! carry the recorded premises at their nodes, the facts and the bound; `check` rejects them until action 5.3 lands
 //! their proofs.
+//!
+//! olint joins parts pairwise (`Part::max`), recording each join as `max-dominance` or `max-normalise` at its first
+//! part's syntax, and a reading's channels by `channel-total`. A join of parts at different nodes is no rule
+//! application at a node of its own, so a certificate holds the parts it joins in its place ([`leaves`]): a
+//! `seq-max` or `branch-join` at a node is `seqMax` or `branchJoin` over one certificate per child site
+//! (`Olint.Rules.seqSites`, `Olint.Rules.branchSites`), each joined part at its child's site and `seqUnit` at every
+//! child without one, concluded at the node's cost by `maxNormalise` or `maxDominance`; a generic constructor's
+//! premises are the joined parts at their own nodes. Every term concludes its derivation's cost.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use oxc_ast::ast::BindingPattern;
 use oxc_span::Span;
@@ -16,8 +24,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::analysis::Analysis;
+use crate::cost::Cost;
 use crate::declarations::{parameters_of, FunctionId};
-use crate::derivation::{DerivationId, Fact};
+use crate::derivation::{Derivation, DerivationArena, DerivationId, Fact};
 use crate::lean_syntax::{string, Dimension, EncodeError, FunctionRef, Measure, Scope};
 use crate::unknowns::SourceSpan;
 use crate::values::{SizeQuantity, ValueId};
@@ -90,8 +99,11 @@ pub const UNCONSTRUCTED: &[&str] = &[
 
 /// The family A rules whose constructors fix their premises' shape: one child certificate per child site
 /// (`seqMax`, `branchJoin`), parts checked at the node itself (`channelTotal`), or a single premise at the node
-/// (`maxDominance`, `maxNormalise`, `productNormalise`, `exprValidity`). `seq-max` without premises is `seqUnit`,
-/// and `channel-total` over parts at its own node is `channelTotal`; every other application of these rules is
+/// (`maxDominance`, `maxNormalise`, `productNormalise`, `exprValidity`). `seq-max` without premises is `seqUnit`, or
+/// one `seqUnit` per child at the entry or a branch; `seq-max` and `branch-join` over premises are `seqMax` and
+/// `branchJoin` over the parts their joins combine, where those parts lie at the node's children; `channel-total`
+/// over parts at its own node is `channelTotal`; `max-dominance`, `max-normalise` and `channel-total` over parts at
+/// other nodes are joins a certificate holds the parts of. Every other application of these rules is
 /// [`Absence::Unshaped`].
 pub const SHAPED: &[&str] = &[
     "seq-max",
@@ -162,10 +174,19 @@ impl<'s, 'p, 'a> Certifier<'s, 'p, 'a> {
             node: entry.node,
         };
         let scope = Scope::of(function, &[]).map_err(Absence::Encode)?;
-        let order = self.postorder(root)?;
+        let mut terms = Terms {
+            arena,
+            scope: &scope,
+            entry,
+            renamed: HashMap::new(),
+            sites: HashMap::new(),
+            shapes: HashMap::new(),
+            texts: HashMap::new(),
+            uses_entry: false,
+        };
+        let order = terms.postorder(root)?;
         // Each dimension is renamed to the index of the argument it measures, so the text depends only on the
         // function and the derivation, never on the order the analysis numbered its dimensions in.
-        let mut renamed = HashMap::new();
         let mut dimensions = Vec::new();
 
         for derivation in order.iter().flat_map(|id| arena.get(*id)) {
@@ -176,7 +197,8 @@ impl<'s, 'p, 'a> Certifier<'s, 'p, 'a> {
 
             for cost in std::iter::once(&derivation.cost).chain(costs) {
                 for id in cost.dimension_ids() {
-                    if let std::collections::hash_map::Entry::Vacant(slot) = renamed.entry(id) {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = terms.renamed.entry(id)
+                    {
                         let argument = self.argument(entry, id)?;
 
                         slot.insert(argument as u64);
@@ -196,18 +218,9 @@ impl<'s, 'p, 'a> Certifier<'s, 'p, 'a> {
         }
 
         let entry_text = scope.entry(&dimensions).map_err(Absence::Encode)?;
-        let mut terms = Terms {
-            scope: &scope,
-            entry,
-            renamed: &renamed,
-            sites: HashMap::new(),
-            texts: HashMap::new(),
-            uses_entry: false,
-        };
 
         for id in &order {
-            let derivation = arena.get(*id).ok_or(Absence::Missing)?;
-            let text = terms.term(self.analysis, derivation)?;
+            let text = terms.term(*id)?;
 
             if text.len() > MAXIMUM_TEXT {
                 return Err(Absence::Size);
@@ -248,40 +261,6 @@ impl<'s, 'p, 'a> Certifier<'s, 'p, 'a> {
         })
     }
 
-    /// The derivations under `root`, each after its premises.
-    fn postorder(&self, root: DerivationId) -> Result<Vec<DerivationId>, Absence> {
-        let arena = &self.analysis.traces.derivations;
-        let mut order = Vec::new();
-        let mut seen = HashSet::new();
-        let mut pending = vec![(root, false)];
-
-        while let Some((id, expanded)) = pending.pop() {
-            if expanded {
-                order.push(id);
-
-                continue;
-            }
-
-            if !seen.insert(id) {
-                continue;
-            }
-
-            let derivation = arena.get(id).ok_or(Absence::Missing)?;
-
-            pending.push((id, true));
-            pending.extend(
-                derivation
-                    .premises
-                    .iter()
-                    .rev()
-                    .filter(|premise| !seen.contains(*premise))
-                    .map(|premise| (*premise, false)),
-            );
-        }
-
-        Ok(order)
-    }
-
     /// The argument whose length a size dimension measures: the entry's `k`-th, when the dimension measures the value
     /// of a plain parameter of the entry.
     fn argument(&self, entry: FunctionId, id: u64) -> Result<usize, Absence> {
@@ -311,21 +290,44 @@ impl<'s, 'p, 'a> Certifier<'s, 'p, 'a> {
     }
 }
 
+/// How a derivation's term reads its premises.
+enum Shape {
+    /// `seqUnit`: `seq-max` without premises at a unit cost.
+    Unit,
+    /// `seqMax` or `branchJoin`: one certificate per child site, the premises' join leaves at their children's sites
+    /// and `seqUnit` at every other child, concluded at the derivation's cost.
+    Composed { branch: bool, sites: Vec<String> },
+    /// The term of the one premise, a bound at the node by the derivation's cost: `seq-max` or `branch-join` passing a
+    /// part derived at the node itself through unchanged.
+    Same,
+    /// `channelTotal`: the premises at the node, each bounding every channel, concluded at the derivation's cost.
+    Total,
+    /// A rule pending its soundness proof: the premises' join leaves at their nodes, the facts and the bound.
+    Generic,
+}
+
 /// The terms of one certificate: each derivation's `Olint.Cert` term, and the sites of the syntax it concerns.
 struct Terms<'s, 'e, 'a> {
+    arena: &'e DerivationArena,
     scope: &'e Scope<'s, 'a>,
     entry: FunctionId,
     /// Each dimension's id in the certificate.
-    renamed: &'e HashMap<u64, u64>,
+    renamed: HashMap<u64, u64>,
     sites: HashMap<SourceSpan, String>,
+    /// Each derivation's shape and the derivations its term holds the terms of.
+    shapes: HashMap<DerivationId, (Shape, Vec<DerivationId>)>,
     texts: HashMap<DerivationId, String>,
     /// Whether a term names a premise node, whose entry the derivation binds as `e`.
     uses_entry: bool,
 }
 
 impl Terms<'_, '_, '_> {
-    fn cost(&self, cost: &crate::cost::Cost) -> String {
+    fn cost(&self, cost: &Cost) -> String {
         cost.lean_with(&|id| self.renamed.get(&id).copied().unwrap_or(id))
+    }
+
+    fn derivation(&self, id: DerivationId) -> Result<&Derivation, Absence> {
+        self.arena.get(id).ok_or(Absence::Missing)
     }
 
     fn site(&mut self, syntax: SourceSpan) -> Result<String, Absence> {
@@ -348,23 +350,49 @@ impl Terms<'_, '_, '_> {
         Ok(site)
     }
 
-    fn premise(&self, id: DerivationId) -> Result<&str, Absence> {
-        self.texts
-            .get(&id)
-            .map(String::as_str)
-            .ok_or(Absence::Missing)
+    /// The derivations whose terms the certificate holds, each after those its term holds, with their shapes.
+    fn postorder(&mut self, root: DerivationId) -> Result<Vec<DerivationId>, Absence> {
+        let mut order = Vec::new();
+        let mut pending = vec![(root, false)];
+
+        while let Some((id, expanded)) = pending.pop() {
+            if expanded {
+                order.push(id);
+
+                continue;
+            }
+
+            if self.shapes.contains_key(&id) {
+                continue;
+            }
+
+            let shaped = self.shape(id)?;
+            let held = shaped.1.clone();
+
+            self.shapes.insert(id, shaped);
+            pending.push((id, true));
+            pending.extend(
+                held.into_iter()
+                    .rev()
+                    .filter(|premise| !self.shapes.contains_key(premise))
+                    .map(|premise| (premise, false)),
+            );
+        }
+
+        Ok(order)
     }
 
-    fn term(
-        &mut self,
-        analysis: &Analysis<'_, '_>,
-        derivation: &crate::derivation::Derivation,
-    ) -> Result<String, Absence> {
+    /// A derivation's shape and the derivations its term holds the terms of.
+    fn shape(&mut self, id: DerivationId) -> Result<(Shape, Vec<DerivationId>), Absence> {
+        let derivation = self.derivation(id)?;
         let rule = derivation.rule;
-        let arena = &analysis.traces.derivations;
 
         if UNCONSTRUCTED.contains(&rule) {
             return Err(Absence::Unconstructed(rule));
+        }
+
+        if is_join(self.arena, derivation) {
+            return Err(Absence::Unshaped(rule));
         }
 
         match rule {
@@ -373,65 +401,275 @@ impl Terms<'_, '_, '_> {
                     && derivation.facts.is_empty()
                     && derivation.cost.is_one() =>
             {
-                return Ok(".seqUnit".to_string());
+                // `seqUnit` holds at statements alone; at the entry or a branch, the unit base is one `seqUnit` per child.
+                let syntax = derivation.syntax;
+                let children = match syntax.file == self.entry.file {
+                    true => self
+                        .scope
+                        .children(Span::new(syntax.start, syntax.end))
+                        .map_err(Absence::Encode)?
+                        .filter(|children| children.branch || children.body.is_some()),
+                    false => None,
+                };
+
+                Ok(match children {
+                    Some(children) => (
+                        Shape::Composed {
+                            branch: children.branch,
+                            sites: children.sites,
+                        },
+                        Vec::new(),
+                    ),
+                    None => (Shape::Unit, Vec::new()),
+                })
             }
-            "channel-total"
+            "seq-max" | "branch-join"
                 if derivation.facts.is_empty()
-                    && derivation.premises.iter().all(|premise| {
-                        arena
-                            .get(*premise)
-                            .is_some_and(|premise| premise.syntax == derivation.syntax)
-                    }) =>
+                    && matches!(derivation.premises.as_slice(), [premise] if self
+                        .arena
+                        .get(*premise)
+                        .is_some_and(|premise| premise.syntax == derivation.syntax && premise.cost == derivation.cost)) =>
             {
-                let parts = derivation
-                    .premises
-                    .iter()
-                    .map(|premise| {
-                        Ok(format!(
-                            "([.normal, .ret, .brk, .cont], {})",
-                            self.premise(*premise)?
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, Absence>>()?;
-
-                return Ok(format!("(.channelTotal [{}])", parts.join(", ")));
+                Ok((Shape::Same, derivation.premises.clone()))
             }
-            rule if SHAPED.contains(&rule) => return Err(Absence::Unshaped(rule)),
-            _ => {}
+            "seq-max" | "branch-join" if derivation.facts.is_empty() => {
+                let syntax = derivation.syntax;
+                let premises = derivation.premises.clone();
+
+                if syntax.file != self.entry.file {
+                    return Err(Absence::Site(syntax));
+                }
+
+                let children = self
+                    .scope
+                    .children(Span::new(syntax.start, syntax.end))
+                    .map_err(Absence::Encode)?
+                    .filter(|children| children.branch == (rule == "branch-join"))
+                    .ok_or(Absence::Unshaped(rule))?;
+                let body = children.body.map(|body| SourceSpan {
+                    file: syntax.file,
+                    start: body.start,
+                    end: body.end,
+                });
+                let leaves = leaves(self.arena, &premises, body)?;
+
+                Ok((
+                    Shape::Composed {
+                        branch: children.branch,
+                        sites: children.sites,
+                    },
+                    leaves,
+                ))
+            }
+            // `channel-total` over parts at other nodes is a join (`is_join`).
+            "channel-total" if derivation.facts.is_empty() => {
+                Ok((Shape::Total, derivation.premises.clone()))
+            }
+            rule if SHAPED.contains(&rule) => Err(Absence::Unshaped(rule)),
+            _ => Ok((
+                Shape::Generic,
+                leaves(self.arena, &derivation.premises, None)?,
+            )),
         }
-
-        let mut premises = Vec::with_capacity(derivation.premises.len());
-
-        for premise in &derivation.premises {
-            let syntax = arena.get(*premise).ok_or(Absence::Missing)?.syntax;
-            let site = self.site(syntax)?;
-
-            premises.push(format!("(⟨e, {site}⟩, {})", self.premise(*premise)?));
-        }
-
-        self.uses_entry |= !premises.is_empty();
-
-        let mut facts = Vec::with_capacity(derivation.facts.len());
-
-        for fact in &derivation.facts {
-            facts.push(match fact {
-                Fact::Cost(cost) => format!(".cost ({})", self.cost(cost)),
-                Fact::Nat(value) => format!(".nat {value}"),
-                Fact::Name(name) => format!(".name {}", string(name)),
-                Fact::Site(syntax) => format!(".site ({})", self.site(*syntax)?),
-                Fact::Flag(flag) => format!(".flag {flag}"),
-                Fact::Declared { .. } => return Err(Absence::Declared),
-            });
-        }
-
-        Ok(format!(
-            "(.{} [{}] [{}] ({}))",
-            constructor_of(rule),
-            premises.join(", "),
-            facts.join(", "),
-            self.cost(&derivation.cost)
-        ))
     }
+
+    /// The term of a derivation whose held terms are in `texts`.
+    fn term(&mut self, id: DerivationId) -> Result<String, Absence> {
+        let arena = self.arena;
+        let get = |id: DerivationId| arena.get(id).ok_or(Absence::Missing);
+        let derivation = get(id)?;
+        let (shape, held) = self.shapes.remove(&id).ok_or(Absence::Missing)?;
+
+        match shape {
+            Shape::Unit => Ok(".seqUnit".to_string()),
+            Shape::Same => Ok(self.held(held[0])?.to_string()),
+            Shape::Composed { branch, sites } => {
+                // Each leaf fills the first unfilled child of its site: children with equal sites are one structural
+                // site, which the leaf bounds whichever of them it concerns.
+                let mut filled: Vec<Option<DerivationId>> = vec![None; sites.len()];
+                let mut unfilled: HashMap<&str, VecDeque<usize>> = HashMap::new();
+
+                for (index, site) in sites.iter().enumerate() {
+                    unfilled.entry(site.as_str()).or_default().push_back(index);
+                }
+
+                for leaf in &held {
+                    let site = self.site(get(*leaf)?.syntax)?;
+                    let slot = unfilled
+                        .get_mut(site.as_str())
+                        .and_then(|slots| slots.pop_front())
+                        .ok_or(Absence::Unshaped(derivation.rule))?;
+
+                    filled[slot] = Some(*leaf);
+                }
+
+                let mut children = Vec::with_capacity(filled.len());
+                let mut costs = Vec::with_capacity(filled.len());
+
+                for slot in filled {
+                    match slot {
+                        Some(leaf) => {
+                            children.push(self.held(leaf)?.to_string());
+                            costs.push(get(leaf)?.cost.clone());
+                        }
+                        None => {
+                            children.push(".seqUnit".to_string());
+                            costs.push(Cost::ONE);
+                        }
+                    }
+                }
+
+                let constructor = match branch {
+                    true => "branchJoin",
+                    false => "seqMax",
+                };
+                let term = format!("(.{constructor} [{}])", children.join(", "));
+
+                Ok(self.concluded(term, &costs, &derivation.cost))
+            }
+            Shape::Total => {
+                let mut parts = Vec::with_capacity(held.len());
+                let mut costs = Vec::with_capacity(held.len());
+
+                for premise in &held {
+                    parts.push(format!(
+                        "([.normal, .ret, .brk, .cont], {})",
+                        self.held(*premise)?
+                    ));
+                    costs.push(get(*premise)?.cost.clone());
+                }
+
+                let term = format!("(.channelTotal [{}])", parts.join(", "));
+
+                Ok(self.concluded(term, &costs, &derivation.cost))
+            }
+            Shape::Generic => {
+                let mut premises = Vec::with_capacity(held.len());
+
+                for premise in &held {
+                    let site = self.site(get(*premise)?.syntax)?;
+
+                    premises.push(format!("(⟨e, {site}⟩, {})", self.held(*premise)?));
+                }
+
+                self.uses_entry |= !premises.is_empty();
+
+                let mut facts = Vec::with_capacity(derivation.facts.len());
+
+                for fact in &derivation.facts {
+                    facts.push(match fact {
+                        Fact::Cost(cost) => format!(".cost ({})", self.cost(cost)),
+                        Fact::Nat(value) => format!(".nat {value}"),
+                        Fact::Name(name) => format!(".name {}", string(name)),
+                        Fact::Site(syntax) => format!(".site ({})", self.site(*syntax)?),
+                        Fact::Flag(flag) => format!(".flag {flag}"),
+                        Fact::Declared { .. } => return Err(Absence::Declared),
+                    });
+                }
+
+                Ok(format!(
+                    "(.{} [{}] [{}] ({}))",
+                    constructor_of(derivation.rule),
+                    premises.join(", "),
+                    facts.join(", "),
+                    self.cost(&derivation.cost)
+                ))
+            }
+        }
+    }
+
+    fn held(&self, id: DerivationId) -> Result<&str, Absence> {
+        self.texts
+            .get(&id)
+            .map(String::as_str)
+            .ok_or(Absence::Missing)
+    }
+
+    /// `term`, which concludes the maximum of `costs`, concluding `target` instead: by `max-normalise` when every
+    /// flattened term of that maximum is `0` or at most a flattened term of `target` (`Olint.Rules.maxCovers`), else by
+    /// `max-dominance`, which drops the terms `O` of a kept one (`Olint.Rules.dominated`).
+    fn concluded(&self, term: String, costs: &[Cost], target: &Cost) -> String {
+        let maximum = format!(
+            ".maximum [{}]",
+            costs
+                .iter()
+                .map(|cost| self.cost(cost))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let target_text = self.cost(target);
+
+        if maximum == target_text {
+            return term;
+        }
+
+        let targets: Vec<(String, Option<u64>)> = target
+            .maximum_terms()
+            .iter()
+            .map(|term| (self.cost(term), term.constant_of()))
+            .collect();
+        let covers = costs.iter().flat_map(Cost::maximum_terms).all(|term| {
+            let (text, constant) = (self.cost(&term), term.constant_of());
+
+            constant == Some(0) || targets.iter().any(|(target, bound)| {
+                *target == text
+                    || matches!((constant, bound), (Some(value), Some(bound)) if value <= *bound)
+            })
+        });
+        let rule = match covers {
+            true => "maxNormalise",
+            false => "maxDominance",
+        };
+
+        format!("(.{rule} {term} ({target_text}))")
+    }
+}
+
+/// Whether a derivation is a join of parts at other nodes rather than a rule application at its own: `max-dominance`
+/// and `max-normalise` (`Part::max`), which record their first part's syntax, and `channel-total` over parts at
+/// different nodes.
+fn is_join(arena: &DerivationArena, derivation: &Derivation) -> bool {
+    derivation.facts.is_empty()
+        && match derivation.rule {
+            "max-dominance" | "max-normalise" => true,
+            "channel-total" => !derivation.premises.iter().all(|premise| {
+                arena
+                    .get(*premise)
+                    .is_some_and(|premise| premise.syntax == derivation.syntax)
+            }),
+            _ => false,
+        }
+}
+
+/// The parts the joins under `premises` combine, each once, in order: a premise that is a join (`is_join`) stands for
+/// its own premises' parts, as does `seq-max` at `body`, the entry's function body.
+fn leaves(
+    arena: &DerivationArena,
+    premises: &[DerivationId],
+    body: Option<SourceSpan>,
+) -> Result<Vec<DerivationId>, Absence> {
+    let mut leaves = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending: Vec<DerivationId> = premises.iter().rev().copied().collect();
+
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+
+        let derivation = arena.get(id).ok_or(Absence::Missing)?;
+        let transparent = is_join(arena, derivation)
+            || (derivation.rule == "seq-max"
+                && derivation.facts.is_empty()
+                && Some(derivation.syntax) == body);
+
+        match transparent {
+            true => pending.extend(derivation.premises.iter().rev()),
+            false => leaves.push(id),
+        }
+    }
+
+    Ok(leaves)
 }
 
 #[cfg(test)]

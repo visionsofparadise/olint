@@ -489,8 +489,26 @@ fn rows_name_their_rules_and_the_certificates_written_beside_them() {
     );
     assert!(record.node.contains("[(0, .arg 0)]⟩"), "{}", record.node);
 
-    // The entry runs its body under `seq-max`, whose constructor takes one certificate per child site.
-    assert_eq!(row_of(&found, "Function").certificate, None);
+    // The entry runs its body under `seq-max`: one certificate per statement, the loop's where the join recorded it and
+    // the unit base at the two statements without work, concluded at the loop's cost.
+    let record = certificate_of(&found, row_of(&found, "Function"));
+
+    assert!(record.node.ends_with(", .entry⟩"), "{}", record.node);
+    assert!(
+        record
+            .derivation
+            .contains("(.maxDominance (.seqMax [.seqUnit, (.loopPhases ["),
+        "{}",
+        record.derivation
+    );
+    assert!(
+        record
+            .derivation
+            .ends_with(".seqUnit]) (.dimension 0 .size)))"),
+        "{}",
+        record.derivation
+    );
+    assert_eq!(record.bound, ".dimension 0 .size");
 }
 
 #[test]

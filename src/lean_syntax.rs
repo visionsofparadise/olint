@@ -256,24 +256,83 @@ impl<'s, 'a> Scope<'s, 'a> {
     /// The `Site` of the syntax at `span` in the entry function: `.entry` for the function itself, else the outermost
     /// statement or expression of its body spanning exactly `span`. `None` when no such syntax exists.
     pub fn site(&self, span: Span) -> Result<Option<String>, EncodeError> {
-        let nodes = self.entry.semantic.nodes();
-        let kind = nodes.kind(self.entry.node);
-
-        if kind.span() == span {
+        if self.entry_span() == span {
             return Ok(Some(".entry".to_string()));
         }
 
+        self.find(span, Encoder::statement_site, Encoder::expression_site)
+    }
+
+    /// The children `Olint.Rules.seqSites` or `Olint.Rules.branchSites` gives the syntax at `span`, each as `site`
+    /// encodes it, in syntax order: the entry's body statements, a block's statements, the expression of an
+    /// expression statement, an initialised declaration or a `return`, and an `if`'s or a conditional's test and
+    /// branches. `None` for any other syntax, and for an arrow function whose body is an expression, whose one child,
+    /// the `return` the model wraps the expression in, has no syntax of its own.
+    pub fn children(&self, span: Span) -> Result<Option<Children>, EncodeError> {
+        if self.entry_span() == span {
+            let body = match self.entry.semantic.nodes().kind(self.entry.node) {
+                AstKind::Function(function) => function.body.as_deref(),
+                AstKind::ArrowFunctionExpression(arrow) => match &arrow.body {
+                    ArrowFunctionBody::FunctionBody(body) => Some(&**body),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            return body
+                .map(|body| {
+                    Ok(Children {
+                        branch: false,
+                        sites: self
+                            .encoder()
+                            .body_terms(body)?
+                            .into_iter()
+                            .map(|statement| format!(".stmt ({statement})"))
+                            .collect(),
+                        body: Some(body.span),
+                    })
+                })
+                .transpose();
+        }
+
+        Ok(self
+            .find(
+                span,
+                Encoder::statement_children,
+                Encoder::expression_children,
+            )?
+            .flatten())
+    }
+
+    fn entry_span(&self) -> Span {
+        self.entry.semantic.nodes().kind(self.entry.node).span()
+    }
+
+    fn encoder(&self) -> Encoder<'_, 'a> {
+        Encoder {
+            semantic: self.entry.semantic,
+            root: self.entry.node,
+            definitions: &self.definitions,
+        }
+    }
+
+    /// Encodes, by `statement` or `expression`, the outermost statement or expression of the entry's body spanning
+    /// exactly `span`. `None` when no such syntax exists.
+    fn find<'e, T>(
+        &'e self,
+        span: Span,
+        statement: fn(&Encoder<'e, 'a>, &Statement<'a>) -> Result<T, EncodeError>,
+        expression: fn(&Encoder<'e, 'a>, &Expression<'a>) -> Result<T, EncodeError>,
+    ) -> Result<Option<T>, EncodeError> {
         let mut finder = SiteFinder {
-            encoder: Encoder {
-                semantic: self.entry.semantic,
-                root: self.entry.node,
-                definitions: &self.definitions,
-            },
+            encoder: self.encoder(),
             span,
+            statement,
+            expression,
             found: None,
         };
 
-        match kind {
+        match self.entry.semantic.nodes().kind(self.entry.node) {
             AstKind::Function(function) => {
                 if let Some(body) = &function.body {
                     finder.visit_function_body(body);
@@ -299,25 +358,35 @@ impl<'s, 'a> Scope<'s, 'a> {
     }
 }
 
-/// Finds the outermost statement or expression spanning exactly `span` and encodes it as a `Site`.
-struct SiteFinder<'s, 'a> {
-    encoder: Encoder<'s, 'a>,
-    span: Span,
-    found: Option<Encoded>,
+/// The children a composing rule's constructor checks one certificate at each of (`Scope::children`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Children {
+    /// Whether the children are a branch's (`branch-join`) rather than a sequence's (`seq-max`).
+    pub branch: bool,
+    /// Each child's `Site`, in syntax order.
+    pub sites: Vec<String>,
+    /// For the entry, the span of its function body, which olint derives as a node of its own between the entry and
+    /// its statements.
+    pub body: Option<Span>,
 }
 
-impl<'a> Visit<'a> for SiteFinder<'_, 'a> {
+/// Finds the outermost statement or expression spanning exactly `span` and encodes it by `statement` or `expression`.
+struct SiteFinder<'s, 'a, T> {
+    encoder: Encoder<'s, 'a>,
+    span: Span,
+    statement: fn(&Encoder<'s, 'a>, &Statement<'a>) -> Result<T, EncodeError>,
+    expression: fn(&Encoder<'s, 'a>, &Expression<'a>) -> Result<T, EncodeError>,
+    found: Option<Result<T, EncodeError>>,
+}
+
+impl<'a, T> Visit<'a> for SiteFinder<'_, 'a, T> {
     fn visit_statement(&mut self, statement: &Statement<'a>) {
         if self.found.is_some() {
             return;
         }
 
         if statement.span() == self.span {
-            self.found = Some(
-                self.encoder
-                    .statement(statement)
-                    .map(|statement| format!(".stmt ({statement})")),
-            );
+            self.found = Some((self.statement)(&self.encoder, statement));
 
             return;
         }
@@ -331,11 +400,7 @@ impl<'a> Visit<'a> for SiteFinder<'_, 'a> {
         }
 
         if expression.span() == self.span {
-            self.found = Some(
-                self.encoder
-                    .expression(expression)
-                    .map(|expression| format!(".expr ({expression})")),
-            );
+            self.found = Some((self.expression)(&self.encoder, expression));
 
             return;
         }
@@ -517,12 +582,16 @@ impl<'a> Encoder<'_, 'a> {
     /// A function body's statements; its top-level function declarations, which strict and
     /// sloppy code instantiate alike, are the only ones the encoder accepts.
     fn body(&self, body: &FunctionBody<'a>) -> Encoded {
+        Ok(list(self.body_terms(body)?))
+    }
+
+    /// The `Stmt` terms of a function body's statements.
+    fn body_terms(&self, body: &FunctionBody<'a>) -> Result<Vec<String>, EncodeError> {
         if let Some(directive) = body.directives.first() {
             return Err(self.unsupported(directive, None));
         }
 
-        let terms = body
-            .statements
+        body.statements
             .iter()
             .map(|statement| match statement {
                 Statement::FunctionDeclaration(function) => {
@@ -538,9 +607,7 @@ impl<'a> Encoder<'_, 'a> {
                 }
                 statement => self.statement(statement),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(list(terms))
+            .collect()
     }
 
     fn func(&self, params: &FormalParameters<'a>, body: String, arrow: bool) -> Encoded {
@@ -621,6 +688,99 @@ impl<'a> Encoder<'_, 'a> {
         }
 
         Ok(format!(".mk {constructor} {}", list(methods)))
+    }
+
+    /// The children `Scope::children` gives a statement that encodes.
+    fn statement_children(
+        &self,
+        statement: &Statement<'a>,
+    ) -> Result<Option<Children>, EncodeError> {
+        self.statement(statement)?;
+
+        let sequence = |sites: Vec<String>| {
+            Some(Children {
+                branch: false,
+                sites,
+                body: None,
+            })
+        };
+
+        Ok(match statement {
+            Statement::ExpressionStatement(inner) => {
+                sequence(vec![self.expression_site(&inner.expression)?])
+            }
+            Statement::VariableDeclaration(declaration) => match self.declared(declaration)?.2 {
+                Some(init) => sequence(vec![self.expression_site(init)?]),
+                None => None,
+            },
+            Statement::ReturnStatement(inner) => match &inner.argument {
+                Some(argument) => sequence(vec![self.expression_site(argument)?]),
+                None => None,
+            },
+            Statement::BlockStatement(block) => sequence(
+                block
+                    .body
+                    .iter()
+                    .map(|statement| self.statement_site(statement))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Statement::IfStatement(inner) => {
+                let mut sites = vec![
+                    self.expression_site(&inner.test)?,
+                    self.statement_site(&inner.consequent)?,
+                ];
+
+                if let Some(alternate) = &inner.alternate {
+                    sites.push(self.statement_site(alternate)?);
+                }
+
+                Some(Children {
+                    branch: true,
+                    sites,
+                    body: None,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// The children `Scope::children` gives an expression that encodes: a conditional's test and branches, through
+    /// the parentheses and `satisfies` the encoding drops.
+    fn expression_children(
+        &self,
+        expression: &Expression<'a>,
+    ) -> Result<Option<Children>, EncodeError> {
+        match expression {
+            Expression::ParenthesizedExpression(inner) => {
+                self.expression_children(&inner.expression)
+            }
+            Expression::TSSatisfiesExpression(inner) => self.expression_children(&inner.expression),
+            Expression::ConditionalExpression(conditional) => Ok(Some(Children {
+                branch: true,
+                sites: [
+                    &conditional.test,
+                    &conditional.consequent,
+                    &conditional.alternate,
+                ]
+                .into_iter()
+                .map(|expression| self.expression_site(expression))
+                .collect::<Result<_, _>>()?,
+                body: None,
+            })),
+            _ => {
+                self.expression(expression)?;
+
+                Ok(None)
+            }
+        }
+    }
+
+    fn statement_site(&self, statement: &Statement<'a>) -> Encoded {
+        Ok(format!(".stmt ({})", self.statement(statement)?))
+    }
+
+    fn expression_site(&self, expression: &Expression<'a>) -> Encoded {
+        Ok(format!(".expr ({})", self.expression(expression)?))
     }
 
     fn statements(&self, statements: &[Statement<'a>]) -> Encoded {

@@ -165,6 +165,21 @@ impl Cost {
         }
     }
 
+    /// The terms of the cost read as a maximum, nested maxima flattened, as `Olint.Rules.flatMax` reads them.
+    pub(crate) fn maximum_terms(&self) -> Vec<Cost> {
+        let mut terms = Vec::new();
+        let mut pending = vec![&self.0];
+
+        while let Some(value) = pending.pop() {
+            match value {
+                Expression::Maximum(values) => pending.extend(values.iter().rev()),
+                value => terms.push(Self(value.clone())),
+            }
+        }
+
+        terms
+    }
+
     pub(crate) fn mentions_dimension_from(&self, floor: u64) -> bool {
         self.0.mentions_dimension_from(floor)
     }
