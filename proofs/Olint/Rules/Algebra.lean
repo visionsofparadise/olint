@@ -20,13 +20,15 @@ shapes `SpecOps` fixes for them, and consult no intrinsic.
 child's bound holds at every configuration its entry's run reaches at the child
 (`Olint.Bound`), so a parent's run, which is one unit of work followed by its children's runs,
 each at most once, is bounded by the maximum of the children's bounds (`bound_compose`). The
-composition lemmas unfold the interpreter one step (`execStmt_block`, `execStmt_ite`, …) and
-use the `Sub` edges from the parent to each child.
+composition lemmas unfold the interpreter one step (`execStmt_block`, `execStmt_ite`, …) into
+run results continued on completion (`Res.bind`), so a child that throws or violates §2.5 ends
+its parent the same way after the same work (`Ends.bind`, `Within.bind`), and use the `Sub`
+edges from the parent to each child.
 
 | Rule | olint | Decidable side condition | Soundness lemma |
 | --- | --- | --- | --- |
 | `seq-max` | cost.rs:2045/1800, walker.rs:675 | `seqSites` on the node, children checked | `seqMax_sound` |
-| `seq-max` (unit base) | walker.rs:497, walker.rs:675 | `unitStmt` or a literal on the node | `unit_bound`, `lit_bound` |
+| `seq-max` (unit base) | walker.rs:497, walker.rs:675 | `unitStmt` or `unitExpr` on the node | `unit_bound`, `unitExpr_bound` |
 | `branch-join` | walker.rs:506-574 | `branchSites` on the node, children checked | `branchJoin_sound` |
 | `channel-total` | cost.rs:2101 | parts checked, channels covered | `channelTotal_sound` |
 | `max-dominance` | cost.rs:1826-1850, cost.rs:1009-1038 | `within` per dropped term | `maxDominance_sound` |
@@ -168,23 +170,142 @@ theorem Cost.eq_of_beqList : ∀ (a b : List Cost), Cost.beqList a b = true → 
 
 end
 
-/-! ## Unfolding frames -/
+/-! ## Run results
+
+A run result completes (`.ok`) or stops, recording why and the work done so far. A composite
+node's result continues its first child's result on completion (`Res.bind`): a child that
+throws or violates §2.5 ends the node the same way, after the same work. -/
+
+/-- Continue a run result with `k` on completion; a stop propagates unchanged. -/
+def Res.bind {α β : Type} (r : Except (Abort × ℕ) (α × St))
+    (k : α → St → Except (Abort × ℕ) (β × St)) : Except (Abort × ℕ) (β × St) :=
+  match r with
+  | .ok (a, st) => k a st
+  | .error e => .error e
+
+/-- Map a run result's value. -/
+def Res.map {α β : Type} (g : α → β) (r : Except (Abort × ℕ) (α × St)) :
+    Except (Abort × ℕ) (β × St) :=
+  Res.bind r fun a st => .ok (g a, st)
+
+@[simp] theorem Res.bind_ok {α β : Type} (a : α) (st : St)
+    (k : α → St → Except (Abort × ℕ) (β × St)) : Res.bind (.ok (a, st)) k = k a st := rfl
+
+@[simp] theorem Res.bind_error {α β : Type} (e : Abort × ℕ)
+    (k : α → St → Except (Abort × ℕ) (β × St)) : Res.bind (.error e) k = .error e := rfl
+
+theorem run_bind' {α β : Type} (x : M α) (g : α → M β) (st : St) :
+    (x >>= g).run st = Res.bind (x.run st) fun a s => (g a).run s := by
+  rw [run_bind]; rcases x.run st with e | ⟨a, s⟩ <;> rfl
+
+theorem run_map' {α β : Type} (g : α → β) (x : M α) (st : St) :
+    (g <$> x).run st = Res.map g (x.run st) := by
+  rw [run_map]; rcases x.run st with e | ⟨a, s⟩ <;> rfl
+
+theorem _root_.Olint.Ends.bind {α β : Type} {r : Except (Abort × ℕ) (α × St)}
+    {k : α → St → Except (Abort × ℕ) (β × St)} (hr : Ends r)
+    (hk : ∀ a st, r = .ok (a, st) → Ends (k a st)) : Ends (Res.bind r k) := by
+  rcases r with ⟨e, w⟩ | ⟨a, st⟩
+  · exact hr
+  · exact hk a st rfl
+
+theorem _root_.Olint.Ends.map {α β : Type} {g : α → β} {r : Except (Abort × ℕ) (α × St)} (hr : Ends r) :
+    Ends (Res.map g r) := hr.bind fun _ _ _ => trivial
+
+theorem _root_.Olint.Ends.of_map {α β : Type} {g : α → β} {r : Except (Abort × ℕ) (α × St)}
+    (h : Ends (Res.map g r)) : Ends r := by
+  rcases r with ⟨e, w⟩ | ⟨a, st⟩
+  · exact h
+  · trivial
+
+theorem _root_.Olint.Within.error_fuel {α : Type} {P : α → Prop} {w0 w : ℕ} {b : ℝ} :
+    Within P w0 b (.error (.fuel, w)) := fun h => by simp [Abort.thrown] at h
+
+theorem _root_.Olint.Within.ok_of {α : Type} {P : α → Prop} {w0 : ℕ} {b : ℝ} {a : α} {st : St}
+    (h : (st.work : ℝ) - w0 ≤ b) : Within P w0 b (.ok (a, st)) := fun _ => h
+
+theorem _root_.Olint.Within.bind {α β : Type} {P : β → Prop} {w0 : ℕ} {b1 b2 : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} {k : α → St → Except (Abort × ℕ) (β × St)}
+    (hr : Within (fun _ => True) w0 b1 r) (hb2 : 0 ≤ b2)
+    (hk : ∀ a st, r = .ok (a, st) → Within P st.work b2 (k a st)) :
+    Within P w0 (b1 + b2) (Res.bind r k) := by
+  rcases r with ⟨e, w⟩ | ⟨a, st⟩
+  · intro he
+    have := hr he
+    linarith
+  · have h1 : (st.work : ℝ) - w0 ≤ b1 := hr trivial
+    have h2 := hk a st rfl
+    show Within P w0 (b1 + b2) (k a st)
+    revert h2
+    rcases k a st with ⟨e, w⟩ | ⟨c, st'⟩
+    · intro h2 he
+      have := h2 he
+      linarith
+    · intro h2 hc
+      have := h2 hc
+      linarith
+
+theorem _root_.Olint.Within.map {α β : Type} {P : β → Prop} {g : α → β} {w0 : ℕ} {b : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} (h : Within (fun a => P (g a)) w0 b r) :
+    Within P w0 b (Res.map g r) := by
+  rcases r with ⟨e, w⟩ | ⟨a, st⟩
+  · exact h
+  · exact h
+
+theorem _root_.Olint.Within.of_map {α β : Type} {P : β → Prop} {g : α → β} {w0 : ℕ} {b : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} (h : Within P w0 b (Res.map g r)) :
+    Within (fun a => P (g a)) w0 b r := by
+  rcases r with ⟨e, w⟩ | ⟨a, st⟩
+  · exact h
+  · exact h
+
+/-- A bound from a later start is a bound from an earlier one plus the work in between. -/
+theorem _root_.Olint.Within.shift {α : Type} {P : α → Prop} {w0 w1 k : ℕ} {b : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} (h : Within P w1 b r) (hw : w1 ≤ w0 + k) :
+    Within P w0 (k + b) r := by
+  have hw' : (w1 : ℝ) ≤ w0 + k := by exact_mod_cast hw
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · intro he
+    have := h he
+    linarith
+  · intro ha
+    have := h ha
+    linarith
+
+/-- Starting one unit of work later costs one unit more from the earlier start. -/
+theorem _root_.Olint.Within.tick {α : Type} {P : α → Prop} {st : St} {b : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} (h : Within P st.tick.work b r) :
+    Within P st.work (1 + b) r := by
+  have := h.shift (w0 := st.work) (k := 1) (by simp [St.tick])
+  simpa using this
+
+/-! ## Frame results -/
+
+theorem result_expr {env : Env} {x : Expr} {st : St} {f : ℕ} :
+    Cfg.result W ⟨.expr env x, st⟩ f = Res.map Outcome.val ((evalExpr W f env x).run st) :=
+  run_map' _ _ _
+
+theorem result_stmt {env : Env} {s : Stmt} {st : St} {f : ℕ} :
+    Cfg.result W ⟨.stmt env s, st⟩ f =
+      Res.map (fun r => Outcome.stmt r.1 r.2) ((execStmt W f env s).run st) :=
+  run_map' _ _ _
+
+theorem result_stmts {env : Env} {ss : List Stmt} {st : St} {f : ℕ} :
+    Cfg.result W ⟨.stmts env ss, st⟩ f =
+      Res.map (fun r => Outcome.stmt r.1 r.2) ((execStmts W f env ss).run st) :=
+  run_map' _ _ _
+
+theorem result_callFunc {fn : Func} {env : Env} {self : Value} {args : List Value} {st : St}
+    {f : ℕ} :
+    Cfg.result W ⟨.callFunc fn env self args, st⟩ f =
+      Res.map Outcome.val ((callFunc W f fn env self args).run st) :=
+  run_map' _ _ _
 
 theorem runs_stmt {env : Env} {s : Stmt} {st : St} {f : ℕ} {o : Outcome} {st' : St} :
     Cfg.Runs W ⟨.stmt env s, st⟩ f o st' ↔
       ∃ r, (execStmt W f env s).run st = .ok (r, st') ∧ o = .stmt r.1 r.2 := by
   simp only [Cfg.Runs, Frame.run, run_map]
   rcases (execStmt W f env s).run st with e | ⟨r, st1⟩
-  · simp
-  · constructor
-    · intro h; cases h; exact ⟨r, rfl, rfl⟩
-    · rintro ⟨r', h1, rfl⟩; cases h1; rfl
-
-theorem runs_stmts {env : Env} {ss : List Stmt} {st : St} {f : ℕ} {o : Outcome} {st' : St} :
-    Cfg.Runs W ⟨.stmts env ss, st⟩ f o st' ↔
-      ∃ r, (execStmts W f env ss).run st = .ok (r, st') ∧ o = .stmt r.1 r.2 := by
-  simp only [Cfg.Runs, Frame.run, run_map]
-  rcases (execStmts W f env ss).run st with e | ⟨r, st1⟩
   · simp
   · constructor
     · intro h; cases h; exact ⟨r, rfl, rfl⟩
@@ -200,21 +321,92 @@ theorem runs_expr {env : Env} {x : Expr} {st : St} {f : ℕ} {o : Outcome} {st' 
     · intro h; cases h; exact ⟨r, rfl, rfl⟩
     · rintro ⟨r', h1, rfl⟩; cases h1; rfl
 
-theorem runs_callFunc {fn : Func} {env : Env} {self : Value} {args : List Value} {st : St}
-    {f : ℕ} {o : Outcome} {st' : St} :
-    Cfg.Runs W ⟨.callFunc fn env self args, st⟩ f o st' ↔
-      ∃ v, (callFunc W f fn env self args).run st = .ok (v, st') ∧ o = .val v := by
-  simp only [Cfg.Runs, Frame.run, run_map]
-  rcases (callFunc W f fn env self args).run st with e | ⟨r, st1⟩
-  · simp
-  · constructor
-    · intro h; cases h; exact ⟨r, rfl, rfl⟩
-    · rintro ⟨r', h1, rfl⟩; cases h1; rfl
+/-- A completed expression evaluation, as the `Ev` premise of a later `Sub` edge. -/
+theorem ev_expr {env : Env} {x : Expr} {st st1 : St} {f : ℕ} {v : Value}
+    (h : (evalExpr W f env x).run st = .ok (v, st1)) : Ev W (.expr env x) st (.val v) st1 :=
+  ⟨f, runs_expr.2 ⟨v, h, rfl⟩⟩
 
-/-! ## Statement lists -/
+/-- A completed statement execution, as the `Ev` premise of a later `Sub` edge. -/
+theorem ev_stmt {env : Env} {s : Stmt} {st st1 : St} {f : ℕ} {r : Env × Completion}
+    (h : (execStmt W f env s).run st = .ok (r, st1)) : Ev W (.stmt env s) st (.stmt r.1 r.2) st1 :=
+  ⟨f, runs_stmt.2 ⟨r, h, rfl⟩⟩
+
+/-- What a bound at an expression site gives about one reached evaluation of it. -/
+theorem _root_.Olint.Holds.at_expr {p : Program} {e : Entry} {i : Instance} {x : Expr} {F : ℕ} {B : ℝ}
+    {env : Env} {st : St} (h : Holds W p e i (.expr x) allChannels F B)
+    (hr : Reach W p e i ⟨.expr env x, st⟩) :
+    (∀ f, F ≤ f → Ends ((evalExpr W f env x).run st)) ∧
+      ∀ f, Within (fun _ => True) st.work B ((evalExpr W f env x).run st) := by
+  obtain ⟨he, hw⟩ := h _ hr ⟨env, rfl⟩
+  refine ⟨fun f hf => ?_, fun f => ?_⟩
+  · have := he f hf
+    rw [result_expr] at this
+    exact this.of_map
+  · have := hw f
+    rw [result_expr] at this
+    exact this.of_map.restrict fun _ _ => mem_allChannels _
+
+/-- What a bound at a statement site gives about one reached execution of it. -/
+theorem _root_.Olint.Holds.at_stmt {p : Program} {e : Entry} {i : Instance} {s : Stmt} {F : ℕ} {B : ℝ}
+    {env : Env} {st : St} (h : Holds W p e i (.stmt s) allChannels F B)
+    (hr : Reach W p e i ⟨.stmt env s, st⟩) :
+    (∀ f, F ≤ f → Ends ((execStmt W f env s).run st)) ∧
+      ∀ f, Within (fun _ => True) st.work B ((execStmt W f env s).run st) := by
+  obtain ⟨he, hw⟩ := h _ hr ⟨env, rfl⟩
+  refine ⟨fun f hf => ?_, fun f => ?_⟩
+  · have := he f hf
+    rw [result_stmt] at this
+    exact this.of_map
+  · have := hw f
+    rw [result_stmt] at this
+    exact this.of_map.restrict fun _ _ => mem_allChannels _
+
+/-- A bound at an expression site from bounds on its interpreter results. -/
+theorem holds_expr_of {p : Program} {e : Entry} {i : Instance} {x : Expr} {F : ℕ} {B : ℝ}
+    (h : ∀ env st, Reach W p e i ⟨.expr env x, st⟩ →
+      (∀ f, F ≤ f → Ends ((evalExpr W f env x).run st)) ∧
+        ∀ f, Within (fun _ => True) st.work B ((evalExpr W f env x).run st)) :
+    Holds W p e i (.expr x) allChannels F B := by
+  rintro ⟨fr, st⟩ hr ⟨env, hc⟩
+  simp only at hc
+  subst hc
+  obtain ⟨he, hw⟩ := h env st hr
+  refine ⟨fun f hf => ?_, fun f => ?_⟩
+  · rw [result_expr]; exact (he f hf).map
+  · rw [result_expr]; exact (hw f).map.restrict fun _ _ => trivial
+
+/-- A bound at a statement site from bounds on its interpreter results. -/
+theorem holds_stmt_of {p : Program} {e : Entry} {i : Instance} {s : Stmt} {F : ℕ} {B : ℝ}
+    (h : ∀ env st, Reach W p e i ⟨.stmt env s, st⟩ →
+      (∀ f, F ≤ f → Ends ((execStmt W f env s).run st)) ∧
+        ∀ f, Within (fun _ => True) st.work B ((execStmt W f env s).run st)) :
+    Holds W p e i (.stmt s) allChannels F B := by
+  rintro ⟨fr, st⟩ hr ⟨env, hc⟩
+  simp only at hc
+  subst hc
+  obtain ⟨he, hw⟩ := h env st hr
+  refine ⟨fun f hf => ?_, fun f => ?_⟩
+  · rw [result_stmt]; exact (he f hf).map
+  · rw [result_stmt]; exact (hw f).map.restrict fun _ _ => trivial
+
+/-! ## Unfolding the interpreter -/
+
+theorem run_tick1 (st : St) : (tick 1).run st = .ok ((), st.tick) := rfl
+
+theorem execStmt_zero (env : Env) (s : Stmt) (st : St) :
+    (execStmt W 0 env s).run st = .error (.fuel, st.work) := by
+  rw [execStmt]; rfl
+
+theorem evalExpr_zero (env : Env) (x : Expr) (st : St) :
+    (evalExpr W 0 env x).run st = .error (.fuel, st.work) := by
+  rw [evalExpr]; rfl
+
+theorem callFunc_zero (fn : Func) (env : Env) (self : Value) (args : List Value) (st : St) :
+    (callFunc W 0 fn env self args).run st = .error (.fuel, st.work) := by
+  rw [callFunc]; rfl
 
 theorem execStmts_zero (env : Env) (ss : List Stmt) (st : St) :
-    (execStmts W 0 env ss).run st = .error .fuel := by
+    (execStmts W 0 env ss).run st = .error (.fuel, st.work) := by
   rw [execStmts]; rfl
 
 theorem execStmts_nil (f : ℕ) (env : Env) (st : St) :
@@ -223,150 +415,59 @@ theorem execStmts_nil (f : ℕ) (env : Env) (st : St) :
 
 theorem execStmts_cons (f : ℕ) (env : Env) (s : Stmt) (ss : List Stmt) (st : St) :
     (execStmts W (f + 1) env (s :: ss)).run st =
-      match (execStmt W f env s).run st with
-      | .ok ((env', .normal), st1) => (execStmts W f env' ss).run st1
-      | .ok ((env', c), st1) => .ok ((env', c), st1)
-      | .error e => .error e := by
+      Res.bind ((execStmt W f env s).run st) fun r st1 =>
+        match r.2 with
+        | .normal => (execStmts W f r.1 ss).run st1
+        | c => .ok ((r.1, c), st1) := by
   simp only [execStmts, run_bind]
   rcases (execStmt W f env s).run st with e | ⟨⟨env', c⟩, st1⟩
   · rfl
   · cases c <;> rfl
 
-theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} (hB : 0 ≤ B)
-    (ss0 : List Stmt) (h : ∀ s ∈ ss0, Holds W p e i (.stmt s) allChannels F B) :
-    ∀ ss : List Stmt, (∀ s ∈ ss, s ∈ ss0) → ∀ env st, Reach W p e i ⟨.stmts env ss, st⟩ →
-      (∀ f, F + ss.length + 1 ≤ f → ∃ o st', Cfg.Runs W ⟨.stmts env ss, st⟩ f o st') ∧
-      (∀ f o st', Cfg.Runs W ⟨.stmts env ss, st⟩ f o st' → (st'.work : ℝ) - st.work ≤ ss.length * B)
-  | [], _, env, st, _ => by
-    refine ⟨fun f hf => ?_, fun f o st' hc => ?_⟩
-    · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
-      exact ⟨_, _, runs_stmts.2 ⟨(env, .normal), execStmts_nil _ _ _, rfl⟩⟩
-    · obtain ⟨r, hr, _⟩ := runs_stmts.1 hc
-      cases f with
-      | zero => rw [execStmts_zero] at hr; cases hr
-      | succ f =>
-        rw [execStmts_nil] at hr
-        cases hr; simp
-  | s :: ss, hss, env, st, hr => by
-    have hs0 : s ∈ ss0 := hss s (by simp)
-    have hhead : Reach W p e i ⟨.stmt env s, st⟩ := hr.tail Sub.stmtsHead
-    obtain ⟨hcomp, hwork⟩ := h s hs0 _ hhead ⟨env, rfl⟩
-    refine ⟨fun f hf => ?_, fun f o st' hc => ?_⟩
-    · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
-      obtain ⟨o1, st1, h1⟩ := hcomp f' (by simp at hf; omega)
-      obtain ⟨⟨env', c⟩, h1', rfl⟩ := runs_stmt.1 h1
-      cases c with
-      | normal =>
-        have htail : Reach W p e i ⟨.stmts env' ss, st1⟩ :=
-          hr.tail (Sub.stmtsTail ⟨f', h1⟩)
-        obtain ⟨o2, st2, h2⟩ := (holds_stmts hB ss0 h ss (fun s' hs' => hss s' (by simp [hs']))
-          env' st1 htail).1 f' (by simp at hf; omega)
-        obtain ⟨r2, h2', rfl⟩ := runs_stmts.1 h2
-        exact ⟨_, _, runs_stmts.2 ⟨r2, by rw [execStmts_cons, h1']; exact h2', rfl⟩⟩
-      | ret v => exact ⟨_, _, runs_stmts.2 ⟨_, by rw [execStmts_cons, h1'], rfl⟩⟩
-      | brk => exact ⟨_, _, runs_stmts.2 ⟨_, by rw [execStmts_cons, h1'], rfl⟩⟩
-      | cont => exact ⟨_, _, runs_stmts.2 ⟨_, by rw [execStmts_cons, h1'], rfl⟩⟩
-    · obtain ⟨r, hr', _⟩ := runs_stmts.1 hc
-      cases f with
-      | zero => rw [execStmts_zero] at hr'; cases hr'
-      | succ f =>
-        rw [execStmts_cons] at hr'
-        have hlen : ((s :: ss).length : ℝ) * B = B + ss.length * B := by
-          simp only [List.length_cons, Nat.cast_add, Nat.cast_one]; ring
-        rw [hlen]
-        rcases h1 : (execStmt W f env s).run st with err | ⟨⟨env', c⟩, st1⟩
-        · rw [h1] at hr'; cases hr'
-        · rw [h1] at hr'
-          have w1 := hwork f _ st1 (runs_stmt.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
-          have hlB : (0 : ℝ) ≤ ss.length * B := mul_nonneg (Nat.cast_nonneg _) hB
-          cases c with
-          | normal =>
-            have htail : Reach W p e i ⟨.stmts env' ss, st1⟩ :=
-              hr.tail (Sub.stmtsTail ⟨f, runs_stmt.2 ⟨_, h1, rfl⟩⟩)
-            have w2 := (holds_stmts hB ss0 h ss (fun s' hs' => hss s' (by simp [hs']))
-              env' st1 htail).2 f _ st' (runs_stmts.2 ⟨r, hr', rfl⟩)
-            linarith
-          | ret v => cases hr'; linarith
-          | brk => cases hr'; linarith
-          | cont => cases hr'; linarith
-
-/-! ## Unfolding statements and expressions -/
-
-theorem run_tick1 (st : St) : (tick 1).run st = .ok ((), st.tick) := rfl
-
-theorem execStmt_zero (env : Env) (s : Stmt) (st : St) :
-    (execStmt W 0 env s).run st = .error .fuel := by
-  rw [execStmt]; rfl
-
-theorem evalExpr_zero (env : Env) (x : Expr) (st : St) :
-    (evalExpr W 0 env x).run st = .error .fuel := by
-  rw [evalExpr]; rfl
-
-theorem callFunc_zero (fn : Func) (env : Env) (self : Value) (args : List Value) (st : St) :
-    (callFunc W 0 fn env self args).run st = .error .fuel := by
-  rw [callFunc]; rfl
-
 theorem execStmt_block (f : ℕ) (env : Env) (ss : List Stmt) (st : St) :
     (execStmt W (f + 1) env (.block ss)).run st =
-      match (instantiate W env ss).run st.tick with
-      | .ok (env', st1) => match (execStmts W f env' ss).run st1 with
-        | .ok ((_, c), st2) => .ok ((env, c), st2)
-        | .error e => .error e
-      | .error e => .error e := by
+      Res.bind ((instantiate W env ss).run st.tick) fun env' st1 =>
+        Res.map (fun r => (env, r.2)) ((execStmts W f env' ss).run st1) := by
   simp only [execStmt, run_bind, run_tick1]
   rcases (instantiate W env ss).run st.tick with e | ⟨env', st1⟩
   · rfl
-  · simp only
+  · simp only [Res.bind_ok]
     rcases (execStmts W f env' ss).run st1 with e | ⟨⟨env'', c⟩, st2⟩ <;> rfl
 
 theorem execStmt_expr (f : ℕ) (env : Env) (x : Expr) (st : St) :
     (execStmt W (f + 1) env (.expr x)).run st =
-      match (evalExpr W f env x).run st.tick with
-      | .ok (_, st1) => .ok ((env, .normal), st1)
-      | .error e => .error e := by
+      Res.map (fun _ => (env, .normal)) ((evalExpr W f env x).run st.tick) := by
   simp only [execStmt, run_bind, run_tick1]
   rcases (evalExpr W f env x).run st.tick with e | ⟨v, st1⟩ <;> rfl
 
 theorem execStmt_ret (f : ℕ) (env : Env) (x : Expr) (st : St) :
     (execStmt W (f + 1) env (.ret (some x))).run st =
-      match (evalExpr W f env x).run st.tick with
-      | .ok (v, st1) => .ok ((env, .ret v), st1)
-      | .error e => .error e := by
+      Res.map (fun v => (env, .ret v)) ((evalExpr W f env x).run st.tick) := by
   simp only [execStmt, run_bind, run_tick1]
   rcases (evalExpr W f env x).run st.tick with e | ⟨v, st1⟩ <;> rfl
 
 theorem execStmt_decl (f : ℕ) (env : Env) (k : DeclKind) (y : Name) (τ : Ty) (x : Expr)
     (st : St) :
     (execStmt W (f + 1) env (.decl k y τ (some x))).run st =
-      match (evalExpr W f env x).run st.tick with
-      | .ok (v, st1) => match (initBinding env k y τ (some v)).run st1 with
-        | .ok (env', st2) => .ok ((env', .normal), st2)
-        | .error e => .error e
-      | .error e => .error e := by
+      Res.bind ((evalExpr W f env x).run st.tick) fun v st1 =>
+        Res.map (fun env' => (env', .normal)) ((initBinding env k y τ (some v)).run st1) := by
   simp only [execStmt, run_bind, run_tick1]
   rcases (evalExpr W f env x).run st.tick with e | ⟨v, st1⟩
   · rfl
-  · simp only [run_pure]
+  · simp only [run_pure, Res.bind_ok]
     rcases (initBinding env k y τ (some v)).run st1 with e | ⟨env', st2⟩ <;> rfl
 
 theorem execStmt_ite (f : ℕ) (env : Env) (c : Expr) (t : Stmt) (el : Option Stmt) (st : St) :
     (execStmt W (f + 1) env (.ite c t el)).run st =
-      match (evalExpr W f env c).run st.tick with
-      | .ok (v, st1) =>
-        if truthy v then
-          match (execStmt W f env t).run st1 with
-          | .ok ((_, c'), st2) => .ok ((env, c'), st2)
-          | .error e => .error e
+      Res.bind ((evalExpr W f env c).run st.tick) fun v st1 =>
+        if truthy v then Res.map (fun r => (env, r.2)) ((execStmt W f env t).run st1)
         else match el with
-          | some g => match (execStmt W f env g).run st1 with
-            | .ok ((_, c'), st2) => .ok ((env, c'), st2)
-            | .error e => .error e
-          | none => .ok ((env, .normal), st1)
-      | .error e => .error e := by
+          | some g => Res.map (fun r => (env, r.2)) ((execStmt W f env g).run st1)
+          | none => .ok ((env, .normal), st1) := by
   simp only [execStmt, run_bind, run_tick1]
   rcases (evalExpr W f env c).run st.tick with e | ⟨v, st1⟩
   · rfl
-  · simp only
+  · simp only [Res.bind_ok]
     split
     · simp only [run_bind]
       rcases (execStmt W f env t).run st1 with e | ⟨⟨env', c'⟩, st2⟩ <;> rfl
@@ -378,13 +479,12 @@ theorem execStmt_ite (f : ℕ) (env : Env) (c : Expr) (t : Stmt) (el : Option St
 
 theorem evalExpr_cond (f : ℕ) (env : Env) (c t g : Expr) (st : St) :
     (evalExpr W (f + 1) env (.cond c t g)).run st =
-      match (evalExpr W f env c).run st.tick with
-      | .ok (v, st1) => if truthy v then (evalExpr W f env t).run st1 else (evalExpr W f env g).run st1
-      | .error e => .error e := by
+      Res.bind ((evalExpr W f env c).run st.tick) fun v st1 =>
+        if truthy v then (evalExpr W f env t).run st1 else (evalExpr W f env g).run st1 := by
   simp only [evalExpr, run_bind, run_tick1]
   rcases (evalExpr W f env c).run st.tick with e | ⟨v, st1⟩
   · rfl
-  · simp only
+  · simp only [Res.bind_ok]
     split <;> rfl
 
 theorem evalExpr_lit (f : ℕ) (env : Env) (l : Lit) (st : St) :
@@ -394,18 +494,69 @@ theorem evalExpr_lit (f : ℕ) (env : Env) (l : Lit) (st : St) :
 theorem callFunc_succ (f : ℕ) (ps : List (Name × Ty)) (body : List Stmt) (ar : Bool) (env : Env)
     (self : Value) (args : List Value) (st : St) :
     (callFunc W (f + 1) (.mk ps body ar) env self args).run st =
-      match (enterFunc W (.mk ps body ar) env self args).run st with
-      | .ok (env', st1) => match (execStmts W f env' body).run st1 with
-        | .ok ((_, c), st2) => .ok ((match c with | .ret v => v | _ => .undef), st2)
-        | .error e => .error e
-      | .error e => .error e := by
+      Res.bind ((enterFunc W (.mk ps body ar) env self args).run st) fun env' st1 =>
+        Res.map (fun r => match r.2 with | .ret v => v | _ => .undef)
+          ((execStmts W f env' body).run st1) := by
   simp only [callFunc, run_bind]
   rcases (enterFunc W (.mk ps body ar) env self args).run st with e | ⟨env', st1⟩
   · rfl
-  · simp only
+  · simp only [Res.bind_ok]
     rcases (execStmts W f env' body).run st1 with e | ⟨⟨env'', c⟩, st2⟩
     · rfl
     · cases c <;> rfl
+
+/-- A computation that never aborts and performs at most `w` work completes, and the result
+it continues is its continuation's. -/
+theorem _root_.Olint.Model.SafeW.res {α β : Type} {x : M α} {w : ℕ} (hx : SafeW x w) (st : St)
+    (k : α → St → Except (Abort × ℕ) (β × St)) :
+    ∃ a st1, x.run st = .ok (a, st1) ∧ Res.bind (x.run st) k = k a st1 ∧
+      st1.work ≤ st.work + w := by
+  obtain ⟨a, h, n, hn, e⟩ := hx st
+  exact ⟨a, ⟨h, st.work + n⟩, e, by rw [e]; rfl, by simp only; omega⟩
+
+/-! ## Statement lists -/
+
+theorem holds_stmts {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} (hB : 0 ≤ B)
+    (ss0 : List Stmt) (h : ∀ s ∈ ss0, Holds W p e i (.stmt s) allChannels F B) :
+    ∀ ss : List Stmt, (∀ s ∈ ss, s ∈ ss0) → ∀ env st, Reach W p e i ⟨.stmts env ss, st⟩ →
+      (∀ f, F + ss.length + 1 ≤ f → Ends ((execStmts W f env ss).run st)) ∧
+      ∀ f, Within (fun _ => True) st.work (ss.length * B) ((execStmts W f env ss).run st)
+  | [], _, env, st, _ => by
+    refine ⟨fun f hf => ?_, fun f => ?_⟩
+    · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
+      rw [execStmts_nil]; trivial
+    · cases f with
+      | zero => rw [execStmts_zero]; exact Within.error_fuel
+      | succ f => rw [execStmts_nil]; exact Within.ok_of (by simp)
+  | s :: ss, hss, env, st, hr => by
+    have hs0 : s ∈ ss0 := hss s (by simp)
+    have hhead : Reach W p e i ⟨.stmt env s, st⟩ := hr.tail Sub.stmtsHead
+    obtain ⟨he, hw⟩ := (h s hs0).at_stmt hhead
+    have tail := fun env' st1 (htail : Reach W p e i ⟨.stmts env' ss, st1⟩) =>
+      holds_stmts hB ss0 h ss (fun s' hs' => hss s' (by simp [hs'])) env' st1 htail
+    have hlB : (0 : ℝ) ≤ ss.length * B := mul_nonneg (Nat.cast_nonneg _) hB
+    refine ⟨fun f hf => ?_, fun f => ?_⟩
+    · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
+      rw [execStmts_cons]
+      refine (he f' (by simp at hf; omega)).bind fun r st1 hres => ?_
+      obtain ⟨env', c⟩ := r
+      cases c with
+      | normal =>
+        exact (tail env' st1 (hr.tail (Sub.stmtsTail (ev_stmt hres)))).1 f'
+          (by simp at hf; omega)
+      | _ => trivial
+    · cases f with
+      | zero => rw [execStmts_zero]; exact Within.error_fuel
+      | succ f =>
+        rw [execStmts_cons]
+        have hlen : ((s :: ss).length : ℝ) * B = B + ss.length * B := by
+          simp only [List.length_cons, Nat.cast_add, Nat.cast_one]; ring
+        rw [hlen]
+        refine (hw f).bind hlB fun r st1 hres => ?_
+        obtain ⟨env', c⟩ := r
+        cases c with
+        | normal => exact (tail env' st1 (hr.tail (Sub.stmtsTail (ev_stmt hres)))).2 f
+        | _ => exact Within.ok_of (by simpa using hlB)
 
 theorem root_eq (p : Program) (e : Entry) (i : Instance) :
     ∃ env h, root p e i = ⟨.callFunc e.fn env i.receiver i.args, ⟨h, 0⟩⟩ := by
@@ -432,36 +583,36 @@ def branchSites : Site → Option (List Site)
   | _ => none
 
 /-- A statement whose run is one unit of work, then its expression child, then a step with no
-work that cannot abort: the statement completes one fuel unit after its child and does one
-more unit of work. -/
+work that cannot stop: the statement ends one fuel unit after its child and does one more unit
+of work. -/
 theorem holds_stmt_single {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ}
     {s : Stmt} {x : Expr}
     (hsub : ∀ env st, Sub W ⟨.stmt env s, st⟩ ⟨.expr env x, st.tick⟩)
-    (hdec : ∀ f env st o st', (execStmt W (f + 1) env s).run st = .ok (o, st') →
-      ∃ v st1, (evalExpr W f env x).run st.tick = .ok (v, st1) ∧ st'.work = st1.work)
-    (henc : ∀ f env st v st1, (evalExpr W f env x).run st.tick = .ok (v, st1) →
-      ∃ o st', (execStmt W (f + 1) env s).run st = .ok (o, st'))
+    (hunf : ∀ f env st, ∃ k : Value → St → Except (Abort × ℕ) ((Env × Completion) × St),
+      (execStmt W (f + 1) env s).run st = Res.bind ((evalExpr W f env x).run st.tick) k ∧
+        ∀ v st1, ∃ r h, k v st1 = .ok (r, ⟨h, st1.work⟩))
     (h : Holds W p e i (.expr x) allChannels F B) :
     Holds W p e i (.stmt s) allChannels (F + 1) (1 + B) := by
-  rintro ⟨fr, st⟩ hr ⟨env, hc⟩
-  simp only at hc
-  subst hc
-  obtain ⟨hcomp, hw⟩ := h _ (hr.tail (hsub env st)) ⟨env, rfl⟩
-  refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
+  refine holds_stmt_of fun env st hr => ?_
+  obtain ⟨he, hw⟩ := h.at_expr (hr.tail (hsub env st))
+  refine ⟨fun f hf => ?_, fun f => ?_⟩
   · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
-    obtain ⟨o2, st2, h2⟩ := hcomp f' (by omega)
-    obtain ⟨v, h2', rfl⟩ := runs_expr.1 h2
-    obtain ⟨o, st', h3⟩ := henc f' env st v st2 h2'
-    exact ⟨_, _, runs_stmt.2 ⟨_, h3, rfl⟩⟩
-  · obtain ⟨r, hv, _⟩ := runs_stmt.1 hrun
-    cases f with
-    | zero => rw [execStmt_zero] at hv; cases hv
+    obtain ⟨k, hk, hsafe⟩ := hunf f' env st
+    rw [hk]
+    refine (he f' (by omega)).bind fun v st1 _ => ?_
+    obtain ⟨r, h', e'⟩ := hsafe v st1
+    rw [e']; trivial
+  · cases f with
+    | zero => rw [execStmt_zero]; exact Within.error_fuel
     | succ f =>
-      obtain ⟨v, st1, h1, hw1⟩ := hdec f env st r st' hv
-      have := hw f _ st1 (runs_expr.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
-      simp only [St.tick, Nat.cast_add, Nat.cast_one] at this ⊢
-      rw [hw1]
-      linarith
+      obtain ⟨k, hk, hsafe⟩ := hunf f env st
+      rw [hk]
+      have := Within.tick (Within.bind (P := fun _ : Env × Completion => True) (k := k)
+        (b2 := 0) (hw f) le_rfl fun v st1 _ => by
+          obtain ⟨r, h', e'⟩ := hsafe v st1
+          rw [e']
+          exact Within.ok_of (by simp))
+      exact this.mono (by linarith)
 
 /-- The work a sequence node does besides its children's: one unit, and for a function body or
 a block, the creation of the function objects its declaration instantiation hoists. -/
@@ -497,31 +648,33 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     subst ha
     rw [hroot] at hr ⊢
     rw [hfn] at hr ⊢
-    obtain ⟨env', h1, n, hn, hsafe⟩ := SafeW.enterFunc W ps body ar env i.receiver i.args ⟨h0, 0⟩
-    have hstmts : Reach W p e i ⟨.stmts env' body, ⟨h1, 0 + n⟩⟩ :=
-      hr.tail (Sub.callFunc hsafe)
-    obtain ⟨hc, hw⟩ := holds_stmts hB body hbody body (fun t ht => ht) env' _ hstmts
-    have hn' : (n : ℝ) ≤ ((funDecls body).length * W.ops.closureCreate : ℕ) := by exact_mod_cast hn
+    have hsafe := SafeW.enterFunc W ps body ar env i.receiver i.args
     simp only [List.length_map, seqK, hfn] at hlB ⊢
-    refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
+    refine ⟨fun f hf => ?_, fun f => ?_⟩
     · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
-      obtain ⟨o2, st2, h2⟩ := hc f' (by omega)
-      obtain ⟨⟨env2, c2⟩, h2', rfl⟩ := runs_stmts.1 h2
-      exact ⟨_, _, runs_callFunc.2 ⟨_, by rw [callFunc_succ, hsafe]; simp only; rw [h2'], rfl⟩⟩
-    · obtain ⟨v, hv, _⟩ := runs_callFunc.1 hrun
-      cases f with
-      | zero => rw [callFunc_zero] at hv; cases hv
+      rw [result_callFunc, callFunc_succ]
+      obtain ⟨env', st1, hx, hb, _⟩ := hsafe.res ⟨h0, 0⟩ fun env' st1 =>
+        Res.map (fun r => match r.2 with | .ret v => v | _ => .undef)
+          ((execStmts W f' env' body).run st1)
+      rw [hb]
+      exact ((holds_stmts hB body hbody body (fun t ht => ht) env' st1
+        (hr.tail (Sub.callFunc hx))).1 f' (by omega)).map.map
+    · cases f with
+      | zero => rw [result_callFunc, callFunc_zero]; exact Within.error_fuel
       | succ f =>
-        rw [callFunc_succ, hsafe] at hv
-        simp only at hv
-        rcases h2 : (execStmts W f env' body).run ⟨h1, 0 + n⟩ with err | ⟨⟨env2, c2⟩, st2⟩
-        · rw [h2] at hv; cases hv
-        · rw [h2] at hv
-          simp only [Except.ok.injEq, Prod.mk.injEq] at hv
-          obtain ⟨_, rfl⟩ := hv
-          have := hw f _ st2 (runs_stmts.2 ⟨_, h2, rfl⟩)
-          simp only [zero_add, Nat.cast_zero, sub_zero] at this ⊢
-          linarith
+        rw [result_callFunc, callFunc_succ]
+        obtain ⟨env', st1, hx, hb, hw1⟩ := hsafe.res ⟨h0, 0⟩ fun env' st1 =>
+          Res.map (fun r => match r.2 with | .ret v => v | _ => .undef)
+            ((execStmts W f env' body).run st1)
+        rw [hb]
+        have := ((holds_stmts hB body hbody body (fun t ht => ht) env' st1
+          (hr.tail (Sub.callFunc hx))).2 f).map (g := fun r =>
+            match r.2 with | .ret v => v | _ => .undef) |>.map (g := Outcome.val)
+          |>.restrict (Q := fun o => o.channel ∈ allChannels) fun _ _ => trivial
+        have := this.shift (w0 := 0) (k := (funDecls body).length * W.ops.closureCreate) hw1
+        refine this.mono ?_
+        push_cast
+        linarith
   | stmt st0 =>
   cases st0 with
   | block ss =>
@@ -529,44 +682,35 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     subst hs
     have hss : ∀ t ∈ ss, Holds W p e i (.stmt t) allChannels F B := fun t ht =>
       h _ (List.mem_map.2 ⟨t, ht, rfl⟩)
-    rintro ⟨fr, st⟩ hr ⟨env, hc⟩
-    simp only at hc
-    subst hc
-    obtain ⟨env', h1, n, hn, hinst⟩ := SafeW.instantiate W env ss st.tick
-    have hstmts : Reach W p e i ⟨.stmts env' ss, ⟨h1, st.tick.work + n⟩⟩ :=
-      hr.tail (Sub.block hinst)
-    obtain ⟨hcomp, hw⟩ := holds_stmts hB ss hss ss (fun t ht => ht) env' _ hstmts
-    have hn' : (n : ℝ) ≤ ((funDecls ss).length * W.ops.closureCreate : ℕ) := by exact_mod_cast hn
+    have hsafe := fun env => SafeW.instantiate W env ss
     simp only [List.length_map, seqK] at hlB ⊢
-    refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
+    refine holds_stmt_of fun env st hr => ⟨fun f hf => ?_, fun f => ?_⟩
     · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
-      obtain ⟨o2, st2, h2⟩ := hcomp f' (by omega)
-      obtain ⟨⟨env2, c2⟩, h2', rfl⟩ := runs_stmts.1 h2
-      exact ⟨_, _, runs_stmt.2 ⟨_, by rw [execStmt_block, hinst]; simp only; rw [h2'], rfl⟩⟩
-    · obtain ⟨r, hv, _⟩ := runs_stmt.1 hrun
-      cases f with
-      | zero => rw [execStmt_zero] at hv; cases hv
+      rw [execStmt_block]
+      obtain ⟨env', st1, hx, hb, _⟩ := (hsafe env).res st.tick fun env' st1 =>
+        Res.map (fun r => (env, r.2)) ((execStmts W f' env' ss).run st1)
+      rw [hb]
+      exact ((holds_stmts hB ss hss ss (fun t ht => ht) env' st1
+        (hr.tail (Sub.block hx))).1 f' (by omega)).map
+    · cases f with
+      | zero => rw [execStmt_zero]; exact Within.error_fuel
       | succ f =>
-        rw [execStmt_block, hinst] at hv
-        simp only at hv
-        rcases h2 : (execStmts W f env' ss).run ⟨h1, st.tick.work + n⟩ with err | ⟨⟨env2, c2⟩, st2⟩
-        · rw [h2] at hv; cases hv
-        · rw [h2] at hv
-          simp only [Except.ok.injEq, Prod.mk.injEq] at hv
-          obtain ⟨_, rfl⟩ := hv
-          have := hw f _ st2 (runs_stmts.2 ⟨_, h2, rfl⟩)
-          simp only [St.tick, Nat.cast_add, Nat.cast_one] at this ⊢
-          linarith
+        rw [execStmt_block]
+        obtain ⟨env', st1, hx, hb, hw1⟩ := (hsafe env).res st.tick fun env' st1 =>
+          Res.map (fun r => (env, r.2)) ((execStmts W f env' ss).run st1)
+        rw [hb]
+        have := ((holds_stmts hB ss hss ss (fun t ht => ht) env' st1
+          (hr.tail (Sub.block hx))).2 f).map (g := fun r => (env, r.2))
+          |>.restrict (Q := fun _ => True) fun _ _ => trivial
+        have := (this.shift (k := (funDecls ss).length * W.ops.closureCreate) hw1).tick
+        refine this.mono ?_
+        push_cast
+        linarith
   | expr x =>
     simp only [seqSites, Option.some.injEq] at hs
     subst hs
     have := holds_stmt_single (s := .expr x) (x := x) (fun env st => Sub.exprStmt)
-      (fun f env st o st' hv => by
-        rw [execStmt_expr] at hv
-        rcases h1 : (evalExpr W f env x).run st.tick with err | ⟨v, st1⟩
-        · rw [h1] at hv; cases hv
-        · rw [h1] at hv; cases hv; exact ⟨v, _, rfl, rfl⟩)
-      (fun f env st v st1 h1 => ⟨_, _, by rw [execStmt_expr, h1]⟩)
+      (fun f env st => ⟨_, execStmt_expr f env x st, fun v st1 => ⟨_, st1.heap, rfl⟩⟩)
       (h (.expr x) (by simp))
     refine this.mono (by simp) (by simp [seqK])
   | ret init =>
@@ -576,12 +720,7 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     simp only [seqSites, Option.some.injEq] at hs
     subst hs
     have := holds_stmt_single (s := .ret (some x)) (x := x) (fun env st => Sub.retExpr)
-      (fun f env st o st' hv => by
-        rw [execStmt_ret] at hv
-        rcases h1 : (evalExpr W f env x).run st.tick with err | ⟨v, st1⟩
-        · rw [h1] at hv; cases hv
-        · rw [h1] at hv; cases hv; exact ⟨v, _, rfl, rfl⟩)
-      (fun f env st v st1 h1 => ⟨_, _, by rw [execStmt_ret, h1]⟩)
+      (fun f env st => ⟨_, execStmt_ret f env x st, fun v st1 => ⟨_, st1.heap, rfl⟩⟩)
       (h (.expr x) (by simp))
     refine this.mono (by simp) (by simp [seqK])
   | decl k y τ init =>
@@ -591,27 +730,31 @@ theorem holds_seq {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {
     simp only [seqSites, Option.some.injEq] at hs
     subst hs
     have := holds_stmt_single (s := .decl k y τ (some x)) (x := x) (fun env st => Sub.declInit)
-      (fun f env st o st' hv => by
-        rw [execStmt_decl] at hv
-        rcases h1 : (evalExpr W f env x).run st.tick with err | ⟨v, st1⟩
-        · rw [h1] at hv; cases hv
-        · rw [h1] at hv
-          obtain ⟨env', h3, hb⟩ := Safe.initBinding env k y τ (some v) st1
-          simp only [hb] at hv
-          cases hv
-          exact ⟨v, st1, rfl, rfl⟩)
-      (fun f env st v st1 h1 => by
+      (fun f env st => ⟨_, execStmt_decl f env k y τ x st, fun v st1 => by
         obtain ⟨env', h3, hb⟩ := Safe.initBinding env k y τ (some v) st1
-        exact ⟨(env', .normal), ⟨h3, st1.work⟩, by rw [execStmt_decl, h1]; simp only [hb]⟩)
+        exact ⟨(env', .normal), h3, by simp only [Res.map, hb]; rfl⟩⟩)
       (h (.expr x) (by simp))
     refine this.mono (by simp) (by simp [seqK])
   | ite | forLoop | forOf | forIn | «while» | doWhile | brk | cont | funDecl | classDecl =>
     simp [seqSites] at hs
 
+/-- A branch child's bound from the test's completion, at the `Sub` edge the test's value
+selects. -/
 theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ} {s : Site}
     {sites : List Site} (hs : branchSites s = some sites) (hB : 0 ≤ B)
     (h : ∀ x ∈ sites, Holds W p e i x allChannels F B) :
     Holds W p e i s allChannels (F + sites.length + 2) (1 + sites.length * B) := by
+  have hlen2 : (2 : ℝ) ≤ sites.length := by
+    cases s with
+    | entry => simp [branchSites] at hs
+    | expr x =>
+      cases x <;> simp [branchSites] at hs
+      subst hs; norm_num
+    | stmt s0 =>
+      cases s0 <;> simp [branchSites] at hs
+      split at hs <;> cases hs <;> norm_num
+  have hF2 : 2 ≤ sites.length := by exact_mod_cast hlen2
+  have hB2 : 1 + 2 * B ≤ 1 + sites.length * B := by nlinarith
   cases s with
   | entry => simp [branchSites] at hs
   | expr x =>
@@ -619,152 +762,136 @@ theorem holds_branch {p : Program} {e : Entry} {i : Instance} {F : ℕ} {B : ℝ
     | cond c t g =>
       simp only [branchSites, Option.some.injEq] at hs
       subst hs
-      rintro ⟨fr, st⟩ hr ⟨env, hc⟩
-      simp only at hc
-      subst hc
-      obtain ⟨hcc, hcw⟩ := h (.expr c) (by simp) _ (hr.tail Sub.condTest) ⟨env, rfl⟩
-      have hbr : ∀ v st1, (evalExpr_run : ∃ f, (evalExpr W f env c).run st.tick = .ok (v, st1)) →
-          ∀ y, (truthy v = true ∧ y = t ∨ truthy v = false ∧ y = g) →
-          (∀ f, F ≤ f → ∃ o st', Cfg.Runs W ⟨.expr env y, st1⟩ f o st') ∧
-          ∀ f o st', Cfg.Runs W ⟨.expr env y, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
-        rintro v st1 ⟨f0, h0⟩ y hy
-        have hev : Ev W (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
-        rcases hy with ⟨hv, rfl⟩ | ⟨hv, rfl⟩
-        · obtain ⟨a, b⟩ := h (.expr y) (by simp) _ (hr.tail (Sub.condThen hev hv)) ⟨env, rfl⟩
-          exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
-        · obtain ⟨a, b⟩ := h (.expr y) (by simp) _ (hr.tail (Sub.condElse hev hv)) ⟨env, rfl⟩
-          exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
-      refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
-      · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
-        obtain ⟨o1, st1, h1⟩ := hcc f' (by simp at hf; omega)
-        obtain ⟨v, h1', rfl⟩ := runs_expr.1 h1
+      refine holds_expr_of fun env st hr => ?_
+      obtain ⟨hce, hcw⟩ := (h (.expr c) (by simp)).at_expr (hr.tail Sub.condTest)
+      have hbr : ∀ v st1 f0, (evalExpr W f0 env c).run st.tick = .ok (v, st1) →
+          (∀ f, F ≤ f → Ends (if truthy v then (evalExpr W f env t).run st1
+            else (evalExpr W f env g).run st1)) ∧
+          ∀ f, Within (fun _ => True) st1.work B (if truthy v then (evalExpr W f env t).run st1
+            else (evalExpr W f env g).run st1) := by
+        intro v st1 f0 h0
         cases hv : truthy v
-        · obtain ⟨o2, st2, h2⟩ := (hbr v st1 ⟨f', h1'⟩ g (Or.inr ⟨hv, rfl⟩)).1 f'
-            (by simp at hf; omega)
-          obtain ⟨w, h2', rfl⟩ := runs_expr.1 h2
-          exact ⟨_, _, runs_expr.2 ⟨w, by rw [evalExpr_cond, h1']; simp only [hv, Bool.false_eq_true, ↓reduceIte]; exact h2', rfl⟩⟩
-        · obtain ⟨o2, st2, h2⟩ := (hbr v st1 ⟨f', h1'⟩ t (Or.inl ⟨hv, rfl⟩)).1 f'
-            (by simp at hf; omega)
-          obtain ⟨w, h2', rfl⟩ := runs_expr.1 h2
-          exact ⟨_, _, runs_expr.2 ⟨w, by rw [evalExpr_cond, h1']; simp only [hv, ↓reduceIte]; exact h2', rfl⟩⟩
-      · obtain ⟨w, hv', _⟩ := runs_expr.1 hrun
-        cases f with
-        | zero => rw [evalExpr_zero] at hv'; cases hv'
+        · simpa using Holds.at_expr (h (.expr g) (by simp))
+            (hr.tail (Sub.condElse (ev_expr h0) hv))
+        · simpa using Holds.at_expr (h (.expr t) (by simp))
+            (hr.tail (Sub.condThen (ev_expr h0) hv))
+      refine ⟨fun f hf => ?_, fun f => ?_⟩
+      · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
+        rw [evalExpr_cond]
+        exact Ends.bind (hce f' (by omega)) fun v st1 h1 => (hbr v st1 f' h1).1 f' (by omega)
+      · cases f with
+        | zero => rw [evalExpr_zero]; exact Within.error_fuel
         | succ f =>
-          rw [evalExpr_cond] at hv'
-          rcases h1 : (evalExpr W f env c).run st.tick with err | ⟨v, st1⟩
-          · rw [h1] at hv'; cases hv'
-          · rw [h1] at hv'
-            have w1 := hcw f _ st1 (runs_expr.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
-            simp only [List.length_cons, List.length_nil] at w1 ⊢
-            simp only [St.tick, Nat.cast_add, Nat.cast_one] at w1
-            cases hv : truthy v
-            · simp only [hv, Bool.false_eq_true, ↓reduceIte] at hv'
-              have w2 := (hbr v st1 ⟨f, h1⟩ g (Or.inr ⟨hv, rfl⟩)).2 f _ st'
-                (runs_expr.2 ⟨_, hv', rfl⟩)
-              push_cast
-              linarith
-            · simp only [hv, ↓reduceIte] at hv'
-              have w2 := (hbr v st1 ⟨f, h1⟩ t (Or.inl ⟨hv, rfl⟩)).2 f _ st'
-                (runs_expr.2 ⟨_, hv', rfl⟩)
-              push_cast
-              linarith
+          rw [evalExpr_cond]
+          have := Within.tick (Within.bind (hcw f) hB fun v st1 h1 => (hbr v st1 f h1).2 f)
+          refine this.mono ?_
+          linarith
     | _ => simp [branchSites] at hs
   | stmt s0 =>
     cases s0 with
     | ite c t el =>
       have hsites : sites = [.expr c, .stmt t] ++ el.toList.map .stmt := by
         cases el <;> simp_all [branchSites]
-      rw [hsites] at h ⊢
-      rintro ⟨fr, st⟩ hr ⟨env, hc⟩
-      simp only at hc
-      subst hc
-      obtain ⟨hcc, hcw⟩ := h (.expr c) (by simp) _ (hr.tail Sub.iteTest) ⟨env, rfl⟩
-      have hthen : ∀ v st1, (∃ f, (evalExpr W f env c).run st.tick = .ok (v, st1)) →
-          truthy v = true →
-          (∀ f, F ≤ f → ∃ o st', Cfg.Runs W ⟨.stmt env t, st1⟩ f o st') ∧
-          ∀ f o st', Cfg.Runs W ⟨.stmt env t, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
-        rintro v st1 ⟨f0, h0⟩ hv
-        have hev : Ev W (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
-        obtain ⟨a, b⟩ := h (.stmt t) (by simp) _ (hr.tail (Sub.iteThen hev hv)) ⟨env, rfl⟩
-        exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
-      have helse : ∀ g v st1, el = some g → (∃ f, (evalExpr W f env c).run st.tick = .ok (v, st1)) →
-          truthy v = false →
-          (∀ f, F ≤ f → ∃ o st', Cfg.Runs W ⟨.stmt env g, st1⟩ f o st') ∧
-          ∀ f o st', Cfg.Runs W ⟨.stmt env g, st1⟩ f o st' → (st'.work : ℝ) - st1.work ≤ B := by
-        rintro g v st1 rfl ⟨f0, h0⟩ hv
-        have hev : Ev W (.expr env c) st.tick (.val v) st1 := ⟨f0, runs_expr.2 ⟨v, h0, rfl⟩⟩
-        obtain ⟨a, b⟩ := h (.stmt g) (by simp) _ (hr.tail (Sub.iteElse hev hv)) ⟨env, rfl⟩
-        exact ⟨a, fun f o st' hc => b f o st' hc (mem_allChannels _)⟩
-      have hlen : (2 : ℝ) ≤ (([Site.expr c, .stmt t] ++ el.toList.map Site.stmt).length : ℕ) := by
-        simp only [List.length_append, List.length_cons, List.length_nil, List.length_map]
-        push_cast
-        have : (0 : ℝ) ≤ (el.toList.length : ℝ) := Nat.cast_nonneg _
-        linarith
-      refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
-      · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by simp at hf; omega⟩
-        obtain ⟨o1, st1, h1⟩ := hcc f' (by simp at hf; omega)
-        obtain ⟨v, h1', rfl⟩ := runs_expr.1 h1
+      subst hsites
+      refine holds_stmt_of fun env st hr => ?_
+      obtain ⟨hce, hcw⟩ := (h (.expr c) (by simp)).at_expr (hr.tail Sub.iteTest)
+      -- The continuation after the test, from its value.
+      have hbr : ∀ v st1 f0, (evalExpr W f0 env c).run st.tick = .ok (v, st1) →
+          (∀ f, F ≤ f → Ends (if truthy v then
+            Res.map (fun r => (env, r.2)) ((execStmt W f env t).run st1)
+            else match el with
+              | some g => Res.map (fun r => (env, r.2)) ((execStmt W f env g).run st1)
+              | none => .ok ((env, .normal), st1))) ∧
+          ∀ f, Within (fun _ => True) st1.work B (if truthy v then
+            Res.map (fun r => (env, r.2)) ((execStmt W f env t).run st1)
+            else match el with
+              | some g => Res.map (fun r => (env, r.2)) ((execStmt W f env g).run st1)
+              | none => .ok ((env, .normal), st1)) := by
+        intro v st1 f0 h0
         cases hv : truthy v
         · cases el with
-          | none =>
-            exact ⟨_, _, runs_stmt.2 ⟨_, by rw [execStmt_ite, h1']; simp only [hv, Bool.false_eq_true, ↓reduceIte]; try rfl, rfl⟩⟩
+          | none => exact ⟨fun _ _ => trivial, fun _ => Within.ok_of (by simpa using hB)⟩
           | some g =>
-            obtain ⟨o2, st2, h2⟩ := (helse g v st1 rfl ⟨f', h1'⟩ hv).1 f' (by simp at hf; omega)
-            obtain ⟨⟨env2, c2⟩, h2', rfl⟩ := runs_stmt.1 h2
-            exact ⟨_, _, runs_stmt.2 ⟨_, by rw [execStmt_ite, h1']; simp only [hv, h2', Bool.false_eq_true, ↓reduceIte]; try rfl, rfl⟩⟩
-        · obtain ⟨o2, st2, h2⟩ := (hthen v st1 ⟨f', h1'⟩ hv).1 f' (by simp at hf; omega)
-          obtain ⟨⟨env2, c2⟩, h2', rfl⟩ := runs_stmt.1 h2
-          exact ⟨_, _, runs_stmt.2 ⟨_, by rw [execStmt_ite, h1']; simp only [hv, h2', ↓reduceIte]; try rfl, rfl⟩⟩
-      · obtain ⟨r, hv', _⟩ := runs_stmt.1 hrun
-        have hB2 : 1 + 2 * B ≤ 1 + (([Site.expr c, .stmt t] ++ el.toList.map Site.stmt).length : ℕ) * B := by
-          nlinarith
-        refine le_trans ?_ hB2
-        cases f with
-        | zero => rw [execStmt_zero] at hv'; cases hv'
+            obtain ⟨a, b⟩ := (h (.stmt g) (by simp)).at_stmt
+              (hr.tail (Sub.iteElse (ev_expr h0) hv))
+            exact ⟨fun f hf => (a f hf).map, fun f => (b f).map⟩
+        · obtain ⟨a, b⟩ := (h (.stmt t) (by simp)).at_stmt
+            (hr.tail (Sub.iteThen (ev_expr h0) hv))
+          exact ⟨fun f hf => (a f hf).map, fun f => (b f).map⟩
+      refine ⟨fun f hf => ?_, fun f => ?_⟩
+      · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
+        rw [execStmt_ite]
+        exact (hce f' (by omega)).bind fun v st1 h1 => (hbr v st1 f' h1).1 f' (by omega)
+      · cases f with
+        | zero => rw [execStmt_zero]; exact Within.error_fuel
         | succ f =>
-          rw [execStmt_ite] at hv'
-          rcases h1 : (evalExpr W f env c).run st.tick with err | ⟨v, st1⟩
-          · rw [h1] at hv'; cases hv'
-          · rw [h1] at hv'
-            have w1 := hcw f _ st1 (runs_expr.2 ⟨_, h1, rfl⟩) (mem_allChannels _)
-            simp only [St.tick, Nat.cast_add, Nat.cast_one] at w1
-            cases hv : truthy v
-            · simp only [hv, Bool.false_eq_true, ↓reduceIte] at hv'
-              cases el with
-              | none =>
-                simp only [Except.ok.injEq, Prod.mk.injEq] at hv'
-                obtain ⟨_, rfl⟩ := hv'
-                linarith
-              | some g =>
-                simp only at hv'
-                rcases h2 : (execStmt W f env g).run st1 with err | ⟨⟨env2, c2⟩, st2⟩
-                · rw [h2] at hv'; cases hv'
-                · rw [h2] at hv'
-                  simp only [Except.ok.injEq, Prod.mk.injEq] at hv'
-                  obtain ⟨_, rfl⟩ := hv'
-                  have w2 := (helse g v st1 rfl ⟨f, h1⟩ hv).2 f _ st2 (runs_stmt.2 ⟨_, h2, rfl⟩)
-                  linarith
-            · simp only [hv, ↓reduceIte] at hv'
-              rcases h2 : (execStmt W f env t).run st1 with err | ⟨⟨env2, c2⟩, st2⟩
-              · rw [h2] at hv'; cases hv'
-              · rw [h2] at hv'
-                simp only [Except.ok.injEq, Prod.mk.injEq] at hv'
-                obtain ⟨_, rfl⟩ := hv'
-                have w2 := (hthen v st1 ⟨f, h1⟩ hv).2 f _ st2 (runs_stmt.2 ⟨_, h2, rfl⟩)
-                linarith
+          rw [execStmt_ite]
+          have := ((hcw f).bind hB fun v st1 h1 => (hbr v st1 f h1).2 f).tick
+          refine this.mono ?_
+          linarith
     | _ => simp [branchSites] at hs
 
-/-! ## Unit bases -/
+/-! ## Unit bases
+
+A unit base bounds a node by `1` from its syntax alone (`seq-max` without premises): from every
+state, the node's run ends after a number of steps its syntax fixes, whatever values its
+variables hold. The fragment is the syntax whose evaluation consults no value's kind beyond
+`ToBoolean` and `typeof`: literals, variable reads (a name the model does not resolve to a
+built-in global, whose read consults an intrinsic), `this`, `!`, `typeof`, the short-circuit
+operators, conditionals, assignments to a variable and function expressions; and the statements
+built from them, blocks, `if`, `return`, `break`, `continue` and function declarations. A read
+of a binding ends by completing, by a ReferenceError in its temporal dead zone or of an
+unresolvable name, or by a §2.5 violation (`Olint.Model.readVar`): each an end (`Ends`). Each
+evaluation of the fragment costs its syntax's ticks (`unitTicksE`, `unitTicksS`), and runs out
+of fuel only below its depth (`unitDepthE`, `unitDepthS`).
+
+Operators whose work depends on the kind of their operands, arithmetic, comparisons, `+`,
+property reads, compound assignments and updates, lie outside the fragment: on a String or an
+object they run `ToNumber`, `ToString` or a property lookup whose work is not fixed by syntax,
+or that the model leaves outside it. -/
+
+/-- The value-kind-independent expression fragment. -/
+def unitExpr : Expr → Bool
+  | .lit _ => true
+  | .ident x => (builtinGlobal x).isNone
+  | .«this» => true
+  | .unary .not a | .unary .typeof a => unitExpr a
+  | .binary .and a b | .binary .or a b | .binary .nullish a b => unitExpr a && unitExpr b
+  | .cond c t g => unitExpr c && unitExpr t && unitExpr g
+  | .assign _ a => unitExpr a
+  | .func _ => true
+  | _ => false
+
+/-- The work a fragment expression performs, at most. -/
+def unitTicksE (W : World) : Expr → ℕ
+  | .unary _ a => 1 + unitTicksE W a
+  | .binary _ a b => 1 + unitTicksE W a + unitTicksE W b
+  | .cond c t g => 1 + unitTicksE W c + unitTicksE W t + unitTicksE W g
+  | .assign _ a => 1 + unitTicksE W a
+  | .func _ => 1 + W.ops.closureCreate
+  | _ => 1
+
+/-- The fuel a fragment expression needs. -/
+def unitDepthE : Expr → ℕ
+  | .unary _ a => 1 + unitDepthE a
+  | .binary _ a b => 1 + max (unitDepthE a) (unitDepthE b)
+  | .cond c t g => 1 + max (unitDepthE c) (max (unitDepthE t) (unitDepthE g))
+  | .assign _ a => 1 + unitDepthE a
+  | _ => 1
 
 mutual
 
-/-- The state-independent statement fragment. -/
+/-- The value-kind-independent statement fragment. -/
 def unitStmt : Stmt → Bool
-  | .expr (.lit _) => true
+  | .expr x => unitExpr x
   | .decl _ _ _ none => true
-  | .decl _ _ _ (some (.lit _)) => true
+  | .decl _ _ _ (some x) => unitExpr x
   | .block ss => unitStmts ss
+  | .ite c t el => unitExpr c && unitStmt t && unitOptStmt el
+  | .ret none => true
+  | .ret (some x) => unitExpr x
+  | .brk | .cont => true
+  | .funDecl _ _ => true
   | _ => false
 
 /-- Every statement of the list lies in the fragment. -/
@@ -772,181 +899,452 @@ def unitStmts : List Stmt → Bool
   | [] => true
   | s :: ss => unitStmt s && unitStmts ss
 
+/-- An absent statement, or one in the fragment. -/
+def unitOptStmt : Option Stmt → Bool
+  | none => true
+  | some s => unitStmt s
+
 end
 
 mutual
 
-/-- The work a fragment statement performs. -/
-def unitTicks : Stmt → ℕ
-  | .expr _ => 2
+/-- The work a fragment statement performs, at most. -/
+def unitTicksS (W : World) : Stmt → ℕ
+  | .expr x => 1 + unitTicksE W x
   | .decl _ _ _ none => 1
-  | .decl _ _ _ (some _) => 2
-  | .block ss => 1 + unitTicksList ss
+  | .decl _ _ _ (some x) => 1 + unitTicksE W x
+  | .block ss => 1 + (funDecls ss).length * W.ops.closureCreate + unitTicksList W ss
+  | .ite c t el => 1 + unitTicksE W c + unitTicksS W t + unitTicksOpt W el
+  | .ret none => 1
+  | .ret (some x) => 1 + unitTicksE W x
+  | .brk | .cont => 1
+  | .funDecl _ _ => 1 + W.ops.closureCreate
   | _ => 0
 
-/-- The work a list of fragment statements performs. -/
-def unitTicksList : List Stmt → ℕ
+/-- The work a list of fragment statements performs, at most. -/
+def unitTicksList (W : World) : List Stmt → ℕ
   | [] => 0
-  | s :: ss => unitTicks s + unitTicksList ss
+  | s :: ss => unitTicksS W s + unitTicksList W ss
+
+/-- The work an optional fragment statement performs, at most. -/
+def unitTicksOpt (W : World) : Option Stmt → ℕ
+  | none => 0
+  | some s => unitTicksS W s
 
 end
 
 mutual
 
 /-- The fuel a fragment statement needs. -/
-def unitDepth : Stmt → ℕ
-  | .expr _ => 2
-  | .decl _ _ _ none => 1
-  | .decl _ _ _ (some _) => 2
+def unitDepthS : Stmt → ℕ
+  | .expr x => 1 + unitDepthE x
+  | .decl _ _ _ (some x) => 1 + unitDepthE x
   | .block ss => 1 + unitDepthList ss
+  | .ite c t el => 1 + max (unitDepthE c) (max (unitDepthS t) (unitDepthOpt el))
+  | .ret (some x) => 1 + unitDepthE x
   | _ => 1
 
 /-- The fuel a list of fragment statements needs. -/
 def unitDepthList : List Stmt → ℕ
   | [] => 1
-  | s :: ss => 1 + max (unitDepth s) (unitDepthList ss)
+  | s :: ss => 1 + max (unitDepthS s) (unitDepthList ss)
+
+/-- The fuel an optional fragment statement needs. -/
+def unitDepthOpt : Option Stmt → ℕ
+  | none => 0
+  | some s => unitDepthS s
 
 end
 
-/-- The outcome of running a fragment statement from work `w`: it completes normally after
-exactly `t` further units, or it runs out of fuel `f` below its depth `d`. -/
-def UnitRun (r : Except Abort ((Env × Completion) × St)) (w t d f : ℕ) : Prop :=
+/-- A unit run's result from work `w0`: it ends after at most `t` units, or runs out of fuel `f`
+below the depth `d`. -/
+def UnitR {α : Type} (r : Except (Abort × ℕ) (α × St)) (w0 t d f : ℕ) : Prop :=
   match r with
-  | .ok ((_, .normal), st') => st'.work = w + t
-  | .ok _ => False
-  | .error .fuel => f < d
-  | .error _ => False
+  | .ok (_, st') => st'.work ≤ w0 + t
+  | .error (e, w) => (e = .fuel ∧ f < d) ∨ ((e.thrown = true ∨ e = .typeViolation) ∧ w ≤ w0 + t)
 
-theorem unitDepth_pos (s : Stmt) : 0 < unitDepth s := by
+theorem UnitR.mono {α : Type} {r : Except (Abort × ℕ) (α × St)} {w0 t t' d d' f : ℕ}
+    (h : UnitR r w0 t d f) (ht : t ≤ t') (hd : d ≤ d') : UnitR r w0 t' d' f := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · rcases h with ⟨h1, h2⟩ | ⟨h1, h2⟩
+    · exact Or.inl ⟨h1, by omega⟩
+    · exact Or.inr ⟨h1, by omega⟩
+  · show st'.work ≤ w0 + t'
+    have : st'.work ≤ w0 + t := h
+    omega
+
+theorem UnitR.bind {α β : Type} {r : Except (Abort × ℕ) (α × St)}
+    {k : α → St → Except (Abort × ℕ) (β × St)} {w0 t1 t2 d f : ℕ} (hr : UnitR r w0 t1 d f)
+    (hk : ∀ a st, r = .ok (a, st) → UnitR (k a st) st.work t2 d f) :
+    UnitR (Res.bind r k) w0 (t1 + t2) d f := by
+  rcases r with ⟨e, w⟩ | ⟨a, st⟩
+  · rcases hr with ⟨h1, h2⟩ | ⟨h1, h2⟩
+    · exact Or.inl ⟨h1, h2⟩
+    · exact Or.inr ⟨h1, by omega⟩
+  · have h1 : st.work ≤ w0 + t1 := hr
+    have h2 := hk a st rfl
+    show UnitR (k a st) w0 (t1 + t2) d f
+    revert h2
+    rcases k a st with ⟨e, w⟩ | ⟨c, st'⟩
+    · rintro (⟨h3, h4⟩ | ⟨h3, h4⟩)
+      · exact Or.inl ⟨h3, h4⟩
+      · exact Or.inr ⟨h3, by omega⟩
+    · intro h2
+      show st'.work ≤ w0 + (t1 + t2)
+      have : st'.work ≤ st.work + t2 := h2
+      omega
+
+theorem UnitR.map {α β : Type} {g : α → β} {r : Except (Abort × ℕ) (α × St)} {w0 t d f : ℕ}
+    (h : UnitR r w0 t d f) : UnitR (Res.map g r) w0 t d f := by
+  have := UnitR.bind (k := fun a st => .ok (g a, st)) (t2 := 0) h fun a st _ =>
+    (show st.work ≤ st.work + 0 by omega)
+  simpa [Res.map] using this
+
+theorem UnitR.tick {α : Type} {r : Except (Abort × ℕ) (α × St)} {st : St} {t d f : ℕ}
+    (h : UnitR r st.tick.work t d f) : UnitR r st.work (1 + t) d f := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · rcases h with ⟨h1, h2⟩ | ⟨h1, h2⟩
+    · exact Or.inl ⟨h1, h2⟩
+    · exact Or.inr ⟨h1, by simp only [St.tick] at h2; omega⟩
+  · show st'.work ≤ st.work + (1 + t)
+    have : st'.work ≤ st.tick.work + t := h
+    simp only [St.tick] at this
+    omega
+
+theorem UnitR.succ {α : Type} {r : Except (Abort × ℕ) (α × St)} {w0 t d f : ℕ}
+    (h : UnitR r w0 t d f) : UnitR r w0 t (d + 1) (f + 1) := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · rcases h with ⟨h1, h2⟩ | ⟨h1, h2⟩
+    · exact Or.inl ⟨h1, by omega⟩
+    · exact Or.inr ⟨h1, h2⟩
+  · exact h
+
+theorem UnitR.ends {α : Type} {r : Except (Abort × ℕ) (α × St)} {w0 t d f : ℕ}
+    (h : UnitR r w0 t d f) (hf : d ≤ f) : Ends r := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · rcases h with ⟨_, h2⟩ | ⟨h1, _⟩
+    · omega
+    · exact h1
+  · trivial
+
+theorem UnitR.within {α : Type} {P : α → Prop} {r : Except (Abort × ℕ) (α × St)} {w0 t d f : ℕ}
+    (h : UnitR r w0 t d f) : Within P w0 t r := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · intro he
+    rcases h with ⟨rfl, _⟩ | ⟨_, h2⟩
+    · simp [Abort.thrown] at he
+    · have : (w : ℝ) ≤ w0 + t := by exact_mod_cast h2
+      linarith
+  · intro _
+    have : st'.work ≤ w0 + t := h
+    have : (st'.work : ℝ) ≤ w0 + t := by exact_mod_cast this
+    linarith
+
+/-- A computation that ends with no work and never runs out of fuel: it completes, throws or
+violates §2.5, at the work it started from. -/
+def Plain {α : Type} (x : M α) : Prop := ∀ st f, UnitR (x.run st) st.work 0 0 f
+
+theorem Plain.unitR {α : Type} {x : M α} (h : Plain x) (st : St) (t d f : ℕ) :
+    UnitR (x.run st) st.work t d f := (h st f).mono (Nat.zero_le _) (Nat.zero_le _)
+
+theorem Plain.pure {α : Type} (a : α) : Plain (pure a : M α) := fun st _ =>
+  show st.work ≤ st.work + 0 by omega
+
+theorem Plain.fail {α : Type} {e : Abort} (he : e.thrown = true ∨ e = .typeViolation) :
+    Plain (fail e : M α) := fun st _ => Or.inr ⟨he, by simp⟩
+
+theorem Plain.ofSafe {α : Type} {x : M α} (h : Safe x) : Plain x := fun st _ => by
+  obtain ⟨a, h', e⟩ := h st
+  rw [e]
+  show st.work ≤ st.work + 0
+  omega
+
+theorem Plain.bind {α β : Type} {x : M α} {g : α → M β} (hx : Plain x) (hg : ∀ a, Plain (g a)) :
+    Plain (x >>= g) := fun st f => by
+  rw [run_bind']
+  have := UnitR.bind (t2 := 0) (hx st f) fun a st1 _ => hg a st1 f
+  simpa using this
+
+theorem Plain.ofLoad (l : Loc) : Plain (load l) := by
+  unfold Olint.Model.load
+  refine Plain.bind (Plain.ofSafe Safe.get) fun s => ?_
+  split
+  · exact Plain.pure _
+  · exact Plain.fail (Or.inl rfl)
+
+theorem Plain.ofReadVarTy (l : Loc) : Plain (readVarTy l) := by
+  unfold Olint.Model.readVarTy
+  refine Plain.bind (Plain.ofLoad l) fun o => ?_
+  split
+  · refine Plain.bind (Plain.ofSafe Safe.get) fun s => ?_
+    split
+    · exact Plain.pure _
+    · exact Plain.fail (Or.inr rfl)
+  · exact Plain.fail (Or.inl rfl)
+  · exact Plain.fail (Or.inl rfl)
+
+theorem Plain.ofReadVar (l : Loc) : Plain (readVar l) := by
+  unfold Olint.Model.readVar
+  exact Plain.bind (Plain.ofReadVarTy l) fun _ => Plain.pure _
+
+theorem Plain.ofCellType (l : Loc) : Plain (cellType l) := by
+  unfold Olint.Model.cellType
+  refine Plain.bind (Plain.ofLoad l) fun o => ?_
+  split
+  · exact Plain.pure _
+  · exact Plain.fail (Or.inl rfl)
+  · exact Plain.fail (Or.inl rfl)
+
+theorem Plain.unop_not (v : Value) : Plain (unop .not v) := Plain.pure _
+
+theorem Plain.unop_typeof (v : Value) : Plain (unop .typeof v) := by
+  cases v with
+  | ref l => exact Plain.bind (Plain.ofLoad l) fun _ => Plain.pure _
+  | _ => exact Plain.pure _
+
+theorem _root_.Olint.Model.SafeW.bindFuns (W : World) (env : Env) (fs : List (Name × Func)) :
+    SafeW (bindFuns W env fs) (fs.length * W.ops.closureCreate) := by
+  unfold Olint.Model.bindFuns
+  refine (SafeW.bind (Safe.bindUninit _ _).safeW fun env' =>
+    SafeW.bind (SafeW.storeFuns W env' _) fun _ => (Safe.pure _).safeW).mono ?_
+  simp
+
+/-- A computation that never aborts and performs at most `w` work is a unit run of `w`
+ticks. -/
+theorem _root_.Olint.Model.SafeW.unitR {α : Type} {x : M α} {w : ℕ} (h : SafeW x w) (st : St) (d f : ℕ) :
+    UnitR (x.run st) st.work w d f := by
+  obtain ⟨a, h', n, hn, e⟩ := h st
+  rw [e]
+  show st.work + n ≤ st.work + w
+  omega
+
+theorem unitE_run (f : ℕ) (ih : ∀ x env st, unitExpr x = true →
+    UnitR ((evalExpr W f env x).run st) st.work (unitTicksE W x) (unitDepthE x) f) :
+    ∀ x env st, unitExpr x = true →
+      UnitR ((evalExpr W (f + 1) env x).run st) st.work (unitTicksE W x) (unitDepthE x) (f + 1)
+  | .lit l, env, st, _ => by
+    rw [evalExpr_lit]
+    show st.tick.work ≤ st.work + 1
+    simp [St.tick]
+  | .ident x, env, st, hx => by
+    simp only [unitExpr, Option.isNone_iff_eq_none] at hx
+    simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+    refine (UnitR.tick (t := 0) ?_).mono (by simp only [unitTicksE]; omega) le_rfl
+    split
+    · exact (Plain.ofReadVar _).unitR _ _ _ _
+    · rw [hx]; exact (Plain.fail (Or.inl rfl)).unitR _ _ _ _
+  | .«this», env, st, _ => by
+    simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+    refine (UnitR.tick (t := 0) ?_).mono (by simp only [unitTicksE]; omega) le_rfl
+    split
+    · exact (Plain.ofReadVar _).unitR _ _ _ _
+    · exact (Plain.pure _).unitR _ _ _ _
+  | .unary op a, env, st, hx => by
+    have ha : unitExpr a = true ∧ (op = .not ∨ op = .typeof) := by
+      cases op <;> simp_all [unitExpr]
+    obtain ⟨ha, hop⟩ := ha
+    rcases hop with rfl | rfl
+    · simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+      refine (UnitR.tick (UnitR.bind (t2 := 0) ((ih a env st.tick ha).succ) fun v st1 _ =>
+        (Plain.unop_not v).unitR st1 0 _ _)).mono (by simp only [unitTicksE]; omega)
+        (by simp only [unitDepthE]; omega)
+    · simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+      refine (UnitR.tick (UnitR.bind (t2 := 0) ((ih a env st.tick ha).succ) fun v st1 _ =>
+        (Plain.unop_typeof v).unitR st1 0 _ _)).mono (by simp only [unitTicksE]; omega)
+        (by simp only [unitDepthE]; omega)
+  | .binary op a b, env, st, hx => by
+    have hab : unitExpr a = true ∧ unitExpr b = true ∧
+        (op = .and ∨ op = .or ∨ op = .nullish) := by
+      cases op <;> simp_all [unitExpr]
+    obtain ⟨ha, hb, hop⟩ := hab
+    have hk : ∀ (o : BinOp) (v : Value) (st1 : St),
+        UnitR ((if evaluatesRight o v then evalExpr W f env b else pure v).run st1) st1.work
+          (unitTicksE W b) (1 + max (unitDepthE a) (unitDepthE b)) (f + 1) := by
+      intro o v st1
+      split
+      · exact ((ih b env st1 hb).succ).mono le_rfl (by omega)
+      · exact (Plain.pure _).unitR _ _ _ _
+    have h1 := ((ih a env st.tick ha).succ).mono (t' := unitTicksE W a) le_rfl
+      (show unitDepthE a + 1 ≤ 1 + max (unitDepthE a) (unitDepthE b) by omega)
+    rcases hop with rfl | rfl | rfl <;>
+    · simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+      refine (UnitR.tick (UnitR.bind h1 fun v st1 _ => hk _ v st1)).mono
+        (by simp only [unitTicksE]; omega) (by simp only [unitDepthE]; omega)
+  | .cond c t g, env, st, hx => by
+    simp only [unitExpr, Bool.and_eq_true] at hx
+    obtain ⟨⟨hc, ht⟩, hg⟩ := hx
+    rw [evalExpr_cond]
+    have hd : unitDepthE (.cond c t g) = 1 + max (unitDepthE c) (max (unitDepthE t) (unitDepthE g)) :=
+      rfl
+    have ht' : unitTicksE W (.cond c t g) = 1 + unitTicksE W c + unitTicksE W t + unitTicksE W g :=
+      rfl
+    rw [hd, ht']
+    refine (UnitR.tick (UnitR.bind (t2 := unitTicksE W t + unitTicksE W g)
+      (((ih c env st.tick hc).succ).mono (t' := unitTicksE W c)
+        (d' := 1 + max (unitDepthE c) (max (unitDepthE t) (unitDepthE g))) le_rfl (by omega))
+        fun v st1 _ => ?_)).mono (by omega) le_rfl
+    split
+    · exact ((ih t env st1 ht).succ).mono (by omega) (by omega)
+    · exact ((ih g env st1 hg).succ).mono (by omega) (by omega)
+  | .assign x a, env, st, hx => by
+    simp only [unitExpr] at hx
+    simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+    refine (UnitR.tick (UnitR.bind (t2 := 0) ((ih a env st.tick hx).succ) fun v st1 _ => ?_)).mono
+      (by simp only [unitTicksE]; omega) (by simp only [unitDepthE]; omega)
+    split
+    · exact (Plain.bind (Plain.ofCellType _) fun _ =>
+        Plain.bind (Plain.ofSafe (Safe.store _ _)) fun _ => Plain.pure _).unitR _ _ _ _
+    · exact (Plain.fail (Or.inl rfl)).unitR _ _ _ _
+  | .func fn, env, st, _ => by
+    simp only [evalExpr, run_bind', run_tick1, Res.bind_ok]
+    have := (SafeW.bind (SafeW.charge W (·.closureCreate)) fun _ =>
+      SafeW.bind (Safe.allocate (.closure fn env)).safeW fun l =>
+        (Safe.pure (Value.ref l)).safeW).unitR st.tick (unitDepthE (.func fn)) (f + 1)
+    exact (UnitR.tick this).mono (by simp only [unitTicksE]; omega) le_rfl
+  | .update _ _ _, _, _, hx | .updateIndex _ _ _ _, _, _, hx | .assignOp _ _ _, _, _, hx
+  | .assignIndex _ _ _, _, _, hx | .assignOpIndex _ _ _ _, _, _, hx | .member _ _, _, _, hx
+  | .index _ _, _, _, hx | .call _ _, _, _, hx | .new _ _, _, _, hx | .klass _, _, _, hx
+  | .array _, _, _, hx | .object _, _, _, hx | .regex _ _, _, _, hx => by simp [unitExpr] at hx
+
+theorem unitE_all : ∀ f x env st, unitExpr x = true →
+    UnitR ((evalExpr W f env x).run st) st.work (unitTicksE W x) (unitDepthE x) f
+  | 0, x, env, st, _ => by
+    rw [evalExpr_zero]
+    refine Or.inl ⟨rfl, ?_⟩
+    cases x <;> simp only [unitDepthE] <;> omega
+  | f + 1, x, env, st, hx => unitE_run f (unitE_all f) x env st hx
+
+theorem unitDepthS_pos (s : Stmt) : 0 < unitDepthS s := by
   cases s with
-  | decl k x τ init => cases init <;> simp [unitDepth]
-  | _ => simp [unitDepth]
+  | decl _ _ _ init => cases init <;> simp [unitDepthS]
+  | ret init => cases init <;> simp [unitDepthS]
+  | _ => simp [unitDepthS]
 
 theorem unitDepthList_pos (ss : List Stmt) : 0 < unitDepthList ss := by
-  cases ss <;> simp [unitDepthList]
+  cases ss <;> simp only [unitDepthList] <;> omega
 
-theorem execStmt_decl_none (f : ℕ) (env : Env) (k : DeclKind) (y : Name) (τ : Ty) (st : St) :
-    (execStmt W (f + 1) env (.decl k y τ none)).run st =
-      match (initBinding env k y τ none).run st.tick with
-      | .ok (env', st2) => .ok ((env', .normal), st2)
-      | .error e => .error e := by
-  simp only [execStmt, run_bind, run_tick1, run_pure]
-  rcases (initBinding env k y τ none).run st.tick with e | ⟨env', st2⟩ <;> rfl
-
-/-- A statement list of the fragment declares no function. -/
-theorem funDecls_unit : ∀ ss : List Stmt, unitStmts ss = true → funDecls ss = []
-  | [], _ => rfl
-  | s :: ss, h => by
-    simp only [unitStmts, Bool.and_eq_true] at h
-    have ih := funDecls_unit ss h.2
-    cases s <;> simp_all [unitStmt, funDecls]
-
-theorem unit_run : ∀ f : ℕ,
+/-- Every fragment statement and statement list ends within its ticks from its depth on. -/
+theorem unitS_all : ∀ f : ℕ,
     (∀ s env st, unitStmt s = true →
-      UnitRun ((execStmt W f env s).run st) st.work (unitTicks s) (unitDepth s) f) ∧
+      UnitR ((execStmt W f env s).run st) st.work (unitTicksS W s) (unitDepthS s) f) ∧
     (∀ ss env st, unitStmts ss = true →
-      UnitRun ((execStmts W f env ss).run st) st.work (unitTicksList ss) (unitDepthList ss) f)
-  | 0 => ⟨fun s env st _ => by rw [execStmt_zero]; exact unitDepth_pos s,
-      fun ss env st _ => by rw [execStmts_zero]; exact unitDepthList_pos ss⟩
+      UnitR ((execStmts W f env ss).run st) st.work (unitTicksList W ss) (unitDepthList ss) f)
+  | 0 => ⟨fun s env st _ => by
+        rw [execStmt_zero]; exact Or.inl ⟨rfl, unitDepthS_pos s⟩,
+      fun ss env st _ => by rw [execStmts_zero]; exact Or.inl ⟨rfl, unitDepthList_pos ss⟩⟩
   | f + 1 => by
-    have ih := unit_run f
+    obtain ⟨ihs, ihl⟩ := unitS_all f
+    have ihe := unitE_all (W := W) f
     refine ⟨fun s env st hs => ?_, fun ss env st hs => ?_⟩
     · match s, hs with
-      | .expr (.lit l), _ =>
+      | .expr x, hs =>
         rw [execStmt_expr]
-        cases f with
-        | zero => rw [evalExpr_zero]; simp [UnitRun, unitDepth]
-        | succ f => rw [evalExpr_lit]; simp [UnitRun, unitTicks, St.tick]
-      | .decl k x τ none, _ =>
-        rw [execStmt_decl_none]
-        obtain ⟨env', h, hb⟩ := Safe.initBinding env k x τ none st.tick
-        rw [hb]
-        simp [UnitRun, unitTicks, St.tick]
-      | .decl k x τ (some (.lit l)), _ =>
+        exact (UnitR.tick ((ihe x env st.tick hs).succ.map)).mono
+          (by simp only [unitTicksS]; omega) (by simp only [unitDepthS]; omega)
+      | .decl k y τ none, _ =>
+        simp only [execStmt]
+        rw [run_bind', run_tick1, Res.bind_ok]
+        have := (Plain.bind (Plain.pure (none : Option Value)) fun v =>
+          Plain.bind (Plain.ofSafe (Safe.initBinding env k y τ v)) fun env' =>
+            Plain.pure ((env', Completion.normal) : Env × Completion)).unitR st.tick 0 1 (f + 1)
+        exact (UnitR.tick this).mono (show 1 + 0 ≤ 1 by omega) (show 1 ≤ 1 by omega)
+      | .decl k y τ (some x), hs =>
+        simp only [unitStmt] at hs
         rw [execStmt_decl]
-        cases f with
-        | zero => rw [evalExpr_zero]; simp [UnitRun, unitDepth]
-        | succ f =>
-          rw [evalExpr_lit]
-          obtain ⟨env', h, hb⟩ := Safe.initBinding env k x τ (some l.value) st.tick.tick
-          simp only [hb]
-          simp only [UnitRun, unitTicks, St.tick]
+        exact (UnitR.tick (UnitR.bind (t2 := 0) (ihe x env st.tick hs).succ fun v st1 _ =>
+          ((Plain.ofSafe (Safe.initBinding env k y τ (some v))).unitR st1 0 _ _).map)).mono
+          (by simp only [unitTicksS]; omega) (by simp only [unitDepthS]; omega)
       | .block ss, hs =>
-        have hu : unitStmts ss = true := by simpa [unitStmt] using hs
-        obtain ⟨env', h1, n, hn, hinst⟩ := SafeW.instantiate W env ss st.tick
-        rw [funDecls_unit ss hu] at hn
-        simp only [List.length_nil, zero_mul, Nat.le_zero] at hn
-        subst hn
-        rw [execStmt_block, hinst]
-        simp only [Nat.add_zero]
-        have h := ih.2 ss env' ⟨h1, st.tick.work⟩ hu
-        revert h
-        rcases (execStmts W f env' ss).run ⟨h1, st.tick.work⟩ with e | ⟨⟨env'', c⟩, st'⟩
-        · cases e <;> simp [UnitRun, unitDepth]; omega
-        · cases c <;> simp [UnitRun, unitTicks, St.tick]; omega
+        simp only [unitStmt] at hs
+        rw [execStmt_block]
+        exact (UnitR.tick (UnitR.bind (t2 := unitTicksList W ss)
+          ((SafeW.instantiate W env ss).unitR st.tick (unitDepthList ss + 1) (f + 1))
+          fun env' st1 _ => ((ihl ss env' st1 hs).succ).map)).mono
+          (by simp only [unitTicksS]; omega) (by simp only [unitDepthS]; omega)
+      | .ite c t el, hs =>
+        simp only [unitStmt, Bool.and_eq_true] at hs
+        obtain ⟨⟨hc, ht⟩, hel⟩ := hs
+        rw [execStmt_ite]
+        have hd : unitDepthS (.ite c t el) =
+            1 + max (unitDepthE c) (max (unitDepthS t) (unitDepthOpt el)) := rfl
+        have ht' : unitTicksS W (.ite c t el) =
+            1 + unitTicksE W c + unitTicksS W t + unitTicksOpt W el := rfl
+        rw [hd, ht']
+        refine (UnitR.tick (UnitR.bind (t2 := unitTicksS W t + unitTicksOpt W el)
+          (((ihe c env st.tick hc).succ).mono (t' := unitTicksE W c)
+            (d' := 1 + max (unitDepthE c) (max (unitDepthS t) (unitDepthOpt el))) le_rfl
+            (by omega)) fun v st1 _ => ?_)).mono (by omega) le_rfl
+        split
+        · exact (((ihs t env st1 ht).succ).mono
+            (t' := unitTicksS W t + unitTicksOpt W el) (by omega) (by omega)).map
+        · cases el with
+          | none => show st1.work ≤ st1.work + _; omega
+          | some g =>
+            simp only [unitOptStmt] at hel
+            have h1 : unitTicksOpt W (some g) = unitTicksS W g := rfl
+            have h2 : unitDepthOpt (some g) = unitDepthS g := rfl
+            rw [h1, h2]
+            exact (((ihs g env st1 hel).succ).mono
+              (t' := unitTicksS W t + unitTicksS W g) (by omega) (by omega)).map
+      | .ret none, _ =>
+        simp only [execStmt, run_bind', run_tick1, Res.bind_ok]
+        exact (UnitR.tick ((Plain.pure _).unitR _ 0 _ _)).mono
+          (by simp only [unitTicksS]; omega) le_rfl
+      | .ret (some x), hs =>
+        simp only [unitStmt] at hs
+        rw [execStmt_ret]
+        exact (UnitR.tick ((ihe x env st.tick hs).succ.map)).mono
+          (by simp only [unitTicksS]; omega) (by simp only [unitDepthS]; omega)
+      | .brk, _ =>
+        simp only [execStmt, run_bind', run_tick1, Res.bind_ok]
+        exact (UnitR.tick ((Plain.pure _).unitR _ 0 _ _)).mono
+          (by simp only [unitTicksS]; omega) le_rfl
+      | .cont, _ =>
+        simp only [execStmt, run_bind', run_tick1, Res.bind_ok]
+        exact (UnitR.tick ((Plain.pure _).unitR _ 0 _ _)).mono
+          (by simp only [unitTicksS]; omega) le_rfl
+      | .funDecl x fn, _ =>
+        simp only [execStmt, run_bind', run_tick1, Res.bind_ok]
+        refine (UnitR.tick (t := W.ops.closureCreate) ?_).mono
+          (by simp only [unitTicksS]; omega) le_rfl
+        split
+        · exact (Plain.pure _).unitR _ _ _ _
+        · have := (SafeW.bind (SafeW.bindFuns W env [(x, fn)]) fun env' =>
+            (Safe.pure ((env', Completion.normal) : Env × Completion)).safeW).unitR st.tick
+              (unitDepthS (.funDecl x fn)) (f + 1)
+          exact this.mono (by simp) le_rfl
     · match ss, hs with
       | [], _ =>
         rw [execStmts_nil]
-        simp [UnitRun, unitTicksList]
+        show st.work ≤ st.work + _; omega
       | s :: ss, hs =>
         simp only [unitStmts, Bool.and_eq_true] at hs
         rw [execStmts_cons]
-        have h1 := ih.1 s env st hs.1
-        revert h1
-        rcases (execStmt W f env s).run st with e | ⟨⟨env', c⟩, st'⟩
-        · cases e <;> simp [UnitRun, unitDepthList]; omega
-        · cases c with
-          | normal =>
-            intro h1
-            have h2 := ih.2 ss env' st' hs.2
-            simp only [UnitRun] at h1
-            dsimp only
-            revert h2
-            rcases (execStmts W f env' ss).run st' with e | ⟨⟨env'', c⟩, st''⟩
-            · cases e <;> simp [UnitRun, unitDepthList]; omega
-            · cases c <;> simp [UnitRun, unitTicksList]; omega
-          | _ => simp [UnitRun]
+        refine (UnitR.bind (t2 := unitTicksList W ss)
+          (((ihs s env st hs.1).succ).mono le_rfl (show unitDepthS s + 1 ≤
+            1 + max (unitDepthS s) (unitDepthList ss) by omega)) fun r st1 _ => ?_).mono
+          (by simp only [unitTicksList]; omega) (by simp only [unitDepthList]; omega)
+        obtain ⟨env', c⟩ := r
+        cases c with
+        | normal =>
+          exact ((ihl ss env' st1 hs.2).succ).mono le_rfl (by omega)
+        | ret v => show st1.work ≤ st1.work + _; omega
+        | brk => show st1.work ≤ st1.work + _; omega
+        | cont => show st1.work ≤ st1.work + _; omega
 
-/-- `seq-max`, unit base: a fragment statement completes from its depth on, doing exactly its
-ticks of work, from every state. -/
+/-- `seq-max`, unit base: a fragment statement ends from its depth on, within its ticks. -/
 theorem holds_unit {p : Program} {e : Entry} {i : Instance} {s : Stmt} (hu : unitStmt s = true) :
-    Holds W p e i (.stmt s) allChannels (unitDepth s) (unitTicks s) := by
-  rintro ⟨fr, st⟩ _ ⟨env, hc⟩
-  simp only at hc
-  subst hc
-  have hr := fun f => (unit_run (W := W) f).1 s env st hu
-  refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
-  · have h := hr f
-    revert h
-    rcases hres : (execStmt W f env s).run st with e | ⟨⟨env', c⟩, st'⟩
-    · cases e with
-      | fuel => simp [UnitRun]; omega
-      | _ => simp [UnitRun]
-    · intro _; exact ⟨_, _, runs_stmt.2 ⟨_, hres, rfl⟩⟩
-  · obtain ⟨r, hv, _⟩ := runs_stmt.1 hrun
-    have h := hr f
-    rw [hv] at h
-    obtain ⟨env', c⟩ := r
-    cases c <;> simp only [UnitRun] at h
-    simp only [h, Nat.cast_add]
-    linarith
+    Holds W p e i (.stmt s) allChannels (unitDepthS s) (unitTicksS W s) :=
+  holds_stmt_of fun env st _ =>
+    ⟨fun f hf => ((unitS_all f).1 s env st hu).ends hf,
+      fun f => ((unitS_all f).1 s env st hu).within⟩
 
-/-- A literal expression completes from fuel `1`, doing one unit of work, from every state. -/
-theorem holds_lit {p : Program} {e : Entry} {i : Instance} {l : Lit} :
-    Holds W p e i (.expr (.lit l)) allChannels 1 1 := by
-  rintro ⟨fr, st⟩ _ ⟨env, hc⟩
-  simp only at hc
-  subst hc
-  refine ⟨fun f hf => ?_, fun f o st' hrun _ => ?_⟩
-  · obtain ⟨f', rfl⟩ : ∃ f', f = f' + 1 := ⟨f - 1, by omega⟩
-    exact ⟨_, _, runs_expr.2 ⟨_, evalExpr_lit f' env l st, rfl⟩⟩
-  · obtain ⟨v, hv, _⟩ := runs_expr.1 hrun
-    cases f with
-    | zero => rw [evalExpr_zero] at hv; cases hv
-    | succ f =>
-      rw [evalExpr_lit] at hv
-      cases hv
-      simp [St.tick]
+/-- A fragment expression ends from its depth on, within its ticks. -/
+theorem holds_unitExpr {p : Program} {e : Entry} {i : Instance} {x : Expr}
+    (hu : unitExpr x = true) :
+    Holds W p e i (.expr x) allChannels (unitDepthE x) (unitTicksE W x) :=
+  holds_expr_of fun env st _ =>
+    ⟨fun f hf => (unitE_all f x env st hu).ends hf, fun f => (unitE_all f x env st hu).within⟩
 
 /-- A bound of every configuration by a fixed work from fixed fuel is a bound by the constant
 `1`. -/
@@ -1043,11 +1441,20 @@ theorem channelTotal_sound {p : Program} {n : Node} {parts : List (List Channel 
     (fun y hy v => by
       obtain ⟨x, hx, rfl⟩ := List.mem_map.1 hy
       exact eval_le_maximum v _ x.2 (List.mem_map.2 ⟨x, hx, rfl⟩))
-  refine ⟨hwf, C, h.mono fun i ⟨F, hF⟩ => ⟨F, fun c hr ha => ⟨?_, fun f o st' hc _ => ?_⟩⟩⟩
+  refine ⟨hwf, C, h.mono fun i ⟨F, hF⟩ => ⟨F, fun c hr ha => ⟨?_, fun f => ?_⟩⟩⟩
   · obtain ⟨x, hx, _⟩ := hcover .normal
     exact (hF (n.site, x.1, x.2) (List.mem_map.2 ⟨x, hx, rfl⟩) c hr ha).1
-  · obtain ⟨x, hx, hk⟩ := hcover o.channel
-    exact (hF (n.site, x.1, x.2) (List.mem_map.2 ⟨x, hx, rfl⟩) c hr ha).2 f o st' hc hk
+  · -- A completion in channel `k` is bounded by a part covering `k`; a throw, by any part.
+    obtain ⟨x0, hx0, _⟩ := hcover .normal
+    have hall := fun x (hx : x ∈ parts) =>
+      (hF (n.site, x.1, x.2) (List.mem_map.2 ⟨x, hx, rfl⟩) c hr ha).2 f
+    revert hall
+    rcases c.result W f with ⟨e', w⟩ | ⟨o, st'⟩
+    · intro hall he
+      exact hall x0 hx0 he
+    · intro hall hk
+      obtain ⟨x, hx, hk'⟩ := hcover o.channel
+      exact hall x hx hk' 
 
 /-- `seq-max`: a sequence node is bounded by the maximum of its children's bounds. -/
 theorem seqMax_sound {p : Program} {n : Node} {sites : List Site} {cs : List Cost}
@@ -1065,16 +1472,17 @@ theorem branchJoin_sound {p : Program} {n : Node} {sites : List Site} {cs : List
     (hchild : ∀ x ∈ sites.zip cs, Bound W p ⟨n.entry, x.1⟩ x.2) : Bound W p n (.maximum cs) :=
   bound_compose hwf zero_le_one hlen hchild fun _ _ _ hB h => holds_branch hs hB h
 
-/-- `seq-max`, unit base, on bounds. -/
+/-- `seq-max`, unit base, on bounds: a fragment statement. -/
 theorem unit_bound {p : Program} {n : Node} {s : Stmt} (hwf : n.entry.wf p = true)
     (hn : n.site = .stmt s) (hu : unitStmt s = true) : Bound W p n (.constant 1) :=
-  bound_of_holds (F := unitDepth s) (w := (unitTicks s : ℝ)) hwf fun i => by
+  bound_of_holds (F := unitDepthS s) (w := (unitTicksS W s : ℝ)) hwf fun i => by
     rw [hn]; exact holds_unit hu
 
-/-- A literal expression is bounded by the unit cost. -/
-theorem lit_bound {p : Program} {n : Node} {l : Lit} (hwf : n.entry.wf p = true)
-    (hn : n.site = .expr (.lit l)) : Bound W p n (.constant 1) :=
-  bound_of_holds (F := 1) (w := 1) hwf fun i => by rw [hn]; exact holds_lit
+/-- `seq-max`, unit base, on bounds: a fragment expression. -/
+theorem unitExpr_bound {p : Program} {n : Node} {x : Expr} (hwf : n.entry.wf p = true)
+    (hn : n.site = .expr x) (hu : unitExpr x = true) : Bound W p n (.constant 1) :=
+  bound_of_holds (F := unitDepthE x) (w := (unitTicksE W x : ℝ)) hwf fun i => by
+    rw [hn]; exact holds_unitExpr hu
 
 /-! ## `expr-validity`
 

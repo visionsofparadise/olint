@@ -36,9 +36,11 @@ Each clause of spec §2 is encoded here, and nowhere else:
 * **§2.5** `Conforms` is the judgement that a value conforms to its declared type, following
   TypeScript's structural assignability for the modelled types (`conforms`). Admission of an
   instance (`Olint.Model.Admitted`) requires it of the entry's inputs, and every read of a
-  variable during the run checks it (`Olint.Model.readVar`), aborting on a value that does not
-  conform: a run that would read a non-conforming value never completes, so no bound covers it
-  and no bound holds vacuously because of it.
+  variable during the run checks it (`Olint.Model.readVar`): a run that reads a non-conforming
+  value violates §2.5, so it is no instance (§1), and `Olint.Bound` says nothing of it, while
+  admission stays non-empty at the level of inputs (`Olint.Model.Admitted.exists`). *Model
+  change under §6.2 (5.3, A2b), pre-authorised remediation pending Matt's ratification:* such
+  a read was an abort no bound admitted before.
 -/
 
 namespace Olint.Model

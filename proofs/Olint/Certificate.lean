@@ -86,8 +86,10 @@ inductive Fact where
 
 /-- A derivation in olint's proof rules, concerning the node it is checked at. -/
 inductive Cert where
-  /-- `seq-max`, unit base (walker.rs:497, walker.rs:675): the node's statement lies in the
-  state-independent fragment `unitStmt`, or the node is a literal, so its cost is `1`. -/
+  /-- `seq-max`, unit base (walker.rs:497, walker.rs:675, snapshot.rs `record_node`): the node's
+  statement or expression lies in the value-kind-independent fragment (`Olint.Rules.unitStmt`,
+  `Olint.Rules.unitExpr`), whose every run ends within ticks its syntax fixes, so its cost is
+  `1`. -/
   | seqUnit
   /-- `seq-max` (cost.rs:2032-2056, walker.rs:675-737): the node runs its children in sequence,
   each at most once (`Olint.Rules.seqSites`: an entry's body, a block's statements, the
@@ -635,7 +637,7 @@ def checkCert (p : Program) (n : Node) : Cert → Bool
   | .seqUnit =>
     match n.site with
     | .stmt s => unitStmt s
-    | .expr (.lit _) => true
+    | .expr x => unitExpr x
     | _ => false
   | .seqMax children =>
     match seqSites n.entry n.site with
@@ -938,8 +940,8 @@ theorem checkCert_sound (W : World) : ∀ (p : Program) (n : Node) (c : Cert),
     split at h
     · rename_i s hs
       exact unit_bound hwf hs h
-    · rename_i l hs
-      exact lit_bound hwf hs
+    · rename_i x hs
+      exact unitExpr_bound hwf hs h
     · exact absurd h Bool.false_ne_true
   | p, n, .seqMax children, hwf, h => by
     simp only [checkCert] at h

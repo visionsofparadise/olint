@@ -18,6 +18,8 @@
 //! - a function declaration outside a function body's top level, where sloppy code's Annex B
 //!   semantics differ from the model's block-scoped one;
 //! - an object literal `__proto__` key, which sets the new object's prototype (§13.2.5.5);
+//! - `try` and `throw`: the model has no handler, so a TypeError or ReferenceError a run throws ends it, which is
+//!   faithful only while no `try` could catch the error;
 //! - a dimension over a free variable, since the encoded entry's scope holds no free variables
 //!   and `Olint.check` rejects a dimension outside it.
 

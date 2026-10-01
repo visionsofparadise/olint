@@ -17,9 +17,9 @@ open Olint Olint.Model Filter
 def W0 : World := ⟨SpecOps.draft, fun _ => false⟩
 
 /-- What a run returns: its value, or why it stopped. -/
-def ret : Except Abort (Value × St) → Abort ⊕ Value
+def ret : Except (Abort × ℕ) (Value × St) → Abort ⊕ Value
   | .ok (v, _) => .inr v
-  | .error e => .inl e
+  | .error (e, _) => .inl e
 
 /-- Evaluate an expression from the empty heap. -/
 def evalIn (W : World) (e : Expr) : Abort ⊕ Value :=
@@ -121,6 +121,18 @@ theorem small_instances_count :
 /-- `({}).toString` is `%Object.prototype.toString%` in ECMAScript; the model does not run
 `%Object.prototype%`'s members, so the read is `.unmodelled`, never `undefined`. -/
 example : evalIn W0 (.member (.object []) "toString") = .inl .unmodelled := by decide
+
+/-- `"n=" + 1.5`, `true + "!"` and `"" + null` concatenate the `ToString` of the primitive
+(§13.15.3, §7.1.17); `"a" + {}` needs `ToPrimitive`, outside the model. -/
+example : evalIn W0 (.binary .add (.lit (.str "n=")) (.lit (.num (Double.round false 3 2 0)))) =
+    .inr (.str "n=1.5") := by decide +kernel
+example : evalIn W0 (.binary .add (.lit (.bool true)) (.lit (.str "!"))) = .inr (.str "true!") := by
+  decide
+example : evalIn W0 (.binary .add (.lit (.str "")) (.lit .null)) = .inr (.str "null") := by decide
+example : evalIn W0 (.binary .add (.lit (.str "a")) (.object [])) = .inl .unmodelled := by decide
+
+/-- An unresolvable name throws a ReferenceError, an end of the run (`Olint.Ends`). -/
+example : evalIn W0 (.ident "nowhere") = .inl .referenceError := by decide
 
 /-- `typeof ({}).toString` likewise stops short of `"function"`. -/
 example : evalIn W0 (.unary .typeof (.member (.object []) "toString")) = .inl .unmodelled := by

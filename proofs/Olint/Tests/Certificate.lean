@@ -101,8 +101,10 @@ example : check program ⟨entry, .stmt (.expr (.lit (.num 9)))⟩ [] .seqUnit =
 /-- … while the same statement inside the entry's first block is accepted. -/
 example : check program ⟨entry, .stmt (.expr (.lit (.num 1)))⟩ [] .seqUnit = true := by decide
 
-/-- The entry's bound bounds its `Work`. -/
-example (W : World) (hW : NoReplacement W []) : ∀ᶠ i in Admits entry, Halts W program i entry :=
+/-- The entry's bound bounds its `Work`: every admitted run halts, completing or throwing, or
+violates §2.5. -/
+example (W : World) (hW : NoReplacement W []) :
+    ∀ᶠ i in Admits entry, Halts W program i entry ∨ Violates W program i entry :=
   (Bound.work_isBigO (n := ⟨entry, .entry⟩) rfl (c_entry W hW)).1
 
 end Olint.Tests

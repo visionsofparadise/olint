@@ -10,12 +10,25 @@ unit, every built-in the work `Olint.Model.step` assigns it (§2.3), and every s
 operation the step cost its world's `SpecOps` gives it (§2.1, the G52 drafts).
 
 Fuel bounds the interpreter's recursion depth and loop iterations, so the interpreter is total.
-A run ends normally, runs out of fuel, or aborts: on a TypeError or ReferenceError, on a
-construct outside the model, on an implementation-defined built-in (§2.4), on a spec-internal
-operation with no work definition, on a read of a value that does not conform to its declared
-type (§2.5), or on consulting an intrinsic the analysed program modified (§2.2). A thrown
-exception aborts the run too: exceptions are outside the model, and `Olint.Bound` requires
-every run it bounds to complete.
+A run completes normally, or stops (`fail`) recording why and the work done so far:
+
+* it throws a TypeError or a ReferenceError (`Abort.thrown`), an ECMAScript throw completion.
+  The model has no `try` statement and the encoder refuses `try` and `throw`, so no handler
+  can catch the error: it propagates through every enclosing statement and call to the end of
+  the run, which ends there, its work charged up to the throw;
+* it reads a value that does not conform to its declared type (§2.5), which puts the execution
+  outside the axioms: §1 defines an instance as an execution the axioms admit;
+* it runs out of fuel, meets a construct outside the model, an implementation-defined built-in
+  (§2.4), a spec-internal operation with no work definition, or an intrinsic the analysed program
+  modified (§2.2), none of which the model gives a work.
+
+`Olint.Bound` bounds the work of every run that completes or throws, requires every run to do
+one or the other unless it violates §2.5, and has nothing to say about a run that violates
+§2.5.
+
+*This is a model change under §6.2 (5.3, A2b), pre-authorised remediation pending Matt's
+ratification: a throw ended a run without a bound before, and a §2.5 violation was an abort no
+bound admitted.*
 
 **Scopes.** Bindings follow ECMA-262's declaration instantiation. Entering a function binds
 `this`, the parameters, and every `var` of its body initialized to `undefined`
@@ -61,6 +74,14 @@ inductive Abort where
   | modified (x : Intrinsic)
   deriving DecidableEq, Repr
 
+/-- An ECMAScript throw completion (ECMA-262 §6.2.4): a TypeError or a ReferenceError. The model
+has no `try` statement, which the encoder (`src/lean_syntax.rs`) refuses, together with `throw`,
+so no handler can catch a thrown error and it propagates to the end of the run, which it ends
+after the work done up to it. -/
+def Abort.thrown : Abort → Bool
+  | .typeError | .referenceError => true
+  | _ => false
+
 /-- Interpreter state: the heap and the work performed so far. -/
 structure St where
   heap : Heap
@@ -69,8 +90,12 @@ structure St where
 /-- The state after one unit of work. -/
 def St.tick (st : St) : St := { st with work := st.work + 1 }
 
-/-- The interpreter monad. -/
-abbrev M := StateT St (Except Abort)
+/-- The interpreter monad. A run that stops before completing records why and the work done up
+to that point, which a thrown error's run is charged. -/
+abbrev M := StateT St (Except (Abort × ℕ))
+
+/-- Stop the run with `e`, recording the work done so far. -/
+def fail {α : Type} (e : Abort) : M α := fun st => .error (e, st.work)
 
 /-- Statement completions (ECMA-262 §6.2.4, without `throw`). -/
 inductive Completion where
@@ -92,13 +117,13 @@ def charge (W : World) (f : SpecOps → ℕ) : M Unit := tick (f W.ops)
 
 /-- Consult an intrinsic, aborting when the analysed program modified it (§2.2). -/
 def consult (W : World) (x : Intrinsic) : M Unit :=
-  if W.modified x then throw (.modified x) else pure ()
+  if W.modified x then fail (.modified x) else pure ()
 
 /-- Read a heap object. -/
 def load (l : Loc) : M Obj := do
   match (← get).heap.get l with
   | some o => pure o
-  | none => throw .typeError
+  | none => fail .typeError
 
 /-- Allocate a heap object. -/
 def allocate (o : Obj) : M Loc := do
@@ -112,13 +137,13 @@ def store (l : Loc) (o : Obj) : M Unit :=
   modify fun s => { s with heap := s.heap.put l o }
 
 /-- Read a variable binding's value and declared type, checking §2.5: a value that does not
-conform to the declared type aborts the run, and a binding in its temporal dead zone throws a
-ReferenceError. -/
+conform to the declared type puts the execution outside the axioms (`typeViolation`), and a
+binding in its temporal dead zone throws a ReferenceError. -/
 def readVarTy (l : Loc) : M (Value × Ty) := do
   match ← load l with
-  | .cell v τ => if conforms (← get).heap v τ then pure (v, τ) else throw .typeViolation
-  | .uninit _ => throw .referenceError
-  | _ => throw .typeError
+  | .cell v τ => if conforms (← get).heap v τ then pure (v, τ) else fail .typeViolation
+  | .uninit _ => fail .referenceError
+  | _ => fail .typeError
 
 /-- Read a variable (§2.5 checked, `readVarTy`). -/
 def readVar (l : Loc) : M Value := do pure (← readVarTy l).1
@@ -128,8 +153,8 @@ throws a ReferenceError (§9.1.1.1.5 `SetMutableBinding`). -/
 def cellType (l : Loc) : M Ty := do
   match ← load l with
   | .cell _ τ => pure τ
-  | .uninit _ => throw .referenceError
-  | _ => throw .typeError
+  | .uninit _ => fail .referenceError
+  | _ => fail .typeError
 
 /-- ECMAScript `ToBoolean` (ECMA-262 §7.1.2) on the modelled values. -/
 def truthy : Value → Bool
@@ -155,20 +180,38 @@ def toNumeric : Value → M Double
   | .undef => pure .nan
   | .null => pure 0
   | .bool b => pure (if b then 1 else 0)
-  | _ => throw .unmodelled
+  | _ => fail .unmodelled
+
+/-- `ToString` (ECMA-262 §7.1.17) of a primitive other than a String: `Number::toString`
+(§6.1.6.1.20) for a Number, charged as the number-to-key conversion, which is that operation, and
+a fixed String for `undefined`, `null` and a Boolean. An object needs `ToPrimitive`, outside the
+model. -/
+def toStringPrim (W : World) : Value → M String
+  | .num n => do charge W (·.numberToKey); pure n.toString
+  | .undef => pure "undefined"
+  | .null => pure "null"
+  | .bool b => pure (if b then "true" else "false")
+  | _ => fail .unmodelled
 
 /-- The value of a non-short-circuit binary operator (ECMA-262 §13.15.3
-`ApplyStringOrNumericBinaryOperator`, §7.2.13 `IsLessThan`, §7.2.15 `IsStrictlyEqual`). `+` on
-two Strings concatenates them; a String beside a non-String needs `ToString` of a Number and
-two Strings compared with `<` need the code-unit order, both outside the model. -/
+`ApplyStringOrNumericBinaryOperator`, §7.2.13 `IsLessThan`, §7.2.15 `IsStrictlyEqual`). `+` with
+a String operand concatenates the `ToString` of both (`toStringPrim`); two Strings compared with
+`<` need the code-unit order, outside the model. -/
 def binop (W : World) : BinOp → Value → Value → M Value
   | .add, .str a, .str b => do charge W (·.stringConcat a b); pure (.str (a ++ b))
-  | .add, .str _, _ | .add, _, .str _ => throw .unmodelled
+  | .add, .str a, v => do
+    let b ← toStringPrim W v
+    charge W (·.stringConcat a b)
+    pure (.str (a ++ b))
+  | .add, v, .str b => do
+    let a ← toStringPrim W v
+    charge W (·.stringConcat a b)
+    pure (.str (a ++ b))
   | .lt, .str _, .str _ | .le, .str _, .str _ | .gt, .str _, .str _ | .ge, .str _, .str _ =>
-    throw .unmodelled
+    fail .unmodelled
   | .strictEq, a, b => do charge W (valueEqWork · a b); pure (.bool (strictEquals a b))
   | .strictNe, a, b => do charge W (valueEqWork · a b); pure (.bool !(strictEquals a b))
-  | .and, _, _ | .or, _, _ | .nullish, _, _ => throw .unmodelled
+  | .and, _, _ | .or, _, _ | .nullish, _, _ => fail .unmodelled
   | op, a, b => do
     let x ← toNumeric a
     let y ← toNumeric b
@@ -372,8 +415,8 @@ def copyBindings (env : Env) : List Name → M Env
         tick
         let env ← bindCell env x v τ
         copyBindings env xs
-      | .uninit _ => throw .referenceError
-      | _ => throw .typeError
+      | .uninit _ => fail .referenceError
+      | _ => fail .typeError
     | none => copyBindings env xs
 
 /-- Evaluate a class definition (§15.7.14 `ClassDefinitionEvaluation`): create one closure per
@@ -415,7 +458,7 @@ other name reads as `undefined`. -/
 def objectProtoGet (W : World) (x : Name) : M Value := do
   consult W .objectPrototype
   charge W (·.propertyLookup)
-  if objectProtoMembers.contains x then throw .unmodelled else pure .undef
+  if objectProtoMembers.contains x then fail .unmodelled else pure .undef
 
 /-- A property lookup continuing past an ordinary object's own properties (§10.1.8.1
 `OrdinaryGet`): the class prototype's methods, then `%Object.prototype%`; an accessor, which
@@ -428,8 +471,8 @@ def protoGet (W : World) (cls : Option Loc) (x : Name) : M Value := do
       charge W (·.propertyLookup)
       match ms.lookup x with
       | some l => pure (.ref l)
-      | none => if acc.contains x then throw .unmodelled else objectProtoGet W x
-    | _ => throw .typeError
+      | none => if acc.contains x then fail .unmodelled else objectProtoGet W x
+    | _ => fail .typeError
   | none => objectProtoGet W x
 
 /-- Resolve a property read on an object (§2.2): an ordinary object's own properties, then its
@@ -441,7 +484,7 @@ def readProp (W : World) (o : Obj) (x : Name) : M Value := do
     charge W (·.propertyLookup)
     match props.lookup x with
     | some v => pure v
-    | none => if acc.contains x then throw .unmodelled else protoGet W cls x
+    | none => if acc.contains x then fail .unmodelled else protoGet W cls x
   | _ =>
     match builtinGetter o x with
     | some (v, w) => do
@@ -456,16 +499,16 @@ def readProp (W : World) (o : Obj) (x : Name) : M Value := do
         consultProto W o
         charge W (2 * ·.propertyLookup)
         pure (.builtin b)
-      | none => throw .unmodelled
+      | none => fail .unmodelled
 
 /-- `v.x`: a property of an object, or a String's `length` in UTF-16 code units. Reading a
 property of `undefined` or `null` throws a TypeError. -/
 def getProp (W : World) (v : Value) (x : Name) : M Value :=
   match v with
   | .ref l => do readProp W (← load l) x
-  | .str s => if x = "length" then pure (.num (Double.ofNat (utf16Length s))) else throw .unmodelled
-  | .undef | .null => throw .typeError
-  | _ => throw .unmodelled
+  | .str s => if x = "length" then pure (.num (Double.ofNat (utf16Length s))) else fail .unmodelled
+  | .undef | .null => fail .typeError
+  | _ => fail .unmodelled
 
 /-- A read of an Array element past its length: the lookup walks `%Array.prototype%` and
 `%Object.prototype%`, which carry no array index or numeric key, and reads `undefined`. -/
@@ -494,14 +537,14 @@ def getIndex (W : World) (v k : Value) : M Value :=
       | none => arrayMiss W
     | o => match d.toPropertyString with
       | some x => readProp W o x
-      | none => throw .unmodelled
+      | none => fail .unmodelled
   | .ref l, .str x => do
     match ← load l, arrayIndexKey x with
     | .array elems, some i => readElem W elems i
     | o, _ => readProp W o x
   | .str s, .str x => getProp W (.str s) x
-  | .undef, _ | .null, _ => throw .typeError
-  | _, _ => throw .unmodelled
+  | .undef, _ | .null, _ => fail .typeError
+  | _, _ => fail .unmodelled
 
 /-- Write an Array element: overwrite within the length; at the length, a new own property,
 for which `OrdinarySet` first walks the prototype chain for a setter (§10.1.9.2); a write past
@@ -514,7 +557,7 @@ def putElem (W : World) (l : Loc) (elems : List Value) (i : ℕ) (v : Value) : M
     consult W .objectPrototype
     charge W fun o => 2 * o.propertyLookup + o.listAppend
     store l (.array (elems ++ [v]))
-  else throw .unmodelled
+  else fail .unmodelled
 
 /-- Write a property of an ordinary object (§10.1.9.2 `OrdinarySet`): overwrite an own data
 property; else walk the prototype chain for a setter, which the model does not run, so an
@@ -523,19 +566,19 @@ def putProp (W : World) (l : Loc) (props : List (Name × Value)) (acc : List Nam
     (x : Name) (v : Value) : M Unit := do
   charge W (·.propertyLookup)
   if props.any (·.1 == x) then store l (.ordinary (setProp props x v) acc cls)
-  else if acc.contains x then throw .unmodelled
+  else if acc.contains x then fail .unmodelled
   else do
     match cls with
     | some c =>
       match ← load c with
       | .klass _ _ cacc _ => do
         charge W (·.propertyLookup)
-        if cacc.contains x then throw .unmodelled
-      | _ => throw .typeError
+        if cacc.contains x then fail .unmodelled
+      | _ => fail .typeError
     | none => pure ()
     consult W .objectPrototype
     charge W (·.propertyLookup)
-    if x = "__proto__" then throw .unmodelled
+    if x = "__proto__" then fail .unmodelled
     store l (.ordinary (setProp props x v) acc cls)
 
 /-- `v[k] = w`. -/
@@ -547,19 +590,19 @@ def putIndex (W : World) (v k w : Value) : M Unit :=
       charge W (·.numberToKey)
       match d.toArrayIndex with
       | some i => putElem W l elems i w
-      | none => throw .unmodelled
+      | none => fail .unmodelled
     | .array elems, .str x => match arrayIndexKey x with
       | some i => putElem W l elems i w
-      | none => throw .unmodelled
+      | none => fail .unmodelled
     | .ordinary props acc cls, .str x => putProp W l props acc cls x w
     | .ordinary props acc cls, .num d => do
       charge W (·.numberToKey)
       match d.toPropertyString with
       | some x => putProp W l props acc cls x w
-      | none => throw .unmodelled
-    | _, _ => throw .unmodelled
-  | .undef | .null => throw .typeError
-  | _ => throw .unmodelled
+      | none => fail .unmodelled
+    | _, _ => fail .unmodelled
+  | .undef | .null => fail .typeError
+  | _ => fail .unmodelled
 
 /-- Whether a binary operator evaluates its right operand once its left operand is `v`: the
 logical operators short-circuit, every other operator evaluates both. -/
@@ -586,7 +629,7 @@ def iterStep (W : World) (o : Obj) (i : ℕ) : M (Option (Option Value)) := do
     | some (some (k, v)) => do
       charge W fun o => o.objectCreate + 2 * o.listAppend
       pure (some (some (.ref (← allocate (.array [k, v])))))
-  | _ => throw .unmodelled
+  | _ => fail .unmodelled
 
 /-- An ordinary object's keys in `OrdinaryOwnPropertyKeys` order (§10.1.11.1): array indices
 ascending, then the other String keys in creation order. -/
@@ -607,7 +650,7 @@ def forInKeys (W : World) (l : Loc) : M (List Value) := do
     consult W .arrayPrototype
     consult W .objectPrototype
     pure ((List.range elems.length).map fun i => Value.str (toString i))
-  | _ => throw .unmodelled
+  | _ => fail .unmodelled
 
 /-- Run a built-in through `Olint.Model.step` with the world's step costs, charging its work. -/
 def runStep (W : World) : Builtin → Bool → Value → List Value → M Value
@@ -616,15 +659,15 @@ def runStep (W : World) : Builtin → Bool → Value → List Value → M Value
     let s ← get
     match step W.ops b isNew s.heap self args with
     | .ok v h w => do modify fun s => { s with heap := h }; tick w; pure v
-    | .typeError => throw .typeError
-    | .unmodelled => throw .unmodelled
-    | .implementationDefined => throw (.implementationDefined b)
+    | .typeError => fail .typeError
+    | .unmodelled => fail .unmodelled
+    | .implementationDefined => fail (.implementationDefined b)
 
 mutual
 
 /-- Evaluate an expression. -/
 def evalExpr (W : World) : ℕ → Env → Expr → M Value
-  | 0, _, _ => throw .fuel
+  | 0, _, _ => fail .fuel
   | fuel + 1, env, e => do
     tick
     match e with
@@ -634,7 +677,7 @@ def evalExpr (W : World) : ℕ → Env → Expr → M Value
       | some l => readVar l
       | none => match builtinGlobal x with
         | some (b, g) => do consult W g; pure (.builtin b)
-        | none => throw .referenceError
+        | none => fail .referenceError
     | .«this» =>
       match env.lookup "this" with
       | some l => readVar l
@@ -657,7 +700,7 @@ def evalExpr (W : World) : ℕ → Env → Expr → M Value
         let τ ← cellType l
         store l (.cell v τ)
         pure v
-      | none => throw .referenceError
+      | none => fail .referenceError
     | .assignIndex o k a => do
       let vo ← evalExpr W fuel env o
       let vk ← evalExpr W fuel env k
@@ -676,7 +719,7 @@ def evalExpr (W : World) : ℕ → Env → Expr → M Value
           store l (.cell r τ)
           pure r
         else pure lv
-      | none => throw .referenceError
+      | none => fail .referenceError
     | .assignOpIndex op o k a => do
       let vo ← evalExpr W fuel env o
       let vk ← evalExpr W fuel env k
@@ -697,7 +740,7 @@ def evalExpr (W : World) : ℕ → Env → Expr → M Value
         let new := if inc then old.add 1 else old.sub 1
         store l (.cell (.num new) τ)
         pure (.num (if pre then new else old))
-      | none => throw .referenceError
+      | none => fail .referenceError
     | .updateIndex inc pre o k => do
       let vo ← evalExpr W fuel env o
       let vk ← evalExpr W fuel env k
@@ -740,7 +783,7 @@ def evalExpr (W : World) : ℕ → Env → Expr → M Value
     | .object props => do
       let ps ← evalProps W fuel env props
       -- `__proto__: v` sets the new object's prototype (§13.2.5.5), outside the model.
-      if ps.any (·.1 == "__proto__") then throw .unmodelled
+      if ps.any (·.1 == "__proto__") then fail .unmodelled
       charge W fun o => o.objectCreate + ps.length * o.propertyLookup
       pure (.ref (← allocate (.ordinary (ps.foldl (fun acc p => setProp acc p.1 p.2) []) [] none)))
     | .regex pattern flags => do
@@ -749,7 +792,7 @@ def evalExpr (W : World) : ℕ → Env → Expr → M Value
 
 /-- Evaluate arguments left to right. -/
 def evalArgs (W : World) : ℕ → Env → List Expr → M (List Value)
-  | 0, _, _ => throw .fuel
+  | 0, _, _ => fail .fuel
   | _ + 1, _, [] => pure []
   | fuel + 1, env, e :: es => do
     let v ← evalExpr W fuel env e
@@ -758,7 +801,7 @@ def evalArgs (W : World) : ℕ → Env → List Expr → M (List Value)
 
 /-- Evaluate object literal properties left to right. -/
 def evalProps (W : World) : ℕ → Env → List (Name × Expr) → M (List (Name × Value))
-  | 0, _, _ => throw .fuel
+  | 0, _, _ => fail .fuel
   | _ + 1, _, [] => pure []
   | fuel + 1, env, (x, e) :: ps => do
     let v ← evalExpr W fuel env e
@@ -768,7 +811,7 @@ def evalProps (W : World) : ℕ → Env → List (Name × Expr) → M (List (Nam
 /-- Call a function value with a receiver. A class called without `new` throws a TypeError
 (§10.2.1 step 2). -/
 def callValue (W : World) : ℕ → Value → Value → List Value → M Value
-  | 0, _, _, _ => throw .fuel
+  | 0, _, _, _ => fail .fuel
   | fuel + 1, callee, self, args => do
     tick
     match callee with
@@ -776,13 +819,13 @@ def callValue (W : World) : ℕ → Value → Value → List Value → M Value
     | .ref l =>
       match ← load l with
       | .closure f env => callFunc W fuel f env self args
-      | _ => throw .typeError
-    | _ => throw .typeError
+      | _ => fail .typeError
+    | _ => fail .typeError
 
 /-- `new` on a value: a class allocates its instance and runs its constructor, whose returned
 object, if any, replaces the instance (§10.2.2 `[[Construct]]` steps 10-11). -/
 def construct (W : World) : ℕ → Value → List Value → M Value
-  | 0, _, _ => throw .fuel
+  | 0, _, _ => fail .fuel
   | fuel + 1, callee, args => do
     tick
     match callee with
@@ -798,12 +841,12 @@ def construct (W : World) : ℕ → Value → List Value → M Value
           | .builtin b => pure (.builtin b)
           | _ => pure self
         | none => pure self
-      | _ => throw .typeError
-    | _ => throw .typeError
+      | _ => fail .typeError
+    | _ => fail .typeError
 
 /-- Run a function body. -/
 def callFunc (W : World) : ℕ → Func → Env → Value → List Value → M Value
-  | 0, _, _, _, _ => throw .fuel
+  | 0, _, _, _, _ => fail .fuel
   | fuel + 1, f, env, self, args => do
     let env ← enterFunc W f env self args
     match f with
@@ -814,7 +857,7 @@ def callFunc (W : World) : ℕ → Func → Env → Value → List Value → M V
 
 /-- Execute a statement, returning the environment it extends. -/
 def execStmt (W : World) : ℕ → Env → Stmt → M (Env × Completion)
-  | 0, _, _ => throw .fuel
+  | 0, _, _ => fail .fuel
   | fuel + 1, env, s => do
     tick
     match s with
@@ -842,18 +885,18 @@ def execStmt (W : World) : ℕ → Env → Stmt → M (Env × Completion)
     | .forOf x e body => do
       match ← evalExpr W fuel env e with
       | .ref l => pure (env, (← forOfLoop W fuel env x l 0 body))
-      | _ => throw .typeError
+      | _ => fail .typeError
     | .forIn x e body => do
       match ← evalExpr W fuel env e with
       | .ref l =>
         match W.ops.ownPropertyKeys with
-        | none => throw (.undefinedWork "OrdinaryOwnPropertyKeys")
+        | none => fail (.undefinedWork "OrdinaryOwnPropertyKeys")
         | some w => do
           tick w
           let keys ← forInKeys W l
           pure (env, (← forEachValue W fuel env x keys body))
       | .undef | .null => pure (env, .normal)
-      | _ => throw .unmodelled
+      | _ => fail .unmodelled
     | .«while» c body => do pure (env, (← whileLoop W fuel env c body))
     | .doWhile body c => do
       let c' := (← execStmt W fuel env body).2
@@ -877,7 +920,7 @@ def execStmt (W : World) : ℕ → Env → Stmt → M (Env × Completion)
 
 /-- Execute a statement list in order, stopping at an abrupt completion. -/
 def execStmts (W : World) : ℕ → Env → List Stmt → M (Env × Completion)
-  | 0, _, _ => throw .fuel
+  | 0, _, _ => fail .fuel
   | _ + 1, env, [] => pure (env, .normal)
   | fuel + 1, env, s :: ss => do
     let (env', c) ← execStmt W fuel env s
@@ -887,7 +930,7 @@ def execStmts (W : World) : ℕ → Env → List Stmt → M (Env × Completion)
 
 /-- `while (c) body`, one fuel unit per iteration. -/
 def whileLoop (W : World) : ℕ → Env → Expr → Stmt → M Completion
-  | 0, _, _, _ => throw .fuel
+  | 0, _, _, _ => fail .fuel
   | fuel + 1, env, c, body => do
     if truthy (← evalExpr W fuel env c) then
       let c' := (← execStmt W fuel env body).2
@@ -901,7 +944,7 @@ def whileLoop (W : World) : ℕ → Env → Expr → Stmt → M Completion
 iteration; after each iteration the bindings `names` are copied into a fresh environment
 before the update runs (§14.7.4.2 `ForBodyEvaluation`). -/
 def forLoop (W : World) : ℕ → Env → List Name → Option Expr → Option Expr → Stmt → M Completion
-  | 0, _, _, _, _, _ => throw .fuel
+  | 0, _, _, _, _, _ => fail .fuel
   | fuel + 1, env, names, test, update, body => do
     let go ← match test with
       | some t => do pure (truthy (← evalExpr W fuel env t))
@@ -922,7 +965,7 @@ def forLoop (W : World) : ℕ → Env → List Name → Option Expr → Option E
 /-- `for (const x of o) body` over the live List of an Array, Map or Set, reading it afresh at
 each step as ECMAScript iterators do; a deleted entry costs its skip. -/
 def forOfLoop (W : World) : ℕ → Env → Name → Loc → ℕ → Stmt → M Completion
-  | 0, _, _, _, _, _ => throw .fuel
+  | 0, _, _, _, _, _ => fail .fuel
   | fuel + 1, env, x, l, i, body => do
     tick
     match ← iterStep W (← load l) i with
@@ -938,7 +981,7 @@ def forOfLoop (W : World) : ℕ → Env → Name → Loc → ℕ → Stmt → M 
 
 /-- Run `body` once per value, binding `x` afresh each time. -/
 def forEachValue (W : World) : ℕ → Env → Name → List Value → Stmt → M Completion
-  | 0, _, _, _, _ => throw .fuel
+  | 0, _, _, _, _ => fail .fuel
   | _ + 1, _, _, [], _ => pure .normal
   | fuel + 1, env, x, v :: vs, body => do
     let env' ← bindCell env x v
@@ -1405,13 +1448,19 @@ def Entry.wf (p : Program) (e : Entry) : Bool :=
   distinct (e.dims.map (·.1)) && distinct (e.dims.map (·.2)) &&
   e.dims.all fun d => e.dimOk d.2
 
+/-- The work a run result performed, when the run completed or threw (`Abort.thrown`), else why
+it stopped. -/
+def resultWork {α : Type} : Except (Abort × ℕ) (α × St) → Except Abort ℕ
+  | .ok (_, st) => .ok st.work
+  | .error (e, w) => if e.thrown then .ok w else .error e
+
 /-- Run an entry in an instance and a world with the given fuel, returning the work
-performed. -/
+performed when it completes or throws. -/
 def run (fuel : ℕ) (W : World) (p : Program) (i : Instance) (e : Entry) : Except Abort ℕ :=
   let c := root p e i
-  ((c.frame.run W fuel).run c.st).map (·.2.work)
+  resultWork ((c.frame.run W fuel).run c.st)
 
-/-- The run halts normally with fuel `fuel`. -/
+/-- The run halts, completing or throwing, with fuel `fuel`. -/
 def HaltsWith (fuel : ℕ) (W : World) (p : Program) (i : Instance) (e : Entry) : Prop :=
   (run fuel W p i e).toBool = true
 
@@ -1419,13 +1468,19 @@ instance (fuel : ℕ) (W : World) (p : Program) (i : Instance) (e : Entry) :
     Decidable (HaltsWith fuel W p i e) :=
   inferInstanceAs (Decidable ((run fuel W p i e).toBool = true))
 
-/-- Some fuel lets the entry's run in instance `i` halt normally. -/
+/-- Some fuel lets the entry's run in instance `i` halt, completing or throwing. -/
 def Halts (W : World) (p : Program) (i : Instance) (e : Entry) : Prop :=
   ∃ fuel, HaltsWith fuel W p i e
 
+/-- The entry's run in instance `i` violates §2.5 with some fuel: it reads a value that does not
+conform to its declared type, which puts the execution outside the axioms (§1). -/
+def Violates (W : World) (p : Program) (i : Instance) (e : Entry) : Prop :=
+  ∃ fuel w, ((root p e i).frame.run W fuel).run (root p e i).st = .error (.typeViolation, w)
+
 open Classical in
 /-- The work entry `e` performs in instance `i` and world `W`: the work of its run at the least
-fuel that halts, and `0` when none does (`Bound` requires halting separately). -/
+fuel that halts, and `0` when none does (`Bound` requires halting separately, unless the run
+violates §2.5). -/
 noncomputable def Work (W : World) (p : Program) (i : Instance) (e : Entry) : ℕ :=
   if h : Halts W p i e then (run (Nat.find h) W p i e).toOption.getD 0 else 0
 
@@ -1454,7 +1509,7 @@ theorem run_tick1 (st : St) : (tick).run st = .ok ((), st.tick) := rfl
 
 theorem run_pure {α} (a : α) (st : St) : (pure a : M α).run st = .ok (a, st) := rfl
 
-theorem run_throw {α} (e : Abort) (st : St) : (throw e : M α).run st = .error e := rfl
+theorem run_fail {α} (e : Abort) (st : St) : (fail e : M α).run st = .error (e, st.work) := rfl
 
 theorem run_discard {α} (x : M α) (st : St) :
     (discard x).run st = match x.run st with

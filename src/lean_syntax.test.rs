@@ -724,6 +724,11 @@ fn constructs_outside_the_model_name_their_kind() {
         ),
         ("function f() { throw x; }", AstType::ThrowStatement, None),
         (
+            "function f() { try {} catch {} }",
+            AstType::TryStatement,
+            None,
+        ),
+        (
             "function f() { l: for (;;) break l; }",
             AstType::LabeledStatement,
             None,

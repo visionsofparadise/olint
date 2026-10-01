@@ -191,6 +191,86 @@ def toPropertyString (d : Double) : Option String :=
       | none => none
     else none
 
+/-- The exact value `m · 2^e` of a finite magnitude, as a numerator and a power-of-two
+denominator exponent: `(m · 2^max e 0) / 2^max (-e) 0`. -/
+def ratio (m : ℕ) (e : ℤ) : ℕ × ℕ := (m <<< e.toNat, 2 ^ (-e).toNat)
+
+/-- The decimal exponent `n` of a positive finite magnitude `m · 2^e`: the integer with
+`10^(n-1) ≤ m · 2^e < 10^n`, the number of decimal digits of the integer part. The magnitude
+times `10^400` is at least `1` for every `m ≥ 1` and `e ≥ -1074`, and a rational `q ≥ 1` has as
+many decimal digits before its point as `⌊q⌋`. -/
+def decimalExponent (m : ℕ) (e : ℤ) : ℤ :=
+  let (num, den) := ratio m e
+  ((Nat.repr (num * 10 ^ 400 / den)).length : ℤ) - 400
+
+/-- `round(false, s · 10^(n-k))`: the Number nearest a decimal candidate `s · 10^(n - k)`. -/
+def ofDecimal (s : ℕ) (n k : ℤ) : Double :=
+  if 0 ≤ n - k then round false (s * 10 ^ (n - k).toNat) 1 0
+  else round false s (10 ^ (k - n).toNat) 0
+
+/-- The decimal significand of `m · 2^e` at `k` digits, by `Number::toString` step 5
+(§6.1.6.1.20): among the two `k`-digit candidates nearest the value, `⌊m · 2^e · 10^(k-n)⌋` and
+the next one, those whose Number is the value itself, the nearer, an even one on a tie; with the
+exponent `n` it is read at, which a candidate of `10^k` raises by one. `none` when neither
+candidate's Number is the value. -/
+def significandAt (x : Double) (m : ℕ) (e n k : ℤ) : Option (ℕ × ℤ) :=
+  let (num, den) := ratio m e
+  -- `m · 2^e · 10^(k-n) = num' / den'`.
+  let num' := if 0 ≤ k - n then num * 10 ^ (k - n).toNat else num
+  let den' := if 0 ≤ k - n then den else den * 10 ^ (n - k).toNat
+  let lo := num' / den'
+  let r := num' % den'
+  let norm := fun (s : ℕ) => if s == 10 ^ k.toNat then (10 ^ (k.toNat - 1), n + 1) else (s, n)
+  let ok := fun (s : ℕ) => let (s', n') := norm s; decide (1 ≤ s') && ofDecimal s' n' k == x
+  let hi := lo + 1
+  if r == 0 then (if ok lo then some (norm lo) else none)
+  else match ok lo, ok hi with
+    | true, true =>
+      -- The nearer of the two; on a tie, the even one.
+      if 2 * r < den' || (2 * r == den' && lo % 2 == 0) then some (norm lo) else some (norm hi)
+    | true, false => some (norm lo)
+    | false, true => some (norm hi)
+    | false, false => none
+
+/-- The `k`, `s` and `n` of `Number::toString` step 5 for a positive finite Number `m · 2^e`:
+the least digit count `k` with a significand (`significandAt`). Every binary64 value has one
+with at most 17 digits (IEEE 754-2019 §5.12.2: 17 significant decimal digits identify every
+binary64 value), so the search stops by `k = 17`. -/
+def shortest (x : Double) (m : ℕ) (e : ℤ) : Option (ℕ × ℕ × ℤ) :=
+  let n := decimalExponent m e
+  ((List.range 17).map (· + 1)).findSome? fun (k : ℕ) =>
+    (significandAt x m e n k).map fun (s, n') => (k, s, n')
+
+/-- `Number::toString(x, 10)` (ECMA-262 §6.1.6.1.20). The result has at most 25 characters: a
+sign, then at most 21 digits (step 6, `n ≤ 21`), `0.`, five zeros and 17 digits (step 8,
+`n > -6`, `k ≤ 17`), or 17 digits, a point, `e`, a sign and three exponent digits (steps 9 and
+10, `|n - 1| ≤ 324`). -/
+def toString (x : Double) : String :=
+  match x with
+  | nan => "NaN"
+  | inf false => "Infinity"
+  | inf true => "-Infinity"
+  | fin neg m e =>
+    if m == 0 then "0" else
+    let sign := if neg then "-" else ""
+    match shortest (fin false m e).normalize m e with
+    | none => sign ++ "NaN"
+    | some (k, s, n) =>
+      let digits := Nat.repr s
+      let k : ℤ := k
+      let exponent := fun (n : ℤ) =>
+        "e" ++ (if 0 ≤ n - 1 then "+" else "-") ++ Nat.repr (n - 1).natAbs
+      sign ++
+        if k ≤ n ∧ n ≤ 21 then digits ++ String.ofList (List.replicate (n - k).toNat '0')
+        else if 0 < n ∧ n ≤ 21 then
+          String.ofList (digits.toList.take n.toNat) ++ "." ++
+            String.ofList (digits.toList.drop n.toNat)
+        else if -6 < n ∧ n ≤ 0 then
+          "0." ++ String.ofList (List.replicate (-n).toNat '0') ++ digits
+        else if k = 1 then digits ++ exponent n
+        else String.ofList (digits.toList.take 1) ++ "." ++
+          String.ofList (digits.toList.drop 1) ++ exponent n
+
 end Double
 
 /-! ## Strings -/

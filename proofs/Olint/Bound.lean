@@ -16,35 +16,52 @@ exactly `0`, reads as `1`, which makes olint's zero-product collapse sound (ledg
 
 **Bound.** `Bound W p n c` is the spec's bound (§1) in world `W`: the node's entry is well
 formed (`Entry.wf`), and there is one constant `C` such that on every instance §2 admits for the
-entry, every configuration the entry's run reaches at the node completes, and does at most
-`C · c` work, measured against the entry's input dimensions. The constant is uniform over all
-admitted instances, small ones included; since every cost and every dimension reads as at least
-`1`, finitely many small instances cost only a larger constant, and a bound never ignores the
+entry, every configuration the entry's run reaches at the node ends, and does at most `C · c`
+work, measured against the entry's input dimensions. The constant is uniform over all admitted
+instances, small ones included; since every cost and every dimension reads as at least `1`,
+finitely many small instances cost only a larger constant, and a bound never ignores the
 instances where some dimension stays small while others grow. A node's bound holds wherever the
 node runs within its entry, so a parent's bound composes from its children's (`Olint.Rules`).
-Completion is part of the bound: every reached run must complete, so a node whose run throws,
-aborts or diverges on some admitted instance has no bound; runs that throw are excluded from
-what a bound can cover. For the entry node itself the configurations are the root call alone,
-and `Bound.work_isBigO` restates the bound over `Work`.
+For the entry node itself the configurations are the root call alone, and `Bound.work_isBigO`
+restates the bound over `Work`.
 
-`BoundOn W p n ks c` is the bound on the runs that end in the channels `ks`, completion still
-required of every run; `Bound` is `BoundOn` over every channel.
+A reached configuration *ends* (`Ends`) when its run completes, throws a TypeError or a
+ReferenceError, or violates §2.5:
+
+* a throw is an ECMAScript throw completion. The model has no `try` and the encoder refuses
+  `try` and `throw`, so no handler catches it: it ends the run, and the bound covers the work up
+  to the throw (`Within`);
+* a §2.5 violation, a read of a value that does not conform to its declared type, puts the
+  execution outside the axioms, so it is no instance (§1), and the bound says nothing of the
+  run. A program whose every run violates its declared types therefore has vacuous bounds on
+  every reached node, which is the spec's reading: §1 quantifies over the executions the axioms
+  admit;
+* every other stop, running out of fuel (divergence), a construct outside the model, an
+  implementation-defined built-in (§2.4), a spec-internal operation with no work definition and
+  an intrinsic the analysed program modified (§2.2), is no end, so a node reaching one on some
+  admitted instance has no bound.
+
+*This is a model change under §6.2 (5.3, A2b), pre-authorised remediation pending Matt's
+ratification.* Before it, a throw and a §2.5 violation were both aborts no bound admitted.
+
+`BoundOn W p n ks c` is the bound on the runs that end in the channels `ks` or throw, every run
+still required to end; `Bound` is `BoundOn` over every channel.
 
 ## Why no bound holds vacuously
 
 A bound quantifies over the admitted instances, so it would say nothing if none existed. Three
-facts exclude that:
+facts exclude that at the level of inputs:
 
 * admission (`Olint.Model.Admitted`) constrains only the entry's inputs: the heap, the arguments,
-  the receiver, the free variables and the dimensions. §2.5 during the run is a check at every variable read
-  (`Olint.Model.readVar`) that aborts the run on a non-conforming value, so a program that
-  violates its declared types makes its runs abort, which no bound admits, instead of emptying
-  admission;
+  the receiver, the free variables and the dimensions. §2.5 during the run is a check at every
+  variable read (`Olint.Model.readVar`), which ends a non-conforming run outside the axioms
+  without narrowing admission, so no program can make admission empty by violating its types;
 * `Bound` requires the entry to be well formed (`Entry.wf`): every dimension measures an
   argument or a free variable of a measurable declared type, dimension ids and measured
   quantities are distinct, and object types name each field once;
 * for a well-formed entry, every valuation of the dimensions has an admitted instance
-  (`Olint.Model.Admitted.exists`), so a bound constrains the entry's runs at every size.
+  (`Olint.Model.Admitted.exists`), so a bound constrains the entry's runs at every size, except
+  on the runs that go on to violate §2.5.
 
 ## Premises every certificate theorem carries
 
@@ -163,25 +180,43 @@ declared types (§2.5) included: a property holds on it when it holds on every a
 instance. -/
 def Admits (e : Entry) : Filter Instance := 𝓟 {i | Admitted e i}
 
-/-- In instance `i` and world `W`, every configuration the entry's run reaches at site `s`
-completes with any fuel from `F` on, and does at most `b` work on a run ending in a channel of
-`ks`. -/
+/-- A run result ends: it completes, it throws (`Abort.thrown`), or it violates §2.5, which puts
+the execution outside the axioms, so it is no instance (§1). -/
+def Ends {α : Type} : Except (Abort × ℕ) (α × St) → Prop
+  | .ok _ => True
+  | .error (e, _) => e.thrown = true ∨ e = .typeViolation
+
+/-- A run result does at most `b` work from work `w0`: when it completes with a value satisfying
+`P`, and when it throws, up to the throw. A run violating §2.5 or stopping otherwise is
+unconstrained. -/
+def Within {α : Type} (P : α → Prop) (w0 : ℕ) (b : ℝ) : Except (Abort × ℕ) (α × St) → Prop
+  | .ok (a, st') => P a → (st'.work : ℝ) - w0 ≤ b
+  | .error (e, w) => e.thrown = true → (w : ℝ) - w0 ≤ b
+
+/-- The result of running configuration `c` with fuel `f`. -/
+def Model.Cfg.result (W : World) (c : Cfg) (f : ℕ) : Except (Abort × ℕ) (Outcome × St) :=
+  (c.frame.run W f).run c.st
+
+/-- In instance `i` and world `W`, every configuration the entry's run reaches at site `s` ends
+with any fuel from `F` on, completing, throwing or violating §2.5, and does at most `b` work on a
+run that ends in a channel of `ks` or throws. -/
 def Holds (W : World) (p : Program) (e : Entry) (i : Instance) (s : Site) (ks : List Channel)
     (F : ℕ) (b : ℝ) : Prop :=
   ∀ c, Reach W p e i c → c.At p e i s →
-    (∀ f, F ≤ f → ∃ o st', c.Runs W f o st') ∧
-    ∀ f o st', c.Runs W f o st' → o.channel ∈ ks → (st'.work : ℝ) - c.st.work ≤ b
+    (∀ f, F ≤ f → Ends (c.result W f)) ∧
+    ∀ f, Within (fun o : Outcome => o.channel ∈ ks) c.st.work b (c.result W f)
 
 /-- `c` bounds node `n` of program `p` in world `W` on the channels `ks`: the node's entry is
 well formed, and one constant `C` serves every admitted instance, where every configuration
-reached at the node completes and does at most `C · c` work on the runs ending in `ks`. -/
+reached at the node ends (`Ends`) and does at most `C · c` work on the runs ending in `ks` or
+throwing. -/
 def BoundOn (W : World) (p : Program) (n : Node) (ks : List Channel) (c : Cost) : Prop :=
   n.entry.wf p = true ∧
     ∃ C : ℝ, ∀ᶠ i in Admits n.entry, ∃ F, Holds W p n.entry i n.site ks F (C * c.eval i.valuation)
 
 /-- `c` bounds node `n` of program `p` in world `W`: on every admitted instance of its
-well-formed entry, every configuration the entry's run reaches at the node completes, and its
-work is `O(c)`, one constant serving all of them. -/
+well-formed entry, every configuration the entry's run reaches at the node ends, and its work is
+`O(c)`, one constant serving all of them. -/
 def Bound (W : World) (p : Program) (n : Node) (c : Cost) : Prop := BoundOn W p n allChannels c
 
 /-! ## Basic lemmas -/
@@ -195,11 +230,23 @@ theorem lg_ge_one (x : ℝ) : 1 ≤ lg x := by
     Real.rpow_one]
   exact le_max_right x 2
 
+theorem Within.mono {α : Type} {P : α → Prop} {w0 : ℕ} {b b' : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} (h : Within P w0 b r) (hb : b ≤ b') : Within P w0 b' r := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · exact fun he => le_trans (h he) hb
+  · exact fun ha => le_trans (h ha) hb
+
+theorem Within.restrict {α : Type} {P Q : α → Prop} {w0 : ℕ} {b : ℝ}
+    {r : Except (Abort × ℕ) (α × St)} (h : Within P w0 b r) (hq : ∀ a, Q a → P a) :
+    Within Q w0 b r := by
+  rcases r with ⟨e, w⟩ | ⟨a, st'⟩
+  · exact h
+  · exact fun ha => h (hq a ha)
+
 theorem Holds.mono {W : World} {p : Program} {e : Entry} {i : Instance} {s : Site}
     {ks : List Channel} {F F' : ℕ} {b b' : ℝ} (h : Holds W p e i s ks F b) (hF : F ≤ F')
     (hb : b ≤ b') : Holds W p e i s ks F' b' := fun c hr ha =>
-  ⟨fun f hf => (h c hr ha).1 f (le_trans hF hf),
-    fun f o st' hc hk => le_trans ((h c hr ha).2 f o st' hc hk) hb⟩
+  ⟨fun f hf => (h c hr ha).1 f (le_trans hF hf), fun f => ((h c hr ha).2 f).mono hb⟩
 
 /-- A bound's constant can be taken nonnegative. -/
 theorem BoundOn.nonneg {W : World} {p : Program} {n : Node} {ks : List Channel} {c : Cost}
@@ -237,21 +284,21 @@ theorem BoundOn.restrict {W : World} {p : Program} {n : Node} {ks ks' : List Cha
     (h : BoundOn W p n ks c) (hk : ∀ k ∈ ks', k ∈ ks) : BoundOn W p n ks' c := by
   obtain ⟨hwf, C, hC⟩ := h
   exact ⟨hwf, C, hC.mono fun i ⟨F, hF⟩ => ⟨F, fun c hr ha =>
-    ⟨(hF c hr ha).1, fun f o st' hc hk' => (hF c hr ha).2 f o st' hc (hk _ hk')⟩⟩⟩
+    ⟨(hF c hr ha).1, fun f => ((hF c hr ha).2 f).restrict fun o ho => hk _ ho⟩⟩⟩
 
-/-- An entry's bound bounds its `Work`: on every admitted instance its run halts, and its work
-is `O(c)`. -/
+/-- An entry's bound bounds its `Work`: on every admitted instance its run halts, completing or
+throwing, or violates §2.5, and its work is `O(c)`. -/
 theorem Bound.work_isBigO {W : World} {p : Program} {n : Node} {c : Cost} (hn : n.site = .entry)
     (h : Bound W p n c) :
-    (∀ᶠ i in Admits n.entry, Halts W p i n.entry) ∧
+    (∀ᶠ i in Admits n.entry, Halts W p i n.entry ∨ Violates W p i n.entry) ∧
       (fun i => (Work W p i n.entry : ℝ)) =O[Admits n.entry] (fun i => c.eval i.valuation) := by
   obtain ⟨C, _, hC⟩ := BoundOn.nonneg h
-  have key : ∀ᶠ i in Admits n.entry, Halts W p i n.entry ∧
+  have key : ∀ᶠ i in Admits n.entry, (Halts W p i n.entry ∨ Violates W p i n.entry) ∧
       (Work W p i n.entry : ℝ) ≤ C * c.eval i.valuation := by
     refine hC.mono fun i ⟨F, hF⟩ => ?_
     have hr : Reach W p n.entry i (root p n.entry i) := Relation.ReflTransGen.refl
     have ha : (root p n.entry i).At p n.entry i n.site := by rw [hn]; rfl
-    obtain ⟨hcomp, hwork⟩ := hF _ hr ha
+    obtain ⟨hend, hwork⟩ := hF _ hr ha
     have h0 : (root p n.entry i).st.work = 0 := by
       unfold root
       split
@@ -261,29 +308,42 @@ theorem Bound.work_isBigO {W : World} {p : Program} {n : Node} {c : Cost} (hn : 
         cases hb
         rfl
       · rfl
-    have halts : Halts W p i n.entry := by
-      obtain ⟨o, st', hc⟩ := hcomp F le_rfl
-      refine ⟨F, ?_⟩
-      simp only [HaltsWith, run]
-      rw [show ((root p n.entry i).frame.run W F).run (root p n.entry i).st = .ok (o, st') from hc]
-      rfl
     have atFuel : ∀ f, HaltsWith f W p i n.entry →
         (((run f W p i n.entry).toOption.getD 0 : ℕ) : ℝ) ≤ C * c.eval i.valuation := by
       intro f hf
+      have hw := hwork f
       simp only [HaltsWith, run] at hf ⊢
-      revert hf
-      rcases hres : ((root p n.entry i).frame.run W f).run (root p n.entry i).st with
-        err | ⟨o, st'⟩
-      · intro hf; simp [Except.map, Except.toBool] at hf
+      unfold Cfg.result at hw
+      revert hf hw
+      rcases ((root p n.entry i).frame.run W f).run (root p n.entry i).st with
+        ⟨e, w⟩ | ⟨o, st'⟩
+      · intro hf hw
+        cases he : e.thrown
+        · simp [resultWork, he, Except.toBool] at hf
+        · have := hw he
+          rw [h0] at this
+          simpa [resultWork, he, Except.toOption] using this
+      · intro _ hw
+        have := hw (mem_allChannels _)
+        rw [h0] at this
+        simpa [resultWork, Except.toOption] using this
+    have hend' := hend F le_rfl
+    have halts : Halts W p i n.entry ∨ Violates W p i n.entry := by
+      revert hend'
+      unfold Cfg.result
+      rcases hres : ((root p n.entry i).frame.run W F).run (root p n.entry i).st with
+        ⟨e, w⟩ | ⟨o, st'⟩
+      · rintro (he | rfl)
+        · exact Or.inl ⟨F, by simp [HaltsWith, run, hres, resultWork, he, Except.toBool]⟩
+        · exact Or.inr ⟨F, w, hres⟩
       · intro _
-        have hw := hwork f o st' hres (mem_allChannels _)
-        rw [h0] at hw
-        simpa [Except.map, Except.toOption] using hw
+        exact Or.inl ⟨F, by simp [HaltsWith, run, hres, resultWork, Except.toBool]⟩
     refine ⟨halts, ?_⟩
     unfold Work
     split
-    · exact atFuel _ (Nat.find_spec halts)
-    · contradiction
+    · exact atFuel _ (Nat.find_spec ‹_›)
+    · simp only [Nat.cast_zero]
+      exact mul_nonneg ‹0 ≤ C› (le_of_lt (c.eval_pos _))
   refine ⟨key.mono fun _ h => h.1, IsBigO.of_bound C (key.mono fun i h => ?_)⟩
   rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_nonneg (Nat.cast_nonneg _),
     abs_of_pos (c.eval_pos _)]
