@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -41,9 +41,11 @@ if (!existsSync(trivyConfig)) {
 	process.exit(1);
 }
 
-const toolsMjs = path.join(repoRoot, "tools.mjs");
-if (!existsSync(toolsMjs)) {
-	console.error(`missing tools.mjs at ${toolsMjs}`);
+const toolsMjs = [path.join(repoRoot, "tools.mjs"), path.join(repoRoot, "scripts", "tools.mjs")].find((candidate) =>
+	existsSync(candidate),
+);
+if (!toolsMjs) {
+	console.error(`missing tools.mjs at ${repoRoot}`);
 	process.exit(1);
 }
 
@@ -119,6 +121,8 @@ if (lines.length === 0) {
 	process.exit(0);
 }
 
+let pushesCommits = false;
+
 for (const line of lines) {
 	const parts = line.split(/\s+/);
 	if (parts.length < 4) {
@@ -129,6 +133,7 @@ for (const line of lines) {
 	if (localSha === zeroSha) {
 		continue;
 	}
+	pushesCommits = true;
 	const commits = listCommits(localSha, remoteSha);
 	if (commits.length > commitCap) {
 		const skipped = commits.filter((sha) => sha !== localSha);
@@ -142,6 +147,19 @@ for (const line of lines) {
 	for (const sha of commits) {
 		const status = scanCommit(sha);
 		if (status !== 0) process.exit(status);
+	}
+}
+
+if (pushesCommits) {
+	const { scripts = {} } = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+	for (const name of ["check", "unit", "integration"]) {
+		if (!(name in scripts)) continue;
+		const result = spawnSync(`npm run ${name}`, { cwd: repoRoot, stdio: "inherit", shell: true });
+		const status = result.status ?? 1;
+		if (status !== 0) {
+			console.error(`pre-push: npm run ${name} failed`);
+			process.exit(status);
+		}
 	}
 }
 

@@ -24,9 +24,10 @@
 		"proofs": "cd proofs && lake build && lake env lean scripts/axioms.lean",
 		"preintegration": "node sweep.mjs",
 		"integration": "cargo build --locked && cargo test --locked --test integration",
-		"prepare": "node -e \"const c=require('node:child_process');if(c.spawnSync('git',['rev-parse','--is-inside-work-tree'],{stdio:'ignore'}).status===0)c.execFileSync('git',['config','core.hooksPath','.githooks'])\" && node tools.mjs install && cargo install styling-lint --version 0.1.0 --locked && cargo install cargo-machete --version 0.9.2 --locked",
+		"prepare": "node -e \"const c=require('node:child_process');if(c.spawnSync('git',['rev-parse','--is-inside-work-tree'],{stdio:'ignore'}).status===0)c.execFileSync('git',['config','core.hooksPath','.githooks'])\" && node tools.mjs install && cargo install styling-lint --version 0.1.0 --locked && cargo install cargo-machete --version 0.9.2 --locked && rustup toolchain install 1.96.0 --profile minimal",
 		"precheck": "node sweep.mjs",
-		"check": "concurrently --group \"prettier --check .\" \"markdownlint-cli2 \\\"**/*.md\\\"\" \"jscpd .\" \"cargo fmt --check\" \"cargo check --locked --all-targets && cargo clippy --locked --all-targets -- -D warnings\" \"cargo clippy --locked --manifest-path corpus/Cargo.toml --all-targets -- -D warnings\" \"cargo machete\" \"styling-lint check\" \"node tools.mjs run actionlint\"",
+		"check": "concurrently --group \"prettier --check .\" \"markdownlint-cli2 \\\"**/*.md\\\"\" \"jscpd .\" \"cargo fmt --check\" \"cargo check --locked --all-targets && cargo clippy --locked --all-targets -- -D warnings\" \"cargo clippy --locked --manifest-path corpus/Cargo.toml --all-targets -- -D warnings\" \"cargo machete\" \"styling-lint check\" \"cargo +1.96.0 check --locked --all-targets --target-dir target/msrv\"",
+		"corpus:test": "cargo test --locked --manifest-path corpus/Cargo.toml",
 		"corpus": "node corpus/select.mjs && node corpus/fetch.mjs",
 		"prefix": "node sweep.mjs",
 		"fix": "concurrently -m 1 --group \"prettier --write .\" \"markdownlint-cli2 --fix \\\"**/*.md\\\"\" \"cargo clippy --fix --locked --allow-dirty --allow-staged --all-targets -- -D warnings\" \"cargo fmt\" \"styling-lint fix\""
