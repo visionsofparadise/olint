@@ -281,3 +281,28 @@ fn a_repetition_is_derived_from_its_witness_and_its_body() {
 
     assert_eq!(premises_of(&traces, &nested).0, "nest-product");
 }
+
+#[test]
+fn a_rule_set_holds_every_rule_beneath_a_derivation_in_ledger_order() {
+    let mut arena = DerivationArena::default();
+    let bound = arena
+        .leaf("bound-additive", span(0), Vec::new(), Cost::ONE)
+        .unwrap();
+    let body = arena.record(leaf(1)).unwrap();
+    let looped = arena
+        .derive(
+            "loop-nest",
+            Some(span(2)),
+            &[bound, body],
+            Vec::new(),
+            Cost::ONE,
+        )
+        .unwrap();
+    let mut sets = RuleSets::default();
+
+    assert_eq!(
+        sets.of(&arena, looped),
+        ["seq-max", "bound-additive", "loop-nest"]
+    );
+    assert_eq!(sets.of(&arena, body), ["seq-max"]);
+}

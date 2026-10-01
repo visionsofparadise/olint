@@ -6,8 +6,10 @@ use oxc_span::GetSpan;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Analysis;
+use crate::certificate::{CertificateRecord, Certifier};
 use crate::cost::{state_of, Cost, Part, Reading, State};
 use crate::declarations::FunctionId;
+use crate::derivation::{DerivationId, RuleSets};
 use crate::directives::PerfTag;
 use crate::flow::loop_phases_of;
 use crate::project::FileId;
@@ -72,6 +74,9 @@ struct Entry {
     key: NodeKey,
     file: FileId,
     node: NodeId,
+    /// The reportable function whose evaluation recorded the node.
+    entry: FunctionId,
+    derivation: Option<DerivationId>,
     cost: Cost,
     unknowns: Option<UnknownId>,
     absent: bool,
@@ -277,6 +282,16 @@ fn path_hash(path: &str) -> u32 {
 }
 
 pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
+    snapshot(analysis, |_| {})
+}
+
+/// The rows, handing `certify` the certificate of every Known bound and proven floor that has one, once per
+/// certificate, as it is serialized: a row names its certificate by `sha256`, and the records stream to their
+/// writer rather than accumulating, since each carries its function's program.
+pub fn snapshot(
+    analysis: &mut Analysis<'_, '_>,
+    mut certify: impl FnMut(CertificateRecord),
+) -> Vec<NodeRow> {
     let functions = analysis.reportable();
 
     // Under `record_nodes`, every reportable function's nodes are recorded once, from the evaluation of its root
@@ -308,17 +323,29 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
 
         let absent = row.state == State::Unknown;
         let kind = analysis.kind_of_node(file, function.node_id());
-        let key = node_key_of(analysis, analysis.source_span(file, kind.span()), kind.ty());
-
-        reportable.insert(FunctionId {
+        let origin = analysis.source_span(file, kind.span());
+        let key = node_key_of(analysis, origin, kind.ty());
+        let entry = FunctionId {
             file,
             node: function.node_id(),
-        });
+        };
+        // The entry runs its body once: `seq-max` derives the function's cost at the function itself from its body's.
+        let derivation = analysis.traces.derivations.over(
+            "seq-max",
+            Some(origin),
+            (row.derivation, &row.cost),
+            Vec::new(),
+            row.cost.clone(),
+        );
+
+        reportable.insert(entry);
         located.insert((file, function.node_id()), entries.len());
         entries.push(Entry {
             key,
             file,
             node: function.node_id(),
+            entry,
+            derivation,
             cost: row.cost,
             unknowns: row.unknowns,
             absent,
@@ -357,6 +384,8 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
             key: node_key_of(analysis, origin, kind),
             file: origin.file,
             node: record.node,
+            entry: record.function,
+            derivation: record.part.derivation,
             absent: record.part.is_absent(),
             cost: record.part.cost,
             unknowns: record.part.unknowns,
@@ -387,10 +416,33 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
 
     let mut kinds = HashMap::new();
     let labels = Labels::of(analysis);
+    let certifier = Certifier::new(analysis);
+    let mut rule_sets = RuleSets::default();
+    let mut certified = HashSet::new();
     let mut rows: Vec<NodeRow> = entries
         .iter()
         .map(|entry| {
             let state = entry.state();
+            let rules = entry
+                .derivation
+                .map(|root| rule_sets.of(&analysis.traces.derivations, root))
+                .unwrap_or_default()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let certificate = entry
+                .derivation
+                .filter(|_| state != NodeState::Unknown)
+                .and_then(|root| certifier.certify(entry.entry, root).ok())
+                .map(|record| {
+                    let sha256 = record.sha256.clone();
+
+                    if certified.insert(sha256.clone()) {
+                        certify(record);
+                    }
+
+                    sha256
+                });
             let text = labels.text(&entry.cost);
             let mut contributions: Vec<(NodeKey, String)> = match state {
                 NodeState::Partial => entry
@@ -413,8 +465,8 @@ pub fn snapshot_rows(analysis: &mut Analysis<'_, '_>) -> Vec<NodeRow> {
                 contributions,
                 asserted: entry.asserted,
                 unknowns: unknown_origins_of(analysis, &mut kinds, entry.unknowns),
-                rules: Vec::new(),
-                certificate: None,
+                rules,
+                certificate,
             }
         })
         .collect();

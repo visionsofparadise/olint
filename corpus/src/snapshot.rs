@@ -18,7 +18,7 @@ use olint::config::{read_config, unknown_policy_of};
 use olint::project::Project;
 use olint::public::public_functions;
 use olint::regex::{RegexError, RegexLimits};
-use olint::snapshot::{snapshot_rows, SCHEMA};
+use olint::snapshot::SCHEMA;
 use olint::summaries::SchedulerLimits;
 use olint::tsc::{ask_counted, TscError};
 use oxc_allocator::Allocator;
@@ -98,8 +98,11 @@ pub struct MemberCounts {
     /// |G|: the syntax nodes of every file the project loaded, counted as `oxc_semantic` AST nodes, the node universe
     /// `NodeKey` spans and kinds are drawn from.
     pub nodes: Option<u64>,
-    /// Peak live bytes the counting allocator saw from project load through `snapshot_rows`.
+    /// Peak live bytes the counting allocator saw from project load through the snapshot, certificates included.
     pub peak_bytes: Option<u64>,
+    /// Certificates written to `certificates/<member>.jsonl.gz` beside the rows.
+    #[serde(default)]
+    pub certificates: usize,
     /// Memory of the tsc and regex sidecar processes, which the counting allocator cannot see. Always `null` until
     /// Phase 6 action 6.3 attributes delegated checker work and memory per query; `peak_bytes` covers olint's own
     /// process only.
@@ -456,13 +459,14 @@ pub fn run_member(
     unknown: Option<&str>,
 ) -> MemberCounts {
     let rows = pass.directory(out).join(format!("{}.jsonl.gz", member.id));
+    let certificates = certificates_path_of(&rows);
     let log = out
         .join("logs")
         .join(pass.name())
         .join(format!("{}.log", member.id));
     let counts = log.with_extension("counts.json");
 
-    for path in [&rows, &log] {
+    for path in [&rows, &certificates, &log] {
         let parent = path.parent().expect("member files have a parent");
 
         if let Err(error) = std::fs::create_dir_all(parent) {
@@ -471,6 +475,7 @@ pub fn run_member(
     }
 
     let _ = std::fs::remove_file(&rows);
+    let _ = std::fs::remove_file(&certificates);
     let _ = std::fs::remove_file(&counts);
 
     let stderr = match File::create(&log) {
@@ -667,10 +672,28 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         }
     }
 
-    let rows = snapshot_rows(&mut analysis);
+    let mut certificates = JsonLines::create(&certificates_path_of(&args.rows))?;
+    let mut written = Ok(0);
+    let rows = olint::snapshot::snapshot(&mut analysis, |record| {
+        if let Ok(count) = &mut written {
+            match certificates.write(&record) {
+                Ok(()) => *count += 1,
+                Err(error) => written = Err(error),
+            }
+        }
+    });
     let peak_bytes = alloc::peak();
+    let certificates_written = written?;
 
-    write_rows(&args.rows, &rows)?;
+    certificates.finish()?;
+
+    let mut lines = JsonLines::create(&args.rows)?;
+
+    for row in &rows {
+        lines.write(row)?;
+    }
+
+    lines.finish()?;
 
     let stats = analysis.scheduler_stats();
     let events = EVENTS
@@ -708,28 +731,54 @@ fn analyse_member(args: &MemberArgs) -> Result<MemberCounts, String> {
         maximum_body_passes: stats.maximum_body_passes,
         nodes: Some(nodes),
         peak_bytes: Some(peak_bytes),
+        certificates: certificates_written,
         sidecar_bytes: None,
         tsc,
         warnings,
     })
 }
 
-fn write_rows(path: &Path, rows: &[olint::snapshot::NodeRow]) -> Result<(), String> {
-    let partial = path.with_extension("partial");
-    let file = File::create(&partial).map_err(io_error("create", &partial))?;
-    let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+/// A member's certificates: `certificates/<member>.jsonl.gz` beside its rows.
+pub fn certificates_path_of(rows: &Path) -> PathBuf {
+    let name = rows.file_name().expect("a rows path names its file");
 
-    for row in rows {
-        serde_json::to_writer(&mut encoder, row).expect("rows serialize");
-        encoder
-            .write_all(b"\n")
-            .map_err(io_error("write", &partial))?;
+    rows.with_file_name("certificates").join(name)
+}
+
+/// Gzip JSON Lines written to a partial file and renamed into place once finished, so a failed member leaves no
+/// truncated file.
+struct JsonLines {
+    path: PathBuf,
+    partial: PathBuf,
+    encoder: GzEncoder<BufWriter<File>>,
+}
+
+impl JsonLines {
+    fn create(path: &Path) -> Result<Self, String> {
+        let partial = path.with_extension("partial");
+        let file = File::create(&partial).map_err(io_error("create", &partial))?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            encoder: GzEncoder::new(BufWriter::new(file), Compression::default()),
+            partial,
+        })
     }
 
-    encoder
-        .finish()
-        .and_then(|mut writer| writer.flush())
-        .map_err(io_error("write", &partial))?;
+    fn write(&mut self, line: &impl Serialize) -> Result<(), String> {
+        serde_json::to_writer(&mut self.encoder, line).expect("lines serialize");
 
-    std::fs::rename(&partial, path).map_err(io_error("rename", &partial))
+        self.encoder
+            .write_all(b"\n")
+            .map_err(io_error("write", &self.partial))
+    }
+
+    fn finish(self) -> Result<(), String> {
+        self.encoder
+            .finish()
+            .and_then(|mut writer| writer.flush())
+            .map_err(io_error("write", &self.partial))?;
+
+        std::fs::rename(&self.partial, &self.path).map_err(io_error("rename", &self.partial))
+    }
 }

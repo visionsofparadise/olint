@@ -1685,7 +1685,27 @@ impl<'p, 'a> Analysis<'p, 'a> {
             }
 
             if factor.is_one() {
-                let main = body_main.max(absorbed, &mut self.unknowns, &mut self.traces);
+                // A constant bound leaves the body's cost as it is, and `loop-nest` still derives it from the bound.
+                let derivation = match (bound.derivation(), body_main.derivation) {
+                    (Some(bound), Some(body)) => Some(vec![bound, body]),
+                    (Some(bound), None) if body_main.cost.is_one() => Some(vec![bound]),
+                    _ => None,
+                }
+                .filter(|_| body_main.cost_error.is_none())
+                .and_then(|premises| {
+                    self.traces.derivations.derive(
+                        "loop-nest",
+                        Some(origin),
+                        &premises,
+                        Vec::new(),
+                        body_main.cost.clone(),
+                    )
+                });
+                let main = body_main.derived(derivation).max(
+                    absorbed,
+                    &mut self.unknowns,
+                    &mut self.traces,
+                );
 
                 result.join(
                     phase,

@@ -14,6 +14,8 @@ use indexmap::IndexSet;
 use crate::cost::Cost;
 use crate::unknowns::SourceSpan;
 
+pub use crate::certificate::{serialize_certificate, CertificateRecord};
+
 #[cfg(doc)]
 use crate::analysis::work::Event;
 
@@ -369,6 +371,50 @@ impl DerivationArena {
     pub(crate) fn begin_generation(&mut self) {
         self.charged = 0;
         self.exhausted = false;
+    }
+}
+
+/// The ledger rules each derivation applies anywhere beneath it, as bit sets over [`RULES`], filled on demand in id
+/// order: a premise's id precedes its conclusion's, so each set is its node's rule joined with its premises' sets.
+#[derive(Debug, Default)]
+pub struct RuleSets {
+    sets: Vec<[u64; 3]>,
+}
+
+const _: () = assert!(RULES.len() <= 3 * 64, "a rule set holds 192 rules");
+
+impl RuleSets {
+    /// The rules `root`'s derivation applies, in ledger order.
+    pub fn of(&mut self, arena: &DerivationArena, root: DerivationId) -> Vec<&'static str> {
+        let end = (root.0 as usize + 1).min(arena.len());
+
+        for index in self.sets.len()..end {
+            let derivation = &arena.records[index];
+            let mut set = [0; 3];
+
+            if let Some(rule) = RULES.iter().position(|rule| *rule == derivation.rule) {
+                set[rule / 64] |= 1 << (rule % 64);
+            }
+
+            for premise in &derivation.premises {
+                for (word, premise) in set.iter_mut().zip(self.sets[premise.0 as usize]) {
+                    *word |= premise;
+                }
+            }
+
+            self.sets.push(set);
+        }
+
+        let Some(set) = self.sets.get(root.0 as usize) else {
+            return Vec::new();
+        };
+
+        RULES
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| set[index / 64] & (1 << (index % 64)) != 0)
+            .map(|(_, rule)| *rule)
+            .collect()
     }
 }
 

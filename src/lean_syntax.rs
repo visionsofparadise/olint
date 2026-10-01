@@ -33,6 +33,7 @@ use oxc_ast::ast::{
     VariableDeclarationKind,
 };
 use oxc_ast::{AstKind, AstType};
+use oxc_ast_visit::Visit;
 use oxc_semantic::{NodeId, Semantic, SymbolId};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::{
@@ -147,71 +148,200 @@ pub fn encode_scope(
     cited: &[FunctionRef<'_, '_>],
     dimensions: &[Dimension],
 ) -> Result<Encoding, EncodeError> {
-    let mut named = BTreeMap::new();
+    Scope::of(entry, cited)?.encode(dimensions)
+}
 
-    if let Some((name, symbol)) = binding(entry)? {
-        named.insert(name, (key(entry), symbol, entry));
+/// A program scope: its entry and the functions its derivation cites, by the name the program
+/// defines each under.
+pub struct Scope<'s, 'a> {
+    entry: FunctionRef<'s, 'a>,
+    named: BTreeMap<String, ((usize, NodeId), SymbolId, FunctionRef<'s, 'a>)>,
+    definitions: Definitions,
+}
+
+impl<'s, 'a> Scope<'s, 'a> {
+    pub fn of(
+        entry: FunctionRef<'s, 'a>,
+        cited: &[FunctionRef<'s, 'a>],
+    ) -> Result<Self, EncodeError> {
+        let mut named = BTreeMap::new();
+
+        if let Some((name, symbol)) = binding(entry)? {
+            named.insert(name, (key(entry), symbol, entry));
+        }
+
+        for function in cited {
+            let span = function.semantic.nodes().kind(function.node).span();
+            let (name, symbol) = binding(*function)?.ok_or(EncodeError::Anonymous { span })?;
+
+            match named.entry(name) {
+                Entry::Vacant(slot) => {
+                    slot.insert((key(*function), symbol, *function));
+                }
+                Entry::Occupied(slot) if slot.get().0 == key(*function) => {}
+                Entry::Occupied(slot) => {
+                    return Err(EncodeError::DuplicateName {
+                        name: slot.key().clone(),
+                    })
+                }
+            }
+        }
+
+        let definitions = named
+            .iter()
+            .map(|(name, (key, symbol, _))| (name.clone(), (key.0, *symbol)))
+            .collect::<BTreeMap<_, _>>();
+
+        Ok(Self {
+            entry,
+            named,
+            definitions,
+        })
     }
 
-    for function in cited {
-        let span = function.semantic.nodes().kind(function.node).span();
-        let (name, symbol) = binding(*function)?.ok_or(EncodeError::Anonymous { span })?;
+    /// The scope's `Program` and its entry `Node` over `dimensions`.
+    pub fn encode(&self, dimensions: &[Dimension]) -> Result<Encoding, EncodeError> {
+        let mut program = Vec::with_capacity(self.named.len());
 
-        match named.entry(name) {
-            Entry::Vacant(slot) => {
-                slot.insert((key(*function), symbol, *function));
+        for (name, (_, _, function)) in &self.named {
+            program.push(format!(
+                "({}, {})",
+                string(name),
+                term(*function, &self.definitions)?
+            ));
+        }
+
+        Ok(Encoding {
+            program: format!("⟨{}⟩", list(program)),
+            node: format!("⟨{}, .entry⟩", self.entry(dimensions)?),
+        })
+    }
+
+    /// The `Entry` of the scope's entry function over `dimensions`, with no free variables.
+    pub fn entry(&self, dimensions: &[Dimension]) -> Encoded {
+        if let Some(Dimension {
+            measure: Measure::Var(name),
+            ..
+        }) = dimensions
+            .iter()
+            .find(|dimension| matches!(dimension.measure, Measure::Var(_)))
+        {
+            return Err(EncodeError::UnscopedDimension { name: name.clone() });
+        }
+
+        let mut dimensions = dimensions.to_vec();
+
+        dimensions.sort();
+
+        // A Map or Set dimension measures `|D|`, deleted entries included (see `Measure`).
+        let dims = list(dimensions.iter().map(|dimension| {
+            let Measure::Arg(k) = &dimension.measure else {
+                unreachable!("free-variable dimensions are refused above");
+            };
+
+            format!("({}, .arg {k})", dimension.id)
+        }));
+
+        Ok(format!(
+            "⟨{}, [], {dims}⟩",
+            term(self.entry, &self.definitions)?
+        ))
+    }
+
+    /// The `Entry` of a function the scope cites, with no free variables and no dimensions.
+    pub fn cited_entry(&self, function: FunctionRef<'s, 'a>) -> Encoded {
+        Ok(format!("⟨{}, [], []⟩", term(function, &self.definitions)?))
+    }
+
+    /// The `Site` of the syntax at `span` in the entry function: `.entry` for the function itself, else the outermost
+    /// statement or expression of its body spanning exactly `span`. `None` when no such syntax exists.
+    pub fn site(&self, span: Span) -> Result<Option<String>, EncodeError> {
+        let nodes = self.entry.semantic.nodes();
+        let kind = nodes.kind(self.entry.node);
+
+        if kind.span() == span {
+            return Ok(Some(".entry".to_string()));
+        }
+
+        let mut finder = SiteFinder {
+            encoder: Encoder {
+                semantic: self.entry.semantic,
+                root: self.entry.node,
+                definitions: &self.definitions,
+            },
+            span,
+            found: None,
+        };
+
+        match kind {
+            AstKind::Function(function) => {
+                if let Some(body) = &function.body {
+                    finder.visit_function_body(body);
+                }
             }
-            Entry::Occupied(slot) if slot.get().0 == key(*function) => {}
-            Entry::Occupied(slot) => {
-                return Err(EncodeError::DuplicateName {
-                    name: slot.key().clone(),
+            AstKind::ArrowFunctionExpression(arrow) => match &arrow.body {
+                ArrowFunctionBody::FunctionBody(body) => finder.visit_function_body(body),
+                body => {
+                    if let Some(expression) = body.as_expression() {
+                        finder.visit_expression(expression);
+                    }
+                }
+            },
+            kind => {
+                return Err(EncodeError::NotAFunction {
+                    kind: kind.ty(),
+                    span: kind.span(),
                 })
             }
         }
+
+        finder.found.transpose()
+    }
+}
+
+/// Finds the outermost statement or expression spanning exactly `span` and encodes it as a `Site`.
+struct SiteFinder<'s, 'a> {
+    encoder: Encoder<'s, 'a>,
+    span: Span,
+    found: Option<Encoded>,
+}
+
+impl<'a> Visit<'a> for SiteFinder<'_, 'a> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.found.is_some() {
+            return;
+        }
+
+        if statement.span() == self.span {
+            self.found = Some(
+                self.encoder
+                    .statement(statement)
+                    .map(|statement| format!(".stmt ({statement})")),
+            );
+
+            return;
+        }
+
+        oxc_ast_visit::walk::walk_statement(self, statement);
     }
 
-    if let Some(Dimension {
-        measure: Measure::Var(name),
-        ..
-    }) = dimensions
-        .iter()
-        .find(|dimension| matches!(dimension.measure, Measure::Var(_)))
-    {
-        return Err(EncodeError::UnscopedDimension { name: name.clone() });
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.found.is_some() {
+            return;
+        }
+
+        if expression.span() == self.span {
+            self.found = Some(
+                self.encoder
+                    .expression(expression)
+                    .map(|expression| format!(".expr ({expression})")),
+            );
+
+            return;
+        }
+
+        oxc_ast_visit::walk::walk_expression(self, expression);
     }
-
-    let definitions = named
-        .iter()
-        .map(|(name, (key, symbol, _))| (name.clone(), (key.0, *symbol)))
-        .collect::<BTreeMap<_, _>>();
-    let entry_term = term(entry, &definitions)?;
-    let mut program = Vec::with_capacity(named.len());
-
-    for (name, (_, _, function)) in &named {
-        program.push(format!(
-            "({}, {})",
-            string(name),
-            term(*function, &definitions)?
-        ));
-    }
-
-    let mut dimensions = dimensions.to_vec();
-
-    dimensions.sort();
-
-    // A Map or Set dimension measures `|D|`, deleted entries included (see `Measure`).
-    let dims = list(dimensions.iter().map(|dimension| {
-        let Measure::Arg(k) = &dimension.measure else {
-            unreachable!("free-variable dimensions are refused above");
-        };
-
-        format!("({}, .arg {k})", dimension.id)
-    }));
-
-    Ok(Encoding {
-        program: format!("⟨{}⟩", list(program)),
-        node: format!("⟨⟨{entry_term}, [], {dims}⟩, .entry⟩"),
-    })
 }
 
 /// A scope function's identity: its file's semantic and its node.

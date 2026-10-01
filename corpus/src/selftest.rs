@@ -590,9 +590,9 @@ fn check_policies(context: &Context, tree: &Path) -> Result<String, String> {
 
     match problems.is_empty() {
         true => Ok(format!(
-            "{} row files identical under ignore, warn and error",
+            "{} row files and their certificates identical under ignore, warn and error",
             rows.keys()
-                .filter(|name| name.ends_with(".jsonl.gz"))
+                .filter(|name| name.ends_with(".jsonl.gz") && !name.contains("certificates/"))
                 .count()
         )),
         false => Err(summary(&problems)),

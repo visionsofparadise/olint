@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod bounds;
 pub mod budgets;
+pub mod certificate;
 pub mod config;
 pub mod constants;
 pub mod cost;

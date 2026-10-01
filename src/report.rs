@@ -173,6 +173,8 @@ pub struct ReportRow {
     pub mark: Option<String>,
     pub site: Site,
     pub trace: Option<TraceId>,
+    /// The derivation of `cost`.
+    pub derivation: Option<crate::derivation::DerivationId>,
 }
 
 pub fn report_rows_of<'a>(
@@ -220,6 +222,7 @@ pub fn report_rows_of<'a>(
             mark,
             site: analysis.function_site_of(file, function),
             trace: part.trace,
+            derivation: part.derivation,
         });
     }
 

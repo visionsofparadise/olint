@@ -175,6 +175,36 @@ impl Cost {
         Some((Self(local), factor.map(Self)))
     }
 
+    /// The dimension ids the cost mentions, ascending.
+    pub fn dimension_ids(&self) -> Vec<u64> {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut pending = vec![&self.0];
+
+        while let Some(value) = pending.pop() {
+            if let Expression::Dimension { id, .. } = value {
+                ids.insert(*id);
+            }
+
+            pending.extend(value.children());
+        }
+
+        ids.into_iter().collect()
+    }
+
+    /// The cost as an `Olint.Cost` term in Lean source text, constructor for constructor.
+    pub fn lean(&self) -> String {
+        self.lean_with(&|id| id)
+    }
+
+    /// The cost as an `Olint.Cost` term with each dimension id renamed by `rename`.
+    pub fn lean_with(&self, rename: &impl Fn(u64) -> u64) -> String {
+        let mut out = String::new();
+
+        self.0.write_lean(&mut out, rename);
+
+        out
+    }
+
     pub(crate) fn names(&self) -> Vec<String> {
         let mut names = std::collections::BTreeSet::new();
         let mut pending = vec![&self.0];
@@ -220,6 +250,63 @@ impl Default for Expression {
 }
 
 impl Expression {
+    fn write_lean(&self, out: &mut String, rename: &impl Fn(u64) -> u64) {
+        let list = |out: &mut String, constructor: &str, values: &[Self]| {
+            out.push_str(constructor);
+            out.push_str(" [");
+
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+
+                value.write_lean(out, rename);
+            }
+
+            out.push(']');
+        };
+        let unary = |out: &mut String, constructor: &str, value: &Self| {
+            out.push_str(constructor);
+            out.push_str(" (");
+            value.write_lean(out, rename);
+            out.push(')');
+        };
+
+        match self {
+            Self::Constant(value) => out.push_str(&format!(".constant {value}")),
+            Self::LegacyN => out.push_str(".legacyN"),
+            Self::LegacyLog => out.push_str(".legacyLog"),
+            Self::LegacyNLog => out.push_str(".legacyNLog"),
+            Self::Name(name) => {
+                out.push_str(&format!(".name {}", crate::lean_syntax::string(name)))
+            }
+            Self::Dimension { id, domain } => out.push_str(&format!(
+                ".dimension {} {}",
+                rename(*id),
+                match domain {
+                    Domain::PositiveReal => ".positiveReal",
+                    Domain::Size => ".size",
+                }
+            )),
+            Self::Sum(values) => list(out, ".sum", values),
+            Self::Product(values) => list(out, ".product", values),
+            Self::Maximum(values) => list(out, ".maximum", values),
+            Self::Log(value) => unary(out, ".log", value),
+            Self::Factorial(value) => unary(out, ".factorial", value),
+            Self::Power(base, exponent) | Self::Ratio(base, exponent) => {
+                let constructor = match self {
+                    Self::Power(..) => ".power",
+                    _ => ".ratio",
+                };
+
+                unary(out, constructor, base);
+                out.push_str(" (");
+                exponent.write_lean(out, rename);
+                out.push(')');
+            }
+        }
+    }
+
     fn children(&self) -> impl Iterator<Item = &Self> {
         let (values, left, right): (&[Self], Option<&Self>, Option<&Self>) = match self {
             Self::Sum(values) | Self::Product(values) | Self::Maximum(values) => {

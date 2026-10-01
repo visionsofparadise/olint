@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use olint::analysis::{Analysis, Options};
 use olint::config::{read_config, unknown_policy_of};
 use olint::cost::{Cost, State};
+use olint::derivation::CertificateRecord;
 use olint::project::Project;
 use olint::public::public_functions;
 use olint::report::{findings_of, lint_lines, report_lines, report_rows_of, Finding};
-use olint::snapshot::{snapshot_rows, Labels, NodeKey, NodeRow, NodeState};
+use olint::snapshot::{snapshot, snapshot_rows, Labels, NodeKey, NodeRow, NodeState};
 use oxc_allocator::Allocator;
 use oxc_span::GetSpan;
 
@@ -192,7 +193,17 @@ fn check_function_rows(project: &Project<'_>, analysis: &mut Analysis<'_, '_>) {
     }
 }
 
+/// A snapshot's rows and the certificates written beside them.
+struct Snapshot {
+    rows: Vec<NodeRow>,
+    certificates: Vec<CertificateRecord>,
+}
+
 fn source_rows(source: &str) -> Vec<NodeRow> {
+    source_snapshot(source).rows
+}
+
+fn source_snapshot(source: &str) -> Snapshot {
     let directory = tempfile::tempdir().expect("temporary directory");
 
     std::fs::create_dir_all(directory.path().join("src")).expect("src");
@@ -207,8 +218,10 @@ fn source_rows(source: &str) -> Vec<NodeRow> {
     let project =
         Project::load(&allocator, &directory.path().join("tsconfig.json")).expect("project loads");
     let mut analysis = Analysis::new(&project, RECORDING);
+    let mut certificates = Vec::new();
+    let rows = snapshot(&mut analysis, |record| certificates.push(record));
 
-    snapshot_rows(&mut analysis)
+    Snapshot { rows, certificates }
 }
 
 /// The rows inside the function whose text starts at `start`, with spans made relative to it.
@@ -397,4 +410,93 @@ fn entries_read_the_same_state_and_cost_in_lint_and_report() {
         assert!(!lint.is_empty(), "{fixture}");
         assert_eq!(lint, entry_readings(&root, true), "{fixture}");
     }
+}
+
+const LOOP_SOURCE: &str = "export function f(xs: number[]): number {
+	let total = 0;
+	for (const x of xs) {
+		total += x;
+	}
+	return total;
+}
+";
+
+fn row_of<'r>(found: &'r Snapshot, kind: &str) -> &'r NodeRow {
+    found
+        .rows
+        .iter()
+        .find(|row| row.key.kind == kind)
+        .unwrap_or_else(|| panic!("a {kind} row"))
+}
+
+fn certificate_of<'r>(found: &'r Snapshot, row: &NodeRow) -> &'r CertificateRecord {
+    let sha256 = row.certificate.as_ref().expect("the row has a certificate");
+
+    found
+        .certificates
+        .iter()
+        .find(|record| &record.sha256 == sha256)
+        .expect("the row's certificate is written")
+}
+
+#[test]
+fn rows_name_their_rules_and_the_certificates_written_beside_them() {
+    let found = source_snapshot(LOOP_SOURCE);
+    let named: BTreeSet<&String> = found
+        .rows
+        .iter()
+        .filter_map(|row| row.certificate.as_ref())
+        .collect();
+    let written: BTreeSet<&String> = found
+        .certificates
+        .iter()
+        .map(|record| &record.sha256)
+        .collect();
+
+    assert_eq!(named, written);
+    assert!(found.rows.iter().all(|row| !row.rules.is_empty()));
+
+    let returned = row_of(&found, "ReturnStatement");
+    let record = certificate_of(&found, returned);
+
+    assert_eq!(returned.rules, ["seq-max"]);
+    assert_eq!(record.derivation, ".seqUnit");
+    assert_eq!(record.bound, ".constant 1");
+    assert!(
+        record
+            .node
+            .ends_with(", .stmt (.ret (some (.ident \"total\")))⟩"),
+        "{}",
+        record.node
+    );
+
+    let looped = row_of(&found, "ForOfStatement");
+    let record = certificate_of(&found, looped);
+
+    assert_eq!(
+        looped.rules,
+        ["seq-max", "bound-for-of-native", "loop-nest", "loop-phases"]
+    );
+    assert!(
+        record.derivation.contains("(.loopNest ["),
+        "{}",
+        record.derivation
+    );
+    assert!(
+        record.derivation.contains("(.boundForOfNative [] []"),
+        "{}",
+        record.derivation
+    );
+    assert!(record.node.contains("[(0, .arg 0)]⟩"), "{}", record.node);
+
+    // The entry runs its body under `seq-max`, whose constructor takes one certificate per child site.
+    assert_eq!(row_of(&found, "Function").certificate, None);
+}
+
+#[test]
+fn certificates_are_identical_across_runs() {
+    assert_eq!(
+        source_snapshot(LOOP_SOURCE).certificates,
+        source_snapshot(LOOP_SOURCE).certificates
+    );
 }
