@@ -302,6 +302,87 @@ fn source_chains_retain_linear_explanations_and_reset_preserves_handles() {
     }
 }
 
+/// Renders `name`'s explanation from `source`.
+fn explanation_of(source: &str, name: &str) -> String {
+    let mut text = String::new();
+
+    support::run_with_source(source, |analysis, file| {
+        let function = support::function_of_name(analysis.project, file, name);
+        let part = analysis
+            .summarize(file, function)
+            .total(&mut analysis.unknowns, &mut analysis.traces);
+
+        text = render(
+            &analysis.traces,
+            part.trace.expect("the function's work is traced"),
+            0,
+            RenderBudget::default(),
+            &|_, out| out.write_str("index.ts"),
+            &cost_text,
+        )
+        .unwrap()
+        .text;
+    });
+
+    text
+}
+
+#[test]
+fn each_step_names_its_rule_and_the_side_conditions_olint_established() {
+    let halve = "function halve(n: number) { if (n >= 0 && n <= 1000000000) { let total = 0, size = n; while (size > 1) { total++; size = size / 2; } return total; } return 0; }";
+    let text = explanation_of(halve, "halve");
+
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.starts_with("in loop while"), "{text}");
+    assert!(
+        text.trim_end()
+            .ends_with("by loop-nest; bound-geometric (halving)"),
+        "{text}"
+    );
+
+    let text = explanation_of(
+        "function sum(xs: number[]) { let total = 0; for (const x of xs) { total += x; } return total; }
+         function caller(xs: number[]) { return sum(xs); }",
+        "caller",
+    );
+    let lines: Vec<&str> = text.lines().collect();
+
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].starts_with("calls sum()"), "{text}");
+    assert!(lines[0].ends_with("by call-summary"), "{text}");
+    assert!(lines[1].starts_with("in loop for-of"), "{text}");
+    assert!(
+        lines[1].ends_with("by loop-nest; bound-for-of-native"),
+        "{text}"
+    );
+}
+
+#[test]
+fn rule_names_keep_explanations_linear_in_a_call_chain() {
+    for count in [64, 256] {
+        let mut functions: Vec<String> = (0..count - 1)
+            .map(|index| format!("function f{index}(xs: number[]){{ f{}(xs); }}", index + 1))
+            .collect();
+
+        functions.push(format!(
+            "function f{}(xs: number[]){{ for (const x of xs) {{ void x; }} }}",
+            count - 1
+        ));
+
+        let text = explanation_of(
+            &functions.join(
+                "
+",
+            ),
+            "f0",
+        );
+
+        assert_eq!(text.lines().count(), count, "{text}");
+        assert!(text.lines().all(|line| line.contains("  by ")), "{text}");
+        assert!(text.len() <= 160 * count, "{} bytes", text.len());
+    }
+}
+
 fn span(start: u32) -> SourceSpan {
     SourceSpan {
         file: FileId(0),
@@ -321,6 +402,7 @@ fn leaf(arena: &mut TraceArena, cost: Cost, start: u32) -> TraceId {
                 },
                 cost,
                 children: vec![],
+                derivation: None,
             },
             Some(span(start)),
             TraceLayout::Factor { inner_children: 0 },
@@ -473,6 +555,7 @@ fn actual_deep_trace_parts_render_and_drop_on_a_small_rust_stack() {
                             },
                             cost: Cost::ONE,
                             children: vec![root],
+                            derivation: None,
                         },
                         Some(span(index)),
                         TraceLayout::Factor { inner_children: 1 },

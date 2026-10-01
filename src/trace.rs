@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Write};
 
 use crate::cost::Cost;
-use crate::derivation::DerivationArena;
+use crate::derivation::{Derivation, DerivationArena, DerivationId, Fact};
 use crate::project::Site;
 use crate::unknowns::SourceSpan;
 
@@ -18,6 +18,8 @@ pub struct TraceNode {
     pub site: Site,
     pub cost: Cost,
     pub children: Vec<TraceId>,
+    /// The derivation of the step's work, whose rule and side conditions the step's explanation names (§6.5).
+    pub derivation: Option<DerivationId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,15 +106,17 @@ impl TraceArena {
         inner: Option<TraceId>,
         continuation: Option<TraceId>,
     ) -> Result<TraceId, TraceError> {
-        self.factor_format(label, site, origin, cost, inner, continuation)
+        self.factor_format(label, (site, origin), cost, None, inner, continuation)
     }
 
+    /// A step doing `cost` work at `site`, derived by `derivation`, over its `inner` work and followed by
+    /// `continuation`.
     pub fn factor_format(
         &mut self,
         label: impl fmt::Display,
-        site: Site,
-        origin: SourceSpan,
+        (site, origin): (Site, SourceSpan),
         cost: Cost,
+        derivation: Option<DerivationId>,
         inner: Option<TraceId>,
         continuation: Option<TraceId>,
     ) -> Result<TraceId, TraceError> {
@@ -130,6 +134,7 @@ impl TraceArena {
                 site,
                 cost,
                 children: inner.into_iter().chain(continuation).collect(),
+                derivation,
             },
             Some(origin),
             TraceLayout::Factor {
@@ -158,6 +163,7 @@ impl TraceArena {
                         site,
                         cost: Cost::ONE,
                         children: vec![left, right],
+                        derivation: None,
                     },
                     None,
                     TraceLayout::Sequence,
@@ -432,7 +438,64 @@ fn spaces(out: &mut dyn Write, mut count: usize) -> fmt::Result {
     Ok(())
 }
 
+/// A rule application as an explanation names it: the ledger rule, then its side-condition facts in parentheses.
+fn rule_text(
+    derivation: &Derivation,
+    out: &mut dyn Write,
+    cost_text: &impl Fn(&Cost, bool, &mut dyn Write) -> fmt::Result,
+) -> fmt::Result {
+    out.write_str(derivation.rule)?;
+
+    for (index, fact) in derivation.facts.iter().enumerate() {
+        out.write_str(if index == 0 { " (" } else { ", " })?;
+
+        match fact {
+            Fact::Cost(cost) => cost_text(cost, false, out)?,
+            Fact::Nat(value) => write!(out, "{value}")?,
+            Fact::Name(name) | Fact::Declared { name, .. } => out.write_str(name)?,
+            Fact::Site(syntax) => write!(out, "{}..{}", syntax.start, syntax.end)?,
+            Fact::Flag(flag) => write!(out, "{flag}")?,
+        }
+    }
+
+    if !derivation.facts.is_empty() {
+        out.write_char(')')?;
+    }
+
+    Ok(())
+}
+
+/// The rules behind a step: its derivation's rule and facts, then those of each premise concerning the step's own
+/// syntax, such as a loop's bound or a repetition's witness, so each step names a constant number of rule
+/// applications and the explanation stays linear in the derivation.
+fn derivation_text(
+    derivations: &DerivationArena,
+    node: &TraceNode,
+    out: &mut dyn Write,
+    cost_text: &impl Fn(&Cost, bool, &mut dyn Write) -> fmt::Result,
+) -> fmt::Result {
+    let Some(derivation) = node.derivation.and_then(|id| derivations.get(id)) else {
+        return Ok(());
+    };
+
+    out.write_str("  by ")?;
+    rule_text(derivation, out, cost_text)?;
+
+    for premise in &derivation.premises {
+        if let Some(premise) = derivations
+            .get(*premise)
+            .filter(|premise| premise.syntax == derivation.syntax)
+        {
+            out.write_str("; ")?;
+            rule_text(premise, out, cost_text)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn node_line(
+    derivations: &DerivationArena,
     node: &TraceNode,
     depth: usize,
     out: &mut dyn Write,
@@ -478,6 +541,8 @@ fn node_line(
         out.write_str(if is_call { "  = " } else { "  x " })?;
         cost_text(&node.cost, is_call, out)?;
     }
+
+    derivation_text(derivations, node, out, cost_text)?;
 
     out.write_char('\n')
 }
@@ -534,7 +599,16 @@ pub fn render(
             ) {
                 let start = out.text.len();
 
-                if node_line(node, frame.depth, &mut out, location, cost_text).is_err() {
+                if node_line(
+                    &arena.derivations,
+                    node,
+                    frame.depth,
+                    &mut out,
+                    location,
+                    cost_text,
+                )
+                .is_err()
+                {
                     if !out.exhausted {
                         return Err(RenderError::Formatter);
                     }

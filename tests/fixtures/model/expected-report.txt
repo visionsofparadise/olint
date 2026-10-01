@@ -20,278 +20,278 @@ O(strings) [partial]    1
 O(items) [partial]    1
 
 O((xs * log(xs))) nlognExpressionStatementTagged [asserted]  src/branches.ts:103
-    reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))
+    reads as @perf O(N log N)                                 src/branches.ts:105  = O((xs * log(xs)))  by dir-cost
 
 O((xs * log(xs))) nlognFunctionTagged [asserted]  src/branches.ts:97
-    reads as @perf O(N log N)                                 src/branches.ts:97  = O((xs * log(xs)))
+    reads as @perf O(N log N)                                 src/branches.ts:97  = O((xs * log(xs)))  by dir-cost
 
 O((xs * log(xs))) nlognStatementTagged [asserted]  src/branches.ts:89
-    reads as @perf O(N log N)                                 src/branches.ts:92  = O((xs * log(xs)))
+    reads as @perf O(N log N)                                 src/branches.ts:92  = O((xs * log(xs)))  by dir-cost
 
 O(rows)        callsHashPrivateMethod  src/classes.ts:37 [partial]
     unknown origin: call target at src/classes.ts:38 [927..964]; multiplicity O(1)
     unknown origin: call target at src/classes.ts:34 [826..845]; multiplicity O(1) via src/classes.ts:38 [927..964]
     unknown origin: input size relation at src/classes.ts:30 [736..766]; multiplicity unknown via src/classes.ts:38 [927..964] -> src/classes.ts:34 [826..845]
-    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows)
-    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows)
-    in loop for-of                                           src/classes.ts:30  x rows
+    calls WithHashPrivateMethod.run()                      src/classes.ts:38  = O(rows)  by call-summary
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:30  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        WithHashPrivateMethod.run  src/classes.ts:33 [partial]
     unknown origin: call target at src/classes.ts:34 [826..845]; multiplicity O(1)
     unknown origin: input size relation at src/classes.ts:30 [736..766]; multiplicity unknown via src/classes.ts:34 [826..845]
-    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows)
-    in loop for-of                                           src/classes.ts:30  x rows
+    calls WithHashPrivateMethod.#compute()                 src/classes.ts:34  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:30  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        callsPrivateMethod  src/classes.ts:23 [partial]
     unknown origin: call target at src/classes.ts:24 [582..615]; multiplicity O(1)
     unknown origin: call target at src/classes.ts:20 [486..504]; multiplicity O(1) via src/classes.ts:24 [582..615]
     unknown origin: input size relation at src/classes.ts:16 [396..426]; multiplicity unknown via src/classes.ts:24 [582..615] -> src/classes.ts:20 [486..504]
-    calls WithPrivateMethod.run()                          src/classes.ts:24  = O(rows)
-    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows)
-    in loop for-of                                           src/classes.ts:16  x rows
+    calls WithPrivateMethod.run()                          src/classes.ts:24  = O(rows)  by call-summary
+    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:16  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        WithPrivateMethod.run  src/classes.ts:19 [partial]
     unknown origin: call target at src/classes.ts:20 [486..504]; multiplicity O(1)
     unknown origin: input size relation at src/classes.ts:16 [396..426]; multiplicity unknown via src/classes.ts:20 [486..504]
-    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows)
-    in loop for-of                                           src/classes.ts:16  x rows
+    calls WithPrivateMethod.compute()                      src/classes.ts:20  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:16  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        instantiateCostedCtor  src/classes.ts:9 [partial]
     unknown origin: input size relation at src/classes.ts:5 [116..146]; multiplicity unknown via src/classes.ts:10 [246..266]
-    calls CostedCtor()                                     src/classes.ts:10  = O(rows)
-    in loop for-of                                           src/classes.ts:5  x rows
+    calls CostedCtor()                                     src/classes.ts:10  = O(rows)  by constructor-call
+    in loop for-of                                           src/classes.ts:5  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        CostedCtor.constructor  src/classes.ts:3 [partial]
     unknown origin: input size relation at src/classes.ts:5 [116..146]; multiplicity unknown
-    in loop for-of                                           src/classes.ts:5  x rows
+    in loop for-of                                           src/classes.ts:5  x rows  by loop-nest; bound-for-of-native
 
 O(o)           forInRecord  src/bounds.ts:65
-    in loop for-in                                           src/bounds.ts:67  x o
+    in loop for-in                                           src/bounds.ts:67  x o  by loop-nest; bound-for-in
 
 O(xs)          parenthesizedRest  src/calls.ts:74
-    does spread ...(rest)                                 src/calls.ts:77  x xs
+    does spread ...(rest)                                 src/calls.ts:77  x xs  by nest-product; input-size-envelope
 
 O(obj)         destructureObjectRest  src/calls.ts:59 [partial]
     unknown origin: call target at src/calls.ts:61 [1439..1446]; multiplicity O(obj)
-    does spread ...rest                                   src/calls.ts:61  x obj
+    does spread ...rest                                   src/calls.ts:61  x obj  by nest-product; input-size-envelope
 
 O(xs)          destructureRest  src/calls.ts:52
-    does spread ...rest                                   src/calls.ts:55  x xs
+    does spread ...rest                                   src/calls.ts:55  x xs  by nest-product; input-size-envelope
 
 O(xs)          functionReturningFunction  src/calls.ts:35 [partial]
     unknown origin: call target at src/calls.ts:37 [903..908]; multiplicity O(xs)
-    does xs.map()                                         src/calls.ts:37  x xs
+    does xs.map()                                         src/calls.ts:37  x xs  by nest-product; input-size-envelope
 
 O(o)           forInClosed  src/bounds.ts:59
-    in loop for-in                                           src/bounds.ts:61  x o
+    in loop for-in                                           src/bounds.ts:61  x o  by loop-nest; bound-for-in
 
 O(xs)          inlineCallbackCall  src/calls.ts:27
-    does xs.map()                                         src/calls.ts:28  x xs
+    does xs.map()                                         src/calls.ts:28  x xs  by nest-product; input-size-envelope
 
 O(t)           forOfTuple  src/bounds.ts:53
-    in loop for-of                                           src/bounds.ts:55  x t
+    in loop for-of                                           src/bounds.ts:55  x t  by loop-nest; bound-for-of-native
 
 O(xs)          swapPattern  src/budgets.ts:97 [partial]
     unknown origin: iteration bound at src/budgets.ts:101 [1858..1885]; multiplicity unknown
-    in loop for-of                                           src/budgets.ts:100  x xs
+    in loop for-of                                           src/budgets.ts:100  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          compoundBound  src/budgets.ts:74 [partial]
     unknown origin: iteration bound at src/budgets.ts:78 [1499..1530]; multiplicity unknown
-    in loop for-of                                           src/budgets.ts:77  x xs
+    in loop for-of                                           src/budgets.ts:77  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          shorthandDestructure  src/budgets.ts:47 [partial]
     unknown origin: iteration bound at src/budgets.ts:51 [1068..1110]; multiplicity unknown
     unknown origin: call target at src/budgets.ts:56 [1124..1130]; multiplicity O(1) via src/budgets.ts:56 [1124..1130]
-    in loop for-of                                           src/budgets.ts:50  x xs
+    in loop for-of                                           src/budgets.ts:50  x xs  by loop-nest; bound-for-of-native
 
 O(matrix)      whileHalvingMidpoint  src/bounds.ts:38 [partial]
     unknown origin: iteration bound at src/bounds.ts:43 [912..1022]; multiplicity unknown
-    in loop for-of                                           src/bounds.ts:40  x matrix
+    in loop for-of                                           src/bounds.ts:40  x matrix  by loop-nest; bound-for-of-native
 
 O(xs)          hotLocalFunctionDeclaration  src/branches.ts:207 [partial]
     unknown origin: input size relation at src/branches.ts:211 [5062..5092]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:211  x xs
+    in loop for-of                                           src/branches.ts:211  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          callsColdFunctionBesideLinear [asserted]  src/branches.ts:190 [partial]
     unknown origin: input size relation at src/branches.ts:55 [1264..1319]; multiplicity unknown via src/branches.ts:191 [4555..4577]
     unknown origin: input size relation at src/branches.ts:55 [1285..1319]; multiplicity unknown via src/branches.ts:191 [4555..4577]
-    in loop for-of                                           src/branches.ts:192  x xs
+    in loop for-of                                           src/branches.ts:192  x xs  by loop-nest; bound-for-of-native
 
 O(matrix)      whileHalvingShift  src/bounds.ts:26 [partial]
     unknown origin: iteration bound at src/bounds.ts:30 [678..725]; multiplicity unknown
-    in loop for-of                                           src/bounds.ts:28  x matrix
+    in loop for-of                                           src/bounds.ts:28  x matrix  by loop-nest; bound-for-of-native
 
 O(xs)          coldElseBranch [asserted]  src/branches.ts:153 [partial]
     unknown origin: input size relation at src/branches.ts:159 [3869..3924]; multiplicity unknown
     unknown origin: input size relation at src/branches.ts:159 [3890..3924]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:156  x xs
+    in loop for-of                                           src/branches.ts:156  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          switchDiscriminantCost  src/branches.ts:137
-    does xs.indexOf()                                     src/branches.ts:138  x xs
+    does xs.indexOf()                                     src/branches.ts:138  x xs  by nest-product; input-size-envelope
 
 O(xs)          maxTaggedPublicFn  src/branches.ts:110 [partial]
     unknown origin: input size relation at src/branches.ts:112 [2848..2903]; multiplicity unknown
     unknown origin: input size relation at src/branches.ts:112 [2869..2903]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:112  x xs
+    in loop for-of                                           src/branches.ts:112  x xs  by loop-nest; bound-for-of-native
 
 O(matrix)      geometricStepLoop  src/bounds.ts:18 [partial]
     unknown origin: iteration bound at src/bounds.ts:21 [473..527]; multiplicity unknown
-    in loop for-of                                           src/bounds.ts:20  x matrix
+    in loop for-of                                           src/bounds.ts:20  x matrix  by loop-nest; bound-for-of-native
 
 O(xs)          boundedNonLoopStatement [asserted]  src/branches.ts:81 [partial]
     unknown origin: input size relation at src/branches.ts:85 [2135..2165]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:85  x xs
+    in loop for-of                                           src/branches.ts:85  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          boundedLoopStatement [asserted]  src/branches.ts:74
-    in loop for-of                                           src/branches.ts:77  x xs
+    in loop for-of                                           src/branches.ts:77  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          ignoredStatementFn [asserted]  src/branches.ts:59
-    in loop for-of                                           src/branches.ts:63  x xs
+    in loop for-of                                           src/branches.ts:63  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          coldFunctionTagged  src/branches.ts:53 [partial]
     unknown origin: input size relation at src/branches.ts:55 [1264..1319]; multiplicity unknown
     unknown origin: input size relation at src/branches.ts:55 [1285..1319]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:55  x xs
+    in loop for-of                                           src/branches.ts:55  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          coldStatementFn [asserted]  src/branches.ts:44 [partial]
     unknown origin: input size relation at src/branches.ts:47 [1034..1089]; multiplicity unknown
     unknown origin: input size relation at src/branches.ts:47 [1055..1089]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:48  x xs
+    in loop for-of                                           src/branches.ts:48  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          hotBlockStatement [asserted]  src/branches.ts:36 [partial]
     unknown origin: input size relation at src/branches.ts:38 [821..851]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:40  x xs
+    in loop for-of                                           src/branches.ts:40  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          hotTryBranch [asserted]  src/branches.ts:25 [partial]
     unknown origin: input size relation at src/branches.ts:31 [674..704]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:29  x xs
+    in loop for-of                                           src/branches.ts:29  x xs  by loop-nest; bound-for-of-native
 
 O(rows)        reexportDefault  src/modules/reexports.ts:3 [partial]
     unknown origin: input size relation at src/modules/reexports.ts:5 [141..175]; multiplicity unknown
-    in loop for-of                                           src/modules/reexports.ts:5  x rows
+    in loop for-of                                           src/modules/reexports.ts:5  x rows  by loop-nest; bound-for-of-native
 
 O(matrix)      tripleNestedOverLimit  src/types.ts:70 [partial]
     unknown origin: input size relation at src/types.ts:72 [1716..1771]; multiplicity unknown
     unknown origin: input size relation at src/types.ts:72 [1737..1771]; multiplicity unknown
-    in loop for-of                                           src/types.ts:72  x matrix
+    in loop for-of                                           src/types.ts:72  x matrix  by loop-nest; bound-for-of-native
 
 O(xs)          hotCaseBranch [asserted]  src/branches.ts:12 [partial]
     unknown origin: input size relation at src/branches.ts:20 [455..485]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:17  x xs
+    in loop for-of                                           src/branches.ts:17  x xs  by loop-nest; bound-for-of-native
 
 O(matrix)      typeAliasChain  src/types.ts:45 [partial]
     unknown origin: input size relation at src/types.ts:47 [1107..1149]; multiplicity unknown
-    in loop for-of                                           src/types.ts:47  x matrix
+    in loop for-of                                           src/types.ts:47  x matrix  by loop-nest; bound-for-of-native
 
 O(matrix)      unionOfClosed  src/types.ts:18 [partial]
     unknown origin: input size relation at src/types.ts:20 [437..486]; multiplicity unknown
-    in loop for-of                                           src/types.ts:20  x matrix
+    in loop for-of                                           src/types.ts:20  x matrix  by loop-nest; bound-for-of-native
 
 O(o)           forInIndexSig  src/types.ts:6
-    in loop for-in                                           src/types.ts:8  x o
+    in loop for-in                                           src/types.ts:8  x o  by loop-nest; bound-for-in
 
 O(xs)          a  src/modules/star.ts:1 [partial]
     unknown origin: input size relation at src/modules/star.ts:3 [81..111]; multiplicity unknown
-    in loop for-of                                           src/modules/star.ts:3  x xs
+    in loop for-of                                           src/modules/star.ts:3  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          hotIfBranch [asserted]  src/branches.ts:1 [partial]
     unknown origin: input size relation at src/branches.ts:7 [188..218]; multiplicity unknown
-    in loop for-of                                           src/branches.ts:5  x xs
+    in loop for-of                                           src/branches.ts:5  x xs  by loop-nest; bound-for-of-native
 
 O(n)           directRecursion  src/recursion.ts:4
-    calls factorialLike()                                  src/recursion.ts:5  = O(n)
-    calls factorialLike()                                  src/recursion.ts:2  = O(n)
-    calls factorialLike()                                  src/recursion.ts:2  = O(n)
+    calls factorialLike()                                  src/recursion.ts:5  = O(n)  by call-summary
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)  by call-summary
+    calls factorialLike()                                  src/recursion.ts:2  = O(n)  by call-summary
 
 O(prefix)      nextLineLabel  src/methods.ts:98
-    does (prefix + "ab").split() [string]                src/methods.ts:99  x prefix
+    does (prefix + "ab").split() [string]                src/methods.ts:99  x prefix  by nest-product; native-charge-length
 
 O(prefix)      surrogateCutLabel  src/methods.ts:94
-    does (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa�....split() [string] src/methods.ts:95  x prefix
+    does (prefix + "aaaaaaaaaaaaaaaaaaaaaaaaa�....split() [string] src/methods.ts:95  x prefix  by nest-product; native-charge-length
 
 O(rows)        spreadRestKeys  src/methods.ts:90 [partial]
     unknown origin: input size relation at src/methods.ts:91 [2218..2238]; multiplicity O(1)
     unknown origin: input size relation at src/methods.ts:91 [2218..2238]; multiplicity unknown
-    does spread ...rows                                   src/methods.ts:90  x rows
+    does spread ...rows                                   src/methods.ts:90  x rows  by nest-product; input-size-envelope
 
 O(rows)        spreadRestTupleSet  src/methods.ts:86 [partial]
     unknown origin: input size relation at src/methods.ts:87 [2119..2135]; multiplicity O(1)
-    does spread ...rows                                   src/methods.ts:86  x rows
+    does spread ...rows                                   src/methods.ts:86  x rows  by nest-product; input-size-envelope
 
 O(rows)        newSetNonConst  src/methods.ts:59 [partial]
     unknown origin: input size relation at src/methods.ts:61 [1635..1637]; multiplicity O(rows)
     unknown origin: input size relation at src/methods.ts:61 [1627..1638]; multiplicity O(rows)
     unknown origin: input size relation at src/methods.ts:61 [1627..1638]; multiplicity unknown
     unknown origin: input size relation at src/methods.ts:61 [1627..1643]; multiplicity O(rows)
-    in loop for-of                                           src/methods.ts:61  x rows
+    in loop for-of                                           src/methods.ts:61  x rows  by loop-nest; bound-for-of-native
 
 O(items)       structuredCloneCall  src/methods.ts:51 [partial]
     unknown origin: input size relation at src/methods.ts:52 [1403..1404]; multiplicity O(items)
     unknown origin: call target at src/methods.ts:52 [1403..1404]; multiplicity unknown
     unknown origin: implementation-defined work at src/methods.ts:52 [1387..1405]; multiplicity O(items)
-    does items.map()                                      src/methods.ts:52  x items
+    does items.map()                                      src/methods.ts:52  x items  by nest-product; input-size-envelope
 
 O(n)           arrayFromCallback  src/methods.ts:37
-    does Array.from({ length: n })                        src/methods.ts:38  x n
+    does Array.from({ length: n })                        src/methods.ts:38  x n  by nest-product; native-charge-length
 
 O(o)           objectKeysCall  src/methods.ts:33
-    does Object.keys(o)                                   src/methods.ts:34  x o
+    does Object.keys(o)                                   src/methods.ts:34  x o  by nest-product; native-charge-length
 
 O(strings)     stringLinearCall  src/methods.ts:17 [partial]
     unknown origin: input size relation at src/methods.ts:19 [543..560]; multiplicity O(strings)
     unknown origin: input size relation at src/methods.ts:19 [543..560]; multiplicity unknown
-    in loop for-of                                           src/methods.ts:19  x strings
+    in loop for-of                                           src/methods.ts:19  x strings  by loop-nest; bound-for-of-native
 
 O(xs)          arrayLinearCall  src/methods.ts:1
-    does xs.includes()                                    src/methods.ts:2  x xs
+    does xs.includes()                                    src/methods.ts:2  x xs  by nest-product; input-size-envelope
 
 O(xs)          AccessorHolder.helper  src/classes.ts:150
-    in loop for-of                                           src/classes.ts:151  x xs
+    in loop for-of                                           src/classes.ts:151  x xs  by loop-nest; bound-for-of-native
 
 O(matrix)      labeledLoop  src/bounds.ts:78 [partial]
     unknown origin: input size relation at src/bounds.ts:81 [1659..1727]; multiplicity unknown
-    in loop for-of                                           src/bounds.ts:80  x matrix
+    in loop for-of                                           src/bounds.ts:80  x matrix  by loop-nest; bound-for-of-native
 
 O(xs)          AccessorHolder.sweep  src/classes.ts:141
-    in loop for-of                                           src/classes.ts:142  x xs
+    in loop for-of                                           src/classes.ts:142  x xs  by loop-nest; bound-for-of-native
 
 O(rows)        usesClassExpression  src/classes.ts:94 [partial]
     unknown origin: call target at src/classes.ts:95 [2313..2351]; multiplicity O(1)
     unknown origin: input size relation at src/classes.ts:90 [2190..2220]; multiplicity unknown via src/classes.ts:95 [2313..2351]
-    calls <class>.run()                                    src/classes.ts:95  = O(rows)
-    in loop for-of                                           src/classes.ts:90  x rows
+    calls <class>.run()                                    src/classes.ts:95  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:90  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        <class>.run  src/classes.ts:88 [partial]
     unknown origin: input size relation at src/classes.ts:90 [2190..2220]; multiplicity unknown
-    in loop for-of                                           src/classes.ts:90  x rows
+    in loop for-of                                           src/classes.ts:90  x rows  by loop-nest; bound-for-of-native
 
 O(xs)          pushesToReadonlyItems  src/classes.ts:81 [partial]
     unknown origin: call target at src/classes.ts:83 [2029..2041]; multiplicity O(1)
-    calls WithReadonlyItems.addAll()                       src/classes.ts:83  = O(xs)
-    does spread ...xs                                     src/classes.ts:78  x xs
+    calls WithReadonlyItems.addAll()                       src/classes.ts:83  = O(xs)  by call-summary
+    does spread ...xs                                     src/classes.ts:78  x xs  by nest-product; input-size-envelope
 
 O(xs)          WithReadonlyItems.addAll  src/classes.ts:77
-    does spread ...xs                                     src/classes.ts:78  x xs
+    does spread ...xs                                     src/classes.ts:78  x xs  by nest-product; input-size-envelope
 
 O(rows)        callsArrowProperty  src/classes.ts:71 [partial]
     unknown origin: call target at src/classes.ts:72 [1762..1799]; multiplicity O(1)
     unknown origin: input size relation at src/classes.ts:67 [1640..1670]; multiplicity unknown via src/classes.ts:72 [1762..1799]
-    calls WithArrowProperty.handler()                      src/classes.ts:72  = O(rows)
-    in loop for-of                                           src/classes.ts:67  x rows
+    calls WithArrowProperty.handler()                      src/classes.ts:72  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:67  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        WithArrowProperty.handler  src/classes.ts:65 [partial]
     unknown origin: input size relation at src/classes.ts:67 [1640..1670]; multiplicity unknown
-    in loop for-of                                           src/classes.ts:67  x rows
+    in loop for-of                                           src/classes.ts:67  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        callsStaticMethod  src/classes.ts:60 [partial]
     unknown origin: call target at src/classes.ts:61 [1488..1518]; multiplicity O(1)
     unknown origin: input size relation at src/classes.ts:56 [1368..1398]; multiplicity unknown via src/classes.ts:61 [1488..1518]
-    calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows)
-    in loop for-of                                           src/classes.ts:56  x rows
+    calls WithStaticMethod.compute()                       src/classes.ts:61  = O(rows)  by call-summary
+    in loop for-of                                           src/classes.ts:56  x rows  by loop-nest; bound-for-of-native
 
 O(rows)        WithStaticMethod.compute  src/classes.ts:54 [partial]
     unknown origin: input size relation at src/classes.ts:56 [1368..1398]; multiplicity unknown
-    in loop for-of                                           src/classes.ts:56  x rows
+    in loop for-of                                           src/classes.ts:56  x rows  by loop-nest; bound-for-of-native
 
 O(1)           constantBoundLoop  src/bounds.ts:6
 

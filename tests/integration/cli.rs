@@ -551,13 +551,16 @@ fn reports_show_scheduled_and_lazy_work_without_charging_unconsumed_generators()
     );
     assert!(stdout.contains("calls rows(xs) [lazy]"), "{stdout}");
     assert!(
-        stdout.contains("in loop for-of [iterator visits]"),
+        stdout.contains("by loop-nest; bound-iterator-visits (iterator visits)"),
         "{stdout}"
     );
     assert!(
         stdout.contains("calls ready.then() callback [scheduled]"),
         "{stdout}"
     );
+    // Each step names the rule it applies (§6.5).
+    assert!(stdout.contains("by lazy-consume"), "{stdout}");
+    assert!(stdout.contains("by native-callback"), "{stdout}");
 
     let (row, _) = reported_row_of(directory.path(), "consume");
 

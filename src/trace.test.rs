@@ -31,6 +31,7 @@ fn factor(
                     Cost::power(Cost::N, Cost::constant(u64::from(degree))).unwrap()
                 },
                 children,
+                derivation: None,
             },
             Some(source(start)),
             TraceLayout::Factor { inner_children },
@@ -49,6 +50,7 @@ fn group(arena: &mut TraceArena, children: Vec<TraceId>) -> TraceId {
                 },
                 cost: Cost::ONE,
                 children,
+                derivation: None,
             },
             None,
             TraceLayout::Group,
@@ -358,6 +360,7 @@ fn invalid_edges_sites_layouts_and_capacity_are_explicit() {
         },
         cost: Cost::ONE,
         children: vec![],
+        derivation: None,
     };
     let layout = TraceLayout::Factor { inner_children: 0 };
 

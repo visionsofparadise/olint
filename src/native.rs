@@ -1263,8 +1263,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             beside = beside.map_parts(|part| {
                 part.explain(
                     format_args!("call {receiver}.{}() callback [scheduled]", site.name),
-                    self.project.site_of(file, site.span),
-                    origin,
+                    (self.project.site_of(file, site.span), origin),
+                    "native-callback",
                     true,
                     &mut self.traces,
                     &mut self.unknowns,

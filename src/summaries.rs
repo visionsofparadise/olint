@@ -3664,7 +3664,13 @@ impl<'p, 'a> Analysis<'p, 'a> {
             None => part.preferred(Preference::Unmarked),
         };
         let syntax = self.source_span(file, self.kind_of_node(file, function.node_id()).span());
+        // A call the explanation names already applies `call-summary` at its site.
+        let named = part
+            .derivation
+            .and_then(|id| self.traces.derivations.get(id))
+            .is_some_and(|held| held.rule == "call-summary" && held.cost == part.cost);
         let derivation = match part.cost_error {
+            _ if named => part.derivation,
             Some(_) => None,
             None => self.traces.derivations.over(
                 "call-summary",
@@ -5787,8 +5793,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         "call {} [lazy]",
                         crate::bounds::short(self.text_of(file, span))
                     ),
-                    self.project.site_of(file, span),
-                    origin,
+                    (self.project.site_of(file, span), origin),
+                    "lazy-consume",
                     true,
                     &mut self.traces,
                     &mut self.unknowns,

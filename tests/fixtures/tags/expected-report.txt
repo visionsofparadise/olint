@@ -6,44 +6,44 @@ O(xs)               3
 
 O(xs)          hotBranch [asserted]  src/tags.ts:26 [partial]
     unknown origin: input size relation at src/tags.ts:32 [765..795]; multiplicity unknown
-    in loop for-of                                           src/tags.ts:30  x xs
+    in loop for-of                                           src/tags.ts:30  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          uses  src/public.ts:34 [partial]
     unknown origin: input size relation at src/public.ts:3 [85..140]; multiplicity unknown via src/public.ts:34 [752..767] -> src/public.ts:31 [686..695]
     unknown origin: input size relation at src/public.ts:3 [106..140]; multiplicity unknown via src/public.ts:34 [752..767] -> src/public.ts:31 [686..695]
     unknown origin: input size relation at src/public.ts:3 [85..140]; multiplicity unknown via src/public.ts:34 [752..767] -> src/public.ts:31 [698..707]
     unknown origin: input size relation at src/public.ts:3 [106..140]; multiplicity unknown via src/public.ts:34 [752..767] -> src/public.ts:31 [698..707]
-    calls notExported()                                    src/public.ts:34  = O(xs)
-    calls cubic()                                          src/public.ts:31  = O(xs)
-    in loop for-of                                           src/public.ts:3  x xs
+    calls notExported()                                    src/public.ts:34  = O(xs)  by call-summary
+    calls cubic()                                          src/public.ts:31  = O(xs)  by call-summary
+    in loop for-of                                           src/public.ts:3  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          Engine.run  src/public.ts:21 [partial]
     unknown origin: input size relation at src/public.ts:3 [85..140]; multiplicity unknown via src/public.ts:22 [548..557]
     unknown origin: input size relation at src/public.ts:3 [106..140]; multiplicity unknown via src/public.ts:22 [548..557]
-    calls cubic()                                          src/public.ts:22  = O(xs)
-    in loop for-of                                           src/public.ts:3  x xs
+    calls cubic()                                          src/public.ts:22  = O(xs)  by call-summary
+    in loop for-of                                           src/public.ts:3  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          quadratic  src/public.ts:14 [partial]
     unknown origin: input size relation at src/public.ts:16 [438..468]; multiplicity unknown
-    in loop for-of                                           src/public.ts:16  x xs
+    in loop for-of                                           src/public.ts:16  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          acceptedCubic  src/public.ts:8 [partial]
     unknown origin: input size relation at src/public.ts:10 [274..329]; multiplicity unknown
     unknown origin: input size relation at src/public.ts:10 [295..329]; multiplicity unknown
-    in loop for-of                                           src/public.ts:10  x xs
+    in loop for-of                                           src/public.ts:10  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          cubic  src/public.ts:1 [partial]
     unknown origin: input size relation at src/public.ts:3 [85..140]; multiplicity unknown
     unknown origin: input size relation at src/public.ts:3 [106..140]; multiplicity unknown
-    in loop for-of                                           src/public.ts:3  x xs
+    in loop for-of                                           src/public.ts:3  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          coldStatement [asserted]  src/tags.ts:7 [partial]
     unknown origin: input size relation at src/tags.ts:10 [246..276]; multiplicity unknown
-    in loop for-of                                           src/tags.ts:11  x xs
+    in loop for-of                                           src/tags.ts:11  x xs  by loop-nest; bound-for-of-native
 
 O(xs)          plainNested  src/tags.ts:1 [partial]
     unknown origin: input size relation at src/tags.ts:3 [91..121]; multiplicity unknown
-    in loop for-of                                           src/tags.ts:3  x xs
+    in loop for-of                                           src/tags.ts:3  x xs  by loop-nest; bound-for-of-native
 
 O(1)           Svc.run [asserted]  src/tags.ts:97 [partial]
     unknown origin: iteration bound at src/tags.ts:99 [2210..2259]; multiplicity unknown

@@ -1863,11 +1863,14 @@ impl Part {
 
         self
     }
+    /// Traces a step of the explanation at `origin`, which applies `rule` to this part: the part's derivation becomes
+    /// that rule's application over it, unless the derivation already is one at `origin` concluding this cost, and the
+    /// step names it (§6.5).
     pub fn explain(
         mut self,
         label: impl std::fmt::Display,
-        site: Site,
-        origin: SourceSpan,
+        (site, origin): (Site, SourceSpan),
+        rule: &'static str,
         inner: bool,
         traces: &mut TraceArena,
         unknowns: &mut Unknowns,
@@ -1878,10 +1881,37 @@ impl Part {
             (None, self.trace)
         };
         let cost = if inner { self.cost.clone() } else { Cost::ONE };
+        let applied = self
+            .derivation
+            .and_then(|id| traces.derivations.get(id))
+            .is_some_and(|held| {
+                held.rule == rule && held.syntax == origin && held.cost == self.cost
+            });
 
-        match traces.factor_format(label, site, origin, cost, child, continuation) {
+        if !applied {
+            self.derivation = match self.cost_error {
+                Some(_) => None,
+                None => traces.derivations.over(
+                    rule,
+                    Some(origin),
+                    (self.derivation, &self.cost),
+                    Vec::new(),
+                    self.cost.clone(),
+                ),
+            };
+        }
+
+        match traces.factor_format(
+            label,
+            (site, origin),
+            cost,
+            self.derivation,
+            child,
+            continuation,
+        ) {
             Ok(trace) => self.trace = Some(trace),
             Err(_) => {
+                self.derivation = None;
                 self.cost_error = Some(CostError::Resource);
                 let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
                 self.unknowns = unknowns.join(self.unknowns, Some(failure));
@@ -2390,8 +2420,30 @@ pub fn nest(
         witness,
         rule,
     } = multiplicity;
-    let trace = traces.factor(label, site, origin, factor.clone(), None, inner.trace);
+    let product = factor.multiply(&inner.cost);
+    let premises = match (inner.derivation, witness) {
+        (Some(premise), Some(witness)) => Some(vec![witness, premise]),
+        (None, Some(witness)) if inner.cost.is_one() => Some(vec![witness]),
+        _ => None,
+    };
+    let derivation = match (&product, premises) {
+        (Ok(cost), Some(premises)) if inner.cost_error.is_none() => {
+            traces
+                .derivations
+                .derive(rule, Some(origin), &premises, Vec::new(), cost.clone())
+        }
+        _ => None,
+    };
+    let trace = traces.factor_format(
+        label,
+        (site, origin),
+        factor.clone(),
+        derivation,
+        None,
+        inner.trace,
+    );
     let trace_error = trace.is_err();
+    let derivation = derivation.filter(|_| !trace_error);
 
     let retained = unknowns.scale(inner.retained, Some(factor.clone()));
     let mut selected_unknowns = unknowns.scale(inner.unknowns, Some(factor.clone()));
@@ -2402,27 +2454,15 @@ pub fn nest(
     }
 
     // A product past the cost representation is an unknown contribution, so it adds nothing to the floor (§1 Floor).
-    let (cost, trace, derived) = match factor.multiply(&inner.cost) {
-        Ok(cost) => (cost, trace.ok(), true),
+    let (cost, trace) = match product {
+        Ok(cost) => (cost, trace.ok()),
         Err(_) => {
             let failure = unknowns.origin(origin, UnknownReason::ResourceExhaustion);
             selected_unknowns = unknowns.join(selected_unknowns, Some(failure));
 
-            (Cost::ONE, None, false)
+            (Cost::ONE, None)
         }
     };
-    let premises = match (inner.derivation, witness) {
-        (Some(premise), Some(witness)) => Some(vec![witness, premise]),
-        (None, Some(witness)) if inner.cost.is_one() => Some(vec![witness]),
-        _ => None,
-    };
-    let derivation = premises
-        .filter(|_| derived && !trace_error && inner.cost_error.is_none())
-        .and_then(|premises| {
-            traces
-                .derivations
-                .derive(rule, Some(origin), &premises, Vec::new(), cost.clone())
-        });
 
     Part {
         origin: Some(origin),

@@ -1995,8 +1995,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             false => match self.trace_name_of(file, function) {
                 Ok(name) => called.explain(
                     format_args!("call {name}() [{operation}]"),
-                    site,
-                    origin,
+                    (site, origin),
+                    "implicit-invocation",
                     true,
                     &mut self.traces,
                     &mut self.unknowns,

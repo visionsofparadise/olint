@@ -789,8 +789,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         true => part,
                         false => part.explain(
                             "continuation after await [scheduled]",
-                            self.site_of_node(file, node),
-                            self.source_span(file, self.kind_of_node(file, node).span()),
+                            (
+                                self.site_of_node(file, node),
+                                self.source_span(file, self.kind_of_node(file, node).span()),
+                            ),
+                            "await-continuation",
                             false,
                             &mut self.traces,
                             &mut self.unknowns,
@@ -1367,8 +1370,11 @@ impl<'p, 'a> Analysis<'p, 'a> {
                     completion_word_of(completion),
                     escape_unit_of(escape)
                 ),
-                self.site_of_node(file, site_node),
-                self.source_span(file, self.kind_of_node(file, site_node).span()),
+                (
+                    self.site_of_node(file, site_node),
+                    self.source_span(file, self.kind_of_node(file, site_node).span()),
+                ),
+                "escape-lift",
                 false,
                 &mut self.traces,
                 &mut self.unknowns,
@@ -1615,11 +1621,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             ));
         }
 
+        // The bound's rule and side condition reach the explanation from the loop's derivation (§6.5).
         let mut label = loop_label(kind).to_string();
-
-        if let Some(proof) = bound.proof(&self.traces.derivations) {
-            label.push_str(&format!(" [{proof}]"));
-        }
 
         if let Some(budget) = &budget {
             let per = match scope {
@@ -2278,8 +2281,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
 
                             callee.explain(
                                 format_args!("new {name}()"),
-                                site,
-                                origin,
+                                (site, origin),
+                                "constructor-call",
                                 true,
                                 &mut self.traces,
                                 &mut self.unknowns,
@@ -2303,8 +2306,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 } else {
                     part.explain(
                         format_args!("new {}()", short(self.text_of(file, new.callee.span()))),
-                        site,
-                        origin,
+                        (site, origin),
+                        "constructor-call",
                         true,
                         &mut self.traces,
                         &mut self.unknowns,
@@ -2478,8 +2481,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
         match self.trace_name_of(target, function) {
             Ok(name) => called.explain(
                 format_args!("call {name}()"),
-                site,
-                origin,
+                (site, origin),
+                "call-summary",
                 true,
                 &mut self.traces,
                 &mut self.unknowns,
@@ -2649,8 +2652,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
             } else {
                 part.explain(
                     "super()",
-                    site,
-                    origin,
+                    (site, origin),
+                    "constructor-call",
                     true,
                     &mut self.traces,
                     &mut self.unknowns,
@@ -2811,8 +2814,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                         } else {
                             part.explain(
                                 format_args!("call {}() [callback parameter]", reference.name),
-                                site,
-                                origin,
+                                (site, origin),
+                                "call-callback-parameter",
                                 true,
                                 &mut self.traces,
                                 &mut self.unknowns,
@@ -2930,8 +2933,8 @@ impl<'p, 'a> Analysis<'p, 'a> {
                 _ if part.cost.is_one() => part,
                 Some(Ok(name)) => part.explain(
                     format_args!("call {name}()"),
-                    site,
-                    origin,
+                    (site, origin),
+                    "call-returned-function",
                     true,
                     &mut self.traces,
                     &mut self.unknowns,
@@ -3427,8 +3430,8 @@ pub(crate) fn tagged_reading_of(
     } else {
         part.explain(
             format_args!("@perf {text}"),
-            site,
-            origin,
+            (site, origin),
+            "dir-cost",
             true,
             traces,
             unknowns,
