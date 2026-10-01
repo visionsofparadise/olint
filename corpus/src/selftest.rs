@@ -50,15 +50,15 @@ struct Plant {
 const WEAKEN: Plant = Plant {
     name: "weaken",
     file: "src/bounds.rs",
-    find: "        let bound = self.inner_bound_of(file, loop_kind);\n",
-    replace: "        let _ = self.inner_bound_of(file, loop_kind);\n        let bound = unresolved_bound_of();\n",
+    find: "        let verdict = self.inner_bound_of(file, loop_kind);\n",
+    replace: "        let _ = self.inner_bound_of(file, loop_kind);\n        let verdict = unresolved_bound_of();\n",
 };
 
 const WIDEN: Plant = Plant {
     name: "widen",
     file: "src/bounds.rs",
-    find: "        let bound = self.inner_bound_of(file, loop_kind);\n",
-    replace: "        let bound = match self.inner_bound_of(file, loop_kind) {\n            Bound::Proven { proof, .. } => Bound::Proven {\n                factor: crate::cost::Cost::dimension(u64::MAX, crate::cost::Domain::Size),\n                proof,\n            },\n            bound => bound,\n        };\n",
+    find: "        let verdict = self.inner_bound_of(file, loop_kind);\n",
+    replace: "        let verdict = match self.inner_bound_of(file, loop_kind) {\n            Verdict::Proven { rule, condition, .. } => Verdict::Proven {\n                factor: crate::cost::Cost::dimension(u64::MAX, crate::cost::Domain::Size),\n                rule,\n                condition,\n            },\n            verdict => verdict,\n        };\n",
 };
 
 const TIGHTEN: Plant = Plant {
